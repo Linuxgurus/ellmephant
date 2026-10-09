@@ -1,0 +1,100 @@
+# Installing llmphant
+
+llmphant is a single binary backed by one SQLite file. You can build it from source or run the
+container image. Either way the store is a single directory (`~/.llmphant` by default, `/data`
+in the container) and the model weights are fetched into it once, then reused offline.
+
+- [Prerequisites](#prerequisites)
+- [Build from source](#build-from-source)
+- [Install the binary on your `PATH`](#install-the-binary-on-your-path)
+- [Store-only build](#store-only-build)
+- [Create the store and fetch weights](#create-the-store-and-fetch-weights)
+- [Docker](#docker)
+- [Verify the installation](#verify-the-installation)
+
+## Prerequisites
+
+- **Rust 1.88+** (edition 2024) and `cargo` — install via [rustup](https://rustup.rs).
+- **A C compiler / linker** (`cc`, `clang`, or `gcc`). SQLite and `sqlite-vec` are compiled from
+  source. On Debian/Ubuntu: `apt install build-essential`.
+- **~3 GB disk** to build, plus **~1.2 GB** for the model weights.
+- **macOS or Linux.** Apple Silicon can use `--device metal`; other platforms run on the CPU.
+  Windows is untested; WSL2 is expected to work.
+
+## Build from source
+
+```sh
+git clone <this-repo> && cd llmphant
+cargo build --release --locked        # or: make release
+./target/release/llmphant --version
+```
+
+The first build is slow: it compiles the SQLite/`sqlite-vec` C sources, the candle ML stack, and
+roughly four hundred crates. Later builds are incremental.
+
+## Install the binary on your `PATH`
+
+```sh
+cargo install --path .                # -> ~/.cargo/bin/llmphant
+# or, without cargo:
+install -m 0755 target/release/llmphant ~/.local/bin/llmphant
+```
+
+## Store-only build
+
+A build without the embedding stack, for machines that only read a store or run JSONL
+export/import. `--mode fts` search works; the KNN leg is unavailable and the encoder reports an
+error if a command needs it.
+
+```sh
+cargo build --release --locked --no-default-features
+```
+
+## Create the store and fetch weights
+
+```sh
+llmphant doctor            # creates ~/.llmphant/ and the schema; prints health
+llmphant model fetch       # one-time ~1.2 GB download into ~/.llmphant/models/
+llmphant doctor --verify   # optional: re-hash every weight file
+```
+
+Every command honours `LLMPHANT_HOME`; without it the store is `~/.llmphant`. After the fetch,
+runs need no network. `llmphant --offline <cmd>` opens no socket.
+
+## Docker
+
+The image is a multi-stage build: dependencies compile in `rust:1-bookworm`, and the runtime is
+`debian:bookworm-slim` plus the one binary. The store is a volume at `/data`
+(`LLMPHANT_HOME=/data`).
+
+```sh
+make docker-build                     # docker build -t llmphant:dev .
+# or:
+docker build -t llmphant:dev .
+```
+
+The image's default command is the MCP server (`mcp`, HTTP on port 8888). To bootstrap a volume,
+name a different command:
+
+```sh
+docker run --rm -v llmphant-data:/data llmphant:dev doctor
+docker run --rm -v llmphant-data:/data llmphant:dev model fetch
+```
+
+Do not bake the weights into the image. Fetch them into the volume (above), or mount an existing
+cache read-only:
+
+```sh
+docker run --rm -it -v llmphant-data:/data \
+                    -v ~/.llmphant/models:/data/models:ro \
+                    llmphant:dev search "where do the logs live"
+```
+
+See the [README](README.md) for usage, including the MCP server on a host and in Docker.
+
+## Verify the installation
+
+```sh
+llmphant --version
+llmphant doctor
+```

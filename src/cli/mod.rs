@@ -224,7 +224,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Doctor => doctor(&paths, &cfg, &spec),
         Command::Model { command } => model_cmd(&spec, command),
         Command::Embed { text, query } => embed(&spec, &cfg, &text, query),
-        Command::Mcp => Err(Error::NotImplemented("mcp server (PLAN.md P7)")),
+        // MCP holds the store open and serves until the client disconnects (P7).
+        Command::Mcp => crate::mcp::serve(paths, cfg, spec),
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
         command => {
             let mut session = Session::open(paths, cfg, spec)?;
@@ -303,12 +304,13 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
             Ok(())
         }
         // Not store commands: the dispatcher above owns these, and the REPL rejects them.
-        Command::Repl | Command::Doctor | Command::Model { .. } | Command::Embed { .. } => {
-            Err(Error::Config("command is not available here".into()))
-        }
+        Command::Repl
+        | Command::Doctor
+        | Command::Model { .. }
+        | Command::Embed { .. }
+        | Command::Mcp => Err(Error::Config("command is not available here".into())),
         Command::Export { .. } => Err(Error::NotImplemented("export (PLAN.md P8)")),
         Command::Import { .. } => Err(Error::NotImplemented("import (PLAN.md P8)")),
-        Command::Mcp => Err(Error::NotImplemented("mcp server (PLAN.md P7)")),
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
     }
 }

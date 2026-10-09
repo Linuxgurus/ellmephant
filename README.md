@@ -10,11 +10,12 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phases 1, 2, 2.5, 3, 4, 5 and 6 are real and tested: bootstrap, schema + FTS triggers, the
+Phases 1, 2, 2.5, 3, 4, 5, 6 and 7 are real and tested: bootstrap, schema + FTS triggers, the
 `sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, the write
-path, hybrid search, and the CLI (one-shot `add`/`search`/`show`/`rm`/`tags` plus an
-interactive REPL with history and tab-completion). MCP and the portability layers are
-still typed stubs that return `NotImplemented`. `cargo test` needs no model and no network.
+path, hybrid search, the CLI (one-shot `add`/`search`/`show`/`rm`/`tags` plus an interactive
+REPL with history and tab-completion), and the MCP stdio server (shared by Cline, TypingMind
+and anything else). The portability layer (JSONL export/import) is still a typed stub that
+returns `NotImplemented`. `cargo test` needs no model and no network.
 
 | Area | State |
 |---|---|
@@ -26,7 +27,8 @@ still typed stubs that return `NotImplemented`. `cargo test` needs no model and 
 | `store` — write path (upsert, tags, links, vec) | done |
 | `search` — hybrid BM25 ∪ KNN fused with RRF, `--expand`, `--max-distance` (P5) | done |
 | `cli` — one-shot `add`/`show`/`rm`/`tags`, REPL with history + completion (P6) | done |
-| MCP (P7), export/import (P8), bench (P10) | stubs |
+| `mcp` — MCP stdio server: 8 tools, schemas, annotations, write policy (P7) | done |
+| export/import (P8), bench (P10) | stubs |
 
 The encoder is behind the default-on `encoder` cargo feature; build with
 `--no-default-features` for a store-only binary that links no ML stack.
@@ -85,6 +87,27 @@ llmphant search "backups" --expand 1                # + linked neighbours
 
 Every hit carries its fused `score` (and `distance` when the KNN leg contributed) so the
 caller can judge confidence — the read policy is snippets + scores, never dumps (SPEC §10).
+
+## MCP
+
+`llmphant mcp` serves the same store to any MCP client over stdio, so Cline, TypingMind and
+the REPL all read and write one memory. Register it once per client (point `command` at the
+built binary; the client launches it):
+
+```jsonc
+{
+  "mcpServers": {
+    "llmphant": { "command": "/absolute/path/to/llmphant", "args": ["mcp"] }
+  }
+}
+```
+
+Tools: `memory_add`, `memory_update`, `memory_delete`, `memory_search`, `memory_get`,
+`memory_backlinks`, `memory_export`, `memory_import`. Read tools carry a read-only
+annotation, `memory_delete` is marked destructive, and the `memory_add`/`memory_update`
+descriptions carry the SPEC §9 write policy (one fact per row, provenance in `source`,
+upsert-by-key, trim-on-edit). `memory_search` returns scored snippets; the KNN leg loads the
+model lazily, so `mode=fts` runs with no weights and no network.
 
 ## Build & test
 

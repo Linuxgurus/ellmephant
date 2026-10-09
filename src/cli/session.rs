@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, Paths};
 use crate::db;
-use crate::embed::{self, Embedder};
+use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
@@ -20,7 +20,7 @@ pub struct Session {
     cfg: Config,
     spec: model::Spec,
     conn: Connection,
-    embedder: Option<embed::qwen3::Qwen3Embedder>,
+    embedder: Option<Box<dyn Embedder>>,
 }
 
 impl Session {
@@ -34,6 +34,13 @@ impl Session {
             conn,
             embedder: None,
         })
+    }
+
+    /// Inject a pre-built encoder instead of loading Qwen3 on first use. The MCP test
+    /// harness feeds a deterministic fake, so its round-trip needs no weights (PLAN §7).
+    pub fn with_embedder(mut self, embedder: Box<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// The resolved store paths.
@@ -55,20 +62,20 @@ impl Session {
     /// the weights cache, so nothing else in the CLI needs it.
     fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
-            self.embedder = Some(super::load_embedder(&self.spec, &self.cfg)?);
+            self.embedder = Some(Box::new(super::load_embedder(&self.spec, &self.cfg)?));
         }
         Ok(())
     }
 
     /// The encoder as a trait object, or `None` while it is still cold.
     fn embedder(&self) -> Option<&dyn Embedder> {
-        self.embedder.as_ref().map(|e| e as &dyn Embedder)
+        self.embedder.as_deref()
     }
 
     /// Upsert a memory (SPEC §7) and return its resolved key.
     pub fn add(&mut self, mem: &Memory) -> Result<String> {
         self.ensure_embedder()?;
-        let embedder = self.embedder.as_ref().expect("encoder was just loaded");
+        let embedder = self.embedder.as_deref().expect("encoder was just loaded");
         let id = store::add(&self.conn, embedder, mem)?;
         let stored = store::get_by_id(&self.conn, id)?.ok_or(Error::NotFound(mem.key.clone()))?;
         Ok(stored.key)

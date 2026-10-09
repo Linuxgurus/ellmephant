@@ -88,9 +88,9 @@ fn doctor_bootstraps_a_fresh_home() {
 
 #[test]
 fn unimplemented_subcommands_fail_loudly() {
-    // `mcp` (P7) is still a stub; it must exit non-zero rather than pretend to serve.
+    // `bench` (P10) is still a stub; it must exit non-zero rather than pretend to run.
     let dir = tempfile::tempdir().unwrap();
-    let out = run(dir.path(), &["mcp"]);
+    let out = run(dir.path(), &["bench"]);
     assert!(
         !out.status.success(),
         "an unimplemented path must not exit 0"

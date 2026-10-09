@@ -2,7 +2,7 @@
 name = "llmphant"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Single-binary, SQLite-backed long-term memory for AI agents"
 license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/llmphant"
@@ -59,6 +59,13 @@ safetensors = { version = "0.8", optional = true }
 rustyline = "18"
 tabled = "0.22"
 
+# --- P7: the MCP server (PLAN §4). `rmcp` is the official Rust MCP SDK (needs rustc 1.88,
+# hence the crate's rust-version bump). Default features bring the `#[tool]`/`#[tool_router]`
+# macros, the `server` runtime and JSON-Schema generation; `transport-io` adds stdio.
+# `tokio` is the transport runtime — the rest of llmphant stays synchronous.
+rmcp = { version = "3.5.1", features = ["transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 [features]
 default = ["encoder"]
 # The candle Qwen3 embedder. `cargo test --no-default-features` skips it.
@@ -72,6 +79,9 @@ encoder = [
 
 [dev-dependencies]
 tempfile = "3"
+# The in-process MCP round-trip test (tests/mcp.rs) needs the client half of the SDK.
+# Features union with the normal dependency, so `cargo build` still ships no client code.
+rmcp = { version = "3.5.1", features = ["client"] }
 
 [profile.release]
 lto = "thin"

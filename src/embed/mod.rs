@@ -14,7 +14,9 @@ use std::hash::{Hash, Hasher};
 use crate::error::Result;
 
 /// Turns text into L2-normalised vectors.
-pub trait Embedder {
+///
+/// `Send + Sync` so a loaded encoder can be shared behind a lock (the MCP server, P7).
+pub trait Embedder: Send + Sync {
     /// Vector length; must be stable for a given model.
     fn dim(&self) -> usize;
     /// Stable model identifier, recorded in `meta` and folded into the row hash.

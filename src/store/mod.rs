@@ -3,6 +3,7 @@
 pub mod links;
 pub mod maintain;
 pub mod slug;
+pub mod stats;
 pub mod tags;
 
 use std::collections::HashSet;

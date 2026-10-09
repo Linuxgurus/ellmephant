@@ -16,6 +16,7 @@ use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
 use crate::search::Query;
 use crate::store::Memory;
+use crate::store::stats;
 
 use self::session::Session;
 
@@ -116,6 +117,13 @@ pub enum Command {
     },
     /// List tags with counts.
     Tags {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Digest of the store: size, spread, tags, links and activity.
+    #[command(visible_alias = "summary", alias = "stat")]
+    Stats {
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -333,6 +341,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         Command::Rm { key } => cmd_rm(session, &key),
         Command::List { json } => cmd_list(session, json),
         Command::Tags { json } => cmd_tags(session, json),
+        Command::Stats { json } => cmd_stats(session, json),
         Command::Rename { old, new } => cmd_rename(session, &old, &new),
         Command::Reembed => cmd_reembed(session),
         Command::Links { json } => cmd_links(session, json),
@@ -382,6 +391,14 @@ fn cmd_list(session: &Session, json: bool) -> Result<()> {
 fn cmd_tags(session: &Session, json: bool) -> Result<()> {
     let tags = session.tags()?;
     emit(format::render_tags(&tags, json)?);
+    Ok(())
+}
+
+fn cmd_stats(session: &Session, json: bool) -> Result<()> {
+    // The store layer is DB-only; the on-disk size is a filesystem fact the CLI supplies.
+    let mut stats = session.stats()?;
+    stats.db_bytes = stats::disk_bytes(&session.paths().db());
+    emit(format::render_stats(&stats, json)?);
     Ok(())
 }
 

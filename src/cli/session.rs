@@ -128,6 +128,11 @@ impl Session {
         store::summaries(&self.conn)
     }
 
+    /// A read-only digest of the store (`stats`); `db_bytes` is filled from the store file.
+    pub fn stats(&self) -> Result<store::stats::Stats> {
+        store::stats::compute(&self.conn)
+    }
+
     /// Recompute every vector and rebuild the derived vector index, handling a model or
     /// dimension change (P9). Loads the encoder, so it is a deliberately heavy command.
     pub fn reembed(&mut self) -> Result<maintain::Report> {

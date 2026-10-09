@@ -295,9 +295,12 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 
 - `llmphant` → **REPL** (rustyline: history at `~/.llmphant/history`, completion;
   bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `list`, `tags`,
-  `rename`, `reembed`, `links`, `model`, `help`, `quit`.
+  `stats`, `rename`, `reembed`, `links`, `model`, `help`, `quit`.
 - One-shot flags for scripting: `llmphant search "..." --json`.
 - `llmphant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
+- `llmphant stats [--json]` (alias `summary`) → a read-only digest: counts, on-disk size and
+  body/title spread, tag shape (distinct, placements, singletons, top-N, per-memory / per-tag
+  averages, coverage), link shape (edges, linked, orphans, dangling) and recent activity (§14).
 - `llmphant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
 - `llmphant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
 

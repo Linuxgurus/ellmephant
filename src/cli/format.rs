@@ -12,6 +12,7 @@ use crate::search::{Bundle, Hit};
 use crate::store::Memory;
 use crate::store::Summary;
 use crate::store::links::Dangling;
+use crate::store::stats::Stats;
 
 /// Render a search bundle for a terminal (or `--json`), ranked first.
 pub fn render_bundle(bundle: &Bundle, json: bool) -> Result<String> {
@@ -136,6 +137,102 @@ pub fn render_summaries(rows: &[Summary], json: bool) -> Result<String> {
     let mut table = Table::new(table_rows);
     table.with(Style::psql());
     Ok(format!("{table}\n"))
+}
+
+/// Render the store digest (`stats`): a block per section, or JSON for scripts.
+///
+/// Numbers are `.0`-rounded for a quick scan; `--json` keeps the exact counts.
+pub fn render_stats(s: &Stats, json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(s)?);
+    }
+    let mut out = String::new();
+
+    out.push_str("store\n");
+    out.push_str(&format!("  memories       {}\n", s.memories));
+    out.push_str(&format!("  on disk        {}\n", human_bytes(s.db_bytes)));
+    out.push_str(&format!(
+        "  bodies         avg {:.0} / min {} / max {} chars ({} total)\n",
+        s.avg_body_chars(),
+        s.body_min,
+        s.body_max,
+        s.body_chars
+    ));
+    out.push_str(&format!(
+        "  titles         avg {:.0} chars\n",
+        avg(s.title_chars, s.memories)
+    ));
+    out.push_str(&format!(
+        "  sources        {}/{} ({:.0}%)\n",
+        s.with_source,
+        s.memories,
+        pct(s.with_source, s.memories)
+    ));
+    out.push_str(&format!(
+        "  activity       {} in last 7d, {} in last 30d\n",
+        s.added_7d, s.added_30d
+    ));
+    match (&s.oldest, &s.newest) {
+        (Some(a), Some(b)) => out.push_str(&format!("  span           {a} -> {b}\n")),
+        _ => out.push_str("  span           (empty)\n"),
+    }
+
+    out.push_str("\ntags\n");
+    out.push_str(&format!("  distinct       {}\n", s.distinct_tags));
+    out.push_str(&format!(
+        "  placements     {} ({:.1} per memory)\n",
+        s.tag_assignments,
+        s.avg_tags_per_memory()
+    ));
+    out.push_str(&format!(
+        "  spread         {:.1} memories per tag\n",
+        s.avg_memories_per_tag()
+    ));
+    out.push_str(&format!(
+        "  coverage       {}/{} memories tagged ({:.0}%)\n",
+        s.tagged,
+        s.memories,
+        pct(s.tagged, s.memories)
+    ));
+    out.push_str(&format!("  singletons     {}\n", s.singleton_tags));
+    if s.top_tags.is_empty() {
+        out.push_str("  top            (none)\n");
+    } else {
+        let top = s
+            .top_tags
+            .iter()
+            .map(|(tag, n)| format!("{tag} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("  top            {top}\n"));
+    }
+
+    out.push_str("\nlinks\n");
+    out.push_str(&format!("  edges          {}\n", s.edges));
+    out.push_str(&format!(
+        "  linked         {}/{} ({:.0}%)\n",
+        s.linked,
+        s.memories,
+        pct(s.linked, s.memories)
+    ));
+    out.push_str(&format!("  orphans        {}\n", s.orphans));
+    out.push_str(&format!("  dangling       {}\n", s.dangling));
+
+    Ok(out)
+}
+
+/// `total / count`, guarding the empty store.
+fn avg(total: i64, count: i64) -> f64 {
+    if count <= 0 {
+        0.0
+    } else {
+        total as f64 / count as f64
+    }
+}
+
+/// `part / whole` as a percentage, guarding the empty store.
+fn pct(part: i64, whole: i64) -> f64 {
+    avg(part, whole) * 100.0
 }
 
 /// Render the dangling-link audit (`links`): one line per unresolved `[[key]]`, or JSON.

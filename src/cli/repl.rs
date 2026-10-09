@@ -24,8 +24,8 @@ use super::session::Session;
 
 /// Verbs offered by tab-completion: the REPL's own plus the one-shot tree.
 const COMMANDS: &[&str] = &[
-    "add", "search", "show", "rm", "list", "tags", "rename", "reembed", "links", "help", "quit",
-    "exit",
+    "add", "search", "show", "rm", "list", "tags", "stats", "rename", "reembed", "links", "help",
+    "quit", "exit",
 ];
 
 /// A REPL line, parsed with the exact `Command` tree the one-shot CLI uses.
@@ -202,6 +202,7 @@ fn print_help() {
          \x20 rm KEY\n\
          \x20 list [--json]\n\
          \x20 tags [--json]\n\
+         \x20 stats [--json]\n\
          \x20 rename OLD NEW | reembed | links [--json]\n\
          \x20 help | quit"
     );

@@ -66,6 +66,7 @@ llmphant show   KEY [--json]
 llmphant rm     KEY
 llmphant list   [--json]
 llmphant tags   [--json]
+llmphant stats  [--json]      # digest: counts, size, tags, links, activity (alias summary)
 ```
 
 `add` upserts by `key`; running it twice with the same key yields one memory. Write in

@@ -22,7 +22,7 @@ pub const TABLE: &str = "memory_vec";
 ///
 /// Must be called *before* a connection is opened: auto-extensions only attach to
 /// connections created afterwards (hence the call at the top of [`crate::db::open`]).
-pub fn register_extension() -> Result<()> {
+pub fn register_extension() {
     /// The signature SQLite expects of a `sqlite3_auto_extension` entry point.
     type EntryPoint = unsafe extern "C" fn(
         *mut rusqlite::ffi::sqlite3,
@@ -32,10 +32,10 @@ pub fn register_extension() -> Result<()> {
 
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| unsafe {
-        let init: EntryPoint = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+        let init =
+            std::mem::transmute::<*const (), EntryPoint>(sqlite_vec::sqlite3_vec_init as *const ());
         rusqlite::ffi::sqlite3_auto_extension(Some(init));
     });
-    Ok(())
 }
 
 /// Vector search hint.
@@ -72,7 +72,7 @@ pub fn stored_dim(conn: &Connection) -> Result<Option<usize>> {
 fn create_sql(dim: usize) -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS {TABLE} USING vec0(\
-         memory_id INTEGER PRIMARY KEY, embedding float[{dim}], scope TEXT)"
+         memory_id INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine, scope TEXT)"
     )
 }
 
@@ -123,14 +123,27 @@ pub fn upsert(conn: &Connection, id: i64, scope: &str, vector: &[f32]) -> Result
     if vector.is_empty() {
         return Err(Error::Config("refusing to store an empty vector".into()));
     }
-    conn.execute(
-        &format!("DELETE FROM {TABLE} WHERE memory_id = ?1"),
-        params![id],
-    )?;
-    conn.execute(
-        &format!("INSERT INTO {TABLE}(memory_id, embedding, scope) VALUES (?1, ?2, ?3)"),
-        params![id, to_blob(vector), scope],
-    )?;
+    // vec0 has no `ON CONFLICT`, so delete+insert; the savepoint keeps the pair atomic
+    // even when the caller owns no transaction.
+    conn.execute_batch("SAVEPOINT vec_upsert")?;
+    let written = conn
+        .execute(
+            &format!("DELETE FROM {TABLE} WHERE memory_id = ?1"),
+            params![id],
+        )
+        .and_then(|_| {
+            conn.execute(
+                &format!("INSERT INTO {TABLE}(memory_id, embedding, scope) VALUES (?1, ?2, ?3)"),
+                params![id, to_blob(vector), scope],
+            )
+        });
+    match written {
+        Ok(_) => conn.execute_batch("RELEASE vec_upsert")?,
+        Err(err) => {
+            conn.execute_batch("ROLLBACK TO vec_upsert; RELEASE vec_upsert")?;
+            return Err(err.into());
+        }
+    }
     Ok(())
 }
 
@@ -203,7 +216,7 @@ mod tests {
     use super::*;
 
     fn conn() -> Connection {
-        register_extension().expect("register");
+        register_extension();
         let conn = Connection::open_in_memory().expect("open");
         conn.execute_batch("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
             .expect("meta");

@@ -34,7 +34,9 @@ RUN install -d -o llmphant -g llmphant /data
 VOLUME ["/data"]
 USER llmphant
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["llmphant", "doctor"]
+# Liveness only: `doctor` opens/migrates the store (a write) on every poll, which is both
+# wasted work and a failure on a read-only volume.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["llmphant", "--version"]
 
 ENTRYPOINT ["llmphant"]
 CMD ["doctor"]

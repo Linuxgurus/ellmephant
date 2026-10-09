@@ -5,6 +5,8 @@ pub mod maintain;
 pub mod slug;
 pub mod tags;
 
+use std::collections::{HashMap, HashSet};
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -96,11 +98,12 @@ pub fn row_hash(embedder: &dyn Embedder, embed_text: &str) -> String {
     crate::hex::encode(&h.finalize())
 }
 
-/// Every key currently in the store (for slug collision avoidance).
-fn taken_keys(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT key FROM memory")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    let mut set = std::collections::HashSet::new();
+/// Keys that share `base` as a prefix (for slug collision avoidance). `base` is `[a-z0-9-]`,
+/// so its `LIKE` pattern carries no wildcards.
+fn taken_variants(conn: &Connection, base: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT key FROM memory WHERE key LIKE ?1")?;
+    let rows = stmt.query_map(params![format!("{base}%")], |r| r.get::<_, String>(0))?;
+    let mut set = HashSet::new();
     for row in rows {
         set.insert(row?);
     }
@@ -114,7 +117,7 @@ fn resolve_key(conn: &Connection, mem: &Memory) -> Result<String> {
         return Ok(slug::slugify(&mem.key));
     }
     let base = slug::slugify(&format!("{} {}", mem.scope, mem.title));
-    Ok(slug::unique_slug(&base, &taken_keys(conn)?))
+    Ok(slug::unique_slug(&base, &taken_variants(conn, &base)?))
 }
 
 /// Replace the tag links for `id` with the normalised set on `mem` (tags are shared
@@ -157,45 +160,92 @@ fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> 
 /// empty strings fall back to `datetime('now')`, which is what the CLI/MCP write path
 /// passes.
 pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i64> {
+    let prepared = prepare(conn, embedder, mem)?;
+    // Create the vec table before the tx so its DDL is not inside it.
+    index::vec::ensure(conn, embedder.dim())?;
+    // Embed before the tx: inference is slow (SPEC §13) and must not hold the write lock.
+    let vector = if prepared.needs_embed() {
+        Some(embedder.embed_one(&prepared.text)?)
+    } else {
+        None
+    };
+    let tx = conn.unchecked_transaction()?;
+    let id = apply(&tx, mem, &prepared, vector.as_deref())?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// A write resolved *outside* the transaction: the key, embed projection, hash and the
+/// existing row it will upsert. Lets the caller embed before taking the write lock.
+pub(crate) struct Prepared {
+    pub(crate) key: String,
+    pub(crate) text: String,
+    hash: String,
+    existing: Option<(i64, String)>,
+    dim: i64,
+    model: String,
+}
+
+impl Prepared {
+    /// Whether the stored hash differs, i.e. the text needs (re-)embedding.
+    pub(crate) fn needs_embed(&self) -> bool {
+        self.existing.as_ref().is_none_or(|(_, h)| h != &self.hash)
+    }
+}
+
+/// Resolve a write without opening a transaction (reads only, no model call).
+pub(crate) fn prepare(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    mem: &Memory,
+) -> Result<Prepared> {
     let key = resolve_key(conn, mem)?;
     let text = projection::embed_text(&mem.title, &mem.body);
     let hash = row_hash(embedder, &text);
-
-    // Create the vec table before the tx so its DDL is not inside it.
-    index::vec::ensure(conn, embedder.dim())?;
-
-    let tx = conn.unchecked_transaction()?;
-    let existing: Option<(i64, String)> = tx
+    let existing: Option<(i64, String)> = conn
         .query_row(
             "SELECT id, hash FROM memory WHERE key = ?1",
             params![key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    Ok(Prepared {
+        key,
+        text,
+        hash,
+        existing,
+        dim: embedder.dim() as i64,
+        model: embedder.model_id().to_string(),
+    })
+}
 
-    let needs_embed = existing.as_ref().is_none_or(|(_, h)| h != &hash);
-    let vector = if needs_embed {
-        Some(embedder.embed_one(&text)?)
-    } else {
-        None
-    };
-    let dim = embedder.dim() as i64;
-    let model = embedder.model_id();
-
-    let id = match existing {
+/// Apply a prepared write inside the caller's transaction. `vector` must be present
+/// exactly when [`Prepared::needs_embed`] is true.
+pub(crate) fn apply(
+    tx: &Connection,
+    mem: &Memory,
+    prepared: &Prepared,
+    vector: Option<&[f32]>,
+) -> Result<i64> {
+    let id = match prepared.existing {
         Some((id, _)) => {
-            update_row(&tx, id, mem, &hash, dim, model)?;
+            update_row(tx, id, mem, &prepared.hash, prepared.dim, &prepared.model)?;
             id
         }
-        None => insert_row(&tx, &key, mem, &hash, dim, model)?,
+        None => insert_row(
+            tx,
+            &prepared.key,
+            mem,
+            &prepared.hash,
+            prepared.dim,
+            &prepared.model,
+        )?,
     };
-
-    write_tags(&tx, id, mem)?;
-    write_links(&tx, id, &key, &mem.body)?;
+    write_tags(tx, id, mem)?;
+    write_links(tx, id, &prepared.key, &mem.body)?;
     if let Some(vector) = vector {
-        index::vec::upsert(&tx, id, &mem.scope, &vector)?;
+        index::vec::upsert(tx, id, &mem.scope, vector)?;
     }
-    tx.commit()?;
     Ok(id)
 }
 
@@ -293,28 +343,33 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
     }
 }
 
+/// Map one `memory` row (the canonical column list) to a `Memory`; tags come separately.
+fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: Some(r.get(0)?),
+        key: r.get(1)?,
+        scope: r.get(2)?,
+        type_: MemoryType::parse(&r.get::<_, String>(3)?),
+        title: r.get(4)?,
+        body: r.get(5)?,
+        source: r.get(6)?,
+        hash: r.get(7)?,
+        tags: Vec::new(),
+        created: r.get(8)?,
+        updated: r.get(9)?,
+    })
+}
+
+/// The canonical column list shared by `get_by_id` and `all`.
+const MEMORY_COLUMNS: &str = "id, key, scope, type, title, body, source, hash, created, updated";
+
 /// Fetch one memory (with tags) by rowid — the hydration step of the read path (P5).
 pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<Memory>> {
     let row = conn
         .query_row(
-            "SELECT id, key, scope, type, title, body, source, hash, created, updated
-               FROM memory WHERE id = ?1",
+            &format!("SELECT {MEMORY_COLUMNS} FROM memory WHERE id = ?1"),
             params![id],
-            |r| {
-                Ok(Memory {
-                    id: Some(r.get(0)?),
-                    key: r.get(1)?,
-                    scope: r.get(2)?,
-                    type_: MemoryType::parse(&r.get::<_, String>(3)?),
-                    title: r.get(4)?,
-                    body: r.get(5)?,
-                    source: r.get(6)?,
-                    hash: r.get(7)?,
-                    tags: Vec::new(),
-                    created: r.get(8)?,
-                    updated: r.get(9)?,
-                })
-            },
+            row_to_memory,
         )
         .optional()?;
 
@@ -329,6 +384,32 @@ pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<Memory>> {
     let tags = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
     mem.tags = tags.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Some(mem))
+}
+
+/// Every memory (with tags), ordered by `key` — the export path, in two queries.
+pub fn all(conn: &Connection) -> Result<Vec<Memory>> {
+    let mut stmt = conn.prepare(&format!("SELECT {MEMORY_COLUMNS} FROM memory ORDER BY key"))?;
+    let mut memories = stmt
+        .query_map([], row_to_memory)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let id_to_index: HashMap<i64, usize> = memories
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| m.id.map(|id| (id, i)))
+        .collect();
+    let mut stmt = conn.prepare(
+        "SELECT mt.memory_id, t.name FROM memory_tag mt JOIN tag t ON t.id = mt.tag_id
+          ORDER BY t.name",
+    )?;
+    let pairs = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for pair in pairs {
+        let (id, name) = pair?;
+        if let Some(&i) = id_to_index.get(&id) {
+            memories[i].tags.push(name);
+        }
+    }
+    Ok(memories)
 }
 
 /// Every key in the store, alphabetical — the REPL's tab-completion vocabulary.

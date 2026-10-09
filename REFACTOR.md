@@ -920,3 +920,213 @@ cargo clippy --all-targets --all-features   # must be warning-free
 - [x] No output string, SQL, or error message changed.
 - [x] `cargo test` green; `cargo clippy -D warnings` clean; `cargo fmt --check` clean.
 
+
+---
+
+# Part 3 — correctness & best-practice fixes (steps 16–24)
+
+> **Status: applied.** Unlike Parts 1–2 these **do change behaviour** (a bounded search
+> body, a cosine distance metric, atomic import/export), because each step closes a
+> gap between the code and `SPEC.md`. Output *strings* and the public API stay
+> compatible; one test gains a tolerance for the metric change (called out in the step).
+> Same verify command as Part 1.
+
+## Why
+
+Findings from a full read of `src/` against `SPEC.md`:
+
+| # | Severity | Location | Violation |
+|---|---|---|---|
+| 1 | high | `search::run` | returns full bodies — SPEC §9/§10/§14 require "snippets + scores, never dumps" |
+| 2 | high | `index::vec::create_sql` | omits `distance_metric=cosine` (SPEC §7); exposed `distance`/`--max-distance` are squared-L2 |
+| 3 | high | `store::add`, `maintain::reembed` | model inference runs *inside* the write transaction |
+| 4 | high | `portable::import` | not atomic (per-line tx) and embeds one text at a time |
+| 5 | med | `portable::export` | writes the target in place (no temp+rename) and queries N+1 |
+| 6 | med | `store::resolve_key` | loads *every* key to pick a collision suffix |
+| 7 | med | `index::vec::upsert` | delete+insert with no transaction of its own |
+| 8 | med | `cli::session` | `expect()` on a reachable branch; a panic poisons the MCP mutex |
+| 9 | low | `index::vec::register_extension` | returns a `Result` that can never be `Err` |
+
+Deferred (noted, not done — both need design work, see *Follow-ups* at the end):
+MCP tool bodies block a tokio worker; CI never builds `--no-default-features`.
+
+---
+
+## Step 16 — bound the search body (snippets, not dumps)
+
+**Problem:** `src/search/mod.rs:174` returns `mem.body` verbatim while the field doc at
+`:93` claims it is "already bounded"; `memory_search` serialises the whole bundle, so MCP
+hands the model full memories. SPEC §9: "return **snippets + scores**, never dumps".
+
+**Do:**
+
+1. In `src/search/mod.rs`, after `pub mod rrf;`, add:
+
+```rust
+/// Characters of a body returned per search hit (SPEC §9/§14: snippets, not dumps).
+pub const SNIPPET_CHARS: usize = 280;
+
+/// First `max` characters of `s`, with a trailing `…` when it was truncated.
+pub fn snippet(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+```
+
+2. Change the `Hit::body` doc and the value at `:174` to `body: snippet(&mem.body, SNIPPET_CHARS)`.
+3. In `expand_frontier`, bind `get_by_id` as `mut memory` and set
+   `memory.body = snippet(&memory.body, SNIPPET_CHARS)` before pushing the `Neighbor`.
+4. Add a unit test for `snippet` (short unchanged, long truncated on a char boundary).
+
+Verify: `cargo test --locked`
+
+## Step 17 — cosine distance metric
+
+**Problem:** `src/index/vec.rs::create_sql` omits `distance_metric`, so `vec0` uses its
+default L2. SPEC §7 specifies cosine, and `--max-distance`/the `distance` field are
+documented (CLI + MCP) as *cosine*.
+
+**Do:** add `distance_metric=cosine` to the `embedding float[{dim}]` column in `create_sql`.
+
+**Note:** an existing `memory_vec` keeps L2 until `reembed` recreates it — acceptable, the
+index is derived and rebuildable. `tests/search.rs::max_distance_filters_the_vector_leg`
+still passed with its old `0.0` ceiling, but that relied on float-exactness; it now uses a
+separating `0.5` (cosine distance is `1 - cos`: exact ≈ 0, unrelated = 1) and asserts both
+the survivor and the filtered-out document.
+
+Verify: `cargo test --locked`
+
+## Step 18 — embed outside the write transaction
+
+**Problem:** `src/store/mod.rs::add` opens the transaction, then calls `embedder.embed_one`
+inside it — a ~1 s CPU hold on the write lock (SPEC §13).
+
+**Do:** split `add` into a read/plan phase and a write phase:
+
+- `struct Prepared { key, text, hash, existing, dim, model }` with
+  `pub(crate) fn needs_embed(&self) -> bool`.
+- `pub(crate) fn prepare(conn, embedder, mem) -> Result<Prepared>` — resolves the key,
+  computes the projection + hash, reads the existing `(id, hash)`; **no model call**.
+- `pub(crate) fn apply(tx, mem, prepared, vector: Option<&[f32]>) -> Result<i64>` — the
+  former insert/update + tags + links + vec writes.
+- `add` = `prepare` → `index::vec::ensure` → embed → open tx → `apply` → commit.
+
+`maintain::reembed` already batches; leave the snapshot-then-write shape but comment that
+the batch embed stays inside the tx deliberately (a full rebuild wants one atomic swap).
+
+Verify: `cargo test --locked`
+
+## Step 19 — atomic, batched, fail-fast import
+
+**Problem:** `src/portable/import.rs` writes row-by-row, each in its own transaction, so a
+bad line halfway leaves a partial store; embeddings are one text at a time.
+
+**Do:**
+
+1. Read + validate the whole file first (`read_records`) — a bad/missing-key line fails
+   before anything is written.
+2. `store::prepare` each record (reads only), collecting `(index, text)` for rows that
+   need embedding.
+3. Embed those texts in `BATCH` (16) sized `embedder.embed` calls — outside the tx.
+4. `index::vec::ensure`, then one `unchecked_transaction` applying every `store::apply`.
+5. `dry_run` returns the pending count without writing (unchanged semantics).
+
+Verify: `cargo test --locked`
+
+## Step 20 — atomic export, two queries
+
+**Problem:** `src/portable/export.rs` selects ids then hydrates each (`get_by_id` = 2
+queries/row → N+1) and writes the destination directly.
+
+**Do:**
+
+1. Add `store::all(conn) -> Result<Vec<Memory>>`: one row query ordered by `key` + one
+   `memory_tag`/`tag` query, grouped in memory (a shared `row_to_memory` helper backs both
+   `get_by_id` and `all`).
+2. Rewrite `to_jsonl`: `store::all` → write to `path` with a `.tmp` extension → flush +
+   `sync_all` → `rename`. Same bytes, same count, but a failed export never leaves a torn
+   dump.
+
+Verify: `cargo test --locked`
+
+
+
+## Step 21 — bounded key-collision probe
+
+**Problem:** `store::resolve_key` builds a `HashSet` of *all* keys per auto-key insert.
+
+**Do:** replace `taken_keys` with `taken_variants(conn, base)` — `SELECT key FROM memory
+WHERE key LIKE '<base>%'` (base is `[a-z0-9-]`, so no wildcard escapes needed) — and feed
+that to the existing `slug::unique_slug`.
+
+Verify: `cargo test --locked`
+
+## Step 22 — atomic `vec0` upsert
+
+**Problem:** `index::vec::upsert` is `DELETE` then `INSERT`; atomic only because callers
+wrap it.
+
+**Do:** wrap the pair in `SAVEPOINT vec_upsert` / `RELEASE`, rolling back on failure, so a
+standalone call cannot drop a vector.
+
+Verify: `cargo test --locked`
+
+## Step 23 — `expect()` → error in the session
+
+**Problem:** `src/cli/session.rs` uses `expect("encoder was just loaded")` in `add` /
+`import` / `reembed`; a panic there poisons the MCP `Mutex<Session>`.
+
+**Do:** `.ok_or_else(|| Error::Config("encoder was not loaded".into()))?`.
+
+Verify: `cargo test --locked`
+
+## Step 24 — `register_extension` needs no `Result`
+
+**Problem:** `index::vec::register_extension` always returns `Ok(())`; callers carry a
+meaningless `?`.
+
+**Do:** return `()`. Update `db::open` and the `vec` unit test. (Keep the `unsafe` block;
+annotate the `transmute` target type in place.)
+
+Verify: `cargo test --locked`
+
+---
+
+## Acceptance (Part 3)
+
+```sh
+cargo fmt --all
+cargo test --locked
+cargo clippy --all-targets --all-features   # must be warning-free
+cargo check --no-default-features           # store-only build still compiles
+```
+
+- [x] `memory_search` / `--json` return snippets, not full bodies.
+- [x] `memory_vec` is cosine; the `distance` field and `--max-distance` mean what they say.
+- [x] No model call runs while a write transaction is open.
+- [x] Import is all-or-nothing and batches its embeds.
+- [x] Export is atomic and does not query N+1.
+- [x] No `expect()` on a reachable branch in the CLI session.
+- [x] `cargo test` green; `cargo clippy -D warnings` clean; `cargo fmt --check` clean.
+
+## Follow-ups (not in this part)
+
+- **MCP blocks the tokio executor.** `src/mcp/mod.rs::with_store` holds a `std::sync::Mutex`
+  and runs synchronous SQLite/model work on a runtime worker. `block_in_place` is out
+  (`tests/mcp.rs` uses a current-thread runtime, where it panics), so this wants
+  `spawn_blocking` with an async tool body — a real change to the `#[tool]` fns.
+- **Config validation up front.** `device`/`precision`/`dim` are only checked at encoder
+  load; one clear message in `Config::load` would be friendlier.
+
+## Incidental (outside the numbered steps)
+
+- **CI feature matrix** (was a follow-up): added `cargo test --locked --no-default-features`
+  to `.github/workflows/ci.yml` so the advertised store-only build can't rot.
+- **Example hermeticity**: `examples/db_bootstrap.rs` now uses `tempfile::tempdir()` instead
+  of a fixed `$TMPDIR/llmphant-example` path.
+- **Docker healthcheck**: `Dockerfile` now probes `llmphant --version` instead of `doctor`,
+  which opened and migrated the store on every 30 s poll.

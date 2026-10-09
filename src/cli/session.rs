@@ -72,15 +72,17 @@ impl Session {
         Ok(())
     }
 
-    /// The encoder as a trait object, or `None` while it is still cold.
-    fn embedder(&self) -> Option<&dyn Embedder> {
-        self.embedder.as_deref()
+    /// The encoder as a trait object; an error if `ensure_embedder` has not run yet.
+    fn embedder(&self) -> Result<&dyn Embedder> {
+        self.embedder
+            .as_deref()
+            .ok_or_else(|| Error::Config("encoder was not loaded".into()))
     }
 
     /// Upsert a memory (SPEC §7) and return its resolved key.
     pub fn add(&mut self, mem: &Memory) -> Result<String> {
         self.ensure_embedder()?;
-        let embedder = self.embedder.as_deref().expect("encoder was just loaded");
+        let embedder = self.embedder()?;
         let id = store::add(&self.conn, embedder, mem)?;
         let stored = store::get_by_id(&self.conn, id)?.ok_or(Error::NotFound(mem.key.clone()))?;
         Ok(stored.key)
@@ -100,8 +102,9 @@ impl Session {
     pub fn search(&mut self, q: &Query) -> Result<Bundle> {
         if q.mode.needs_embedder() {
             self.ensure_embedder()?;
+            return search::run(&self.conn, Some(self.embedder()?), q);
         }
-        search::run(&self.conn, self.embedder(), q)
+        search::run(&self.conn, None, q)
     }
 
     /// Write the whole store to `path` as canonical JSONL; returns the row count (P8).
@@ -113,7 +116,7 @@ impl Session {
     /// This is the only path that touches the weights cache outside `add`/`search`.
     pub fn import(&mut self, path: &Path, dry_run: bool) -> Result<usize> {
         self.ensure_embedder()?;
-        let embedder = self.embedder.as_deref().expect("encoder was just loaded");
+        let embedder = self.embedder()?;
         portable::import::from_jsonl(&self.conn, embedder, path, dry_run)
     }
 
@@ -121,7 +124,7 @@ impl Session {
     /// dimension change (P9). Loads the encoder, so it is a deliberately heavy command.
     pub fn reembed(&mut self) -> Result<maintain::Report> {
         self.ensure_embedder()?;
-        let embedder = self.embedder.as_deref().expect("encoder was just loaded");
+        let embedder = self.embedder()?;
         maintain::reembed(&self.conn, embedder, &self.cfg.instruction)
     }
 

@@ -179,13 +179,44 @@ fn max_distance_filters_the_vector_leg() {
     seed(&conn, &embedder, "alpha-note", "infra", "alpha beta gamma");
     seed(&conn, &embedder, "other-note", "infra", "epsilon zeta eta");
 
+    // Cosine distance: the exact document is ~0, the unrelated one is ~1.
     let mut q = query("alpha beta gamma", Mode::Vec);
-    q.max_distance = Some(0.0); // only a perfect match survives
+    q.max_distance = Some(0.5);
     let hits = search::run(&conn, Some(&embedder), &q)
         .expect("search")
         .hits;
-    // The exact document is distance ~0; the unrelated one is filtered out.
-    assert!(hits.iter().all(|h| h.distance.unwrap_or(1.0) <= 0.0));
+    assert!(
+        hits.iter().all(|h| h.distance.unwrap_or(1.0) <= 0.5),
+        "got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.key == "alpha-note"),
+        "the exact match must survive the ceiling"
+    );
+    assert!(
+        !hits.iter().any(|h| h.key == "other-note"),
+        "the unrelated document must be filtered"
+    );
+}
+
+#[test]
+fn search_returns_a_bounded_snippet_not_the_full_body() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let long = "zebra ".repeat(200); // well past `SNIPPET_CHARS`
+    seed(&conn, &embedder, "long-note", "infra", &long);
+
+    let hits = search::run(&conn, Some(&embedder), &query("zebra", Mode::Fts))
+        .expect("search")
+        .hits;
+    let body = &hits[0].body;
+    assert!(
+        body.chars().count() <= search::SNIPPET_CHARS + 1,
+        "body was not bounded: {} chars",
+        body.chars().count()
+    );
+    assert!(body.ends_with('…'), "a truncated snippet should be marked");
 }
 
 #[test]

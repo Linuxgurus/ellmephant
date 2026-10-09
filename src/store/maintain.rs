@@ -53,6 +53,8 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
 
     let rows_count = rows.len();
     let dim_col = dim as i64;
+    // The batch embed stays inside the tx on purpose: a full rebuild wants one atomic swap
+    // of the whole index, and it is a deliberate, rare maintenance command.
     let tx = conn.unchecked_transaction()?;
     for chunk in rows.chunks(BATCH) {
         let texts: Vec<String> = chunk

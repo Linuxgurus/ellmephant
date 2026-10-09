@@ -15,7 +15,7 @@ pub fn open(paths: &Paths) -> Result<Connection> {
     paths.ensure()?;
     // Auto-extensions only attach to connections created *after* registration, so this
     // must run before `Connection::open` (PLAN §5 S0.1).
-    crate::index::vec::register_extension()?;
+    crate::index::vec::register_extension();
     let conn = Connection::open(paths.db())?;
     configure(&conn)?;
     migrate::run(&conn)?;

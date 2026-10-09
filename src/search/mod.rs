@@ -7,6 +7,19 @@
 
 pub mod rrf;
 
+/// Characters of a body returned per search hit (SPEC §9/§14: snippets, not dumps).
+pub const SNIPPET_CHARS: usize = 280;
+
+/// First `max` characters of `s`, with a trailing `…` when it was truncated.
+pub fn snippet(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
@@ -37,7 +50,7 @@ impl Mode {
             "hybrid" => Ok(Mode::Hybrid),
             "vec" => Ok(Mode::Vec),
             "fts" => Ok(Mode::Fts),
-            other => Err(crate::error::Error::Config(format!(
+            other => Err(Error::Config(format!(
                 "invalid mode {other:?} (want hybrid|vec|fts)"
             ))),
         }
@@ -90,7 +103,7 @@ pub struct Hit {
     pub type_: String,
     /// Salient line.
     pub title: String,
-    /// Full body (already bounded by the caller's snippet policy).
+    /// Bounded body snippet (SPEC §9: snippets, not dumps).
     pub body: String,
     /// Fused score.
     pub score: f64,
@@ -171,7 +184,7 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
             scope: mem.scope,
             type_: mem.type_.as_str().to_string(),
             title: mem.title,
-            body: mem.body,
+            body: snippet(&mem.body, SNIPPET_CHARS),
             score,
             distance: distances.get(&id).copied(),
             tags: mem.tags,
@@ -217,9 +230,10 @@ fn expand_frontier(
             if !visited.insert(nid) {
                 continue;
             }
-            let Some(memory) = store::get_by_id(conn, nid)? else {
+            let Some(mut memory) = store::get_by_id(conn, nid)? else {
                 continue;
             };
+            memory.body = snippet(&memory.body, SNIPPET_CHARS);
             out.push(Neighbor {
                 hop,
                 via: key.clone(),
@@ -247,4 +261,17 @@ fn adjacent(conn: &Connection, id: i64, key: &str) -> Result<Vec<(i64, String)>>
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippet_keeps_short_and_truncates_long() {
+        assert_eq!(snippet("short", 10), "short");
+        assert_eq!(snippet("", 0), "");
+        // Truncation is on a char boundary, not a byte index.
+        assert_eq!(snippet(&"á".repeat(5), 3), "ááá…");
+    }
 }

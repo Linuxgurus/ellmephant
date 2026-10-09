@@ -6,8 +6,8 @@ use llmphant::config::Paths;
 use llmphant::db;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::temp_dir().join("llmphant-example");
-    let paths = Paths::from_root(&dir);
+    let dir = tempfile::tempdir()?; // removed on drop
+    let paths = Paths::from_root(dir.path());
     let conn = db::open(&paths)?;
 
     println!("root           {}", paths.root().display());
@@ -23,6 +23,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {kind:<7} {name}");
     }
 
-    std::fs::remove_dir_all(&dir).ok();
     Ok(())
 }

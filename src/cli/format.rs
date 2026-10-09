@@ -10,18 +10,14 @@ use tabled::{Table, Tabled};
 use crate::error::Result;
 use crate::search::{Bundle, Hit};
 use crate::store::Memory;
-
-/// Serialise any hit list as a JSON array.
-pub fn hits_to_json(hits: &[Hit]) -> Result<String> {
-    Ok(serde_json::to_string_pretty(hits)?)
-}
+use crate::store::links::Dangling;
 
 /// Render a search bundle for a terminal (or `--json`), ranked first.
 pub fn render_bundle(bundle: &Bundle, json: bool) -> Result<String> {
     if json {
         return Ok(serde_json::to_string_pretty(bundle)?);
     }
-    let mut out = render_hits(&bundle.hits, false)?;
+    let mut out = render_hits(&bundle.hits)?;
     if !bundle.neighbors.is_empty() {
         out.push_str(&format!("\n{} linked:\n", bundle.neighbors.len()));
         for n in &bundle.neighbors {
@@ -34,11 +30,8 @@ pub fn render_bundle(bundle: &Bundle, json: bool) -> Result<String> {
     Ok(out)
 }
 
-/// Render hits for a terminal, newest-ranked first.
-pub fn render_hits(hits: &[Hit], json: bool) -> Result<String> {
-    if json {
-        return hits_to_json(hits);
-    }
+/// Render hits for a terminal, ranked first.
+fn render_hits(hits: &[Hit]) -> Result<String> {
     if hits.is_empty() {
         return Ok("(no matches)".to_string());
     }
@@ -116,6 +109,41 @@ pub fn render_tags(tags: &[(String, i64)], json: bool) -> Result<String> {
     Ok(format!("{table}\n"))
 }
 
+/// Render the dangling-link audit (`links`): one line per unresolved `[[key]]`, or JSON.
+pub fn render_dangling(dangling: &[Dangling], json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(dangling)?);
+    }
+    if dangling.is_empty() {
+        return Ok("(no dangling links)".to_string());
+    }
+    let mut out = String::new();
+    for d in dangling {
+        out.push_str(&format!(
+            "[[{}]]  <-  {}\n",
+            d.to_key,
+            d.from_keys.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+/// Bytes -> a short human string (`1.2 GiB`).
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,16 +163,21 @@ mod tests {
     }
 
     #[test]
-    fn json_roundtrips() {
-        let json = hits_to_json(&[hit()]).unwrap();
-        assert!(json.contains("\"infra-gitops\""));
-        assert!(json.trim_start().starts_with('['));
+    fn bundle_json_roundtrips() {
+        let bundle = Bundle {
+            hits: vec![hit()],
+            ..Default::default()
+        };
+        let json = render_bundle(&bundle, true).unwrap();
+        assert!(json.contains("\"infra-gitops\""), "{json}");
+        assert!(json.trim_start().starts_with('{'), "{json}");
     }
 
     #[test]
     fn empty_is_explicit() {
-        assert_eq!(render_hits(&[], false).unwrap(), "(no matches)");
-        assert_eq!(render_hits(&[], true).unwrap(), "[]");
+        assert_eq!(render_hits(&[]).unwrap(), "(no matches)");
+        let json = render_bundle(&Bundle::default(), true).unwrap();
+        assert!(json.contains("\"hits\": []"), "{json}");
     }
 
     fn memory() -> Memory {
@@ -185,5 +218,19 @@ mod tests {
         assert!(json.contains("\"count\": 2"), "{json}");
 
         assert_eq!(render_tags(&[], false).unwrap(), "(no tags)");
+    }
+
+    #[test]
+    fn dangling_renders_and_serialises() {
+        assert_eq!(render_dangling(&[], false).unwrap(), "(no dangling links)");
+        let dangling = vec![Dangling {
+            to_key: "ghost".into(),
+            from_keys: vec!["a".into(), "b".into()],
+        }];
+        let text = render_dangling(&dangling, false).unwrap();
+        assert!(text.contains("[[ghost]]"), "{text}");
+        assert!(text.contains("a, b"), "{text}");
+        let json = render_dangling(&dangling, true).unwrap();
+        assert!(json.contains("\"ghost\""), "{json}");
     }
 }

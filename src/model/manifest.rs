@@ -103,26 +103,12 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
-/// Lowercase hex of a byte slice.
-pub fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(DIGITS[(b >> 4) as usize] as char);
-        out.push(DIGITS[(b & 0x0f) as usize] as char);
-    }
-    out
-}
+/// Lowercase hex of a byte slice (single implementation lives in [`crate::hex`]).
+pub use crate::hex::encode as hex;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hex_is_lowercase_and_padded() {
-        assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
-        assert_eq!(hex(&[]), "");
-    }
 
     #[test]
     fn sha256_file_matches_known_vector() {

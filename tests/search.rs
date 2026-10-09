@@ -4,35 +4,25 @@
 //! bag-of-words model, so "meaning" here reduces to shared tokens; that is enough to prove
 //! the two legs run, fuse and hydrate without loading weights.
 
-use llmphant::config::Paths;
+mod common;
+
+use common::temp_store;
 use llmphant::db;
 use llmphant::embed::HashEmbedder;
 use llmphant::search::{self, Mode, Query};
 use llmphant::store::{self, Memory, MemoryType};
 use rusqlite::Connection;
-use tempfile::TempDir;
 
 const DIM: usize = 64;
 
-fn temp_store() -> (TempDir, Paths) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::from_root(dir.path());
-    (dir, paths)
-}
-
 fn memory(key: &str, scope: &str, title: &str, body: &str) -> Memory {
     Memory {
-        id: None,
         key: key.to_string(),
         scope: scope.to_string(),
         type_: MemoryType::Fact,
         title: title.to_string(),
         body: body.to_string(),
-        source: None,
-        hash: String::new(),
-        tags: Vec::new(),
-        created: String::new(),
-        updated: String::new(),
+        ..Default::default()
     }
 }
 

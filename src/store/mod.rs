@@ -1,6 +1,7 @@
 //! The write/read path over `memory` and its derived indexes (P4).
 
 pub mod links;
+pub mod maintain;
 pub mod slug;
 pub mod tags;
 
@@ -49,8 +50,9 @@ impl MemoryType {
     }
 }
 
-/// One atomic memory: the storage *and* embedding unit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One atomic memory: the storage *and* embedding unit. `Default` is the draft baseline
+/// the write path fills in (`id`/`hash`/timestamps are derived on insert).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Memory {
     /// Rowid; `None` before insert and omitted from export (local/derived).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -83,17 +85,6 @@ pub struct Memory {
     pub updated: String,
 }
 
-/// `hex` of a byte slice, lowercase.
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(DIGITS[(b >> 4) as usize] as char);
-        out.push(DIGITS[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
 /// `sha256(model|dim|embed_text)` — the re-embed trigger (SPEC §15 #7).
 pub fn row_hash(embedder: &dyn Embedder, embed_text: &str) -> String {
     let mut h = Sha256::new();
@@ -102,7 +93,7 @@ pub fn row_hash(embedder: &dyn Embedder, embed_text: &str) -> String {
     h.update(embedder.dim().to_string().as_bytes());
     h.update(b"|");
     h.update(embed_text.as_bytes());
-    hex(&h.finalize())
+    crate::hex::encode(&h.finalize())
 }
 
 /// Every key currently in the store (for slug collision avoidance).
@@ -314,6 +305,13 @@ pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<Memory>> {
     let tags = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
     mem.tags = tags.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Some(mem))
+}
+
+/// Every key in the store, alphabetical — the REPL's tab-completion vocabulary.
+pub fn keys(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT key FROM memory ORDER BY key")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]

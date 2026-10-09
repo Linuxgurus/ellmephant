@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::model;
 use crate::portable;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory};
+use crate::store::{self, Memory, links, maintain, tags};
 
 /// A store handle plus its (lazily loaded) encoder.
 pub struct Session {
@@ -65,7 +65,9 @@ impl Session {
     /// the weights cache, so nothing else in the CLI needs it.
     fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
-            self.embedder = Some(Box::new(super::load_embedder(&self.spec, &self.cfg)?));
+            self.embedder = Some(Box::new(super::embed::load_embedder(
+                &self.spec, &self.cfg,
+            )?));
         }
         Ok(())
     }
@@ -115,29 +117,41 @@ impl Session {
         portable::import::from_jsonl(&self.conn, embedder, path, dry_run)
     }
 
+    /// Recompute every vector and rebuild the derived vector index, handling a model or
+    /// dimension change (P9). Loads the encoder, so it is a deliberately heavy command.
+    pub fn reembed(&mut self) -> Result<maintain::Report> {
+        self.ensure_embedder()?;
+        let embedder = self.embedder.as_deref().expect("encoder was just loaded");
+        maintain::reembed(&self.conn, embedder, &self.cfg.instruction)
+    }
+
+    /// Rename a key: rewrite `[[old]]` in bodies and repoint links (P9).
+    pub fn rename(&self, old: &str, new: &str) -> Result<links::RenameOutcome> {
+        links::rename(&self.conn, old, new)
+    }
+
+    /// `[[key]]` targets with no matching row, grouped by target (P9 audit).
+    pub fn dangling(&self) -> Result<Vec<links::Dangling>> {
+        links::dangling(&self.conn)
+    }
+
+    /// Tags no memory references (P9 governance).
+    pub fn orphans(&self) -> Result<Vec<String>> {
+        tags::orphans(&self.conn)
+    }
+
+    /// Drop orphan tags; returns how many were removed (P9 governance).
+    pub fn prune_tags(&self) -> Result<usize> {
+        tags::prune(&self.conn)
+    }
+
     /// Every tag with its reference count, alphabetical.
     pub fn tags(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT t.name, count(mt.memory_id)
-               FROM tag t LEFT JOIN memory_tag mt ON mt.tag_id = t.id
-              GROUP BY t.id ORDER BY t.name",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        tags::list(&self.conn)
     }
 
     /// Every key in the store, alphabetical — the REPL's tab-completion vocabulary.
     pub fn keys(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT key FROM memory ORDER BY key")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        store::keys(&self.conn)
     }
 }

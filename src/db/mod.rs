@@ -1,5 +1,6 @@
 //! Database open + schema migration. One writer connection; readers open their own.
 
+pub mod meta;
 pub mod migrate;
 
 use std::time::Duration;

@@ -1,7 +1,5 @@
 //! Error type shared across the crate.
 
-use std::path::PathBuf;
-
 /// Everything that can go wrong in llmphant.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -33,9 +31,6 @@ pub enum Error {
 
     #[error("home directory not found (set HOME or LLMPHANT_HOME)")]
     NoHome,
-
-    #[error("path must be valid utf-8: {}", .0.display())]
-    NonUtf8Path(PathBuf),
 
     #[error("{0} is not implemented yet (see PLAN.md)")]
     NotImplemented(&'static str),

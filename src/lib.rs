@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod embed;
 pub mod error;
+pub mod hex;
 pub mod index;
 pub mod mcp;
 pub mod model;

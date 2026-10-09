@@ -37,9 +37,47 @@ fn help_lists_the_subcommands() {
     let out = run(dir.path(), &["--help"]);
     assert!(out.status.success());
     let text = stdout(&out);
-    for cmd in ["doctor", "search", "add", "mcp", "export"] {
+    for cmd in [
+        "doctor", "search", "add", "mcp", "export", "reembed", "rename", "links",
+    ] {
         assert!(text.contains(cmd), "help is missing {cmd}: {text}");
     }
+}
+
+#[test]
+fn maintenance_commands_behave_on_a_fresh_store() {
+    // P9 commands must work without the model: `rename`, `links` and `tags prune` touch
+    // only the relational store, so a cold home is enough to exercise them end to end.
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run(dir.path(), &["links"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).contains("no dangling links"),
+        "got: {}",
+        stdout(&out)
+    );
+
+    let out = run(dir.path(), &["tags", "prune", "--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("0 orphan"), "got: {}", stdout(&out));
+
+    let out = run(dir.path(), &["rename", "ghost", "new"]);
+    assert!(!out.status.success(), "renaming a missing key must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .to_lowercase()
+            .contains("ghost"),
+        "the error should name the key"
+    );
 }
 
 #[test]

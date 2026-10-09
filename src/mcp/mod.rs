@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::cli::session::Session;
 use crate::config::{Config, Paths};
@@ -101,17 +101,14 @@ impl AddParams {
     /// Convert the request into the storage/embedding unit.
     fn into_memory(self) -> Memory {
         Memory {
-            id: None,
             key: self.key.unwrap_or_default(),
             scope: self.scope,
             type_: MemoryType::parse(self.type_.as_deref().unwrap_or("fact")),
             title: self.title,
             body: self.body,
             source: self.source,
-            hash: String::new(),
             tags: self.tags,
-            created: String::new(),
-            updated: String::new(),
+            ..Default::default()
         }
     }
 }
@@ -172,14 +169,6 @@ pub struct ImportParams {
     pub dry_run: Option<bool>,
 }
 
-/// One incoming `[[key]]` edge, as returned by `memory_backlinks`.
-#[derive(Debug, Serialize)]
-struct Backlink {
-    key: String,
-    scope: String,
-    title: String,
-}
-
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
 #[derive(Clone)]
@@ -214,26 +203,6 @@ impl MemoryServer {
 /// One JSON object as the tool's text result.
 fn json_ok(value: serde_json::Value) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Incoming `[[…]]` edges for `key` (backlinks), ordered by source key.
-fn backlinks(conn: &rusqlite::Connection, key: &str) -> crate::error::Result<Vec<Backlink>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.key, m.scope, m.title FROM memory_link l JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key = ?1 ORDER BY m.key",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![key], |r| {
-        Ok(Backlink {
-            key: r.get(0)?,
-            scope: r.get(1)?,
-            title: r.get(2)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }
 
 #[tool_router]
@@ -384,7 +353,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let links = self.with_store(|s| backlinks(s.conn(), &p.key))?;
+        let links = self.with_store(|s| crate::store::links::backlinks(s.conn(), &p.key))?;
         serde_json::to_string(&links).map_err(|e| e.to_string())
     }
 

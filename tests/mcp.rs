@@ -28,9 +28,10 @@ async fn call(
     args: serde_json::Value,
 ) -> CallToolResult {
     client
-        .call_tool(CallToolRequestParams::new(name).with_arguments(
-            args.as_object().expect("object args").clone(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new(name)
+                .with_arguments(args.as_object().expect("object args").clone()),
+        )
         .await
         .expect("tool call")
 }
@@ -89,9 +90,18 @@ async fn tools_round_trip_over_the_transport() {
         }),
     )
     .await;
-    assert!(!added.is_error.unwrap_or(false), "add failed: {}", text(&added));
+    assert!(
+        !added.is_error.unwrap_or(false),
+        "add failed: {}",
+        text(&added)
+    );
 
-    let got = call(&client, "memory_get", serde_json::json!({ "key": "infra-logs" })).await;
+    let got = call(
+        &client,
+        "memory_get",
+        serde_json::json!({ "key": "infra-logs" }),
+    )
+    .await;
     assert!(text(&got).contains("Logs ship to ns1"), "{}", text(&got));
 
     let found = call(
@@ -120,7 +130,11 @@ async fn tools_round_trip_over_the_transport() {
         serde_json::json!({ "key": "infra-logs" }),
     )
     .await;
-    assert!(text(&back).contains("infra-observability"), "{}", text(&back));
+    assert!(
+        text(&back).contains("infra-observability"),
+        "{}",
+        text(&back)
+    );
 
     // update requires an existing key; a missing one is a tool error.
     let updated = call(
@@ -146,7 +160,12 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert!(!removed.is_error.unwrap_or(false), "{}", text(&removed));
-    let gone = call(&client, "memory_get", serde_json::json!({ "key": "infra-logs" })).await;
+    let gone = call(
+        &client,
+        "memory_get",
+        serde_json::json!({ "key": "infra-logs" }),
+    )
+    .await;
     assert_eq!(gone.is_error, Some(true));
 
     client.cancel().await.expect("cancel");

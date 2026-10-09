@@ -24,7 +24,8 @@ use super::session::Session;
 
 /// Verbs offered by tab-completion: the REPL's own plus the one-shot tree.
 const COMMANDS: &[&str] = &[
-    "add", "search", "show", "rm", "tags", "export", "import", "help", "quit", "exit",
+    "add", "search", "show", "rm", "tags", "rename", "reembed", "links", "export", "import",
+    "help", "quit", "exit",
 ];
 
 /// A REPL line, parsed with the exact `Command` tree the one-shot CLI uses.
@@ -40,7 +41,7 @@ struct Line {
     command: Command,
 }
 
-/// Tab-completes commands (first word) and memory keys (the `show`/`rm` argument).
+/// Tab-completes commands (first word) and memory keys (`show`/`rm`/`rename` arguments).
 struct ReplHelper {
     keys: Rc<RefCell<Vec<String>>>,
 }
@@ -60,7 +61,7 @@ impl Completer for ReplHelper {
         let verb = head[..start].split_whitespace().next();
         let candidates = match verb {
             None => candidates(COMMANDS.iter().copied(), word),
-            Some("show" | "rm") => {
+            Some("show" | "rm" | "rename") => {
                 let keys = self.keys.borrow();
                 candidates(keys.iter().map(String::as_str), word)
             }
@@ -200,7 +201,8 @@ fn print_help() {
          \x20 search \"QUERY\" [--scope S] [-k N] [--mode hybrid|vec|fts] [--expand N] [--json]\n\
          \x20 show KEY [--json]\n\
          \x20 rm KEY\n\
-         \x20 tags [--json]\n\
+         \x20 tags [--json] | tags prune [--dry-run]\n\
+         \x20 rename OLD NEW | reembed | links [--json]\n\
          \x20 export PATH | import PATH [--dry-run]\n\
          \x20 help | quit"
     );

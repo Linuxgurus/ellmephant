@@ -10,13 +10,13 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phases 1, 2, 2.5, 3, 4, 5, 6, 7 and 8 are real and tested: bootstrap, schema + FTS triggers,
+Phases 1, 2, 2.5, 3, 4, 5, 6, 7, 8 and 9 are real and tested: bootstrap, schema + FTS triggers,
 the `sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, the write
-path, hybrid search, the CLI (one-shot `add`/`search`/`show`/`rm`/`tags`/`export`/`import` plus
-an interactive REPL with history and tab-completion), the MCP stdio server (shared by Cline,
-TypingMind and anything else), and the JSONL portability layer. Maintenance (`reembed`,
-`rename`, link audit) and `bench` are still ahead (P9–P10). `cargo test` needs no model and no
-network.
+path, hybrid search, the CLI (one-shot `add`/`search`/`show`/`rm`/`tags`/`rename`/`reembed`/
+`links`/`export`/`import` plus an interactive REPL with history and tab-completion), the MCP
+stdio server (shared by Cline, TypingMind and anything else), the JSONL portability layer, and
+maintenance (`reembed`, `rename`, the dangling-link audit, `tags prune`, a deep `doctor`).
+`bench` is still ahead (P10). `cargo test` needs no model and no network.
 
 | Area | State |
 |---|---|
@@ -30,6 +30,7 @@ network.
 | `cli` — one-shot `add`/`show`/`rm`/`tags`, REPL with history + completion (P6) | done |
 | `mcp` — MCP stdio server: 8 tools, schemas, annotations, write policy (P7) | done |
 | `portable` — JSONL export/import, upsert-by-key, re-embed on hash change (P8) | done |
+| maintenance — `reembed`, `rename`, link audit, `tags prune`, deep `doctor` (P9) | done |
 | bench (P10) | stub |
 
 The encoder is behind the default-on `encoder` cargo feature; build with
@@ -104,6 +105,26 @@ llmphant import memory.jsonl            # upsert by key; re-embed only on hash c
 Import re-embeds, so it loads the encoder; a second import of the same file is a no-op
 (it returns `0` changes). Export is ordered by `key`, so equal content exports byte-identical.
 
+## Maintenance
+
+The `memory` table is the source of truth; every index on top of it is rebuildable (P9).
+
+```sh
+llmphant reembed                        # recompute every vector; survives a model/dim change
+llmphant rename OLD NEW                 # rewrite [[OLD]] in bodies + repoint link edges
+llmphant links                          # audit the graph for dangling [[key]] targets
+llmphant links --json
+llmphant tags prune [--dry-run]         # drop tags no memory references
+llmphant doctor                         # + link/tag/vector health
+llmphant doctor --verify                # + full re-hash of the cached weights (SPEC §6.3)
+```
+
+`reembed` is the deliberate path that the frozen-dimension guard in `index::vec::ensure`
+refuses: it drops and recreates `memory_vec` when the embedder's width changes, rewrites each
+row's `hash`/`model`/`dim`, and records `dim`/`model`/`instruction` in `meta`. `rename` is one
+transaction — `[[…]]` is stripped from the embed projection, so it never invalidates a stored
+vector — and refuses to clobber an existing key.
+
 ## MCP
 
 `llmphant mcp` serves the same store to any MCP client over stdio, so Cline, TypingMind and
@@ -161,9 +182,9 @@ src/
 ├── error.rs           thiserror
 ├── config.rs          ~/.llmphant paths, config.toml
 ├── model/             weights cache: resolve, fetch, verify (SPEC §6)
-├── db/                open, pragmas, migrate()
+├── db/                open, pragmas, migrate(), meta key/value
 ├── embed/             Embedder trait, qwen3, tokenize, projection
-├── store/             add/get over memory + derived indexes (slug, tags, links)
+├── store/             add/get + derived indexes (slug, tags, links) + maintain (reembed)
 ├── index/             vec0 (KNN) and fts5 (BM25) legs
 ├── search/            hybrid orchestration + RRF
 ├── cli/               subcommands, repl, session, output formatting

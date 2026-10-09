@@ -1,17 +1,9 @@
 //! `store != embed`: the row keeps the full body, the vector is computed over a
 //! condensed projection with wiki links stripped (SPEC §6, §8).
 
-use std::sync::LazyLock;
-
-use regex::Regex;
-
-/// `[[key]]` where key is `[a-z0-9-]+` (SPEC §8).
-static LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[\[[a-z0-9-]+\]\]").expect("link regex is valid"));
-
-/// Remove every wiki link token from `s`.
+/// Remove every wiki link token from `s` (the syntax is owned by `store::links`).
 pub fn strip_links(s: &str) -> String {
-    LINK_RE.replace_all(s, "").to_string()
+    crate::store::links::strip_links(s)
 }
 
 /// The text actually handed to the embedder: `title` then link-stripped `body`.

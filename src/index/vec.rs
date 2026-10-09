@@ -12,6 +12,7 @@ use std::sync::Once;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::db::meta;
 use crate::error::{Error, Result};
 
 /// The `vec0` table mirroring `memory.id` (PLAN §9: swap point for the vector store).
@@ -55,31 +56,24 @@ pub fn to_blob(v: &[f32]) -> Vec<u8> {
 
 /// Inverse of [`to_blob`]; a trailing partial element is ignored.
 pub fn from_blob(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
         .collect()
-}
-
-fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT v FROM meta WHERE k = ?1", params![key], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()?)
-}
-
-fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO meta (k, v) VALUES (?1, ?2)
-         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        params![key, value],
-    )?;
-    Ok(())
 }
 
 /// The dimension recorded in `meta`, if the store has ever been written to.
 pub fn stored_dim(conn: &Connection) -> Result<Option<usize>> {
-    Ok(meta_get(conn, "dim")?.and_then(|v| v.parse().ok()))
+    Ok(meta::get(conn, meta::DIM)?.and_then(|v| v.parse().ok()))
+}
+
+/// The `CREATE VIRTUAL TABLE` for a given dimension.
+fn create_sql(dim: usize) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {TABLE} USING vec0(\
+         memory_id INTEGER PRIMARY KEY, embedding float[{dim}], scope TEXT)"
+    )
 }
 
 /// Create the `vec0` table for `dim` if missing, and reject a dimension change.
@@ -97,12 +91,30 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
             )));
         }
         Some(_) => {}
-        None => meta_set(conn, "dim", &dim.to_string())?,
+        None => meta::set(conn, meta::DIM, &dim.to_string())?,
     }
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {TABLE} USING vec0(\
-         memory_id INTEGER PRIMARY KEY, embedding float[{dim}], scope TEXT)"
-    ))?;
+    conn.execute_batch(&create_sql(dim))?;
+    Ok(())
+}
+
+/// Drop and recreate the `vec0` table for a *new* dimension, recording it in `meta`.
+///
+/// This is the deliberate rebuild path [`ensure`] refuses: `reembed` (P9) calls it when the
+/// model — and therefore the vector width — changes, so the frozen-dimension guard never
+/// fires for an operator who means it.
+pub fn recreate(conn: &Connection, dim: usize) -> Result<()> {
+    if dim == 0 {
+        return Err(Error::Config("embedder dim must be > 0".into()));
+    }
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {TABLE}"))?;
+    meta::set(conn, meta::DIM, &dim.to_string())?;
+    conn.execute_batch(&create_sql(dim))?;
+    Ok(())
+}
+
+/// Empty the table so a full re-embed repopulates it from scratch (same dimension).
+pub fn clear(conn: &Connection) -> Result<()> {
+    conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
     Ok(())
 }
 
@@ -234,6 +246,22 @@ mod tests {
         ensure(&conn, 4).unwrap(); // idempotent
         let err = ensure(&conn, 8).unwrap_err();
         assert!(format!("{err}").contains("dim changed"));
+    }
+
+    #[test]
+    fn recreate_switches_dimension_and_clears() {
+        let conn = conn();
+        ensure(&conn, 2).unwrap();
+        upsert(&conn, 1, "infra", &[1.0, 0.0]).unwrap();
+
+        recreate(&conn, 4).unwrap();
+        assert_eq!(stored_dim(&conn).unwrap(), Some(4));
+        assert_eq!(count(&conn).unwrap(), 0, "rebuild starts empty");
+        upsert(&conn, 1, "infra", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(get(&conn, 1).unwrap().unwrap().len(), 4);
+
+        clear(&conn).unwrap();
+        assert_eq!(count(&conn).unwrap(), 0);
     }
 
     #[test]

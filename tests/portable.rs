@@ -4,39 +4,26 @@
 //! assertion is `export(db1) == export(db2)`: because export omits ids and vectors,
 //! byte-identical JSONL proves the portable content survived the trip unchanged.
 
-use llmphant::config::Paths;
+mod common;
+
+use common::{count, temp_store};
 use llmphant::db;
 use llmphant::embed::HashEmbedder;
 use llmphant::portable::{export, import};
 use llmphant::store::{self, Memory, MemoryType};
-use rusqlite::Connection;
-use tempfile::TempDir;
 
 const DIM: usize = 8;
 
-fn temp_store() -> (TempDir, Paths) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::from_root(dir.path());
-    (dir, paths)
-}
-
-fn count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |r| r.get(0)).expect("count query")
-}
-
 fn memory(key: &str, title: &str, body: &str, tags: &[&str]) -> Memory {
     Memory {
-        id: None,
         key: key.to_string(),
         scope: "infra".to_string(),
         type_: MemoryType::Signpost,
         title: title.to_string(),
         body: body.to_string(),
         source: Some("tests/portable.rs".to_string()),
-        hash: String::new(),
         tags: tags.iter().map(|s| s.to_string()).collect(),
-        created: String::new(),
-        updated: String::new(),
+        ..Default::default()
     }
 }
 

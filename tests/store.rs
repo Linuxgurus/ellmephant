@@ -3,16 +3,17 @@
 //! Runs offline — the embedder is the deterministic [`HashEmbedder`], wrapped so the
 //! test can prove *when* a re-embed happens (and when it must not).
 
+mod common;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use common::{count, temp_store};
 use llmphant::Result;
-use llmphant::config::Paths;
 use llmphant::db;
 use llmphant::embed::{Embedder, HashEmbedder};
 use llmphant::index::vec;
 use llmphant::store::{self, Memory, MemoryType};
-use rusqlite::{Connection, params};
-use tempfile::TempDir;
+use rusqlite::params;
 
 const DIM: usize = 8;
 
@@ -50,30 +51,17 @@ impl Embedder for CountingEmbedder {
     }
 }
 
-fn temp_store() -> (TempDir, Paths) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::from_root(dir.path());
-    (dir, paths)
-}
-
-fn count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |r| r.get(0)).expect("count query")
-}
-
 /// A memory with an explicit key and the given body/tags.
 fn memory(key: &str, title: &str, body: &str, tags: &[&str]) -> Memory {
     Memory {
-        id: None,
         key: key.to_string(),
         scope: "infra".to_string(),
         type_: MemoryType::Signpost,
         title: title.to_string(),
         body: body.to_string(),
         source: Some("tests/store.rs".to_string()),
-        hash: String::new(),
         tags: tags.iter().map(|s| s.to_string()).collect(),
-        created: String::new(),
-        updated: String::new(),
+        ..Default::default()
     }
 }
 

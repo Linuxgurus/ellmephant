@@ -1,6 +1,9 @@
 //! The CLI: one clap tree, three faces (REPL, one-shot, MCP) over one core.
 
+pub mod doctor;
+pub mod embed;
 pub mod format;
+pub mod model;
 pub mod repl;
 pub mod session;
 
@@ -12,7 +15,6 @@ use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
 use crate::search::{Mode, Query};
 use crate::store::{Memory, MemoryType};
-use crate::{db, embed, index, model};
 
 use self::session::Session;
 
@@ -55,8 +57,12 @@ pub struct Cli {
 pub enum Command {
     /// Interactive REPL (default when no subcommand is given).
     Repl,
-    /// Print paths, schema version and index status.
-    Doctor,
+    /// Print paths, schema version and derived-index health.
+    Doctor {
+        /// Re-hash every cached weight file (slow; SPEC §6.3).
+        #[arg(long)]
+        verify: bool,
+    },
     /// Store a memory (upsert by key).
     Add {
         /// Slug; auto-generated from scope + title when omitted.
@@ -113,8 +119,25 @@ pub enum Command {
     },
     /// Delete one memory by key.
     Rm { key: String },
-    /// List tags with counts.
+    /// List tags with counts, or `tags prune`.
     Tags {
+        /// Emit JSON (list mode).
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        command: Option<TagCommand>,
+    },
+    /// Recompute every vector and rebuild the vector index (handles a model/dim change).
+    Reembed,
+    /// Rename a key: rewrite `[[old]]` in bodies and repoint link edges.
+    Rename {
+        /// Existing key.
+        old: String,
+        /// New key.
+        new: String,
+    },
+    /// Audit the link graph for dangling `[[key]]` targets.
+    Links {
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -192,6 +215,17 @@ pub enum ModelCommand {
     },
 }
 
+/// `llmphant tags …` — tag governance (PLAN §2 #6).
+#[derive(Debug, Subcommand)]
+pub enum TagCommand {
+    /// Drop tags no memory references.
+    Prune {
+        /// Report how many would be dropped without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// Resolve paths, then dispatch.
 pub fn run(cli: Cli) -> Result<()> {
     let paths = match cli.home {
@@ -207,7 +241,7 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 
     // Flags override config (SPEC §12); `--model-dir` is inherently offline.
-    let mut spec = model::Spec::from_config(&cfg, &paths);
+    let mut spec = crate::model::Spec::from_config(&cfg, &paths);
     if cli.offline {
         spec.offline = true;
     }
@@ -221,9 +255,9 @@ pub fn run(cli: Cli) -> Result<()> {
             let session = Session::open(paths, cfg, spec)?;
             repl::run(session)
         }
-        Command::Doctor => doctor(&paths, &cfg, &spec),
-        Command::Model { command } => model_cmd(&spec, command),
-        Command::Embed { text, query } => embed(&spec, &cfg, &text, query),
+        Command::Doctor { verify } => doctor::run(&paths, &cfg, &spec, verify),
+        Command::Model { command } => model::cmd(&spec, command),
+        Command::Embed { text, query } => embed::run(&spec, &cfg, &text, query),
         // MCP holds the store open and serves until the client disconnects (P7).
         Command::Mcp => crate::mcp::serve(paths, cfg, spec),
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
@@ -248,17 +282,14 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
             tags,
         } => {
             let mem = Memory {
-                id: None,
                 key: key.unwrap_or_default(),
                 scope,
                 type_: MemoryType::parse(&r#type),
                 title,
                 body: read_body(&body)?,
                 source,
-                hash: String::new(),
                 tags,
-                created: String::new(),
-                updated: String::new(),
+                ..Default::default()
             };
             let key = session.add(&mem)?;
             println!("added {key}");
@@ -298,9 +329,49 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
                 Err(Error::NotFound(key))
             }
         }
-        Command::Tags { json } => {
-            let tags = session.tags()?;
-            emit(format::render_tags(&tags, json)?);
+        Command::Tags { json, command } => match command {
+            Some(TagCommand::Prune { dry_run }) => {
+                if dry_run {
+                    let orphans = session.orphans()?.len();
+                    println!("{orphans} orphan tag(s) would be pruned");
+                } else {
+                    let pruned = session.prune_tags()?;
+                    println!("pruned {pruned} orphan tag(s)");
+                }
+                Ok(())
+            }
+            None => {
+                let tags = session.tags()?;
+                emit(format::render_tags(&tags, json)?);
+                Ok(())
+            }
+        },
+        Command::Rename { old, new } => {
+            let outcome = session.rename(&old, &new)?;
+            println!(
+                "renamed {} -> {} ({} body/bodies rewritten, {} edge(s) repointed)",
+                old, outcome.key, outcome.bodies, outcome.edges
+            );
+            Ok(())
+        }
+        Command::Reembed => {
+            let report = session.reembed()?;
+            println!(
+                "re-embedded {} row(s) at dim {}{} ({})",
+                report.rows,
+                report.dim,
+                if report.rebuilt {
+                    "; vector index recreated"
+                } else {
+                    ""
+                },
+                report.model
+            );
+            Ok(())
+        }
+        Command::Links { json } => {
+            let dangling = session.dangling()?;
+            emit(format::render_dangling(&dangling, json)?);
             Ok(())
         }
         Command::Export { path } => {
@@ -319,7 +390,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         }
         // Not store commands: the dispatcher above owns these, and the REPL rejects them.
         Command::Repl
-        | Command::Doctor
+        | Command::Doctor { .. }
         | Command::Model { .. }
         | Command::Embed { .. }
         | Command::Mcp => Err(Error::Config("command is not available here".into())),
@@ -344,214 +415,4 @@ fn read_body(arg: &str) -> Result<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
-}
-
-/// Build the production Qwen3 encoder from the resolved cache + config. This is the one
-/// place the weights directory and the `Embedder` meet (PLAN §6 P3).
-pub(crate) fn load_embedder(
-    spec: &model::Spec,
-    cfg: &Config,
-) -> Result<embed::qwen3::Qwen3Embedder> {
-    let fetcher = model::fetch::UreqFetcher::from_env();
-    let dir = model::ensure(spec, &fetcher)?;
-    let opts = embed::qwen3::Options::new(cfg.dim, &cfg.device, &cfg.precision, &cfg.instruction);
-    embed::qwen3::Qwen3Embedder::load(&dir, &opts)
-}
-
-/// `llmphant embed "…" [--query]` — load the encoder and report dim + latency (P3).
-fn embed(spec: &model::Spec, cfg: &Config, text: &str, query: bool) -> Result<()> {
-    use crate::embed::Embedder;
-
-    let started = std::time::Instant::now();
-    let embedder = load_embedder(spec, cfg)?;
-    let loaded = started.elapsed().as_secs_f64() * 1e3;
-
-    let started = std::time::Instant::now();
-    let vector = if query {
-        embedder.embed_query(text)?
-    } else {
-        embedder.embed_one(text)?
-    };
-    let embedded = started.elapsed().as_secs_f64() * 1e3;
-
-    // Vectors are L2-normalised, so the norm doubles as a sanity check (SPEC §6).
-    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-    println!("model          {}", embedder.model_id());
-    println!(
-        "  kind         {}",
-        if query { "query" } else { "document" }
-    );
-    println!("  dim          {}", vector.len());
-    println!("  load         {loaded:.0} ms");
-    println!("  embed        {embedded:.0} ms");
-    println!("  norm         {norm:.6}");
-    Ok(())
-}
-
-/// `llmphant model …` — status / fetch / rm over the weights cache (SPEC §6.5).
-fn model_cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
-    match command {
-        ModelCommand::Status {
-            repo,
-            revision,
-            verify,
-        } => {
-            let mut spec = spec.clone();
-            if let Some(repo) = repo {
-                spec.repo = repo;
-            }
-            if let Some(revision) = revision {
-                spec.revision = revision;
-            }
-            let status = model::status(&spec)?;
-            print_model_status(&status);
-            if verify {
-                let bad = model::verify(&spec)?;
-                if bad.is_empty() {
-                    println!("  verify         ok (all sha256 match)");
-                } else {
-                    for line in &bad {
-                        println!("  verify         MISMATCH {line}");
-                    }
-                    return Err(Error::Model(format!(
-                        "{} file(s) failed verification",
-                        bad.len()
-                    )));
-                }
-            }
-            Ok(())
-        }
-        ModelCommand::Fetch {
-            repo,
-            revision,
-            force,
-        } => {
-            let mut spec = spec.clone();
-            if let Some(repo) = repo {
-                spec.repo = repo;
-            }
-            if let Some(revision) = revision {
-                spec.revision = revision;
-            }
-            spec.force = force;
-            let fetcher = model::fetch::UreqFetcher::from_env();
-            let dir = model::ensure(&spec, &fetcher)?;
-            println!("weights ready: {}", dir.display());
-            Ok(())
-        }
-        ModelCommand::Rm {
-            repo,
-            revision,
-            all,
-        } => {
-            let mut spec = spec.clone();
-            if let Some(repo) = repo {
-                spec.repo = repo;
-            }
-            if let Some(revision) = revision {
-                spec.revision = revision;
-            }
-            let removed = model::remove(&spec, all)?;
-            println!("removed {removed} revision(s)");
-            Ok(())
-        }
-    }
-}
-
-/// Render a [`model::Status`] as a human-readable block.
-fn print_model_status(status: &model::Status) {
-    let resolved = match &status.resolved {
-        Some(sha) => format!(" -> {sha}"),
-        None => " (unresolved)".to_string(),
-    };
-    println!("model          {}", status.repo);
-    println!("  revision     {}{resolved}", status.revision);
-    println!("  dir          {}", status.dir.display());
-    println!(
-        "  manifest     {}",
-        if status.manifest { "present" } else { "absent" }
-    );
-    let mut total = 0u64;
-    for file in &status.files {
-        match file.size {
-            Some(size) => {
-                total += size;
-                println!("    {:<24} {:>10}  ok", file.name, human(size));
-            }
-            None => println!("    {:<24} {:>10}  missing", file.name, "-"),
-        }
-    }
-    println!("  total        {}", human(total));
-}
-
-/// Bytes -> a short human string (`1.2 GiB`).
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// `llmphant doctor` — paths, schema version, table count, embedded-index status.
-pub fn doctor(paths: &Paths, cfg: &Config, spec: &model::Spec) -> Result<()> {
-    paths.ensure()?;
-    let conn = db::open(paths)?;
-    let schema = db::migrate::version(&conn)?;
-    let objects: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view','trigger')",
-        [],
-        |r| r.get(0),
-    )?;
-
-    println!("llmphant {}", crate::VERSION);
-    println!("  root           {}", paths.root().display());
-    println!("  db             {}", paths.db().display());
-    println!(
-        "  config         {} ({})",
-        paths.config().display(),
-        if paths.config().exists() {
-            "file"
-        } else {
-            "defaults"
-        }
-    );
-    println!("  models         {}", paths.models().display());
-    println!(
-        "  schema         v{} (binary knows v{})",
-        schema,
-        db::migrate::latest()
-    );
-    println!("  objects        {objects}");
-    println!("  model          {} dim={}", cfg.model, cfg.dim);
-
-    // Weights cache summary (no network; SPEC §6.5).
-    let weights = model::status(spec)?;
-    let present = weights.files.iter().filter(|f| f.present).count();
-    let bytes: u64 = weights.files.iter().filter_map(|f| f.size).sum();
-    let at = match &weights.resolved {
-        Some(sha) => format!("{}@{}", weights.repo, &sha[..sha.len().min(12)]),
-        None => format!("{}@{}", weights.repo, weights.revision),
-    };
-    println!(
-        "  weights        {}  {present}/{} files, {}{}",
-        at,
-        weights.files.len(),
-        human(bytes),
-        if weights.offline { " (offline)" } else { "" }
-    );
-
-    let vec_status = match index::vec::stored_dim(&conn)? {
-        Some(dim) => format!("vec0 dim={dim}, {} rows", index::vec::count(&conn)?),
-        None => "registered (no vectors yet)".to_string(),
-    };
-    println!("  vec0           {vec_status}");
-    Ok(())
 }

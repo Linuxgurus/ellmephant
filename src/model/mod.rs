@@ -73,6 +73,18 @@ impl Spec {
             force: false,
         }
     }
+
+    /// A copy with `repo`/`revision` overridden when supplied (the `model …` flags).
+    pub fn with_overrides(&self, repo: Option<String>, revision: Option<String>) -> Self {
+        let mut spec = self.clone();
+        if let Some(repo) = repo {
+            spec.repo = repo;
+        }
+        if let Some(revision) = revision {
+            spec.revision = revision;
+        }
+        spec
+    }
 }
 
 /// One file's presence in a cached revision.

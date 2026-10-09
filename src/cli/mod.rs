@@ -7,7 +7,7 @@ pub mod model;
 pub mod repl;
 pub mod session;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -270,6 +270,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
 /// Run one already-parsed store command against a live [`Session`] — the shared core of
 /// the one-shot CLI and the REPL, so the two can never drift apart (PLAN §6 P6).
+/// The dispatcher only builds the request; each `cmd_*` does the work and the printing.
 pub fn execute(session: &mut Session, command: Command) -> Result<()> {
     match command {
         Command::Add {
@@ -291,9 +292,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
                 tags,
                 ..Default::default()
             };
-            let key = session.add(&mem)?;
-            println!("added {key}");
-            Ok(())
+            cmd_add(session, &mem)
         }
         Command::Search {
             query,
@@ -312,82 +311,16 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
                 max_distance,
                 expand,
             };
-            let bundle = session.search(&q)?;
-            emit(format::render_bundle(&bundle, json)?);
-            Ok(())
+            cmd_search(session, q, json)
         }
-        Command::Show { key, json } => {
-            let mem = session.show(&key)?;
-            emit(format::render_memory(&mem, json)?);
-            Ok(())
-        }
-        Command::Rm { key } => {
-            if session.rm(&key)? {
-                println!("removed {key}");
-                Ok(())
-            } else {
-                Err(Error::NotFound(key))
-            }
-        }
-        Command::Tags { json, command } => match command {
-            Some(TagCommand::Prune { dry_run }) => {
-                if dry_run {
-                    let orphans = session.orphans()?.len();
-                    println!("{orphans} orphan tag(s) would be pruned");
-                } else {
-                    let pruned = session.prune_tags()?;
-                    println!("pruned {pruned} orphan tag(s)");
-                }
-                Ok(())
-            }
-            None => {
-                let tags = session.tags()?;
-                emit(format::render_tags(&tags, json)?);
-                Ok(())
-            }
-        },
-        Command::Rename { old, new } => {
-            let outcome = session.rename(&old, &new)?;
-            println!(
-                "renamed {} -> {} ({} body/bodies rewritten, {} edge(s) repointed)",
-                old, outcome.key, outcome.bodies, outcome.edges
-            );
-            Ok(())
-        }
-        Command::Reembed => {
-            let report = session.reembed()?;
-            println!(
-                "re-embedded {} row(s) at dim {}{} ({})",
-                report.rows,
-                report.dim,
-                if report.rebuilt {
-                    "; vector index recreated"
-                } else {
-                    ""
-                },
-                report.model
-            );
-            Ok(())
-        }
-        Command::Links { json } => {
-            let dangling = session.dangling()?;
-            emit(format::render_dangling(&dangling, json)?);
-            Ok(())
-        }
-        Command::Export { path } => {
-            let count = session.export(&path)?;
-            println!("exported {count} memories to {}", path.display());
-            Ok(())
-        }
-        Command::Import { path, dry_run } => {
-            let count = session.import(&path, dry_run)?;
-            if dry_run {
-                println!("{count} memory change(s) pending from {}", path.display());
-            } else {
-                println!("imported {count} memory change(s) from {}", path.display());
-            }
-            Ok(())
-        }
+        Command::Show { key, json } => cmd_show(session, &key, json),
+        Command::Rm { key } => cmd_rm(session, &key),
+        Command::Tags { json, command } => cmd_tags(session, json, command),
+        Command::Rename { old, new } => cmd_rename(session, &old, &new),
+        Command::Reembed => cmd_reembed(session),
+        Command::Links { json } => cmd_links(session, json),
+        Command::Export { path } => cmd_export(session, &path),
+        Command::Import { path, dry_run } => cmd_import(session, &path, dry_run),
         // Not store commands: the dispatcher above owns these, and the REPL rejects them.
         Command::Repl
         | Command::Doctor { .. }
@@ -396,6 +329,100 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         | Command::Mcp => Err(Error::Config("command is not available here".into())),
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
     }
+}
+
+fn cmd_add(session: &mut Session, mem: &Memory) -> Result<()> {
+    let key = session.add(mem)?;
+    println!("added {key}");
+    Ok(())
+}
+
+fn cmd_search(session: &mut Session, q: Query, json: bool) -> Result<()> {
+    let bundle = session.search(&q)?;
+    emit(format::render_bundle(&bundle, json)?);
+    Ok(())
+}
+
+fn cmd_show(session: &Session, key: &str, json: bool) -> Result<()> {
+    let mem = session.show(key)?;
+    emit(format::render_memory(&mem, json)?);
+    Ok(())
+}
+
+fn cmd_rm(session: &Session, key: &str) -> Result<()> {
+    if session.rm(key)? {
+        println!("removed {key}");
+        Ok(())
+    } else {
+        Err(Error::NotFound(key.to_string()))
+    }
+}
+
+fn cmd_tags(session: &Session, json: bool, command: Option<TagCommand>) -> Result<()> {
+    match command {
+        Some(TagCommand::Prune { dry_run }) => {
+            if dry_run {
+                let orphans = session.orphans()?.len();
+                println!("{orphans} orphan tag(s) would be pruned");
+            } else {
+                let pruned = session.prune_tags()?;
+                println!("pruned {pruned} orphan tag(s)");
+            }
+            Ok(())
+        }
+        None => {
+            let tags = session.tags()?;
+            emit(format::render_tags(&tags, json)?);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_rename(session: &Session, old: &str, new: &str) -> Result<()> {
+    let outcome = session.rename(old, new)?;
+    println!(
+        "renamed {} -> {} ({} body/bodies rewritten, {} edge(s) repointed)",
+        old, outcome.key, outcome.bodies, outcome.edges
+    );
+    Ok(())
+}
+
+fn cmd_reembed(session: &mut Session) -> Result<()> {
+    let report = session.reembed()?;
+    println!(
+        "re-embedded {} row(s) at dim {}{} ({})",
+        report.rows,
+        report.dim,
+        if report.rebuilt {
+            "; vector index recreated"
+        } else {
+            ""
+        },
+        report.model
+    );
+    Ok(())
+}
+
+fn cmd_links(session: &Session, json: bool) -> Result<()> {
+    let dangling = session.dangling()?;
+    emit(format::render_dangling(&dangling, json)?);
+    Ok(())
+}
+
+fn cmd_export(session: &Session, path: &Path) -> Result<()> {
+    let count = session.export(path)?;
+    println!("exported {count} memories to {}", path.display());
+    Ok(())
+}
+
+fn cmd_import(session: &mut Session, path: &Path, dry_run: bool) -> Result<()> {
+    let count = session.import(path, dry_run)?;
+    if dry_run {
+        println!("{count} memory change(s) pending from {}", path.display());
+    } else {
+        println!("imported {count} memory change(s) from {}", path.display());
+    }
+    Ok(())
 }
 
 /// Print rendered output, guaranteeing a trailing newline so the next prompt starts clean.

@@ -180,53 +180,14 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i
         None
     };
     let dim = embedder.dim() as i64;
+    let model = embedder.model_id();
 
     let id = match existing {
         Some((id, _)) => {
-            tx.execute(
-                "UPDATE memory
-                    SET scope = ?2, type = ?3, title = ?4, body = ?5, source = ?6,
-                        hash = ?7, model = ?8, dim = ?9,
-                        updated = COALESCE(NULLIF(?10, ''), datetime('now'))
-                  WHERE id = ?1",
-                params![
-                    id,
-                    mem.scope,
-                    mem.type_.as_str(),
-                    mem.title,
-                    mem.body,
-                    mem.source,
-                    hash,
-                    embedder.model_id(),
-                    dim,
-                    mem.updated
-                ],
-            )?;
+            update_row(&tx, id, mem, &hash, dim, model)?;
             id
         }
-        None => {
-            tx.execute(
-                "INSERT INTO memory (key, scope, type, title, body, source, hash, model, dim,
-                                     created, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                         COALESCE(NULLIF(?10, ''), datetime('now')),
-                         COALESCE(NULLIF(?11, ''), datetime('now')))",
-                params![
-                    key,
-                    mem.scope,
-                    mem.type_.as_str(),
-                    mem.title,
-                    mem.body,
-                    mem.source,
-                    hash,
-                    embedder.model_id(),
-                    dim,
-                    mem.created,
-                    mem.updated
-                ],
-            )?;
-            tx.last_insert_rowid()
-        }
+        None => insert_row(&tx, &key, mem, &hash, dim, model)?,
     };
 
     write_tags(&tx, id, mem)?;
@@ -236,6 +197,69 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i
     }
     tx.commit()?;
     Ok(id)
+}
+
+/// The `UPDATE` half of [`add`]: the key already exists.
+fn update_row(
+    tx: &Connection,
+    id: i64,
+    mem: &Memory,
+    hash: &str,
+    dim: i64,
+    model: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE memory
+            SET scope = ?2, type = ?3, title = ?4, body = ?5, source = ?6,
+                hash = ?7, model = ?8, dim = ?9,
+                updated = COALESCE(NULLIF(?10, ''), datetime('now'))
+          WHERE id = ?1",
+        params![
+            id,
+            mem.scope,
+            mem.type_.as_str(),
+            mem.title,
+            mem.body,
+            mem.source,
+            hash,
+            model,
+            dim,
+            mem.updated
+        ],
+    )?;
+    Ok(())
+}
+
+/// The `INSERT` half of [`add`]: a new key; returns its rowid.
+fn insert_row(
+    tx: &Connection,
+    key: &str,
+    mem: &Memory,
+    hash: &str,
+    dim: i64,
+    model: &str,
+) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO memory (key, scope, type, title, body, source, hash, model, dim,
+                             created, updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                 COALESCE(NULLIF(?10, ''), datetime('now')),
+                 COALESCE(NULLIF(?11, ''), datetime('now')))",
+        params![
+            key,
+            mem.scope,
+            mem.type_.as_str(),
+            mem.title,
+            mem.body,
+            mem.source,
+            hash,
+            model,
+            dim,
+            mem.created,
+            mem.updated
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
 }
 
 /// Delete a memory by key. `memory_fts`/`memory_tag`/`memory_link` follow via triggers

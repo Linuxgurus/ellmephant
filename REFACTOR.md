@@ -4,6 +4,8 @@
 > and `cargo clippy --all-targets --all-features -- -D warnings` are all green.
 > Kept as the record of *what* changed and *why*; each step below is still the
 > recipe to reproduce or extend it.
+>
+> **Part 2** (steps 10–15, complexity reduction) follows at the end of this file.
 
 Mechanical refactors only; **no behaviour change**. Every step is independently
 verifiable. Target audience: a smaller model — do the steps in order, run the
@@ -426,4 +428,495 @@ Definition of done:
 - `src/index/vec.rs::from_blob` used `chunks_exact(4)`; rustc 1.99's clippy lint
   `chunks_exact_to_as_chunks` fails CI under `-D warnings`. Switched to
   `as_chunks::<4>()` (stable since 1.88). Pre-existing issue, behaviour-identical.
+
+
+# Part 2 — cyclomatic-complexity reduction (steps 10–15)
+
+> **Status: applied.** Same ground rules as Part 1: mechanical only, **no behaviour
+> change** — identical output strings, SQL, error messages and public API. After each
+> step run the Part 1 *verify* command.
+
+## Method
+
+Measured with two tools, cross-checked:
+
+```sh
+rust-code-analysis-cli -m -O json -p src -o /tmp/rca      # true cyclomatic, per function
+cargo clippy --all-targets --all-features -- -W clippy::cognitive_complexity
+# (with a local `clippy.toml`: cognitive-complexity-threshold = 1, deleted after)
+```
+
+`rust-code-analysis` counts every `?` and every closure body as a decision point, so
+Rust cyclomatic numbers run high; clippy's cognitive score is nesting-weighted and is
+the better readability signal. `clippy`'s default cognitive threshold (25) is not
+reached anywhere in `src/`, so this is trimming, not rescue.
+
+## Baseline (src/, 383 functions/closures)
+
+median cyclomatic 1, mean 2.95, p90 7; **11** functions ≥ 15, **23** ≥ 10.
+
+| cyclomatic | cognitive | sloc | location |
+|---|---|---|---|
+| 38 | 7 | 127 | `src/cli/mod.rs` `execute` |
+| 33 | 9 | 90 | `src/cli/doctor.rs` `run` |
+| 24 | 4 | 45 | `src/store/maintain.rs` `reembed` |
+| 20 | 4 | 81 | `src/store/mod.rs` `add` |
+| 17 | 13 | 46 | `src/model/mod.rs` `remove` |
+| 17 | 8 | 61 | `src/search/mod.rs` `run` |
+| 12 | 11 | 50 | `src/cli/model.rs` `cmd` (dup verify block) |
+| 10 | 13 | 30 | `src/search/mod.rs` `expand` |
+
+---
+
+## Step 10 — one weight-verify reporter (was duplicated)
+
+**Problem:** the `model::verify` report — the `ok` line, the `MISMATCH` loop and the
+`N file(s) failed verification` error — is copy-pasted in `src/cli/doctor.rs::run` and
+`src/cli/model.rs::cmd`. The two differ only in what a hashing *error* does: `doctor`
+prints `skipped (…)` and carries on; `model status` propagates it.
+
+**Do:**
+
+1. `src/cli/model.rs`: add
+
+```rust
+/// Report a `model::verify` run (SPEC §6.3/§6.5): print the `ok` or `MISMATCH` lines,
+/// then fail on any mismatch. `lenient` (doctor) turns a hashing error into a
+/// `skipped` line; the strict caller (`model status`) propagates it.
+pub(crate) fn verify_weights(spec: &model::Spec, lenient: bool) -> Result<()> {
+    let bad = match model::verify(spec) {
+        Ok(bad) => bad,
+        Err(err) if lenient => {
+            println!("  verify         skipped ({err})");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    if bad.is_empty() {
+        println!("  verify         ok (all sha256 match)");
+        return Ok(());
+    }
+    for line in &bad {
+        println!("  verify         MISMATCH {line}");
+    }
+    Err(Error::Model(format!(
+        "{} file(s) failed verification",
+        bad.len()
+    )))
+}
+```
+
+2. `src/cli/model.rs::cmd`, the `Status` arm: replace the inline `if verify { … }` with
+
+```rust
+            if verify {
+                verify_weights(&spec, false)?;
+            }
+```
+
+3. `src/cli/doctor.rs::run`: replace the whole `if verify { match model::verify … }`
+   block with `verify_weights(spec, true)?;` and add
+   `use super::model::verify_weights;` (keep `use crate::model;` — different name).
+
+Verify: `cargo test --locked`
+
+---
+
+
+## Step 11 — split `cli::doctor::run`
+
+**Problem:** one function gathers stats, prints ~15 lines, then verifies — 90 sloc.
+
+**Do:** keep `run` as the orchestrator and extract three printers (verbatim bodies):
+
+```rust
+pub fn run(paths: &Paths, cfg: &Config, spec: &model::Spec, verify: bool) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open(paths)?;
+    let schema = db::migrate::version(&conn)?;
+    let objects: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view','trigger')",
+        [],
+        |r| r.get(0),
+    )?;
+    print_env(paths, cfg, schema, objects);
+    print_weights(spec)?;
+    print_index_health(&conn)?;
+    if verify {
+        verify_weights(spec, true)?;
+    }
+    Ok(())
+}
+```
+
+- `fn print_env(paths: &Paths, cfg: &Config, schema: i64, objects: i64)` — the
+  root/db/config/models/schema/objects/model lines.
+- `fn print_weights(spec: &model::Spec) -> Result<()>` — the weights-cache summary.
+- `fn print_index_health(conn: &Connection) -> Result<()>` — memories/vec0/links/tags.
+
+Verify: `cargo test --locked`
+
+---
+
+
+## Step 12 — split `cli::execute` into per-command handlers
+
+**Problem:** `execute` is a 15-arm match that also does the work and the printing
+(127 sloc). Keep it the dispatcher; move each store command's body out.
+
+**Do:**
+
+1. In `src/cli/mod.rs`, add private handlers (all ≤ 3 args, so no
+   `too_many_arguments`):
+
+```rust
+fn cmd_add(session: &mut Session, mem: &Memory) -> Result<()> {
+    let key = session.add(mem)?;
+    println!("added {key}");
+    Ok(())
+}
+
+fn cmd_search(session: &mut Session, q: Query, json: bool) -> Result<()> {
+    let bundle = session.search(&q)?;
+    emit(format::render_bundle(&bundle, json)?);
+    Ok(())
+}
+
+fn cmd_show(session: &Session, key: &str, json: bool) -> Result<()> {
+    let mem = session.show(key)?;
+    emit(format::render_memory(&mem, json)?);
+    Ok(())
+}
+
+fn cmd_rm(session: &Session, key: &str) -> Result<()> {
+    if session.rm(key)? {
+        println!("removed {key}");
+        Ok(())
+    } else {
+        Err(Error::NotFound(key.to_string()))
+    }
+}
+```
+
+
+```rust
+fn cmd_tags(session: &Session, json: bool, command: Option<TagCommand>) -> Result<()> {
+    match command {
+        Some(TagCommand::Prune { dry_run }) => {
+            if dry_run {
+                let orphans = session.orphans()?.len();
+                println!("{orphans} orphan tag(s) would be pruned");
+            } else {
+                let pruned = session.prune_tags()?;
+                println!("pruned {pruned} orphan tag(s)");
+            }
+            Ok(())
+        }
+        None => {
+            let tags = session.tags()?;
+            emit(format::render_tags(&tags, json)?);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_rename(session: &Session, old: &str, new: &str) -> Result<()> {
+    let outcome = session.rename(old, new)?;
+    println!(
+        "renamed {} -> {} ({} body/bodies rewritten, {} edge(s) repointed)",
+        old, outcome.key, outcome.bodies, outcome.edges
+    );
+    Ok(())
+}
+
+fn cmd_reembed(session: &mut Session) -> Result<()> {
+    let report = session.reembed()?;
+    println!(
+        "re-embedded {} row(s) at dim {}{} ({})",
+        report.rows,
+        report.dim,
+        if report.rebuilt {
+            "; vector index recreated"
+        } else {
+            ""
+        },
+        report.model
+    );
+    Ok(())
+}
+
+fn cmd_links(session: &Session, json: bool) -> Result<()> {
+    let dangling = session.dangling()?;
+    emit(format::render_dangling(&dangling, json)?);
+    Ok(())
+}
+
+fn cmd_export(session: &Session, path: &Path) -> Result<()> {
+    let count = session.export(path)?;
+    println!("exported {count} memories to {}", path.display());
+    Ok(())
+}
+
+fn cmd_import(session: &mut Session, path: &Path, dry_run: bool) -> Result<()> {
+    let count = session.import(path, dry_run)?;
+    if dry_run {
+        println!("{count} memory change(s) pending from {}", path.display());
+    } else {
+        println!("imported {count} memory change(s) from {}", path.display());
+    }
+    Ok(())
+}
+```
+
+> `Error::NotFound` takes a `String`: the `Rm` arm currently passes the moved `key`;
+> the handler takes `&str` and does `key.to_string()` — same error value.
+
+
+2. `execute` becomes just construction + dispatch (the `Query` build stays here so
+   `cmd_search` needs no 8-arg signature):
+
+```rust
+pub fn execute(session: &mut Session, command: Command) -> Result<()> {
+    match command {
+        Command::Add {
+            key, scope, title, body, r#type, source, tags,
+        } => {
+            let mem = Memory {
+                key: key.unwrap_or_default(),
+                scope,
+                type_: MemoryType::parse(&r#type),
+                title,
+                body: read_body(&body)?,
+                source,
+                tags,
+                ..Default::default()
+            };
+            cmd_add(session, &mem)
+        }
+        Command::Search {
+            query, scope, k, mode, max_distance, json, expand,
+        } => {
+            let q = Query {
+                text: query,
+                scope,
+                k: k.unwrap_or_else(|| session.default_k()),
+                mode: Mode::parse(&mode)?,
+                max_distance,
+                expand,
+            };
+            cmd_search(session, q, json)
+        }
+        Command::Show { key, json } => cmd_show(session, &key, json),
+        Command::Rm { key } => cmd_rm(session, &key),
+        Command::Tags { json, command } => cmd_tags(session, json, command),
+        Command::Rename { old, new } => cmd_rename(session, &old, &new),
+        Command::Reembed => cmd_reembed(session),
+        Command::Links { json } => cmd_links(session, json),
+        Command::Export { path } => cmd_export(session, &path),
+        Command::Import { path, dry_run } => cmd_import(session, &path, dry_run),
+        Command::Repl
+        | Command::Doctor { .. }
+        | Command::Model { .. }
+        | Command::Embed { .. }
+        | Command::Mcp => Err(Error::Config("command is not available here".into())),
+        Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
+    }
+}
+```
+
+Verify: `cargo test --locked`
+
+---
+
+
+## Step 13 — split `store::add` (update vs insert)
+
+**Problem:** `add` inlines two large `params!` lists behind the
+`Some(existing) => UPDATE / None => INSERT` arms.
+
+**Do:** in `src/store/mod.rs`, bind `let model = embedder.model_id();` after computing
+`hash`, then:
+
+```rust
+    let id = match existing {
+        Some((id, _)) => update_row(&tx, id, mem, &hash, dim, model)?,
+        None => insert_row(&tx, &key, mem, &hash, dim, model)?,
+    };
+```
+
+and add the two helpers (SQL moved verbatim; `params!` borrows `mem`'s fields as before):
+
+```rust
+/// The `UPDATE` half of [`add`]: the key already exists.
+fn update_row(
+    tx: &Connection,
+    id: i64,
+    mem: &Memory,
+    hash: &str,
+    dim: i64,
+    model: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE memory SET scope = ?2, type = ?3, title = ?4, body = ?5, source = ?6,
+                hash = ?7, model = ?8, dim = ?9,
+                updated = COALESCE(NULLIF(?10, ''), datetime('now'))
+          WHERE id = ?1",
+        params![
+            id,
+            mem.scope,
+            mem.type_.as_str(),
+            mem.title,
+            mem.body,
+            mem.source,
+            hash,
+            model,
+            dim,
+            mem.updated
+        ],
+    )?;
+    Ok(())
+}
+
+/// The `INSERT` half of [`add`]: a new key; returns its rowid.
+fn insert_row(
+    tx: &Connection,
+    key: &str,
+    mem: &Memory,
+    hash: &str,
+    dim: i64,
+    model: &str,
+) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO memory (key, scope, type, title, body, source, hash, model, dim,
+                             created, updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                 COALESCE(NULLIF(?10, ''), datetime('now')),
+                 COALESCE(NULLIF(?11, ''), datetime('now')))",
+        params![
+            key,
+            mem.scope,
+            mem.type_.as_str(),
+            mem.title,
+            mem.body,
+            mem.source,
+            hash,
+            model,
+            dim,
+            mem.created,
+            mem.updated
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+```
+
+Verify: `cargo test --locked`
+
+---
+
+
+## Step 14 — split `model::remove` (all vs one revision)
+
+**Problem:** `remove` handles both the "drop every revision" and the "resolve one
+revision from refs" paths; highest cognitive score in `src/` (13).
+
+**Do:** in `src/model/mod.rs` keep `remove` as the guard + chooser and extract the two
+halves verbatim:
+
+```rust
+pub fn remove(spec: &Spec, all: bool) -> Result<usize> {
+    if spec.model_dir.is_some() {
+        return Err(Error::Model("refusing to remove a --model-dir".into()));
+    }
+    let repo_dir = cache::repo_dir(&spec.cache_root, &spec.repo);
+    if !repo_dir.is_dir() {
+        return Ok(0);
+    }
+    if all {
+        remove_all(spec, &repo_dir)
+    } else {
+        remove_one(spec)
+    }
+}
+```
+
+- `fn remove_all(spec: &Spec, repo_dir: &Path) -> Result<usize>` — the `read_dir` sweep
+  plus the `refs` cleanup.
+- `fn remove_one(spec: &Spec) -> Result<usize>` — resolve `spec.revision` (sha-or-ref)
+  and drop the one revision dir.
+
+Add `use std::path::Path;` if not already imported.
+
+Verify: `cargo test --locked`
+
+---
+
+## Step 15 — split `search::expand` BFS level
+
+**Problem:** three nested loops (`hop → frontier → adjacent`) with a 2-deep `?` body.
+
+**Do:** in `src/search/mod.rs` factor one BFS level out:
+
+```rust
+pub fn expand(conn: &Connection, seeds: &[Hit], hops: u8) -> Result<Vec<Neighbor>> {
+    let mut visited: HashSet<i64> = seeds.iter().map(|h| h.id).collect();
+    let mut frontier: Vec<(i64, String)> = seeds.iter().map(|h| (h.id, h.key.clone())).collect();
+    let mut out = Vec::new();
+
+    for hop in 1..=hops.max(1) {
+        frontier = expand_frontier(conn, &frontier, hop, &mut visited, &mut out)?;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// One BFS level: append every unseen neighbour of `frontier` to `out` and return the
+/// frontier for the next hop.
+fn expand_frontier(
+    conn: &Connection,
+    frontier: &[(i64, String)],
+    hop: u8,
+    visited: &mut HashSet<i64>,
+    out: &mut Vec<Neighbor>,
+) -> Result<Vec<(i64, String)>> {
+    let mut next = Vec::new();
+    for (id, key) in frontier {
+        for (nid, nkey) in adjacent(conn, *id, key)? {
+            if !visited.insert(nid) {
+                continue;
+            }
+            let Some(memory) = store::get_by_id(conn, nid)? else {
+                continue;
+            };
+            out.push(Neighbor {
+                hop,
+                via: key.clone(),
+                memory,
+            });
+            next.push((nid, nkey));
+        }
+    }
+    Ok(next)
+}
+```
+
+Verify: `cargo test --locked`
+
+---
+
+## Acceptance (Part 2)
+
+```sh
+cargo fmt --all
+cargo test --locked
+cargo clippy --all-targets --all-features   # must be warning-free
+```
+
+- [x] `execute` / `doctor::run` / `add` / `remove` / `expand` no longer own their
+      nested work; each helper is single-purpose.
+- [x] The `model::verify` report exists once (`cli::model::verify_weights`).
+- [x] No output string, SQL, or error message changed.
+- [x] `cargo test` green; `cargo clippy -D warnings` clean; `cargo fmt --check` clean.
 

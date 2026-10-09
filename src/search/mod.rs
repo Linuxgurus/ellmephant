@@ -194,29 +194,41 @@ pub fn expand(conn: &Connection, seeds: &[Hit], hops: u8) -> Result<Vec<Neighbor
     let mut out = Vec::new();
 
     for hop in 1..=hops.max(1) {
-        let mut next = Vec::new();
-        for (id, key) in &frontier {
-            for (nid, nkey) in adjacent(conn, *id, key)? {
-                if !visited.insert(nid) {
-                    continue;
-                }
-                let Some(memory) = store::get_by_id(conn, nid)? else {
-                    continue;
-                };
-                out.push(Neighbor {
-                    hop,
-                    via: key.clone(),
-                    memory,
-                });
-                next.push((nid, nkey));
-            }
-        }
-        if next.is_empty() {
+        frontier = expand_frontier(conn, &frontier, hop, &mut visited, &mut out)?;
+        if frontier.is_empty() {
             break;
         }
-        frontier = next;
     }
     Ok(out)
+}
+
+/// One BFS level: append every unseen neighbour of `frontier` to `out` and return the
+/// frontier for the next hop.
+fn expand_frontier(
+    conn: &Connection,
+    frontier: &[(i64, String)],
+    hop: u8,
+    visited: &mut HashSet<i64>,
+    out: &mut Vec<Neighbor>,
+) -> Result<Vec<(i64, String)>> {
+    let mut next = Vec::new();
+    for (id, key) in frontier {
+        for (nid, nkey) in adjacent(conn, *id, key)? {
+            if !visited.insert(nid) {
+                continue;
+            }
+            let Some(memory) = store::get_by_id(conn, nid)? else {
+                continue;
+            };
+            out.push(Neighbor {
+                hop,
+                via: key.clone(),
+                memory,
+            });
+            next.push((nid, nkey));
+        }
+    }
+    Ok(next)
 }
 
 /// Neighbours of `(id, key)` in both directions: outgoing `[[…]]` edges and incoming

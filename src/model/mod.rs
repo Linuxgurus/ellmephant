@@ -359,23 +359,32 @@ pub fn remove(spec: &Spec, all: bool) -> Result<usize> {
     if !repo_dir.is_dir() {
         return Ok(0);
     }
-
     if all {
-        let mut removed = 0;
-        for entry in std::fs::read_dir(&repo_dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path)?;
-                removed += 1;
-            }
-        }
-        let refs = cache::refs_path(&spec.cache_root, &spec.repo);
-        if refs.exists() {
-            std::fs::remove_file(refs)?;
-        }
-        return Ok(removed);
+        remove_all(spec, &repo_dir)
+    } else {
+        remove_one(spec)
     }
+}
 
+/// Drop every cached revision of the repo, plus its `refs` index.
+fn remove_all(spec: &Spec, repo_dir: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(repo_dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+            removed += 1;
+        }
+    }
+    let refs = cache::refs_path(&spec.cache_root, &spec.repo);
+    if refs.exists() {
+        std::fs::remove_file(refs)?;
+    }
+    Ok(removed)
+}
+
+/// Drop the one requested revision, resolving a ref to its sha first.
+fn remove_one(spec: &Spec) -> Result<usize> {
     let sha = if looks_like_sha(&spec.revision) {
         Some(spec.revision.clone())
     } else {

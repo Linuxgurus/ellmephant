@@ -17,18 +17,7 @@ pub fn cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
             let status = model::status(&spec)?;
             print_model_status(&status);
             if verify {
-                let bad = model::verify(&spec)?;
-                if bad.is_empty() {
-                    println!("  verify         ok (all sha256 match)");
-                } else {
-                    for line in &bad {
-                        println!("  verify         MISMATCH {line}");
-                    }
-                    return Err(Error::Model(format!(
-                        "{} file(s) failed verification",
-                        bad.len()
-                    )));
-                }
+                verify_weights(&spec, false)?;
             }
             Ok(())
         }
@@ -55,6 +44,31 @@ pub fn cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Report a `model::verify` run (SPEC §6.3/§6.5): print the `ok` or `MISMATCH` lines,
+/// then fail on any mismatch. `lenient` (doctor) turns a hashing error into a
+/// `skipped` line; the strict caller (`model status`) propagates it.
+pub(crate) fn verify_weights(spec: &model::Spec, lenient: bool) -> Result<()> {
+    let bad = match model::verify(spec) {
+        Ok(bad) => bad,
+        Err(err) if lenient => {
+            println!("  verify         skipped ({err})");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    if bad.is_empty() {
+        println!("  verify         ok (all sha256 match)");
+        return Ok(());
+    }
+    for line in &bad {
+        println!("  verify         MISMATCH {line}");
+    }
+    Err(Error::Model(format!(
+        "{} file(s) failed verification",
+        bad.len()
+    )))
 }
 
 /// Render a [`model::Status`] as a human-readable block.

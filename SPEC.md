@@ -1,12 +1,15 @@
-# Elephant — Design Spec (decision record)
+# llmphant — Design Spec (decision record)
 
 > **Status:** seed spec / decision record. This captures *what we decided and why*, so a
 > fresh high-effort session can turn it into a detailed technical spec. Open questions are
 > collected in §15.
+>
+> **Name:** the crate/binary is **`llmphant`** (LLM + elephant — "never forgets"). The crate
+> name is **free on crates.io** (`elephant` was taken). Personal store root: `~/.llmphant`.
 
 ## 0. One-liner
 
-Elephant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
+llmphant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
 embedder engine is compiled into the binary, one SQLite file is the sole source of truth,
 and a *rebuildable* vector + full-text + link index sits on top of it. It speaks MCP (so
 any client — Cline, TypingMind — shares the same memory) and ships an interactive REPL for
@@ -24,7 +27,7 @@ the human.
 **Goals**
 
 - Hermetic Rust binary: no Python/Node runtime, no external service, no cloud.
-- SQLite is the single source of truth (one file, `~/.elephant/memory.db`).
+- SQLite is the single source of truth (one file, `~/.llmphant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
 - Hybrid retrieval (BM25 + KNN) with scope/tag prefilter.
 - Wiki-style links with backlinks and one-hop graph expansion.
@@ -64,7 +67,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 | 6 | **bf16** weights (f16 fallback) | ~1.2 GB resident; bf16 is fine under Metal; CPU kernels may emulate bf16 ⇒ `--precision f16` escape hatch |
 | 7 | Weights **external** (HF cache or `--model-dir`), `--offline` flag | Keeps the binary small; weights are data |
 | 8 | **cosine**, L2-normalised both sides; **last-token pooling + left-pad** | Qwen3 is a decoder embedder — mean pooling (the candle BERT example) gives silently worse vectors |
-| 9 | Root `~/.elephant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
+| 9 | Root `~/.llmphant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
 | 10 | Free-form tags; **single** `scope` | Tags give the many-to-many; scope is the one bucket (matches existing `infra-`/`projects-` prefixes) |
 | 11 | `key` = **global-unique slug**, optional to supply | Doubles as identity (upsert target) and link target; auto-slugged from scope+words when omitted |
 | 12 | Export/import **JSONL** (+ optional Markdown bundle) | Streamable, greppable, `jq`-able, line-atomic diffs; ids and vectors excluded (both local/derived) |
@@ -86,7 +89,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 
 - **Model:** `Qwen/Qwen3-Embedding-0.6B`, output **1024** (MRL allows 32–1024; frozen at
   `CREATE`, choose 1024 — rebuildable later).
-- **Engine:** candle, pure Rust. **Weights:** HF cache (`~/.elephant/models/` or `HF_HOME`)
+- **Engine:** candle, pure Rust. **Weights:** HF cache (`~/.llmphant/models/` or `HF_HOME`)
   or `--model-dir`; download on first run; `--offline` to forbid network.
 - **Precision:** bf16 default; `--precision f16` for native ARM CPU path.
 - **Pooling:** last-token with **left** padding, then L2-normalise.
@@ -208,21 +211,21 @@ SELECT m.id, bm25(memory_fts) AS score FROM memory_fts
 
 **CLI** — three faces over one core:
 
-- `elephant` → **REPL** (rustyline: history at `~/.elephant/history`, completion;
+- `llmphant` → **REPL** (rustyline: history at `~/.llmphant/history`, completion;
   bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `tags`, `link`,
   `reembed`, `export`, `import`, `help`, `quit`.
-- One-shot flags for scripting: `elephant search "..." --json`.
-- `elephant mcp` → MCP stdio server.
+- One-shot flags for scripting: `llmphant search "..." --json`.
+- `llmphant mcp` → MCP stdio server.
 
 **Export/import:** JSONL canonical (`{key,scope,type,title,body,source,tags,created,updated}`;
 no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embed on hash change.
 
 ## 12. Config & paths
 
-- `~/.elephant/memory.db` — the store.
-- `~/.elephant/config.toml` — model, dim, precision, instruction, defaults (flags override).
-- `~/.elephant/models/` — weights cache (or `HF_HOME`).
-- `~/.elephant/history` — REPL history.
+- `~/.llmphant/memory.db` — the store.
+- `~/.llmphant/config.toml` — model, dim, precision, instruction, defaults (flags override).
+- `~/.llmphant/models/` — weights cache (or `HF_HOME`).
+- `~/.llmphant/history` — REPL history.
 - `meta` table mirrors model/dim/instruction for drift detection at startup.
 
 ## 13. Performance expectations

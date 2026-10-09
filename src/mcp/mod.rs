@@ -16,6 +16,7 @@
 //! [`Transport::Stdio`] keeps the client-launched pipe.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -31,8 +32,9 @@ use crate::config::{Config, Paths};
 // uses the unqualified `Result` from `rmcp`, and our single-parameter alias would shadow it.
 use crate::error::Error;
 use crate::model;
-use crate::search::{Bundle, Query};
-use crate::store::Memory;
+use crate::search::{Bundle, Query, to_wire_json};
+use crate::store::links::backlinks_to_wire_json;
+use crate::store::{Memory, summaries_to_wire_json};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
@@ -339,7 +341,7 @@ impl MemoryServer {
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
-        description = "Hunt memory by meaning. Whole document (key, tags, title, body) sit in embedding. Phrase touch any part, memory rise. Back come likeliest keys: {title, tags, distance}. No bodies. Start small `k`. Read titles. `memory_get` only hit you use. None fit? Widen. Raise `k`. Empty? Loosen `max_distance`. Know `key`? memory_get instead.",
+        description = "Hunt memory by meaning. Whole document (key, tags, title, body) sit in embedding. Phrase touch any part, memory rise. Back come rows; top `cols` header name each column [key, title, tags, distance] — rows are positional arrays, no per-row keys. No bodies. Start small `k`. Read titles. `memory_get` only hit you use. None fit? Widen. Raise `k`. Empty? Loosen `max_distance`. Know `key`? memory_get instead.",
         annotations(
             title = "Search memory",
             read_only_hint = true,
@@ -371,7 +373,7 @@ impl MemoryServer {
                 s.search(&q)
             })
             .await?;
-        let json = serde_json::to_string(&bundle).map_err(|e| e.to_string())?;
+        let json = to_wire_json(&bundle).map_err(|e| e.to_string())?;
         log_search(
             log_query.as_deref(),
             expand,
@@ -410,7 +412,7 @@ impl MemoryServer {
     /// List the memories whose bodies link to `key`.
     #[tool(
         name = "memory_backlinks",
-        description = "List memories whose body point at `key` with `[[…]]`.",
+        description = "List memories whose body point at `key` with `[[…]]`. Back positional: `cols` [key, title], `backlinks` bare rows.",
         annotations(
             title = "Backlinks",
             read_only_hint = true,
@@ -429,13 +431,13 @@ impl MemoryServer {
             .with_store("memory_backlinks", move |s| s.backlinks(&lookup))
             .await?;
         tracing::debug!(tool = "memory_backlinks", key = %key, count = links.len(), "backlinks");
-        serde_json::to_string(&links).map_err(|e| e.to_string())
+        backlinks_to_wire_json(&links).map_err(|e| e.to_string())
     }
 
     /// List the store's index (no bodies).
     #[tool(
         name = "memory_list",
-        description = "List whole index: key, tags, title every memory. No bodies. Browse. Pick keys before get/search.",
+        description = "List whole index: key, tags, title every memory. No bodies. Back positional: top `cols` [key, title, tags], `memories` bare rows. Browse. Pick keys before get/search.",
         annotations(
             title = "List memories",
             read_only_hint = true,
@@ -452,10 +454,7 @@ impl MemoryServer {
             .with_store("memory_list", move |s| s.summaries())
             .await?;
         tracing::info!(tool = "memory_list", count = memories.len(), "listed");
-        Ok(json_ok(serde_json::json!({
-            "count": memories.len(),
-            "memories": memories,
-        })))
+        summaries_to_wire_json(&memories).map_err(|e| e.to_string())
     }
 }
 
@@ -534,12 +533,16 @@ pub fn http_router(server: MemoryServer, bind_host: &str) -> axum::Router {
         );
         StreamableHttpServerConfig::default().disable_allowed_hosts()
     };
+    // rmcp reaps an idle session after 5 minutes (`SessionConfig::DEFAULT_KEEP_ALIVE`). A client
+    // that pauses longer than that — a slow human, a long local build — then gets
+    // "Session not found" on its next call and must re-handshake. Hold sessions for a day instead.
+    // (`None` disables reaping outright: never stuck, but a client that silently vanishes keeps
+    // its slot until the process restarts.)
+    const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
     let service: StreamableHttpService<MemoryServer, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(server.clone()),
-            LocalSessionManager::default().into(),
-            config,
-        );
+        StreamableHttpService::new(move || Ok(server.clone()), sessions.into(), config);
     axum::Router::new().nest_service("/mcp", service)
 }
 

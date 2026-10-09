@@ -328,6 +328,24 @@ pub fn summaries(conn: &Connection) -> Result<Vec<Summary>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Serialize a [`Summary`] slice for the MCP wire: a top-level `cols` header names the fields
+/// and `memories` are positional rows, so field names appear once rather than on every row.
+///
+/// The compact LLM-facing shape (fewer tokens than keyed JSON); the keyed serde form remains
+/// the stable machine face used by `--json`. Each row sits on its own line
+/// (see [`crate::wire::rows_array`]) so a raw result is scannable, not one blob.
+pub fn summaries_to_wire_json(rows: &[Summary]) -> Result<String> {
+    let memories: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|s| serde_json::json!([s.key, s.title, s.tags]))
+        .collect();
+    Ok(format!(
+        "{{\"cols\":[\"key\",\"title\",\"tags\"],\"count\":{},\"memories\":{}}}",
+        rows.len(),
+        crate::wire::rows_array(&memories)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +359,39 @@ mod tests {
         assert_ne!(row_hash(&a, "x"), row_hash(&a, "y"), "text must matter");
         assert_eq!(row_hash(&a, "x"), row_hash(&a, "x"), "must be stable");
         assert_eq!(row_hash(&a, "x").len(), 64, "sha256 hex is 64 chars");
+    }
+
+    #[test]
+    fn summaries_wire_is_positional_with_a_cols_header() {
+        let rows = vec![
+            Summary {
+                key: "a".into(),
+                title: "A".into(),
+                tags: vec!["t1".into()],
+            },
+            Summary {
+                key: "b".into(),
+                title: "B".into(),
+                tags: vec![],
+            },
+        ];
+        let wire = summaries_to_wire_json(&rows).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["cols"], serde_json::json!(["key", "title", "tags"]));
+        assert_eq!(v["count"], serde_json::json!(2));
+        assert_eq!(v["memories"][0], serde_json::json!(["a", "A", ["t1"]]));
+        assert_eq!(v["memories"][1], serde_json::json!(["b", "B", []]));
+        // Field names appear once, in the header — never per row.
+        assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
+        // One row per line: header(+open), row, row, close.
+        assert_eq!(wire.lines().count(), 4, "scannable rows: {wire}");
+    }
+
+    #[test]
+    fn summaries_wire_is_empty_but_self_describing() {
+        let v: serde_json::Value =
+            serde_json::from_str(&summaries_to_wire_json(&[]).unwrap()).unwrap();
+        assert_eq!(v["count"], serde_json::json!(0));
+        assert_eq!(v["memories"], serde_json::json!([]));
     }
 }

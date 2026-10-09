@@ -111,7 +111,13 @@ async fn tools_round_trip_over_the_transport() {
         serde_json::json!({ "query": "where do logs go" }),
     )
     .await;
-    assert!(text(&found).contains("infra-logs"), "{}", text(&found));
+    let found: serde_json::Value = serde_json::from_str(&text(&found)).expect("search json");
+    // Positional wire: a `cols` header names the fields, rows are bare arrays.
+    assert_eq!(
+        found["cols"],
+        serde_json::json!(["key", "title", "tags", "distance"])
+    );
+    assert_eq!(found["hits"][0][0], serde_json::json!("infra-logs"));
 
     // A second memory links back; `memory_backlinks` finds it.
     call(
@@ -130,10 +136,12 @@ async fn tools_round_trip_over_the_transport() {
         serde_json::json!({ "key": "infra-logs" }),
     )
     .await;
-    assert!(
-        text(&back).contains("infra-observability"),
-        "{}",
-        text(&back)
+    let back: serde_json::Value = serde_json::from_str(&text(&back)).expect("backlinks json");
+    // Positional wire: a `cols` header names the fields, rows are bare arrays.
+    assert_eq!(back["cols"], serde_json::json!(["key", "title"]));
+    assert_eq!(
+        back["backlinks"][0][0],
+        serde_json::json!("infra-observability")
     );
 
     // update requires an existing key; a missing one is a tool error.
@@ -329,13 +337,16 @@ async fn list_tool_reports_the_index_without_bodies() {
 
     let listed = call(&client, "memory_list", serde_json::json!({})).await;
     assert!(!listed.is_error.unwrap_or(false), "{}", text(&listed));
-    let listed: serde_json::Value = serde_json::from_str(&text(&listed)).expect("list json");
+    let raw = text(&listed);
+    let listed: serde_json::Value = serde_json::from_str(&raw).expect("list json");
+    // Positional wire: a `cols` header names the fields, rows are bare arrays.
+    assert_eq!(listed["cols"], serde_json::json!(["key", "title", "tags"]));
     assert_eq!(listed["count"], serde_json::json!(2));
-    assert_eq!(listed["memories"][0]["key"], serde_json::json!("note-one"));
-    assert_eq!(listed["memories"][0]["tags"], serde_json::json!(["infra"]));
+    assert_eq!(listed["memories"][0][0], serde_json::json!("note-one"));
+    assert_eq!(listed["memories"][0][2], serde_json::json!(["infra"]));
     assert!(
-        listed["memories"][0].get("body").is_none(),
-        "list must not carry bodies: {listed}"
+        !raw.contains("\"body\""),
+        "list must not carry bodies: {raw}"
     );
 
     client.cancel().await.expect("cancel");

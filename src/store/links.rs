@@ -166,6 +166,21 @@ pub fn backlinks(conn: &Connection, key: &str) -> Result<Vec<Backlink>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Serialize a [`Backlink`] slice for the MCP wire: a top-level `cols` header names the fields
+/// and `backlinks` are positional rows, so field names appear once rather than on every row
+/// (mirrors [`crate::search::to_wire_json`]). The keyed serde form stays for scripts. Each row
+/// sits on its own line (see [`crate::wire::rows_array`]) so a raw result is scannable.
+pub fn backlinks_to_wire_json(rows: &[Backlink]) -> Result<String> {
+    let backlinks: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|b| serde_json::json!([b.key, b.title]))
+        .collect();
+    Ok(format!(
+        "{{\"cols\":[\"key\",\"title\"],\"backlinks\":{}}}",
+        crate::wire::rows_array(&backlinks)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +203,26 @@ mod tests {
     #[test]
     fn no_links_is_empty() {
         assert!(extract_links("plain text").is_empty());
+    }
+
+    #[test]
+    fn backlinks_wire_is_positional_with_a_cols_header() {
+        let rows = vec![
+            Backlink {
+                key: "a".into(),
+                title: "A".into(),
+            },
+            Backlink {
+                key: "b".into(),
+                title: "B".into(),
+            },
+        ];
+        let wire = backlinks_to_wire_json(&rows).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["cols"], serde_json::json!(["key", "title"]));
+        assert_eq!(v["backlinks"][0], serde_json::json!(["a", "A"]));
+        assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
+        // One row per line: header(+open), row, row, close.
+        assert_eq!(wire.lines().count(), 4, "scannable rows: {wire}");
     }
 }

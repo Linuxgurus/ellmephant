@@ -85,6 +85,57 @@ pub struct Bundle {
     pub neighbors: Vec<Neighbor>,
 }
 
+/// Serialize a [`Bundle`] for the MCP wire: a top-level `cols` header names the hit fields and
+/// `hits` are positional rows, so the payload stays self-describing without repeating field
+/// names on every row. Link `neighbors`, when present, carry their own `cols`/`rows` table.
+///
+/// This is the compact LLM-facing shape (fewer tokens than keyed JSON); the keyed serde form
+/// remains the stable machine face used by `--json` and `structuredContent`. Each row sits on
+/// its own line (see [`crate::wire::rows_array`]) so a raw result is scannable, not one blob.
+pub fn to_wire_json(bundle: &Bundle) -> Result<String> {
+    let hits: Vec<serde_json::Value> = bundle
+        .hits
+        .iter()
+        .map(|h| {
+            let distance = h.distance.map(wire_distance);
+            serde_json::json!([h.key, h.title, h.tags, distance])
+        })
+        .collect();
+
+    let mut out = String::from("{\"cols\":[\"key\",\"title\",\"tags\",\"distance\"],\"hits\":");
+    out.push_str(&crate::wire::rows_array(&hits));
+
+    if !bundle.neighbors.is_empty() {
+        let rows: Vec<serde_json::Value> = bundle
+            .neighbors
+            .iter()
+            .map(|n| {
+                serde_json::json!([
+                    n.hop,
+                    n.via,
+                    n.memory.key,
+                    n.memory.title,
+                    n.memory.tags,
+                    n.memory.body
+                ])
+            })
+            .collect();
+        out.push_str(
+            ",\"neighbors\":{\"cols\":[\"hop\",\"via\",\"key\",\"title\",\"tags\",\"body\"],\"rows\":",
+        );
+        out.push_str(&crate::wire::rows_array(&rows));
+        out.push('}');
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// Round a distance to 4 decimals for the wire: enough to rank, and it avoids the long
+/// `f32`→`f64` widening tail that `json!` would otherwise print (`0.41999998…`).
+fn wire_distance(d: f32) -> f64 {
+    ((d as f64) * 10_000.0).round() / 10_000.0
+}
+
 /// Run a query. `embedder` is required when a phrase is given, ignored otherwise.
 pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Result<Bundle> {
     let phrase = phrase_ids(conn, embedder, q)?;

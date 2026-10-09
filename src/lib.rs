@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod model;
 pub mod search;
 pub mod store;
+pub mod wire;
 
 pub use config::{Config, Paths};
 pub use error::{Error, Result};

@@ -252,13 +252,14 @@ document, so a phrase reaches them semantically.
 
 - The phrase is embedded (query-side instruction) and the KNN of the whole store is taken,
   within a cosine-distance ceiling. One vector per row (§6).
-- **Params:** default `k=10`; `max_distance` optional, falling back to the configured
-  `default_max_distance` (`0.5`; `null` disables the cap). With no phrase, results are ordered
+- **Params:** default `k=5`; `max_distance` optional, falling back to the configured
+  `default_max_distance` (`0.6`; `null` disables the cap). With no phrase, results are ordered
   by `key` and uncapped. The KNN is taken over the whole store and `k` truncates the ranked
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
 - **Returns:** `{key, title, tags, distance}` — **never the body** (fetch it with
-  `memory_get`/`show`).
+  `memory_get`/`show`). Over MCP this is emitted as **positional JSON**: a top-level `cols`
+  header names the fields and each row is a bare array (§11); `--json`/core keep the keyed form.
 - **`--expand N`:** pull N-hop link neighbourhoods into the result bundle (derived profiles);
   neighbours keep their (snipped) bodies.
 
@@ -278,6 +279,15 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 - `memory_search` takes a semantic `phrase` and the ranking knobs `k`, `max_distance` and
   `expand`; there are **no key/tag filters and no regex leg** — `key`/`tags` are not search
   constraints, and `memory_get` reads a known key.
+- The list-shaped reads return **positional JSON** to keep the LLM-facing payload small: a
+  top-level `cols` header names the fields and the rows are bare arrays, **one row per line**
+  (whitespace is insignificant to a parser, so a raw result is scannable, not one blob). The
+  `cols` header is self-describing (the model can't mis-map columns) while field names aren't
+  repeated per row; distances are rounded to 4 decimals. `memory_search` →
+  `{"cols":["key","title","tags","distance"],"hits":[[…],…]}`; link `neighbors` (with `expand>0`)
+  carry their own `cols`/`rows` table. `memory_list` →
+  `{"cols":["key","title","tags"],"count":N,"memories":[[…],…]}`. `memory_backlinks` →
+  `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
 - `memory_list` returns the store index (`key`, `tags`, `title`, no bodies) — cheap browsing (§9).
 - `memory_get` is the **only** read that returns a body, and the way to read a known `key`.
 
@@ -314,8 +324,8 @@ precision  = "bf16"                       # bf16 | f16
 device     = "cpu"                        # cpu | metal
 instruction = "Given a question, retrieve relevant memories"
 dim        = 1024
-default_k  = 10
-default_max_distance = 0.5                # KNN cosine-distance ceiling; null = off
+default_k  = 5
+default_max_distance = 0.6                # KNN cosine-distance ceiling; null = off
 port       = 8888                         # MCP HTTP port; `mcp --stdio` ignores it
 ```
 
@@ -332,7 +342,7 @@ any model is touched; flags are re-checked the same way after they override the 
 - **`bench` (P10)** replaces these estimates with numbers: it prints load time, embed latency
   and semantic-search latency (mean/p50/p95) at the store's current row count. `bench --golden`
   scores a JSONL query set (recall@k + MRR, gate recall@3 ≥ 0.8); `bench --sweep` walks `k`. The
-  seed set lives in `tests/golden/`; the shipped default is `k=10`.
+  seed set lives in `tests/golden/`; the shipped default is `k=5`.
 
 ## 14. Risks
 

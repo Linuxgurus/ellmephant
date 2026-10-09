@@ -9,7 +9,7 @@ mod common;
 use common::temp_store;
 use llmphant::db;
 use llmphant::embed::HashEmbedder;
-use llmphant::search::{self, Query};
+use llmphant::search::{self, Hit, Neighbor, Query};
 use llmphant::store::{self, Memory};
 use rusqlite::Connection;
 
@@ -193,5 +193,66 @@ fn no_constraints_returns_everything_in_key_order() {
     assert_eq!(
         hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
         ["a", "b"]
+    );
+}
+
+#[test]
+fn wire_json_is_positional_with_a_cols_header() {
+    let bundle = search::Bundle {
+        hits: vec![Hit {
+            id: 1,
+            key: "k".into(),
+            title: "T".into(),
+            tags: vec!["a".into(), "b".into()],
+            distance: Some(0.42),
+        }],
+        neighbors: vec![],
+    };
+    let wire = search::to_wire_json(&bundle).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    assert_eq!(
+        v["cols"],
+        serde_json::json!(["key", "title", "tags", "distance"])
+    );
+    assert_eq!(
+        v["hits"][0],
+        serde_json::json!(["k", "T", ["a", "b"], 0.42])
+    );
+    assert!(
+        v.get("neighbors").is_none(),
+        "no neighbours by default: {wire}"
+    );
+    // Field names appear once, in the header — never per row.
+    assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
+    assert!(!wire.contains("\"body\""), "hits carry no body: {wire}");
+    // One row per line, so a raw result is scannable rather than a wall of blob.
+    assert_eq!(wire.lines().count(), 3, "open+row+close: {wire}");
+}
+
+#[test]
+fn wire_json_emits_a_neighbors_table_when_expanded() {
+    let bundle = search::Bundle {
+        hits: vec![],
+        neighbors: vec![Neighbor {
+            hop: 1,
+            via: "seed".into(),
+            memory: Memory {
+                key: "linked".into(),
+                title: "Linked".into(),
+                body: "a snippet".into(),
+                tags: vec!["t".into()],
+                ..Default::default()
+            },
+        }],
+    };
+    let wire = search::to_wire_json(&bundle).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    assert_eq!(
+        v["neighbors"]["cols"],
+        serde_json::json!(["hop", "via", "key", "title", "tags", "body"])
+    );
+    assert_eq!(
+        v["neighbors"]["rows"][0],
+        serde_json::json!([1, "seed", "linked", "Linked", ["t"], "a snippet"])
     );
 }

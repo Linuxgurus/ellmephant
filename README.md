@@ -108,8 +108,8 @@ dim         = 1024                           # frozen at CREATE; MRL allows 32..
 precision   = "bf16"                         # bf16 | f16 (CPU is always f32)
 device      = "cpu"                          # cpu | metal
 instruction = "Given a question, retrieve relevant memories"   # query side only
-default_k   = 10                             # search result count
-default_max_distance = 0.5                   # cosine-distance ceiling; null disables it
+default_k   = 5                              # search result count
+default_max_distance = 0.6                   # cosine-distance ceiling; null disables it
 port        = 8888                           # MCP HTTP port (`mcp --stdio` ignores it)
 ```
 
@@ -141,7 +141,7 @@ within `--max-distance`; with no phrase, results are unranked (key order). A res
 you read a known key directly.
 
 ```sh
-llmphant search "where do the logs live"                  # semantic, k=10
+llmphant search "where do the logs live"                  # semantic, k=5
 llmphant search "portainer-notes-gw"                      # key/tag tokens are in the embedding
 llmphant search "backups" --expand 1                      # + linked neighbours
 ```
@@ -189,8 +189,14 @@ llmphant mcp --stdio
 `memory_backlinks`, `memory_list`. Read tools are annotated read-only and `memory_delete` is
 annotated destructive. `memory_search` matches a semantic `phrase` (the whole document — key,
 tags, title, body — is embedded), with `k` and `max_distance`; there are **no key/tag filters
-and no regex leg**, and hits carry titles, tags and distances, never bodies. The server also
-advertises the write policy and the search strategy as its `instructions`.
+and no regex leg**, and hits carry titles, tags and distances, never bodies. The list-shaped
+reads return compact **positional JSON** — a top-level `cols` header names the fields and each
+row is a bare array, **one row per line** (so a raw result is scannable, not one blob), meaning
+field names aren't repeated per row while the payload stays self-describing. `memory_search` →
+`{"cols":["key","title","tags","distance"],"hits":[[…],…]}`;
+`memory_list` → `{"cols":["key","title","tags"],"count":N,"memories":[[…],…]}`;
+`memory_backlinks` → `{"cols":["key","title"],"backlinks":[[…],…]}`. The server also advertises
+the write policy and the search strategy as its `instructions`.
 
 ## Usage in Docker
 

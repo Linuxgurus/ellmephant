@@ -2,9 +2,8 @@
 //!
 //! Two instruments live here. [`timings`] measures the real load/embed/search latency against
 //! a live store, and [`evaluate`] scores a *golden* query set with recall@k and MRR. [`sweep`]
-//! walks the query-time knobs (result count, RRF weight) and [`sweep_projections`] compares
-//! the embed projections offline. Everything takes an [`Embedder`] trait object, so the whole
-//! module runs offline with the deterministic [`HashEmbedder`](crate::embed::HashEmbedder).
+//! walks the result count. Everything takes an [`Embedder`] trait object, so the whole module
+//! runs offline with the deterministic [`HashEmbedder`](crate::embed::HashEmbedder).
 
 use std::path::Path;
 use std::time::Instant;
@@ -12,10 +11,9 @@ use std::time::Instant;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::embed::{Embedder, projection};
+use crate::embed::Embedder;
 use crate::error::{Error, Result};
-use crate::search::{self, DEFAULT_RRF_K, Mode, Query};
-use crate::store::Memory;
+use crate::search::{self, Query};
 
 /// The cutoff the golden set is scored at unless it names its own (PLAN §6 P10).
 pub const DEFAULT_EVAL_K: usize = 3;
@@ -82,10 +80,6 @@ pub struct Eval {
     pub mrr: f64,
     /// The cutoff applied where a case did not name its own.
     pub k: usize,
-    /// The RRF constant the run used.
-    pub rrf_k: f64,
-    /// The retrieval mode the run used.
-    pub mode: String,
 }
 
 impl Eval {
@@ -95,29 +89,29 @@ impl Eval {
     }
 }
 
+/// The semantic query a golden case runs: the phrase against both embedded fields.
+fn case_query(case: &Case, k: usize) -> Query {
+    Query {
+        text: Some(case.query.clone()),
+        k,
+        max_distance: None,
+        expand: 0,
+    }
+}
+
 /// Score `cases` against the live store: run each query and look for an expected key in the
-/// top `k`. `rrf_k` is threaded through the [`Query`] so a sweep can vary it.
+/// top `k`.
 pub fn evaluate(
     conn: &Connection,
     embedder: Option<&dyn Embedder>,
     cases: &[Case],
     k: usize,
-    rrf_k: f64,
-    mode: Mode,
 ) -> Result<Eval> {
     let mut hits = 0usize;
     let mut reciprocal_ranks = 0.0f64;
     for case in cases {
         let cutoff = case.k.unwrap_or(k).max(1);
-        let query = Query {
-            text: case.query.clone(),
-            scope: None,
-            k: cutoff,
-            mode,
-            max_distance: None,
-            expand: 0,
-            rrf_k,
-        };
+        let query = case_query(case, cutoff);
         let bundle = search::run(conn, embedder, &query)?;
         if let Some(rank) = bundle
             .hits
@@ -136,25 +130,19 @@ pub fn evaluate(
         recall: hits as f64 / denom,
         mrr: reciprocal_ranks / denom,
         k,
-        rrf_k,
-        mode: mode.as_str().to_string(),
     })
 }
 
 /// The default result counts to sweep.
 pub const SWEEP_KS: [usize; 3] = [3, 5, 10];
-/// RRF constants around the SPEC §10 default of 60.
-pub const SWEEP_RRF_KS: [f64; 3] = [20.0, 60.0, 100.0];
 
-/// Walk every `(k, rrf_k)` pair, scoring the golden set for each (PLAN §6 P10: "sweep k,
-/// RRF weights"). Cases with their own `k` are cleared so the swept cutoff applies uniformly.
+/// Walk every `k`, scoring the golden set for each (PLAN §6 P10: "sweep k"). Cases with their
+/// own `k` are cleared so the swept cutoff applies uniformly.
 pub fn sweep(
     conn: &Connection,
     embedder: Option<&dyn Embedder>,
     cases: &[Case],
     ks: &[usize],
-    rrf_ks: &[f64],
-    mode: Mode,
 ) -> Result<Vec<Eval>> {
     let uniform: Vec<Case> = cases
         .iter()
@@ -163,27 +151,11 @@ pub fn sweep(
             ..c.clone()
         })
         .collect();
-    let mut out = Vec::with_capacity(ks.len() * rrf_ks.len());
+    let mut out = Vec::with_capacity(ks.len());
     for &k in ks {
-        for &rrf_k in rrf_ks {
-            out.push(evaluate(conn, embedder, &uniform, k, rrf_k, mode)?);
-        }
+        out.push(evaluate(conn, embedder, &uniform, k)?);
     }
     Ok(out)
-}
-
-/// The best-scoring configuration in a sweep, by recall then MRR.
-pub fn best(evals: &[Eval]) -> Option<&Eval> {
-    evals.iter().max_by(|a, b| {
-        a.recall
-            .partial_cmp(&b.recall)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                a.mrr
-                    .partial_cmp(&b.mrr)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    })
 }
 
 /// A latency distribution: `n` samples summarised, all in milliseconds.
@@ -230,7 +202,7 @@ pub fn summarise(mut samples: Vec<f64>) -> Sample {
 /// Measured latency and the scale it was measured at (SPEC §13, replaced with numbers).
 #[derive(Debug, Clone, Serialize)]
 pub struct Timings {
-    /// Indexed vectors (the `N rows` the numbers are reported at).
+    /// Indexed title vectors (the `N rows` the numbers are reported at).
     pub rows: i64,
     /// Embedding dimension.
     pub dim: usize,
@@ -238,13 +210,13 @@ pub struct Timings {
     pub load_ms: f64,
     /// Document-embedding latency.
     pub embed: Sample,
-    /// Hybrid-search latency (query embed + both legs + fuse + hydrate).
+    /// Search latency (query embed + KNN + hydrate).
     pub search: Sample,
 }
 
-/// Measure embed and hybrid-search latency. `samples` are embedded as documents; `queries`
-/// are run through [`search::run`]. A warmup embed is issued first so the first sample does
-/// not carry one-time costs (lazy allocations, thread-pool spin-up).
+/// Measure embed and search latency. `samples` are embedded as documents; `queries` are run
+/// through [`search::run`]. A warmup embed is issued first so the first sample does not carry
+/// one-time costs (lazy allocations, thread-pool spin-up).
 pub fn timings(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -267,15 +239,14 @@ pub fn timings(
 
     let mut search_times = Vec::with_capacity(queries.len());
     for text in queries {
-        let query = Query {
-            text: text.clone(),
-            scope: None,
-            k: k.max(1),
-            mode: Mode::Hybrid,
-            max_distance: None,
-            expand: 0,
-            rrf_k: DEFAULT_RRF_K,
-        };
+        let query = case_query(
+            &Case {
+                query: text.clone(),
+                expect: Vec::new(),
+                k: None,
+            },
+            k.max(1),
+        );
         let started = Instant::now();
         search::run(conn, Some(embedder), &query)?;
         search_times.push(started.elapsed().as_secs_f64() * 1e3);
@@ -290,111 +261,18 @@ pub fn timings(
     })
 }
 
-/// The embed projections worth comparing (`embed::projection`, SPEC §6/§8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Projection {
-    /// `title\nbody` — the shipped default.
-    Full,
-    /// `body` only.
-    BodyOnly,
-    /// `title` only.
-    TitleOnly,
-}
-
-impl Projection {
-    /// Every variant, in report order.
-    pub const ALL: [Projection; 3] = [
-        Projection::Full,
-        Projection::BodyOnly,
-        Projection::TitleOnly,
-    ];
-
-    /// Canonical name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Projection::Full => "title+body",
-            Projection::BodyOnly => "body",
-            Projection::TitleOnly => "title",
-        }
-    }
-
-    /// The text this projection hands the embedder for one memory.
-    pub fn text(self, title: &str, body: &str) -> String {
-        match self {
-            Projection::Full => projection::embed_text(title, body),
-            Projection::BodyOnly => projection::strip_links(body).trim().to_string(),
-            Projection::TitleOnly => title.trim().to_string(),
-        }
-    }
-}
-
-/// One projection's retrieval score over the golden set.
-#[derive(Debug, Clone, Serialize)]
-pub struct ProjectionScore {
-    /// The projection tried.
-    pub projection: &'static str,
-    /// Its score (KNN-leg only — a projection only moves document vectors).
-    pub eval: Eval,
-}
-
-/// Compare the embed projections on a fixed corpus without touching the store: embed every
-/// document under each variant, rank by cosine distance, and score the golden set (PLAN §6
-/// P10: "sweep … projection"). Vectors are L2-normalised, so cosine distance is `1 - dot`.
-pub fn sweep_projections(
-    embedder: &dyn Embedder,
-    corpus: &[Memory],
-    cases: &[Case],
-    k: usize,
-    rrf_k: f64,
-) -> Result<Vec<ProjectionScore>> {
-    let mut out = Vec::with_capacity(Projection::ALL.len());
-    for projection in Projection::ALL {
-        let docs: Vec<Vec<f32>> = corpus
-            .iter()
-            .map(|m| embedder.embed_one(&projection.text(&m.title, &m.body)))
-            .collect::<Result<_>>()?;
-
-        let mut hits = 0usize;
-        let mut reciprocal_ranks = 0.0f64;
-        for case in cases {
-            let cutoff = case.k.unwrap_or(k).max(1);
-            let query = embedder.embed_query(&case.query)?;
-            let mut ranked: Vec<(usize, f32)> = docs
-                .iter()
-                .enumerate()
-                .map(|(i, d)| (i, cosine_distance(&query, d)))
-                .collect();
-            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let rank = ranked
-                .iter()
-                .take(cutoff)
-                .position(|(i, _)| case.expect.contains(&corpus[*i].key));
-            if let Some(rank) = rank {
-                hits += 1;
-                reciprocal_ranks += 1.0 / (rank + 1) as f64;
-            }
-        }
-        let n = cases.len();
-        let denom = n.max(1) as f64;
-        out.push(ProjectionScore {
-            projection: projection.as_str(),
-            eval: Eval {
-                cases: n,
-                hits,
-                recall: hits as f64 / denom,
-                mrr: reciprocal_ranks / denom,
-                k,
-                rrf_k,
-                mode: "vec".to_string(),
-            },
-        });
-    }
-    Ok(out)
-}
-
-/// Cosine distance for L2-normalised vectors: `1 - dot`.
-fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+/// The best-scoring configuration in a sweep, by recall then MRR.
+pub fn best(evals: &[Eval]) -> Option<&Eval> {
+    evals.iter().max_by(|a, b| {
+        a.recall
+            .partial_cmp(&b.recall)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.mrr
+                    .partial_cmp(&b.mrr)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    })
 }
 
 #[cfg(test)]
@@ -434,19 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn projection_text_matches_the_shipped_default() {
-        assert_eq!(Projection::Full.text(" T ", "Body [[x]]"), "T\nBody");
-        assert_eq!(Projection::BodyOnly.text(" T ", "Body [[x]]"), "Body");
-        assert_eq!(Projection::TitleOnly.text(" T ", "Body [[x]]"), "T");
-    }
-
-    #[test]
-    fn cosine_distance_is_zero_for_identical_unit_vectors() {
-        let v = vec![0.6f32, 0.8];
-        assert!(cosine_distance(&v, &v).abs() < 1e-6);
-    }
-
-    #[test]
     fn best_prefers_recall_then_mrr() {
         let evals = vec![
             Eval {
@@ -455,8 +320,6 @@ mod tests {
                 recall: 0.8,
                 mrr: 0.6,
                 k: 3,
-                rrf_k: 60.0,
-                mode: "hybrid".into(),
             },
             Eval {
                 cases: 10,
@@ -464,8 +327,6 @@ mod tests {
                 recall: 0.8,
                 mrr: 0.7,
                 k: 5,
-                rrf_k: 60.0,
-                mode: "hybrid".into(),
             },
             Eval {
                 cases: 10,
@@ -473,8 +334,6 @@ mod tests {
                 recall: 0.7,
                 mrr: 0.9,
                 k: 10,
-                rrf_k: 20.0,
-                mode: "hybrid".into(),
             },
         ];
         let winner = best(&evals).expect("a best");
@@ -490,8 +349,6 @@ mod tests {
             recall: 0.8,
             mrr: 0.0,
             k: 3,
-            rrf_k: 60.0,
-            mode: "hybrid".into(),
         };
         assert!(eval.passes());
         eval.recall = 0.79;

@@ -76,26 +76,25 @@ fn print_weights(spec: &model::Spec) -> Result<()> {
 /// Derived-index health (PLAN §6 P9): rows, `vec0`, links and tags.
 fn print_index_health(conn: &Connection) -> Result<()> {
     let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
-    // `memory_vec` only exists once something has been written; `stored_dim` is the tell.
+    // The vec0 table only exists once something has been written; `stored_dim` is the tell.
     let dim = index::vec::stored_dim(conn)?;
     let vectors = match dim {
         Some(_) => index::vec::count(conn)?,
         None => 0,
     };
     let vec_status = match dim {
-        Some(dim) => format!("vec0 dim={dim}, {vectors}/{memories} rows embedded"),
-        None => format!("vec0 dim=? ({vectors}/{memories} rows embedded)"),
+        Some(dim) => format!("vec0 dim={dim}, {vectors}/{memories} vectors"),
+        None => format!("vec0 dim=? ({vectors}/{memories} vectors)"),
     };
     println!("  vec0           {vec_status}");
 
-    // Derived-index health (PLAN §6 P9): a dangling `[[key]]` is a lost rename target, an
-    // orphan tag is vocabulary a delete left behind, a missing vector is a `reembed` job.
+    // Derived-index health (PLAN §6 P9): a dangling `[[key]]` is a lost rename target, a
+    // missing vector is a `reembed` job.
     let edges: i64 = conn.query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))?;
     let dangling = links::dangling(conn)?.len();
     println!("  links          {edges} edge(s), {dangling} dangling");
-    let tag_count: i64 = conn.query_row("SELECT count(*) FROM tag", [], |r| r.get(0))?;
-    let orphans = tags::orphans(conn)?.len();
-    println!("  tags           {tag_count} tag(s), {orphans} orphaned");
+    let tag_count = tags::list(conn)?.len();
+    println!("  tags           {tag_count} tag(s)");
     println!(
         "  vectors        {} row(s) without a vector",
         (memories - vectors).max(0)

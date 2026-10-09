@@ -3,6 +3,13 @@
 > Companion to `SPEC.md`. This is the *how*: verified facts, resolved open questions, repo
 > layout, dependencies, and a phased build with acceptance criteria. Target is **v1** = the
 > spec's Goals (§2), nothing more.
+>
+> **Model revision (v2).** The memory model moved on from the original phase descriptions below:
+> no `scope`, no `type`; the write style is **smart-caveman**; one **document** (`key` + tags +
+> `title` + `body`) is embedded; and search is a single **semantic phrase** with no key/tag
+> constraints and no regex leg, rather than hybrid BM25∪KNN fusion. Where this plan still
+> describes FTS/RRF/`mode`/`scope`, `SPEC.md` §7/§9/§10 is authoritative — the phase history is
+> kept as the record of how the build went.
 
 ## 0. Scope of v1
 
@@ -112,20 +119,17 @@ llmphant/
 │   │   ├── tags.rs
 │   │   └── links.rs       # extract/backlinks/rename/dangling
 │   ├── index/
-│   │   ├── vec.rs         # vec0 write + KNN        (encapsulates sqlite-vec)
-│   │   └── fts.rs         # fts5/BM25 query
+│   │   └── vec.rs         # vec0 write + KNN, one document table (encapsulates sqlite-vec)
 │   ├── search/
-│   │   ├── mod.rs         # hybrid orchestration + hydrate
-│   │   └── rrf.rs
+│   │   └── mod.rs         # semantic phrase search + hydrate
 │   ├── cli/
 │   │   ├── mod.rs         # one-shot subcommands
 │   │   ├── repl.rs        # rustyline
 │   │   └── format.rs      # tabled output + --json
-│   ├── mcp/mod.rs         # rmcp stdio server + tools
-│   └── portable/{export.rs, import.rs}
+│   └── mcp/mod.rs         # rmcp server (HTTP default, stdio option) + tools
 ├── tests/
-│   ├── db.rs  search.rs  portable.rs  links.rs
-│   └── golden/queries.jsonl
+│   ├── db.rs  search.rs  links.rs
+│   └── golden/{memories,queries}.jsonl
 └── examples/              # Phase-0 spikes (throwaway)
 ```
 

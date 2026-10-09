@@ -38,7 +38,7 @@ fn help_lists_the_subcommands() {
     assert!(out.status.success());
     let text = stdout(&out);
     for cmd in [
-        "doctor", "search", "add", "mcp", "export", "reembed", "rename", "links", "bench",
+        "doctor", "search", "add", "mcp", "reembed", "rename", "links", "bench", "list",
     ] {
         assert!(text.contains(cmd), "help is missing {cmd}: {text}");
     }
@@ -62,13 +62,33 @@ fn maintenance_commands_behave_on_a_fresh_store() {
         stdout(&out)
     );
 
-    let out = run(dir.path(), &["tags", "prune", "--dry-run"]);
+    let out = run(dir.path(), &["list"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout(&out).contains("0 orphan"), "got: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("no memories"),
+        "got: {}",
+        stdout(&out)
+    );
+
+    let out = run(dir.path(), &["list", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out).trim(), "[]", "got: {}", stdout(&out));
+
+    let out = run(dir.path(), &["tags"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("no tags"), "got: {}", stdout(&out));
 
     let out = run(dir.path(), &["rename", "ghost", "new"]);
     assert!(!out.status.success(), "renaming a missing key must fail");
@@ -170,35 +190,23 @@ fn an_invalid_device_flag_is_rejected_before_any_model_load() {
 }
 
 #[test]
-fn fts_search_needs_no_model_and_reports_no_matches() {
-    // `--mode fts` must not load 1.2 GB of weights: a fresh store searches lexically and
-    // exits cleanly with an empty result set.
+fn search_surface_is_semantic_only() {
+    // The regex leg and the field/match knobs are gone (SPEC §10): `search` takes a phrase and
+    // its ranking knobs only.
     let dir = tempfile::tempdir().unwrap();
-    let out = run(dir.path(), &["search", "anything", "--mode", "fts"]);
-    assert!(
-        out.status.success(),
-        "fts search failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(stdout(&out).contains("no matches"), "got: {}", stdout(&out));
-}
-
-#[test]
-fn fts_search_json_is_machine_readable() {
-    // `--json` is the stable face of a command (PLAN §6 P6): a fresh store still emits a
-    // well-formed object, so scripts never have to special-case the empty result.
-    let dir = tempfile::tempdir().unwrap();
-    let out = run(
-        dir.path(),
-        &["search", "anything", "--mode", "fts", "--json"],
-    );
+    let out = run(dir.path(), &["search", "--help"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
-    assert_eq!(value["hits"], serde_json::json!([]));
+    let text = stdout(&out);
+    assert!(!text.contains("--match"), "got: {text}");
+    assert!(!text.contains("--field"), "got: {text}");
+    assert!(
+        text.contains("--k") && text.contains("--max-distance"),
+        "got: {text}"
+    );
 }
 
 #[test]

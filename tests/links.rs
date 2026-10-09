@@ -9,7 +9,7 @@ mod common;
 use common::temp_store;
 use llmphant::db;
 use llmphant::embed::HashEmbedder;
-use llmphant::store::{self, Memory, MemoryType, links};
+use llmphant::store::{self, Memory, links};
 use rusqlite::Connection;
 
 const DIM: usize = 8;
@@ -17,8 +17,6 @@ const DIM: usize = 8;
 fn memory(key: &str, body: &str) -> Memory {
     Memory {
         key: key.to_string(),
-        scope: "infra".to_string(),
-        type_: MemoryType::Fact,
         title: key.to_string(),
         body: body.to_string(),
         ..Default::default()

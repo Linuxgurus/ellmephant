@@ -8,14 +8,14 @@ pub mod model;
 pub mod repl;
 pub mod session;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
-use crate::search::{Mode, Query};
-use crate::store::{Memory, MemoryType};
+use crate::search::Query;
+use crate::store::Memory;
 
 use self::session::Session;
 
@@ -66,42 +66,30 @@ pub enum Command {
     },
     /// Store a memory (upsert by key).
     Add {
-        /// Slug; auto-generated from scope + title when omitted.
+        /// Slug; auto-generated from the title when omitted.
         #[arg(long)]
         key: Option<String>,
-        /// Bucket, e.g. `infra`.
-        #[arg(long)]
-        scope: String,
-        /// Salient one-liner.
+        /// One-liner.
         #[arg(long)]
         title: String,
-        /// Full body; `-` reads stdin.
+        /// Fact; `-` reads stdin.
         #[arg(long)]
         body: String,
-        /// `signpost|dictate|fact|profile`.
-        #[arg(long, default_value = "fact")]
-        r#type: String,
         /// Provenance (command/path/repo/quote).
         #[arg(long)]
         source: Option<String>,
-        /// Repeatable tag.
+        /// Repeatable tag (an aspect of the subject).
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
-    /// Hybrid suffix search.
+    /// Semantic phrase search over the embedded document.
     Search {
-        /// Query text.
-        query: String,
-        /// Restrict to one bucket.
-        #[arg(long)]
-        scope: Option<String>,
+        /// The phrase.
+        query: Option<String>,
         /// Result count.
         #[arg(long)]
         k: Option<usize>,
-        /// `hybrid|vec|fts`.
-        #[arg(long, default_value = "hybrid")]
-        mode: String,
-        /// Cosine-distance ceiling (KNN leg only).
+        /// Cosine-distance ceiling.
         #[arg(long)]
         max_distance: Option<f32>,
         /// Emit JSON.
@@ -120,13 +108,17 @@ pub enum Command {
     },
     /// Delete one memory by key.
     Rm { key: String },
-    /// List tags with counts, or `tags prune`.
-    Tags {
-        /// Emit JSON (list mode).
+    /// List the memory index (key, tags, title) without bodies.
+    List {
+        /// Emit JSON.
         #[arg(long)]
         json: bool,
-        #[command(subcommand)]
-        command: Option<TagCommand>,
+    },
+    /// List tags with counts.
+    Tags {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Recompute every vector and rebuild the vector index (handles a model/dim change).
     Reembed,
@@ -142,15 +134,6 @@ pub enum Command {
         /// Emit JSON.
         #[arg(long)]
         json: bool,
-    },
-    /// Export the store to JSONL.
-    Export { path: PathBuf },
-    /// Import JSONL into the store.
-    Import {
-        path: PathBuf,
-        /// Report what would change without writing.
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Serve MCP over Streamable HTTP (default) or stdio.
     Mcp {
@@ -182,7 +165,7 @@ pub enum Command {
         /// Golden JSONL (default: `<home>/golden/queries.jsonl`).
         #[arg(long, value_name = "FILE")]
         golden_file: Option<PathBuf>,
-        /// Sweep the result count, the RRF weight and the embed projection.
+        /// Sweep the result count and the embed projection.
         #[arg(long)]
         sweep: bool,
         /// Result count for the timing search and the single-shot golden run.
@@ -237,17 +220,6 @@ pub enum ModelCommand {
         /// Drop every cached revision of the repo.
         #[arg(long)]
         all: bool,
-    },
-}
-
-/// `llmphant tags …` — tag governance (PLAN §2 #6).
-#[derive(Debug, Subcommand)]
-pub enum TagCommand {
-    /// Drop tags no memory references.
-    Prune {
-        /// Report how many would be dropped without writing.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -327,17 +299,13 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
     match command {
         Command::Add {
             key,
-            scope,
             title,
             body,
-            r#type,
             source,
             tags,
         } => {
             let mem = Memory {
                 key: key.unwrap_or_default(),
-                scope,
-                type_: MemoryType::parse(&r#type),
                 title,
                 body: read_body(&body)?,
                 source,
@@ -348,32 +316,26 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         }
         Command::Search {
             query,
-            scope,
             k,
-            mode,
             max_distance,
             json,
             expand,
         } => {
             let q = Query {
                 text: query,
-                scope,
                 k: k.unwrap_or_else(|| session.default_k()),
-                mode: Mode::parse(&mode)?,
-                max_distance,
+                max_distance: max_distance.or(session.default_max_distance()),
                 expand,
-                rrf_k: crate::search::DEFAULT_RRF_K,
             };
             cmd_search(session, q, json)
         }
         Command::Show { key, json } => cmd_show(session, &key, json),
         Command::Rm { key } => cmd_rm(session, &key),
-        Command::Tags { json, command } => cmd_tags(session, json, command),
+        Command::List { json } => cmd_list(session, json),
+        Command::Tags { json } => cmd_tags(session, json),
         Command::Rename { old, new } => cmd_rename(session, &old, &new),
         Command::Reembed => cmd_reembed(session),
         Command::Links { json } => cmd_links(session, json),
-        Command::Export { path } => cmd_export(session, &path),
-        Command::Import { path, dry_run } => cmd_import(session, &path, dry_run),
         // Not store commands: the dispatcher above owns these, and the REPL rejects them.
         Command::Repl
         | Command::Doctor { .. }
@@ -411,24 +373,16 @@ fn cmd_rm(session: &Session, key: &str) -> Result<()> {
     }
 }
 
-fn cmd_tags(session: &Session, json: bool, command: Option<TagCommand>) -> Result<()> {
-    match command {
-        Some(TagCommand::Prune { dry_run }) => {
-            if dry_run {
-                let orphans = session.orphans()?.len();
-                println!("{orphans} orphan tag(s) would be pruned");
-            } else {
-                let pruned = session.prune_tags()?;
-                println!("pruned {pruned} orphan tag(s)");
-            }
-            Ok(())
-        }
-        None => {
-            let tags = session.tags()?;
-            emit(format::render_tags(&tags, json)?);
-            Ok(())
-        }
-    }
+fn cmd_list(session: &Session, json: bool) -> Result<()> {
+    let rows = session.summaries()?;
+    emit(format::render_summaries(&rows, json)?);
+    Ok(())
+}
+
+fn cmd_tags(session: &Session, json: bool) -> Result<()> {
+    let tags = session.tags()?;
+    emit(format::render_tags(&tags, json)?);
+    Ok(())
 }
 
 fn cmd_rename(session: &Session, old: &str, new: &str) -> Result<()> {
@@ -459,22 +413,6 @@ fn cmd_reembed(session: &mut Session) -> Result<()> {
 fn cmd_links(session: &Session, json: bool) -> Result<()> {
     let dangling = session.dangling()?;
     emit(format::render_dangling(&dangling, json)?);
-    Ok(())
-}
-
-fn cmd_export(session: &Session, path: &Path) -> Result<()> {
-    let count = session.export(path)?;
-    println!("exported {count} memories to {}", path.display());
-    Ok(())
-}
-
-fn cmd_import(session: &mut Session, path: &Path, dry_run: bool) -> Result<()> {
-    let count = session.import(path, dry_run)?;
-    if dry_run {
-        println!("{count} memory change(s) pending from {}", path.display());
-    } else {
-        println!("imported {count} memory change(s) from {}", path.display());
-    }
     Ok(())
 }
 

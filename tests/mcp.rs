@@ -84,10 +84,8 @@ async fn tools_round_trip_over_the_transport() {
         "memory_add",
         serde_json::json!({
             "key": "infra-logs",
-            "scope": "infra",
             "title": "Where logs live",
             "body": "Logs ship to ns1 via vector.",
-            "type": "signpost",
             "source": "docs/observability.md",
             "tags": ["logs", "observability"]
         }),
@@ -121,7 +119,6 @@ async fn tools_round_trip_over_the_transport() {
         "memory_add",
         serde_json::json!({
             "key": "infra-observability",
-            "scope": "infra",
             "title": "Observability",
             "body": "Dashboards are in Grafana; see [[infra-logs]] for the pipeline."
         }),
@@ -143,14 +140,14 @@ async fn tools_round_trip_over_the_transport() {
     let updated = call(
         &client,
         "memory_update",
-        serde_json::json!({ "key": "infra-logs", "scope": "infra", "title": "Where logs live", "body": "Logs ship to ns1 via vector (updated)." }),
+        serde_json::json!({ "key": "infra-logs", "title": "Where logs live", "body": "Logs ship to ns1 via vector (updated)." }),
     )
     .await;
     assert!(!updated.is_error.unwrap_or(false), "{}", text(&updated));
     let missing = call(
         &client,
         "memory_update",
-        serde_json::json!({ "key": "ghost", "scope": "infra", "title": "x", "body": "y" }),
+        serde_json::json!({ "key": "ghost", "title": "x", "body": "y" }),
     )
     .await;
     assert_eq!(missing.is_error, Some(true));
@@ -170,6 +167,15 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert_eq!(gone.is_error, Some(true));
+
+    // An unknown argument is ignored (serde default), so the search still succeeds.
+    let extra = call(
+        &client,
+        "memory_search",
+        serde_json::json!({ "query": "where do logs go", "match": "fuzzy" }),
+    )
+    .await;
+    assert!(!extra.is_error.unwrap_or(false), "{}", text(&extra));
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
@@ -278,7 +284,7 @@ async fn tools_round_trip_over_http() {
         serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": { "name": "memory_add", "arguments": {
-                "key": "http-note", "scope": "infra",
+                "key": "http-note",
                 "title": "HTTP note", "body": "reached over http"
             }}
         }),
@@ -292,7 +298,8 @@ async fn tools_round_trip_over_http() {
 }
 
 #[tokio::test]
-async fn export_and_import_tools_round_trip() {
+async fn list_tool_reports_the_index_without_bodies() {
+    // `memory_list` is the read-out surface: the store index (no bodies), optionally scoped.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path()));
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -312,49 +319,24 @@ async fn export_and_import_tools_round_trip() {
             &client,
             "memory_add",
             serde_json::json!({
-                "key": key,
-                "scope": "infra",
-                "title": key,
-                "body": format!("body for {key}"),
+                "key": key, "title": key, "body": format!("body for {key}"),
+                "tags": ["infra"],
             }),
         )
         .await;
         assert!(!added.is_error.unwrap_or(false), "{}", text(&added));
     }
 
-    let dump = dir.path().join("dump.jsonl");
-    let exported = call(
-        &client,
-        "memory_export",
-        serde_json::json!({ "path": dump.to_str().unwrap() }),
-    )
-    .await;
-    assert!(!exported.is_error.unwrap_or(false), "{}", text(&exported));
+    let listed = call(&client, "memory_list", serde_json::json!({})).await;
+    assert!(!listed.is_error.unwrap_or(false), "{}", text(&listed));
+    let listed: serde_json::Value = serde_json::from_str(&text(&listed)).expect("list json");
+    assert_eq!(listed["count"], serde_json::json!(2));
+    assert_eq!(listed["memories"][0]["key"], serde_json::json!("note-one"));
+    assert_eq!(listed["memories"][0]["tags"], serde_json::json!(["infra"]));
     assert!(
-        text(&exported).contains("\"count\":2"),
-        "{}",
-        text(&exported)
+        listed["memories"][0].get("body").is_none(),
+        "list must not carry bodies: {listed}"
     );
-    assert!(dump.is_file(), "export wrote no file");
-
-    // Importing the just-written dump is idempotent, so a dry-run reports zero changes.
-    let dry = call(
-        &client,
-        "memory_import",
-        serde_json::json!({ "path": dump.to_str().unwrap(), "dry_run": true }),
-    )
-    .await;
-    assert!(!dry.is_error.unwrap_or(false), "{}", text(&dry));
-    assert!(text(&dry).contains("\"count\":0"), "{}", text(&dry));
-
-    // A bad retrieval mode is a tool error, not a panic.
-    let bad = call(
-        &client,
-        "memory_search",
-        serde_json::json!({ "query": "anything", "mode": "knn" }),
-    )
-    .await;
-    assert_eq!(bad.is_error, Some(true));
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");

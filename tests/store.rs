@@ -1,7 +1,7 @@
-//! Integration: the P4 write path against a real store file and a real `vec0` table.
+//! Integration: the P4 write path against a real store file and real `vec0` tables.
 //!
-//! Runs offline — the embedder is the deterministic [`HashEmbedder`], wrapped so the
-//! test can prove *when* a re-embed happens (and when it must not).
+//! Runs offline — the embedder is the deterministic [`HashEmbedder`], wrapped so the test can
+//! prove *when* a (re-)embed happens (and when it must not).
 
 mod common;
 
@@ -12,7 +12,7 @@ use llmphant::Result;
 use llmphant::db;
 use llmphant::embed::{Embedder, HashEmbedder};
 use llmphant::index::vec;
-use llmphant::store::{self, Memory, MemoryType};
+use llmphant::store::{self, Memory};
 use rusqlite::params;
 
 const DIM: usize = 8;
@@ -55,8 +55,6 @@ impl Embedder for CountingEmbedder {
 fn memory(key: &str, title: &str, body: &str, tags: &[&str]) -> Memory {
     Memory {
         key: key.to_string(),
-        scope: "infra".to_string(),
-        type_: MemoryType::Signpost,
         title: title.to_string(),
         body: body.to_string(),
         source: Some("tests/store.rs".to_string()),
@@ -66,7 +64,7 @@ fn memory(key: &str, title: &str, body: &str, tags: &[&str]) -> Memory {
 }
 
 #[test]
-fn add_writes_row_fts_vec_tags_and_links() {
+fn add_writes_row_one_vector_tags_and_links() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
@@ -86,26 +84,20 @@ fn add_writes_row_fts_vec_tags_and_links() {
     // row
     let got = store::get(&conn, "anchor").unwrap().expect("row");
     assert_eq!(got.id, Some(id));
-    assert_eq!(got.type_, MemoryType::Signpost);
     assert_eq!(got.tags, vec!["infra".to_string(), "k8s".to_string()]);
+    assert!(!got.doc_hash.is_empty());
 
-    // fts
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'brown'"
-        ),
-        1
-    );
-
-    // vec
+    // one document vector
     assert_eq!(vec::count(&conn).unwrap(), 1);
-    let vector = vec::get(&conn, id).unwrap().expect("vector");
-    assert_eq!(vector.len(), DIM);
+    assert_eq!(vec::get(&conn, id).unwrap().unwrap().len(), DIM);
 
-    // tags (normalised + linked)
-    assert_eq!(count(&conn, "SELECT count(*) FROM tag"), 2);
-    assert_eq!(count(&conn, "SELECT count(*) FROM memory_tag"), 2);
+    // tags live on the row, normalised + sorted
+    let tags: String = conn
+        .query_row("SELECT tags FROM memory WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(tags, "infra,k8s");
 
     // links
     let target: String = conn
@@ -126,7 +118,7 @@ fn identical_readd_does_not_re_embed() {
 
     let m = memory("note", "Note", "same words here", &["k8s"]);
     let first = store::add(&conn, &embedder, &m).expect("add");
-    assert_eq!(embedder.calls(), 1, "first add embeds once");
+    assert_eq!(embedder.calls(), 1, "first add embeds the document");
     let vector_before = vec::get(&conn, first).unwrap();
 
     let again = store::add(&conn, &embedder, &m).expect("re-add");
@@ -137,19 +129,20 @@ fn identical_readd_does_not_re_embed() {
 }
 
 #[test]
-fn changed_body_reembeds_in_place() {
+fn changed_body_reembeds_the_document() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
 
     let first = store::add(&conn, &embedder, &memory("note", "Note", "alpha", &[])).expect("add");
-    let before = vec::get(&conn, first).unwrap().unwrap();
+    let vector_before = vec::get(&conn, first).unwrap().unwrap();
+    assert_eq!(embedder.calls(), 1);
 
     let second =
         store::add(&conn, &embedder, &memory("note", "Note", "beta gamma", &[])).expect("update");
     assert_eq!(second, first, "upsert keeps the row id");
-    assert_eq!(embedder.calls(), 2, "changed text must re-embed");
-    assert_ne!(vec::get(&conn, first).unwrap().unwrap(), before);
+    assert_eq!(embedder.calls(), 2, "a changed document re-embeds");
+    assert_ne!(vec::get(&conn, first).unwrap().unwrap(), vector_before);
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 1);
 }
 
@@ -168,18 +161,8 @@ fn delete_removes_row_and_every_derived_index() {
 
     assert!(store::delete(&conn, "anchor").unwrap(), "row existed");
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 0);
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'lonely'"
-        ),
-        0
-    );
-    assert_eq!(vec::count(&conn).unwrap(), 0, "vector must be gone");
-    assert_eq!(count(&conn, "SELECT count(*) FROM memory_tag"), 0);
+    assert_eq!(vec::count(&conn).unwrap(), 0, "vector gone");
     assert_eq!(count(&conn, "SELECT count(*) FROM memory_link"), 0);
-    // shared tag vocabulary survives the row.
-    assert_eq!(count(&conn, "SELECT count(*) FROM tag"), 1);
 
     assert!(
         !store::delete(&conn, "anchor").unwrap(),
@@ -194,7 +177,6 @@ fn auto_key_gets_a_collision_suffix() {
     let embedder = CountingEmbedder::new();
 
     let mut auto = memory("", "", "", &[]);
-    auto.scope = "infra".into();
     auto.title = "GitOps registry".into();
 
     store::add(&conn, &embedder, &auto).unwrap();
@@ -207,9 +189,26 @@ fn auto_key_gets_a_collision_suffix() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(
-        keys,
-        vec!["infra-gitops-registry", "infra-gitops-registry-2"]
+    assert_eq!(keys, vec!["gitops-registry", "gitops-registry-2"]);
+}
+
+#[test]
+fn summaries_carry_key_title_and_tags_without_bodies() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = CountingEmbedder::new();
+    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    store::add(&conn, &embedder, &memory("b", "B", "body b", &["db"])).unwrap();
+
+    let all = store::summaries(&conn).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].key, "a");
+    assert_eq!(all[0].tags, vec!["k8s".to_string()]);
+
+    let json = serde_json::to_string(&all).unwrap();
+    assert!(
+        !json.contains("\"body\""),
+        "summaries must not carry bodies"
     );
 }
 

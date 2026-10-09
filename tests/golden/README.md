@@ -4,8 +4,9 @@ Seed set for `llmphant bench --golden` (PLAN §6 P10). Search quality is one of 
 everyone claims to have and nobody measures, so this directory is where the claims meet the
 recall number. Two files:
 
-- `memories.jsonl` — a canonical-JSONL corpus (the same shape `llmphant export` writes). The
-  test harness imports it with the deterministic `HashEmbedder`; a real store uses its own rows.
+- `memories.jsonl` — a canonical-JSONL corpus, one memory per line (`key`, `title`, `body`,
+  `source`, `tags`). The test harness imports it with the deterministic `HashEmbedder`; a real
+  store uses its own rows.
 - `queries.jsonl` — one JSON object per line (blank lines and `#` comments ignored):
 
 ```json

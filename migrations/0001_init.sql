@@ -1,57 +1,23 @@
--- 0001_init — SPEC §7, minus the vec0 table.
+-- 0001_init — the store schema (SPEC §7), minus the vec0 table.
 --
--- `memory_vec` (vec0) is a derived index created programmatically by `index::vec::ensure`
--- (PLAN §5 S0.1): its dimension is a runtime property of the embedder, not schema. Keeping
--- the pure-SQLite schema separate means `cargo test` runs with no extension, no dylib, offline.
+-- `memory_vec` (vec0) is a derived index created programmatically by `index::vec::ensure`:
+-- its dimension is a runtime property of the embedder, not schema. Keeping the pure-SQLite
+-- schema separate means `cargo test` runs with no extension, no dylib, offline.
+--
+-- One memory embeds a single document — `key` + `tags` + `title` + `body` — so a single
+-- `doc_hash` governs whether the row needs (re-)embedding.
 
 CREATE TABLE memory (
-  id      INTEGER PRIMARY KEY,
-  key     TEXT NOT NULL UNIQUE,                 -- slug; upsert + link target
-  scope   TEXT NOT NULL,                        -- single
-  type    TEXT NOT NULL DEFAULT 'fact',         -- signpost|dictate|fact|profile
-  title   TEXT NOT NULL,                        -- salient line
-  body    TEXT NOT NULL,                        -- full, verifiable
-  source  TEXT,                                 -- provenance: command/path/repo/quote
-  hash    TEXT NOT NULL,                        -- sha256(model|dim|embed_text)
-  model   TEXT,
-  dim     INTEGER,
-  created TEXT NOT NULL DEFAULT (datetime('now')),
-  updated TEXT NOT NULL DEFAULT (datetime('now'))
+  id         INTEGER PRIMARY KEY,
+  key        TEXT NOT NULL UNIQUE,              -- slug; upsert + link target
+  title      TEXT NOT NULL,                     -- smart-caveman one-liner
+  body       TEXT NOT NULL,                     -- smart-caveman fact
+  tags       TEXT NOT NULL DEFAULT '',          -- normalised names, comma-joined, sorted
+  source     TEXT,                              -- provenance: command/path/repo/quote
+  doc_hash   TEXT NOT NULL,                     -- sha256(model|dim|embedded document)
+  created    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX idx_memory_scope ON memory(scope);
-CREATE INDEX idx_memory_type  ON memory(type);
-
-CREATE TABLE tag (
-  id   INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE memory_tag (
-  memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
-  tag_id    INTEGER NOT NULL REFERENCES tag(id)    ON DELETE CASCADE,
-  PRIMARY KEY (memory_id, tag_id)
-) WITHOUT ROWID;
-CREATE INDEX idx_mtag_tag ON memory_tag(tag_id);
-
--- external-content FTS: no text copy, kept in sync by the three triggers below
-CREATE VIRTUAL TABLE memory_fts USING fts5(
-  title, body, content='memory', content_rowid='id',
-  tokenize='unicode61 remove_diacritics 2');
-
-CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN
-  INSERT INTO memory_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
-END;
-
-CREATE TRIGGER memory_ad AFTER DELETE ON memory BEGIN
-  INSERT INTO memory_fts(memory_fts, rowid, title, body)
-    VALUES ('delete', old.id, old.title, old.body);
-END;
-
-CREATE TRIGGER memory_au AFTER UPDATE ON memory BEGIN
-  INSERT INTO memory_fts(memory_fts, rowid, title, body)
-    VALUES ('delete', old.id, old.title, old.body);
-  INSERT INTO memory_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
-END;
 
 CREATE TABLE memory_link (
   from_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
@@ -65,3 +31,4 @@ CREATE TABLE meta (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
 );
+

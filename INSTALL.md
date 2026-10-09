@@ -42,9 +42,9 @@ install -m 0755 target/release/llmphant ~/.local/bin/llmphant
 
 ## Store-only build
 
-A build without the embedding stack, for machines that only read a store or run JSONL
-export/import. `--mode fts` search works; the KNN leg is unavailable and the encoder reports an
-error if a command needs it.
+A build without the embedding stack, for machines that only read a store. `--match regex` search
+and every key/tag query work; a semantic phrase needs the encoder and reports an error without
+it.
 
 ```sh
 cargo build --release --locked --no-default-features

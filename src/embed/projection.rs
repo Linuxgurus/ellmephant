@@ -1,21 +1,23 @@
-//! `store != embed`: the row keeps the full body, the vector is computed over a
-//! condensed projection with wiki links stripped (SPEC §6, §8).
+//! `store != embed`: the row keeps the full text, a single document is embedded, and
+//! wiki links are stripped from the projection (SPEC §6, §8).
 
 /// Remove every wiki link token from `s` (the syntax is owned by `store::links`).
 pub fn strip_links(s: &str) -> String {
     crate::store::links::strip_links(s)
 }
 
-/// The text actually handed to the embedder: `title` then link-stripped `body`.
-pub fn embed_text(title: &str, body: &str) -> String {
+/// The text handed to the embedder for one memory: `key`, tags, `title` and `body`, one
+/// non-empty part per line, with `[[links]]` stripped from the body. Embedding the whole
+/// document (rather than separate fields) keeps one vector per row and lets a query match
+/// on the slug or a tag as well as the prose.
+pub fn embed_document(key: &str, tags: &[String], title: &str, body: &str) -> String {
     let body = strip_links(body);
-    let body = body.trim();
-    let title = title.trim();
-    if body.is_empty() {
-        title.to_string()
-    } else {
-        format!("{title}\n{body}")
-    }
+    let tags = tags.join(" ");
+    [key.trim(), tags.trim(), title.trim(), body.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -34,15 +36,18 @@ mod tests {
     }
 
     #[test]
-    fn joins_title_and_body() {
+    fn document_is_key_tags_title_body() {
+        let tags = vec!["logs".to_string(), "observability".to_string()];
+        let doc = embed_document("infra-logs", &tags, "Where logs live", "Ship to ns1.");
         assert_eq!(
-            embed_text(" Title ", "Body [[x]] tail"),
-            "Title\nBody  tail"
+            doc,
+            "infra-logs\nlogs observability\nWhere logs live\nShip to ns1."
         );
     }
 
     #[test]
-    fn empty_body_is_title_only() {
-        assert_eq!(embed_text("Only", "   "), "Only");
+    fn document_strips_links_and_omits_empty_parts() {
+        let doc = embed_document(" k ", &[], "  Only title  ", "   ");
+        assert_eq!(doc, "k\nOnly title");
     }
 }

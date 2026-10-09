@@ -1,12 +1,13 @@
 //! `sqlite-vec` encapsulation (PLAN §5 S0.1, §9).
 //!
-//! Everything that knows about `vec0` lives here so the extension can be swapped
-//! without touching the rest of the crate. The module is registered **in-process**
-//! with `sqlite3_auto_extension` — no `.dylib`, no `load_extension`.
+//! Everything that knows about `vec0` lives here so the extension can be swapped without
+//! touching the rest of the crate. The module is registered **in-process** with
+//! `sqlite3_auto_extension` — no `.dylib`, no `load_extension`.
 //!
-//! `memory_vec` is a *derived, rebuildable* index (like `memory_fts`), not part of the
-//! relational schema: its dimension is a runtime property of the embedder, so it is
-//! created and validated by [`ensure`] rather than by a SQL migration.
+//! One vec0 table, `memory_vec`, holds one vector per memory: the embedding of the whole
+//! document (`key` + tags + `title` + `body`, SPEC §6/§8). It is a *derived, rebuildable*
+//! index: its dimension is a runtime property of the embedder, so it is created by
+//! [`ensure`] rather than by a SQL migration.
 
 use std::sync::Once;
 
@@ -15,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::db::meta;
 use crate::error::{Error, Result};
 
-/// The `vec0` table mirroring `memory.id` (PLAN §9: swap point for the vector store).
+/// The single vec0 table holding one document embedding per memory.
 pub const TABLE: &str = "memory_vec";
 
 /// Register the `vec0` virtual-table module on the process. Idempotent.
@@ -40,11 +41,9 @@ pub fn register_extension() {
 
 /// Vector search hint.
 #[derive(Debug, Clone, Copy)]
-pub struct Knn<'a> {
+pub struct Knn {
     /// Number of neighbours.
     pub k: usize,
-    /// Restrict to one scope (metadata-column filter inside the KNN scan).
-    pub scope: Option<&'a str>,
     /// Optional cosine-distance ceiling.
     pub max_distance: Option<f32>,
 }
@@ -72,11 +71,11 @@ pub fn stored_dim(conn: &Connection) -> Result<Option<usize>> {
 fn create_sql(dim: usize) -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS {TABLE} USING vec0(\
-         memory_id INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine, scope TEXT)"
+         memory_id INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine)"
     )
 }
 
-/// Create the `vec0` table for `dim` if missing, and reject a dimension change.
+/// Create the vec0 table for `dim` if missing, and reject a dimension change.
 ///
 /// The dimension is frozen at `CREATE`: switching models is a `reembed` (P9), not a
 /// silent reinterpretation of stored vectors.
@@ -97,11 +96,10 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
     Ok(())
 }
 
-/// Drop and recreate the `vec0` table for a *new* dimension, recording it in `meta`.
+/// Drop and recreate the table for a *new* dimension, recording it in `meta`.
 ///
 /// This is the deliberate rebuild path [`ensure`] refuses: `reembed` (P9) calls it when the
-/// model — and therefore the vector width — changes, so the frozen-dimension guard never
-/// fires for an operator who means it.
+/// model — and therefore the vector width — changes.
 pub fn recreate(conn: &Connection, dim: usize) -> Result<()> {
     if dim == 0 {
         return Err(Error::Config("embedder dim must be > 0".into()));
@@ -112,14 +110,8 @@ pub fn recreate(conn: &Connection, dim: usize) -> Result<()> {
     Ok(())
 }
 
-/// Empty the table so a full re-embed repopulates it from scratch (same dimension).
-pub fn clear(conn: &Connection) -> Result<()> {
-    conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
-    Ok(())
-}
-
 /// Insert or replace the vector for `id` (vec0 has no `ON CONFLICT`, so delete+insert).
-pub fn upsert(conn: &Connection, id: i64, scope: &str, vector: &[f32]) -> Result<()> {
+pub fn upsert(conn: &Connection, id: i64, vector: &[f32]) -> Result<()> {
     if vector.is_empty() {
         return Err(Error::Config("refusing to store an empty vector".into()));
     }
@@ -133,8 +125,8 @@ pub fn upsert(conn: &Connection, id: i64, scope: &str, vector: &[f32]) -> Result
         )
         .and_then(|_| {
             conn.execute(
-                &format!("INSERT INTO {TABLE}(memory_id, embedding, scope) VALUES (?1, ?2, ?3)"),
-                params![id, to_blob(vector), scope],
+                &format!("INSERT INTO {TABLE}(memory_id, embedding) VALUES (?1, ?2)"),
+                params![id, to_blob(vector)],
             )
         });
     match written {
@@ -173,31 +165,18 @@ pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT count(*) FROM {TABLE}"), [], |r| r.get(0))?)
 }
 
-/// KNN over `memory_vec`, nearest first: `(memory_id, cosine distance)`.
-pub fn knn(conn: &Connection, query: &[f32], hint: &Knn<'_>) -> Result<Vec<(i64, f32)>> {
+/// KNN over the table, nearest first: `(memory_id, cosine distance)`.
+pub fn knn(conn: &Connection, query: &[f32], hint: &Knn) -> Result<Vec<(i64, f32)>> {
     if query.is_empty() {
         return Err(Error::Config("empty query vector".into()));
     }
     let k = i64::try_from(hint.k).map_err(|_| Error::Config("k too large".into()))?;
-
-    let (scope_clause, args): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match hint.scope {
-        Some(s) => (
-            " AND scope = ?3",
-            vec![
-                Box::new(to_blob(query)),
-                Box::new(k),
-                Box::new(s.to_string()),
-            ],
-        ),
-        None => ("", vec![Box::new(to_blob(query)), Box::new(k)]),
-    };
-
     let sql = format!(
         "SELECT memory_id, distance FROM {TABLE} \
-         WHERE embedding MATCH ?1 AND k = ?2{scope_clause} ORDER BY distance"
+         WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+    let rows = stmt.query_map(params![to_blob(query), k], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?))
     })?;
 
@@ -209,6 +188,12 @@ pub fn knn(conn: &Connection, query: &[f32], hint: &Knn<'_>) -> Result<Vec<(i64,
         out.retain(|(_, d)| *d <= max);
     }
     Ok(out)
+}
+
+/// Empty the table so a full re-embed repopulates it from scratch (same dimension).
+pub fn clear(conn: &Connection) -> Result<()> {
+    conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,11 +228,13 @@ mod tests {
     fn ensure_round_trips_a_vector() {
         let conn = conn();
         ensure(&conn, 3).unwrap();
-        upsert(&conn, 1, "infra", &[1.0, 2.0, 3.0]).unwrap();
+        upsert(&conn, 1, &[1.0, 2.0, 3.0]).unwrap();
         assert_eq!(get(&conn, 1).unwrap(), Some(vec![1.0, 2.0, 3.0]));
-        upsert(&conn, 1, "infra", &[4.0, 5.0, 6.0]).unwrap();
+
+        upsert(&conn, 1, &[4.0, 5.0, 6.0]).unwrap();
         assert_eq!(get(&conn, 1).unwrap(), Some(vec![4.0, 5.0, 6.0]));
         assert_eq!(count(&conn).unwrap(), 1);
+
         delete(&conn, 1).unwrap();
         assert_eq!(count(&conn).unwrap(), 0);
     }
@@ -265,12 +252,12 @@ mod tests {
     fn recreate_switches_dimension_and_clears() {
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        upsert(&conn, 1, "infra", &[1.0, 0.0]).unwrap();
+        upsert(&conn, 1, &[1.0, 0.0]).unwrap();
 
         recreate(&conn, 4).unwrap();
         assert_eq!(stored_dim(&conn).unwrap(), Some(4));
         assert_eq!(count(&conn).unwrap(), 0, "rebuild starts empty");
-        upsert(&conn, 1, "infra", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        upsert(&conn, 1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         assert_eq!(get(&conn, 1).unwrap().unwrap().len(), 4);
 
         clear(&conn).unwrap();
@@ -296,7 +283,7 @@ mod tests {
     fn upsert_rejects_an_empty_vector() {
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        assert!(upsert(&conn, 1, "infra", &[]).is_err());
+        assert!(upsert(&conn, 1, &[]).is_err());
     }
 
     #[test]
@@ -305,44 +292,28 @@ mod tests {
         ensure(&conn, 2).unwrap();
         let hint = Knn {
             k: 1,
-            scope: None,
             max_distance: None,
         };
         assert!(knn(&conn, &[], &hint).is_err());
     }
 
     #[test]
-    fn knn_returns_nearest_first_and_honours_scope() {
+    fn knn_returns_nearest_first() {
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        upsert(&conn, 1, "infra", &[1.0, 0.0]).unwrap();
-        upsert(&conn, 2, "infra", &[0.0, 1.0]).unwrap();
-        upsert(&conn, 3, "media", &[-1.0, 0.0]).unwrap();
+        upsert(&conn, 1, &[1.0, 0.0]).unwrap();
+        upsert(&conn, 2, &[0.0, 1.0]).unwrap();
 
         let hits = knn(
             &conn,
             &[1.0, 0.0],
             &Knn {
                 k: 3,
-                scope: None,
                 max_distance: None,
             },
         )
         .unwrap();
         assert_eq!(hits[0].0, 1, "exact match should rank first");
         assert!(hits[0].1 <= hits[1].1);
-
-        let scoped = knn(
-            &conn,
-            &[1.0, 0.0],
-            &Knn {
-                k: 3,
-                scope: Some("media"),
-                max_distance: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].0, 3);
     }
 }

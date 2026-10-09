@@ -147,8 +147,6 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
 pub struct Backlink {
     /// The linking memory's key.
     pub key: String,
-    /// Its bucket.
-    pub scope: String,
     /// Its salient line.
     pub title: String,
 }
@@ -156,14 +154,13 @@ pub struct Backlink {
 /// Incoming `[[…]]` edges for `key`, ordered by source key (the MCP `memory_backlinks`).
 pub fn backlinks(conn: &Connection, key: &str) -> Result<Vec<Backlink>> {
     let mut stmt = conn.prepare(
-        "SELECT m.key, m.scope, m.title FROM memory_link l JOIN memory m ON m.id = l.from_id
+        "SELECT m.key, m.title FROM memory_link l JOIN memory m ON m.id = l.from_id
           WHERE l.to_key = ?1 ORDER BY m.key",
     )?;
     let rows = stmt.query_map(params![key], |r| {
         Ok(Backlink {
             key: r.get(0)?,
-            scope: r.get(1)?,
-            title: r.get(2)?,
+            title: r.get(1)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

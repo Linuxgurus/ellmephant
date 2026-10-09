@@ -12,7 +12,7 @@ use crate::error::Result;
 const MIGRATIONS: &[(i32, &str, &str)] = &[(
     1,
     include_str!("../../migrations/0001_init.sql"),
-    "init: memory, tags, fts, links, meta",
+    "init: memory, links, meta",
 )];
 
 /// Current schema version recorded in the file.

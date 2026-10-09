@@ -10,6 +10,7 @@ use tabled::{Table, Tabled};
 use crate::error::Result;
 use crate::search::{Bundle, Hit};
 use crate::store::Memory;
+use crate::store::Summary;
 use crate::store::links::Dangling;
 
 /// Render a search bundle for a terminal (or `--json`), ranked first.
@@ -30,19 +31,23 @@ pub fn render_bundle(bundle: &Bundle, json: bool) -> Result<String> {
     Ok(out)
 }
 
-/// Render hits for a terminal, ranked first.
+/// Render hits for a terminal, ranked first. A hit carries no body (SPEC §10): key, title,
+/// tags and (semantic only) the distance.
 fn render_hits(hits: &[Hit]) -> Result<String> {
     if hits.is_empty() {
         return Ok("(no matches)".to_string());
     }
     let mut out = String::new();
     for (rank, hit) in hits.iter().enumerate() {
+        let distance = match hit.distance {
+            Some(d) => format!("{d:.4}"),
+            None => "-".to_string(),
+        };
         out.push_str(&format!(
-            "{}. {:.4}  {}  [{}]\n   {}\n",
+            "{}. {:>8}  {}\n   {}\n",
             rank + 1,
-            hit.score,
+            distance,
             hit.key,
-            hit.scope,
             hit.title
         ));
         if !hit.tags.is_empty() {
@@ -57,13 +62,7 @@ pub fn render_memory(mem: &Memory, json: bool) -> Result<String> {
     if json {
         return Ok(serde_json::to_string_pretty(mem)?);
     }
-    let mut out = format!(
-        "{}  [{}/{}]\n  title   {}\n",
-        mem.key,
-        mem.scope,
-        mem.type_.as_str(),
-        mem.title
-    );
+    let mut out = format!("{}\n  title   {}\n", mem.key, mem.title);
     if !mem.tags.is_empty() {
         out.push_str(&format!("  tags    {}\n", mem.tags.join(", ")));
     }
@@ -105,6 +104,36 @@ pub fn render_tags(tags: &[(String, i64)], json: bool) -> Result<String> {
         })
         .collect();
     let mut table = Table::new(rows);
+    table.with(Style::psql());
+    Ok(format!("{table}\n"))
+}
+
+/// One memory-index row, as `tabled` renders it.
+#[derive(Tabled)]
+struct ListRow {
+    key: String,
+    tags: String,
+    title: String,
+}
+
+/// Render the memory index (`list`): a bordered table, or JSON for scripts. Bodies are left
+/// out on purpose (SPEC §14) — key, tags and title only.
+pub fn render_summaries(rows: &[Summary], json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(rows)?);
+    }
+    if rows.is_empty() {
+        return Ok("(no memories)".to_string());
+    }
+    let table_rows: Vec<ListRow> = rows
+        .iter()
+        .map(|s| ListRow {
+            key: s.key.clone(),
+            tags: s.tags.join(", "),
+            title: s.title.clone(),
+        })
+        .collect();
+    let mut table = Table::new(table_rows);
     table.with(Style::psql());
     Ok(format!("{table}\n"))
 }
@@ -152,11 +181,7 @@ mod tests {
         Hit {
             id: 1,
             key: "infra-gitops".into(),
-            scope: "infra".into(),
-            type_: "fact".into(),
             title: "GitOps & registry".into(),
-            body: "argocd".into(),
-            score: 0.5,
             distance: Some(0.25),
             tags: vec!["k8s".into()],
         }
@@ -184,12 +209,10 @@ mod tests {
         Memory {
             id: Some(7),
             key: "infra-note".into(),
-            scope: "infra".into(),
-            type_: crate::store::MemoryType::Signpost,
             title: "Note".into(),
             body: "first line\nsecond line".into(),
             source: Some("tests".into()),
-            hash: "abc".into(),
+            doc_hash: "abc".into(),
             tags: vec!["k8s".into()],
             created: "2026-01-01 00:00:00".into(),
             updated: "2026-01-02 00:00:00".into(),
@@ -199,7 +222,8 @@ mod tests {
     #[test]
     fn memory_renders_a_block_and_an_object() {
         let block = render_memory(&memory(), false).unwrap();
-        assert!(block.contains("infra-note  [infra/signpost]"), "{block}");
+        assert!(block.contains("infra-note"), "{block}");
+        assert!(block.contains("  title   Note"), "{block}");
         assert!(block.contains("    second line"), "{block}");
 
         let json = render_memory(&memory(), true).unwrap();
@@ -218,6 +242,30 @@ mod tests {
         assert!(json.contains("\"count\": 2"), "{json}");
 
         assert_eq!(render_tags(&[], false).unwrap(), "(no tags)");
+    }
+
+    #[test]
+    fn summaries_render_a_table_and_json_without_bodies() {
+        let rows = vec![Summary {
+            key: "infra-note".into(),
+            title: "Note".into(),
+            tags: vec!["k8s".into()],
+        }];
+        let table = render_summaries(&rows, false).unwrap();
+        assert!(
+            table.contains("infra-note") && table.contains("tags"),
+            "{table}"
+        );
+
+        let json = render_summaries(&rows, true).unwrap();
+        assert!(json.contains("\"key\": \"infra-note\""), "{json}");
+        assert!(json.contains("\"k8s\""), "{json}");
+        assert!(
+            !json.contains("\"body\""),
+            "list must not carry bodies: {json}"
+        );
+
+        assert_eq!(render_summaries(&[], false).unwrap(), "(no memories)");
     }
 
     #[test]

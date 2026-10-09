@@ -24,8 +24,8 @@ use super::session::Session;
 
 /// Verbs offered by tab-completion: the REPL's own plus the one-shot tree.
 const COMMANDS: &[&str] = &[
-    "add", "search", "show", "rm", "tags", "rename", "reembed", "links", "export", "import",
-    "help", "quit", "exit",
+    "add", "search", "show", "rm", "list", "tags", "rename", "reembed", "links", "help", "quit",
+    "exit",
 ];
 
 /// A REPL line, parsed with the exact `Command` tree the one-shot CLI uses.
@@ -196,14 +196,13 @@ fn split_args(line: &str) -> Result<Vec<String>> {
 fn print_help() {
     println!(
         "commands (same flags as the one-shot CLI):\n\
-         \x20 add --scope S --title T --body B [--key K] [--type signpost|dictate|fact|profile]\n\
-         \x20     [--source SRC] [--tag TAG]...\n\
-         \x20 search \"QUERY\" [--scope S] [-k N] [--mode hybrid|vec|fts] [--expand N] [--json]\n\
+         \x20 add --title T --body B [--key K] [--source SRC] [--tag TAG]...\n\
+         \x20 search [\"PHRASE\"] [--k N] [--max-distance D] [--expand N] [--json]\n\
          \x20 show KEY [--json]\n\
          \x20 rm KEY\n\
-         \x20 tags [--json] | tags prune [--dry-run]\n\
+         \x20 list [--json]\n\
+         \x20 tags [--json]\n\
          \x20 rename OLD NEW | reembed | links [--json]\n\
-         \x20 export PATH | import PATH [--dry-run]\n\
          \x20 help | quit"
     );
 }
@@ -233,7 +232,7 @@ mod tests {
     #[test]
     fn parses_a_line_through_the_shared_tree() {
         let line =
-            Line::try_parse_from(split_args("search \"roll back\" --mode fts").unwrap()).unwrap();
+            Line::try_parse_from(split_args("search \"roll back\" --expand 1").unwrap()).unwrap();
         assert!(matches!(line.command, Command::Search { .. }));
     }
 }

@@ -6,7 +6,7 @@ llmphant gives AI assistants a shared, persistent memory that runs entirely on y
 
 - the [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) encoder is compiled
   into the binary; no Python or external runtime is required;
-- one SQLite file is the source of truth, with rebuildable full-text, vector, and link indexes;
+- one SQLite file is the source of truth, with rebuildable vector and link indexes;
 - it speaks [MCP](https://modelcontextprotocol.io) over Streamable HTTP (or stdio), so Cline,
   TypingMind, and other MCP clients read and write the same memory;
 - there is an interactive REPL and a one-shot CLI for scripting and cron jobs.
@@ -38,8 +38,8 @@ llmphant is the local answer: one file, one process, one shared memory.
 ```sh
 llmphant doctor            # create ~/.llmphant/ and the schema
 llmphant model fetch       # one-time ~1.2 GB weights download
-llmphant add --scope infra --title "Gateway hostname" \
-  --body "the gateway answers at portainer-notes-gw.internal on 8443" --tag network
+llmphant add --title "Gateway hostname" \
+  --body "gateway = portainer-notes-gw.internal :8443" --tag network
 llmphant search "which host is the internal gateway"
 llmphant                   # REPL
 ```
@@ -59,16 +59,18 @@ any subcommand. `--json` prints the machine-readable form where a command provid
 **Memory**
 
 ```sh
-llmphant add    --scope S --title T --body B [--key K] [--type signpost|dictate|fact|profile]
-                [--source SRC] [--tag T]...        # --body - reads stdin; upsert by key
-llmphant search "QUERY" [--scope S] [--k N] [--mode hybrid|vec|fts]
-                [--max-distance D] [--expand N] [--json]
+llmphant add    --title T --body B [--key K] [--source SRC] [--tag TAG]...
+                                                   # --body - reads stdin; upsert by key
+llmphant search ["PHRASE"] [--k N] [--max-distance D] [--expand N] [--json]
 llmphant show   KEY [--json]
 llmphant rm     KEY
-llmphant tags   [--json] | tags prune [--dry-run]
+llmphant list   [--json]
+llmphant tags   [--json]
 ```
 
-`add` upserts by `key`; running it twice with the same key yields one memory.
+`add` upserts by `key`; running it twice with the same key yields one memory. Write in
+**smart-caveman**: drop filler, articles and glue words; keep high-signal words. One fact per
+row, `--tag` the aspect of the subject (`storage`, `gotchas`), and put provenance in `--source`.
 
 **Maintenance**
 
@@ -77,13 +79,6 @@ llmphant reembed                 # recompute every vector; needed after a model/
 llmphant rename OLD NEW          # rewrite [[OLD]] in bodies and repoint link edges
 llmphant links [--json]          # list dangling [[key]] targets
 llmphant doctor [--verify]       # paths, schema, index health; --verify re-hashes weights
-```
-
-**Export / import**
-
-```sh
-llmphant export FILE.jsonl              # canonical JSONL; no model needed
-llmphant import FILE.jsonl [--dry-run]  # upsert by key; re-embed only when content changed
 ```
 
 **Model, embeddings, benchmarks, interfaces**
@@ -114,6 +109,7 @@ precision   = "bf16"                         # bf16 | f16 (CPU is always f32)
 device      = "cpu"                          # cpu | metal
 instruction = "Given a question, retrieve relevant memories"   # query side only
 default_k   = 10                             # search result count
+default_max_distance = 0.5                   # cosine-distance ceiling; null disables it
 port        = 8888                           # MCP HTTP port (`mcp --stdio` ignores it)
 ```
 
@@ -137,31 +133,24 @@ llmphant --offline doctor          # open no socket
 
 ### Search
 
-`hybrid` (the default) runs the lexical and vector legs and fuses them with RRF (k=60).
-`--mode vec|fts` runs one leg. `--mode fts` needs no weights and no network.
+A search matches a single **semantic phrase** — there are no key or tag filters and no regex
+leg. Each memory is embedded as one **document** (`key` + tags + `title` + body), so a phrase
+that shares words with the key or a tag can surface the memory too. `--k` caps the results
+within `--max-distance`; with no phrase, results are unranked (key order). A result carries
+`key`, `title`, `tags` and `distance` — never the body; fetch it with `show`, which is also how
+you read a known key directly.
 
 ```sh
-llmphant search "where do the logs live"            # hybrid, k=10
-llmphant search "portainer-notes-gw" --mode fts     # exact identifier, no model
-llmphant search "gateway" --scope infra --json
-llmphant search "backups" --expand 1                # include linked neighbours
+llmphant search "where do the logs live"                  # semantic, k=10
+llmphant search "portainer-notes-gw"                      # key/tag tokens are in the embedding
+llmphant search "backups" --expand 1                      # + linked neighbours
 ```
-
-Every result carries its fused score (and cosine distance for the vector leg), and results are
-bounded snippets rather than full bodies.
 
 ### Wiki links
 
 Author links inline in the body as `[[key]]`. They become link edges on write; `--expand` walks
-them and `llmphant links` reports dangling targets. Links are by key, so they survive
-export/import.
-
-### Export / import
-
-The JSONL format uses the canonical fields
-(`key,scope,type,title,body,source,tags,created,updated`) and excludes ids and vectors, so a dump
-survives a different machine, model, or dimension. Import is all-or-nothing and upserts by key;
-re-importing an unchanged file is a no-op.
+them and `llmphant links` reports dangling targets. Links are by key, never by id, so they
+survive a `reembed` or a `rename`.
 
 ### MCP over HTTP (default)
 
@@ -197,9 +186,11 @@ llmphant mcp --stdio
 ### MCP tools
 
 `memory_add`, `memory_update`, `memory_delete`, `memory_search`, `memory_get`,
-`memory_backlinks`, `memory_export`, `memory_import`. Read tools are annotated read-only and
-`memory_delete` is annotated destructive. `memory_search` returns scored snippets; its `mode=fts`
-path needs no weights.
+`memory_backlinks`, `memory_list`. Read tools are annotated read-only and `memory_delete` is
+annotated destructive. `memory_search` matches a semantic `phrase` (the whole document — key,
+tags, title, body — is embedded), with `k` and `max_distance`; there are **no key/tag filters
+and no regex leg**, and hits carry titles, tags and distances, never bodies. The server also
+advertises the write policy and the search strategy as its `instructions`.
 
 ## Usage in Docker
 
@@ -223,6 +214,18 @@ Inside the container the server binds `0.0.0.0:8888`; publish the port and point
 ```sh
 docker run --rm -p 8888:8888 -v llmphant-data:/data llmphant:dev
 ```
+
+### Logging
+
+The image ships `RUST_LOG=llmphant=info,rmcp=info,warn`, so `docker logs` shows a startup
+banner (version, store path, model, dim, device), each `memory_search` (the query, hit count and
+`elapsed_ms`) with every returned hit — `key`, `tags`, `distance` — plus the serialized response
+size in bytes, each write
+(`memory_add`/`memory_update`/`memory_delete`, with `key`, `tags`, `body_bytes`) and each
+`memory_list` (count). The first semantic operation logs `loading encoder` /
+`encoder loaded` around the ~1.2 GB weight load, and every tool failure is logged as a
+`tool error`. `rmcp` at info surfaces client connect/disconnect. Override `RUST_LOG` to
+quieten or deepen it, e.g. `-e RUST_LOG=warn` or `-e RUST_LOG=llmphant=debug`.
 
 ### MCP over stdio
 
@@ -266,14 +269,14 @@ volumes:
 
 ## FAQ
 
-**Is it a vector database?** It includes a vector index, but it is also a relational store, a
-full-text index, and a link graph. The `memory` table is the source of truth; the indexes are
-derived and rebuildable.
+**Is it a vector database?** It includes a vector index, but it is also a relational store and a
+link graph. The `memory` table is the source of truth; the indexes are derived and rebuildable.
 
 **Does it send my data anywhere?** No. The only outbound request is the one-time weights
 download, which can be disabled with `--offline` and a local cache.
 
-**How do I export everything?** `llmphant export memory.jsonl` writes all memories to JSONL.
+**How do I back up or move the store?** Copy `~/.llmphant/memory.db` (with any `-wal`/`-shm`
+sidecars); it is the whole store. Everything else there is a rebuildable cache.
 
 **Why are the weights fetched separately?** They are ~1.2 GB of data, not code, so they live in
 the store directory rather than in the binary.

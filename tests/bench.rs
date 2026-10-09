@@ -11,7 +11,6 @@ use common::temp_store;
 use llmphant::bench;
 use llmphant::db;
 use llmphant::embed::HashEmbedder;
-use llmphant::search::Mode;
 use llmphant::store::{self, Memory};
 
 const DIM: usize = 512;
@@ -48,15 +47,8 @@ fn golden_eval_clears_the_recall_gate() {
     let cases = bench::load_cases(&golden("queries.jsonl")).expect("golden queries");
     assert!(cases.len() >= 20, "PLAN §6 P10 wants >= 20 questions");
 
-    let eval = bench::evaluate(
-        &conn,
-        Some(&embedder),
-        &cases,
-        bench::DEFAULT_EVAL_K,
-        llmphant::search::DEFAULT_RRF_K,
-        Mode::Hybrid,
-    )
-    .expect("evaluate");
+    let eval =
+        bench::evaluate(&conn, Some(&embedder), &cases, bench::DEFAULT_EVAL_K).expect("evaluate");
 
     assert_eq!(eval.cases, cases.len());
     assert!(
@@ -72,7 +64,7 @@ fn golden_eval_clears_the_recall_gate() {
 }
 
 #[test]
-fn sweep_walks_every_knob_pair_and_names_a_winner() {
+fn sweep_walks_every_k_and_names_a_winner() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -81,41 +73,9 @@ fn sweep_walks_every_knob_pair_and_names_a_winner() {
     }
     let cases = bench::load_cases(&golden("queries.jsonl")).expect("golden queries");
 
-    let evals = bench::sweep(
-        &conn,
-        Some(&embedder),
-        &cases,
-        &bench::SWEEP_KS,
-        &bench::SWEEP_RRF_KS,
-        Mode::Hybrid,
-    )
-    .expect("sweep");
+    let evals = bench::sweep(&conn, Some(&embedder), &cases, &bench::SWEEP_KS).expect("sweep");
 
-    assert_eq!(
-        evals.len(),
-        bench::SWEEP_KS.len() * bench::SWEEP_RRF_KS.len()
-    );
+    assert_eq!(evals.len(), bench::SWEEP_KS.len());
     assert!(evals.iter().all(|e| e.cases == cases.len()));
     assert!(bench::best(&evals).is_some());
-}
-
-#[test]
-fn projection_sweep_scores_every_variant() {
-    // A projection only moves document vectors, so this needs no store at all.
-    let embedder = HashEmbedder::new(DIM);
-    let corpus = read_corpus(&golden("memories.jsonl"));
-    let cases = bench::load_cases(&golden("queries.jsonl")).expect("golden queries");
-
-    let scores = bench::sweep_projections(
-        &embedder,
-        &corpus,
-        &cases,
-        bench::DEFAULT_EVAL_K,
-        llmphant::search::DEFAULT_RRF_K,
-    )
-    .expect("projection sweep");
-
-    assert_eq!(scores.len(), bench::Projection::ALL.len());
-    let names: Vec<&str> = scores.iter().map(|s| s.projection).collect();
-    assert_eq!(names, vec!["title+body", "body", "title"]);
 }

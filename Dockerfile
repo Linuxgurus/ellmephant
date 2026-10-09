@@ -30,8 +30,10 @@ COPY --from=builder /src/target/release/llmphant /usr/local/bin/llmphant
 
 # The MCP server serves Streamable HTTP on a port by default; bind all interfaces so the port
 # is reachable from outside the container (localhost is the safer default off Docker).
+# `llmphant` at info (startup, writes, searches, encoder load), `rmcp` at info (client
+# session lifecycle); `warn` is the default for everything else.
 ENV LLMPHANT_HOME=/data \
-    RUST_LOG=warn \
+    RUST_LOG=llmphant=info,rmcp=info,warn \
     LLMPHANT_MCP_HOST=0.0.0.0 \
     LLMPHANT_MCP_PORT=8888
 RUN install -d -o llmphant -g llmphant /data

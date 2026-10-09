@@ -45,8 +45,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- P3: the Qwen3 encoder (PLAN §4). Optional so `--no-default-features` builds a
-# store-only binary with no ML stack. `metal`/`accelerate` are Apple-only no-ops elsewhere.
-candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+# store-only binary with no ML stack.
+# `candle-core`'s `metal`/`accelerate` features pull Apple-only `objc2`, which fails to
+# compile off macOS (`compile_error!`), so they are enabled only for macOS targets; other
+# platforms get plain CPU. See the two `[target.*]` tables below.
 candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 # Match candle-core 0.11's `^0.22` so only one `tokenizers` links (PLAN §1).
@@ -68,6 +70,15 @@ rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-ht
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 # Hosts rmcp's `StreamableHttpService` (a tower service) — MCP-over-HTTP is the `mcp` default.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+
+# `candle-core` is declared per-target: `metal`/`accelerate` (which transitively require
+# `objc2`) only exist on macOS. On other hosts it is plain CPU, so the Linux/Docker build
+# does not try to compile Apple-only crates. Both stay optional and feed `dep:candle-core`.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-core = { version = "0.11", optional = true }
 
 [features]
 default = ["encoder"]

@@ -1,17 +1,13 @@
-//! Hybrid search orchestration: run both legs, fuse with RRF, hydrate rows (P5).
+//! Search: a single semantic phrase over the store (SPEC §10).
 //!
-//! The two legs answer different questions — BM25 finds exact tokens, KNN finds meaning —
-//! and their scores are not comparable, so [`rrf::fuse`] merges them *by rank*. Every hit
-//! carries its fused score (and vector distance when the KNN leg contributed) so the
-//! caller can judge confidence (SPEC §10, §14).
+//! A query is one `phrase`, embedded and compared against the stored document embeddings by
+//! cosine distance. There are no key/tag constraints and no literal (regex) leg — the key and
+//! tags are part of the embedded document, so a query reaches them semantically.
+//!
+//! Results are distance-ranked, capped by `k` and a `max_distance` ceiling. A hit carries
+//! `key`/`title`/`tags` and its `distance` — never a body; fetch it with `memory_get`/`show`.
 
-pub mod rrf;
-
-/// The RRF constant used unless a caller overrides it (SPEC §10). Re-exported so callers
-/// that build a [`Query`] never reach into [`rrf`] directly.
-pub use rrf::DEFAULT_RRF_K;
-
-/// Characters of a body returned per search hit (SPEC §9/§14: snippets, not dumps).
+/// Characters of a neighbour's body returned by `--expand` (SPEC §9/§14: snippets, not dumps).
 pub const SNIPPET_CHARS: usize = 280;
 
 /// First `max` characters of `s`, with a trailing `…` when it was truncated.
@@ -24,7 +20,7 @@ pub fn snippet(s: &str, max: usize) -> String {
     out
 }
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -34,91 +30,38 @@ use crate::error::{Error, Result};
 use crate::index;
 use crate::store::{self, Memory};
 
-/// Which retrieval legs to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// BM25 ∪ KNN, fused with RRF.
-    #[default]
-    Hybrid,
-    /// KNN only.
-    Vec,
-    /// BM25 only.
-    Fts,
-}
+/// A candidate row: its id and, when the phrase was semantic, its cosine distance.
+type Candidate = (i64, Option<f32>);
 
-impl Mode {
-    /// Parse a CLI/config string (`hybrid`, `vec`, `fts`).
-    pub fn parse(s: &str) -> Result<Mode> {
-        match s.to_ascii_lowercase().as_str() {
-            "hybrid" => Ok(Mode::Hybrid),
-            "vec" => Ok(Mode::Vec),
-            "fts" => Ok(Mode::Fts),
-            other => Err(Error::Config(format!(
-                "invalid mode {other:?} (want hybrid|vec|fts)"
-            ))),
-        }
-    }
-
-    /// Canonical name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Hybrid => "hybrid",
-            Mode::Vec => "vec",
-            Mode::Fts => "fts",
-        }
-    }
-
-    /// Whether this mode needs an embedder (i.e. the KNN leg runs).
-    pub fn needs_embedder(self) -> bool {
-        matches!(self, Mode::Hybrid | Mode::Vec)
-    }
-}
-
-/// Search request.
+/// Search request — a single semantic phrase and its ranking knobs (SPEC §10).
 #[derive(Debug, Clone)]
 pub struct Query {
-    /// The user's question.
-    pub text: String,
-    /// Restrict to one bucket.
-    pub scope: Option<String>,
-    /// Result count.
+    /// The phrase; `None`/blank means "no phrase" (every row, key order).
+    pub text: Option<String>,
+    /// Result cap (semantic ranking only).
     pub k: usize,
-    /// `hybrid` (default), `vec` or `fts`.
-    pub mode: Mode,
     /// Optional cosine-distance ceiling.
     pub max_distance: Option<f32>,
     /// Link-neighbourhood hops to include (0 = off).
     pub expand: u8,
-    /// RRF constant `k` for the fusion ([`DEFAULT_RRF_K`] in normal use; P10 sweeps it).
-    pub rrf_k: f64,
 }
 
-/// One hydrated hit. Scores are returned so the caller can judge confidence
-/// (SPEC §14 false-memory hazard).
+/// One hydrated hit: `key`/`title`/`tags` and (semantic only) `distance`. No body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
-    /// `memory.id`.
+    /// `memory.id` (local; not serialized).
+    #[serde(skip)]
     pub id: i64,
     /// Slug.
     pub key: String,
-    /// Bucket.
-    pub scope: String,
-    /// Usage class.
-    #[serde(rename = "type")]
-    pub type_: String,
     /// Salient line.
     pub title: String,
-    /// Bounded body snippet (SPEC §9: snippets, not dumps).
-    pub body: String,
-    /// Fused score.
-    pub score: f64,
-    /// Vector distance when the KNN leg contributed.
+    /// Attached tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Vector distance when the semantic leg ranked this hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f32>,
-    /// Attached tags.
-    #[serde(default)]
-    pub tags: Vec<String>,
 }
 
 /// A link-neighbour pulled in by `--expand` (SPEC §10).
@@ -132,68 +75,40 @@ pub struct Neighbor {
     pub memory: Memory,
 }
 
-/// The result bundle: ranked hits plus (when asked) their link neighbourhood.
+/// The result bundle: hits plus (when asked) their link neighbourhood.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Bundle {
-    /// Ranked hits.
+    /// Hits, distance-ranked when the phrase was semantic.
     pub hits: Vec<Hit>,
     /// Link neighbours, breadth-first from the hits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub neighbors: Vec<Neighbor>,
 }
 
-/// Run a query. `embedder` is required for `hybrid`/`vec` and ignored by `fts`.
+/// Run a query. `embedder` is required when a phrase is given, ignored otherwise.
 pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Result<Bundle> {
-    let limit = q.k.max(1);
-    let scope = q.scope.as_deref();
+    let phrase = phrase_ids(conn, embedder, q)?;
+    let ranked = phrase.is_some();
 
-    let mut vec_hits: Vec<(i64, f32)> = Vec::new();
-    if q.mode.needs_embedder() {
-        let embedder = embedder.ok_or_else(|| {
-            Error::Config(format!("{} search needs an embedder", q.mode.as_str()))
-        })?;
-        let query_vector = embedder.embed_query(&q.text)?;
-        let hint = index::vec::Knn {
-            k: limit,
-            scope,
-            max_distance: q.max_distance,
-        };
-        vec_hits = index::vec::knn(conn, &query_vector, &hint)?;
+    let mut ordered: Vec<(i64, Option<f32>)> = match phrase {
+        Some(p) => p,
+        None => all_ranked(conn)?,
+    };
+    if ranked {
+        ordered.truncate(q.k.max(1)); // k caps the distance-ranked case only
     }
 
-    let fts_hits = if matches!(q.mode, Mode::Hybrid | Mode::Fts) {
-        index::fts::search(conn, &q.text, scope, limit)?
-    } else {
-        Vec::new()
-    };
-
-    // RRF is rank-based, so the two score scales never meet (SPEC §10).
-    let vec_ranking: Vec<i64> = vec_hits.iter().map(|(id, _)| *id).collect();
-    let fts_ranking: Vec<i64> = fts_hits.iter().map(|h| h.id).collect();
-    let rankings: Vec<Vec<i64>> = match q.mode {
-        Mode::Vec => vec![vec_ranking],
-        Mode::Fts => vec![fts_ranking],
-        Mode::Hybrid => vec![vec_ranking, fts_ranking],
-    };
-    let fused = rrf::fuse(&rankings, q.rrf_k);
-
-    let distances: HashMap<i64, f32> = vec_hits.into_iter().collect();
-
-    let mut hits = Vec::with_capacity(limit);
-    for (id, score) in fused.into_iter().take(limit) {
+    let mut hits = Vec::with_capacity(ordered.len());
+    for (id, distance) in ordered {
         let Some(mem) = store::get_by_id(conn, id)? else {
-            continue; // a leg returned an id that vanished; skip, don't fail the query
+            continue; // the leg returned an id that vanished; skip, don't fail the query
         };
         hits.push(Hit {
             id,
             key: mem.key,
-            scope: mem.scope,
-            type_: mem.type_.as_str().to_string(),
             title: mem.title,
-            body: snippet(&mem.body, SNIPPET_CHARS),
-            score,
-            distance: distances.get(&id).copied(),
             tags: mem.tags,
+            distance,
         });
     }
 
@@ -203,6 +118,51 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         Vec::new()
     };
     Ok(Bundle { hits, neighbors })
+}
+
+/// Every id, `key` order — the "no constraints at all" case.
+fn all_ranked(conn: &Connection) -> Result<Vec<(i64, Option<f32>)>> {
+    let mut stmt = conn.prepare("SELECT id FROM memory ORDER BY key")?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push((row?, None));
+    }
+    Ok(out)
+}
+
+/// Candidates satisfying the phrase, distance-ranked (`None` when no phrase given).
+fn phrase_ids(
+    conn: &Connection,
+    embedder: Option<&dyn Embedder>,
+    q: &Query,
+) -> Result<Option<Vec<Candidate>>> {
+    let Some(text) = q.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let embedder =
+        embedder.ok_or_else(|| Error::Config("semantic search needs an embedder".into()))?;
+    Ok(Some(
+        semantic_ids(conn, embedder, q, text)?
+            .into_iter()
+            .map(|(id, d)| (id, Some(d)))
+            .collect(),
+    ))
+}
+
+/// Semantic phrase search: KNN over the vec0 table, nearest first.
+fn semantic_ids(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    q: &Query,
+    text: &str,
+) -> Result<Vec<(i64, f32)>> {
+    let query_vector = embedder.embed_query(text)?;
+    let hint = index::vec::Knn {
+        k: index::vec::count(conn)?.max(1) as usize,
+        max_distance: q.max_distance,
+    };
+    index::vec::knn(conn, &query_vector, &hint)
 }
 
 /// Breadth-first over `memory_link` in *both* directions, up to `hops` from the seeds.
@@ -282,25 +242,15 @@ mod tests {
     }
 
     #[test]
-    fn mode_parses_case_insensitively_and_round_trips() {
-        for (text, mode) in [
-            ("hybrid", Mode::Hybrid),
-            ("VEC", Mode::Vec),
-            ("Fts", Mode::Fts),
-        ] {
-            assert_eq!(Mode::parse(text).unwrap(), mode);
-            assert_eq!(Mode::parse(mode.as_str()).unwrap(), mode);
-        }
-        assert!(
-            format!("{}", Mode::parse("knn").unwrap_err()).contains("hybrid"),
-            "the error should name the valid modes"
-        );
-    }
-
-    #[test]
-    fn only_vector_legs_need_an_embedder() {
-        assert!(Mode::Hybrid.needs_embedder());
-        assert!(Mode::Vec.needs_embedder());
-        assert!(!Mode::Fts.needs_embedder());
+    fn a_blank_phrase_is_no_constraint() {
+        let q = Query {
+            text: Some("   ".to_string()),
+            k: 10,
+            max_distance: None,
+            expand: 0,
+        };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // No phrase ⇒ no candidates, and no embedder required.
+        assert!(phrase_ids(&conn, None, &q).unwrap().is_none());
     }
 }

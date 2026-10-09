@@ -24,6 +24,11 @@ pub const DEFAULT_INSTRUCTION: &str = "Given a question, retrieve relevant memor
 /// Default TCP port for the MCP server (SPEC §11). High and unassigned.
 pub const DEFAULT_PORT: u16 = 8888;
 
+/// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance`
+/// (SPEC §10). Calibrated on the sample store: a genuinely relevant hit sits at ≲0.5 while
+/// the noise floor is ≳0.65, so this keeps the good hits and drops the paraphrase chaff.
+pub const DEFAULT_MAX_DISTANCE: f32 = 0.5;
+
 /// Resolved on-disk locations. `LLMPHANT_HOME` wins over `$HOME/.llmphant`, which
 /// keeps tests hermetic without touching the real store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +109,9 @@ pub struct Config {
     pub instruction: String,
     /// Default number of results for search.
     pub default_k: usize,
+    /// Cosine-distance ceiling applied when a search omits `max_distance` (SPEC §10).
+    /// `null` disables the cap.
+    pub default_max_distance: Option<f32>,
     /// TCP port for the MCP server (SPEC §11); `llmphant mcp` listens here by default.
     pub port: u16,
 }
@@ -120,6 +128,7 @@ impl Default for Config {
             device: "cpu".to_string(),
             instruction: DEFAULT_INSTRUCTION.to_string(),
             default_k: 10,
+            default_max_distance: Some(DEFAULT_MAX_DISTANCE),
             port: DEFAULT_PORT,
         }
     }

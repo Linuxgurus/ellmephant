@@ -4,8 +4,6 @@
 //! `--mode fts` and `show`/`rm` never pay for 1.2 GB of weights, while the REPL keeps the
 //! model warm across commands (the reason v1 has no daemon — PLAN §2 #4).
 
-use std::path::Path;
-
 use rusqlite::Connection;
 
 use crate::config::{Config, Paths};
@@ -13,7 +11,6 @@ use crate::db;
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::model;
-use crate::portable;
 use crate::search::{self, Bundle, Query};
 use crate::store::{self, Memory, links, maintain, tags};
 
@@ -61,13 +58,33 @@ impl Session {
         self.cfg.default_k
     }
 
+    /// Default cosine-distance ceiling applied when a search omits `max_distance`
+    /// (SPEC §10). `None` means the cap is off.
+    pub fn default_max_distance(&self) -> Option<f32> {
+        self.cfg.default_max_distance
+    }
+
     /// Load the encoder once; later calls are free. This is the only path that touches
     /// the weights cache, so nothing else in the CLI needs it.
     fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
+            // Loading ~1.2 GB of weights can take a while; log both ends so a "stuck" first
+            // search in `docker logs` is visibly a model load, not a hang.
+            tracing::info!(
+                model = %self.cfg.model,
+                device = %self.cfg.device,
+                precision = %self.cfg.precision,
+                dim = self.cfg.dim,
+                "loading encoder"
+            );
+            let started = std::time::Instant::now();
             self.embedder = Some(Box::new(super::embed::load_embedder(
                 &self.spec, &self.cfg,
             )?));
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "encoder loaded"
+            );
         }
         Ok(())
     }
@@ -98,26 +115,23 @@ impl Session {
         store::delete(&self.conn, key)
     }
 
-    /// Run a query, loading the encoder only when the mode's KNN leg needs it.
+    /// Run a query, loading the encoder only when there is a phrase to embed.
     pub fn search(&mut self, q: &Query) -> Result<Bundle> {
-        if q.mode.needs_embedder() {
+        let needs_embedder = q
+            .text
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if needs_embedder {
             self.ensure_embedder()?;
             return search::run(&self.conn, Some(self.embedder()?), q);
         }
         search::run(&self.conn, None, q)
     }
 
-    /// Write the whole store to `path` as canonical JSONL; returns the row count (P8).
-    pub fn export(&self, path: &Path) -> Result<usize> {
-        portable::export::to_jsonl(&self.conn, path)
-    }
-
-    /// Upsert canonical JSONL from `path`; returns the number of new/changed records.
-    /// This is the only path that touches the weights cache outside `add`/`search`.
-    pub fn import(&mut self, path: &Path, dry_run: bool) -> Result<usize> {
-        self.ensure_embedder()?;
-        let embedder = self.embedder()?;
-        portable::import::from_jsonl(&self.conn, embedder, path, dry_run)
+    /// Every row as an index [`Summary`](store::Summary) — no bodies.
+    pub fn summaries(&self) -> Result<Vec<store::Summary>> {
+        store::summaries(&self.conn)
     }
 
     /// Recompute every vector and rebuild the derived vector index, handling a model or
@@ -136,16 +150,6 @@ impl Session {
     /// `[[key]]` targets with no matching row, grouped by target (P9 audit).
     pub fn dangling(&self) -> Result<Vec<links::Dangling>> {
         links::dangling(&self.conn)
-    }
-
-    /// Tags no memory references (P9 governance).
-    pub fn orphans(&self) -> Result<Vec<String>> {
-        tags::orphans(&self.conn)
-    }
-
-    /// Drop orphan tags; returns how many were removed (P9 governance).
-    pub fn prune_tags(&self) -> Result<usize> {
-        tags::prune(&self.conn)
     }
 
     /// Every tag with its reference count, alphabetical.

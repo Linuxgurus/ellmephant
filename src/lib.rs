@@ -14,7 +14,6 @@ pub mod hex;
 pub mod index;
 pub mod mcp;
 pub mod model;
-pub mod portable;
 pub mod search;
 pub mod store;
 

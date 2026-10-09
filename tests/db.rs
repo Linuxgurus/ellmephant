@@ -1,4 +1,4 @@
-//! Integration tests: real SQLite file, real schema, real FTS triggers.
+//! Integration tests: real SQLite file, real schema.
 //!
 //! Everything here runs offline — no model, no extension.
 
@@ -17,8 +17,7 @@ fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
 
 fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     conn.execute(
-        "INSERT INTO memory (key, scope, type, title, body, hash)
-         VALUES (?1, 'infra', 'fact', ?2, ?3, 'deadbeef')",
+        "INSERT INTO memory (key, title, body, doc_hash) VALUES (?1, ?2, ?3, 'h')",
         params![key, title, body],
     )
     .expect("insert memory");
@@ -32,30 +31,20 @@ fn fresh_store_is_at_schema_v1_with_every_object() {
     assert_eq!(db::migrate::version(&conn).unwrap(), 1);
     assert_eq!(db::migrate::latest(), 1);
 
-    for name in [
-        "memory",
-        "tag",
-        "memory_tag",
-        "memory_fts",
-        "memory_link",
-        "meta",
-    ] {
+    for name in ["memory", "memory_link", "meta"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
-    for name in ["memory_ai", "memory_ad", "memory_au"] {
+    // One embedding per row, so no per-field vector tables, no BM25 index, no tag tables.
+    for name in ["memory_fts", "tag", "memory_tag"] {
         assert!(
-            object_exists(&conn, "trigger", name),
-            "missing trigger {name}"
+            !object_exists(&conn, "table", name),
+            "{name} should not exist"
         );
     }
-    for name in [
-        "idx_memory_scope",
-        "idx_memory_type",
-        "idx_mtag_tag",
-        "idx_link_to",
-    ] {
-        assert!(object_exists(&conn, "index", name), "missing index {name}");
-    }
+    assert!(
+        object_exists(&conn, "index", "idx_link_to"),
+        "missing index"
+    );
     assert!(paths.db().exists(), "memory.db was not created");
 }
 
@@ -89,65 +78,50 @@ fn migrations_are_idempotent_across_reopen() {
 }
 
 #[test]
-fn fts_stays_in_sync_on_insert_update_delete() {
+fn memory_keeps_a_doc_hash_tags_and_no_scope_or_type() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
-
-    insert(&conn, "a", "Slow loris", "the quick brown fox");
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'brown'"
-        ),
-        1
-    );
-
     conn.execute(
-        "UPDATE memory SET body = 'nothing left here' WHERE key = 'a'",
+        "INSERT INTO memory (key, title, body, tags, doc_hash)
+         VALUES ('a', 'T', 'B', 'k8s,infra', 'dh')",
         [],
     )
     .unwrap();
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'brown'"
-        ),
-        0,
-        "stale token survived an update"
-    );
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'nothing'"
-        ),
-        1
-    );
 
-    conn.execute("DELETE FROM memory WHERE key = 'a'", [])
+    let (tags, doc_hash): (String, String) = conn
+        .query_row(
+            "SELECT tags, doc_hash FROM memory WHERE key = 'a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'nothing'"
-        ),
-        0
+    assert_eq!((tags.as_str(), doc_hash.as_str()), ("k8s,infra", "dh"));
+
+    // `doc_hash` is NOT NULL; `tags` defaults to the empty string.
+    assert!(
+        conn.execute(
+            "INSERT INTO memory (key, title, body) VALUES ('b', 'T', 'B')",
+            [],
+        )
+        .is_err()
     );
+    conn.execute(
+        "INSERT INTO memory (key, title, body, doc_hash) VALUES ('c', 'T', 'B', 'dh')",
+        [],
+    )
+    .unwrap();
+    let tags: String = conn
+        .query_row("SELECT tags FROM memory WHERE key = 'c'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tags, "");
 }
 
 #[test]
-fn deleting_a_memory_cascades_to_tags_and_links() {
+fn deleting_a_memory_cascades_to_links() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
 
     insert(&conn, "a", "Anchor", "see [[ghost]]");
-    conn.execute("INSERT INTO tag (name) VALUES ('k8s')", [])
-        .unwrap();
-    conn.execute(
-        "INSERT INTO memory_tag (memory_id, tag_id)
-         SELECT m.id, t.id FROM memory m, tag t WHERE m.key = 'a' AND t.name = 'k8s'",
-        [],
-    )
-    .unwrap();
     conn.execute(
         "INSERT INTO memory_link (from_id, to_key, rel)
          SELECT id, 'ghost', 'see' FROM memory WHERE key = 'a'",
@@ -158,10 +132,7 @@ fn deleting_a_memory_cascades_to_tags_and_links() {
     conn.execute("DELETE FROM memory WHERE key = 'a'", [])
         .unwrap();
 
-    assert_eq!(count(&conn, "SELECT count(*) FROM memory_tag"), 0);
     assert_eq!(count(&conn, "SELECT count(*) FROM memory_link"), 0);
-    // The tag itself is shared vocabulary and must survive the link going away.
-    assert_eq!(count(&conn, "SELECT count(*) FROM tag"), 1);
 }
 
 #[test]
@@ -171,8 +142,7 @@ fn key_is_unique() {
 
     insert(&conn, "dup", "One", "body");
     let err = conn.execute(
-        "INSERT INTO memory (key, scope, title, body, hash)
-         VALUES ('dup', 'infra', 'Two', 'body', 'h')",
+        "INSERT INTO memory (key, title, body, doc_hash) VALUES ('dup', 'Two', 'body', 'h')",
         [],
     );
     assert!(

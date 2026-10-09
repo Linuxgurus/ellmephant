@@ -30,9 +30,10 @@ attempt.
 - Hermetic Rust binary: no Python/Node runtime, no external service, no cloud.
 - SQLite is the single source of truth (one file, `~/.llmphant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
-- Hybrid retrieval (BM25 + KNN) with scope/tag prefilter.
+- Retrieval as a single **phrase** matched semantically (KNN) or by regex over `title`/`body` —
+  `key`/`tags` are identity and lookup, not search.
 - Wiki-style links with backlinks and one-hop graph expansion.
-- Multi-client via MCP; interactive REPL for humans; JSONL export/import.
+- Multi-client via MCP; interactive REPL for humans.
 
 **Non-goals**
 
@@ -61,7 +62,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 | # | Decision | Rationale |
 |---|---|---|
 | 1 | **Rust**, single binary | Pure-Rust inference + `bundled` SQLite ⇒ no interpreter, no sidecar. Go loses: no pure-Go BERT inference |
-| 2 | **SQLite = truth**; no markdown on disk | One authoritative file; portability via export. Markdown loses atomic updates, normalised tags, and flat retrieval as it grows |
+| 2 | **SQLite = truth**; no markdown on disk | One authoritative file you can copy. Markdown loses atomic updates, normalised tags, and flat retrieval as it grows |
 | 3 | **`rusqlite` (`bundled`) + `sqlite-vec`** as auto-extension | SQLite **and** `vec0` statically linked into the binary (`sqlite3_vec_init` via `sqlite3_auto_extension`). No `.dylib`, no `load_extension` |
 | 4 | **`candle`** for inference (not `ort`/ONNX) | `ort` binds C++ ONNX Runtime (default: downloaded shared lib) — a sidecar. `candle` is pure Rust ⇒ truly in-binary |
 | 5 | **Qwen3-Embedding-0.6B**, 1024d, cosine | Best MTEB-multilingual of the candidates we compared (64.33 vs bge-m3 59.56), 32k context, MRL-capable, instruction-aware, and the only one with a **native candle path** (`fastembed`'s `Qwen3TextEmbedding`) |
@@ -69,9 +70,9 @@ mcp-memory-service → typed edges + tag AND/OR).
 | 7 | Weights **external**: our own flat cache under `~/.llmphant/models/`, or `--model-dir`; `--offline`; sha-pinned revision (§6.1–6.5) | Keeps the binary small; weights are data. We own the layout (not `HF_HOME`) so it is inspectable, `gc`-able, and integrity-checked |
 | 8 | **cosine**, L2-normalised both sides; **last-token pooling + left-pad** | Qwen3 is a decoder embedder — mean pooling (the candle BERT example) gives silently worse vectors |
 | 9 | Root `~/.llmphant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
-| 10 | Free-form tags; **single** `scope` | Tags give the many-to-many; scope is the one bucket (matches existing `infra-`/`projects-` prefixes) |
-| 11 | `key` = **global-unique slug**, optional to supply | Doubles as identity (upsert target) and link target; auto-slugged from scope+words when omitted |
-| 12 | Export/import **JSONL** (+ optional Markdown bundle) | Streamable, greppable, `jq`-able, line-atomic diffs; ids and vectors excluded (both local/derived) |
+| 10 | **Tags** name aspects of a subject (e.g. `storage`, `gotchas`); no `scope`, no `type` | Tags are a facet and part of the embedded document, so a tag token is retrievable; a bucket/type taxonomy adds vocabulary without adding recall |
+| 11 | `key` = **global-unique slug**, optional to supply | Identity (upsert target) and link target; auto-slugged from the title when omitted |
+| 12 | **Smart-caveman** writing; **one** document embedding over `key` + tags + `title` + `body` | Terse text embeds sharply, and one vector per row is simpler to build and rebuild; terseness keeps the body from swamping the title |
 
 ## 5. Architecture
 
@@ -84,8 +85,8 @@ mcp-memory-service → typed edges + tag AND/OR).
 - **Process model:** one **long-lived** process (REPL or `mcp`) holds the model warm
   (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
   A shared daemon is *optional* and only if bare one-shot latency annoys us (see §15).
-- **Indexes are derived:** vectors (`memory_vec`), full-text (`memory_fts`), and links
-  (`memory_link`) are all rebuildable from `memory`. Only `memory` is truth.
+- **Indexes are derived:** the document vectors (`memory_vec`) and links (`memory_link`) are all
+  rebuildable from `memory`. Only `memory` is truth — no FTS index, no tag tables.
 
 ## 6. Embedder
 
@@ -97,9 +98,9 @@ mcp-memory-service → typed edges + tag AND/OR).
 - **Pooling:** last-token with **left** padding, then L2-normalise.
 - **Query instruction:** `Instruct: <task>\nQuery: <q>` on the query side; documents bare
   (+1–5%). Task string stored in `meta`.
-- **store ≠ embed:** the *row* keeps the full `body`; the *vector* is computed over a
-  **condensed projection** (`title` + canonical body, `[[links]]` stripped). Retrieval
-  stays sharp while storage stays rich.
+- **store ≠ embed:** the *row* keeps the full literal text; one **document** is embedded — the
+  `key`, the tags, the title and the link-stripped body (`[[links]]` removed), one non-empty
+  part per line. One vector per row.
 
 ### 6.1 Weights are data: the model cache
 
@@ -178,35 +179,18 @@ PRAGMA foreign_keys = ON;
 PRAGMA user_version = 1;
 
 CREATE TABLE memory (
-  id      INTEGER PRIMARY KEY,
-  key     TEXT NOT NULL UNIQUE,                 -- slug; upsert + link target
-  scope   TEXT NOT NULL,                        -- single
-  type    TEXT NOT NULL DEFAULT 'fact',         -- signpost|dictate|fact|profile
-  title   TEXT NOT NULL,                        -- salient line
-  body    TEXT NOT NULL,                        -- full, verifiable
-  source  TEXT,                                 -- provenance: command/path/repo/quote
-  hash    TEXT NOT NULL,                        -- sha256(model|dim|embed_text)
-  model   TEXT,
-  dim     INTEGER,
-  created TEXT NOT NULL DEFAULT (datetime('now')),
-  updated TEXT NOT NULL DEFAULT (datetime('now'))
+  id       INTEGER PRIMARY KEY,
+  key      TEXT NOT NULL UNIQUE,              -- slug; upsert + link target
+  title    TEXT NOT NULL,                     -- smart-caveman one-liner
+  body     TEXT NOT NULL,                     -- smart-caveman fact
+  tags     TEXT NOT NULL DEFAULT '',          -- normalised names, comma-joined, sorted
+  source   TEXT,                              -- provenance: command/path/repo/quote
+  doc_hash TEXT NOT NULL,                     -- sha256(model|dim|embedded document)
+  created  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated  TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX idx_memory_scope ON memory(scope);
-CREATE INDEX idx_memory_type  ON memory(type);
 
-CREATE TABLE tag (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-CREATE TABLE memory_tag (
-  memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
-  tag_id    INTEGER NOT NULL REFERENCES tag(id)    ON DELETE CASCADE,
-  PRIMARY KEY (memory_id, tag_id)
-) WITHOUT ROWID;
-CREATE INDEX idx_mtag_tag ON memory_tag(tag_id);
-
-CREATE VIRTUAL TABLE memory_fts USING fts5(
-  title, body, content='memory', content_rowid='id',
-  tokenize='unicode61 remove_diacritics 2');
--- triggers memory_ai / memory_ad / memory_au keep FTS in sync (external content)
-
+-- Derived, created programmatically by `index::vec::ensure` (dim is runtime, not schema):
 CREATE VIRTUAL TABLE memory_vec USING vec0(
   memory_id INTEGER PRIMARY KEY,
   embedding float[1024] distance_metric=cosine);
@@ -230,7 +214,7 @@ Notes: `memory_vec` is **app-written** (SQLite can't embed). FTS is external-con
 
 - **Author:** inline `[[key]]` in `body` (canonical, greppable, exportable).
 - **Index:** parse to `memory_link(from_id, to_key, rel)` at write time — a *derived* index.
-- **By key, never by id:** survives export/import; supports forward refs; dangling links are
+- **By key, never by id:** survives a `reembed`; supports forward refs; dangling links are
   detected (non-fatal) rather than broken FKs:
   `SELECT DISTINCT to_key FROM memory_link WHERE to_key NOT IN (SELECT key FROM memory);`
 - **Backlinks:** `SELECT from_id FROM memory_link WHERE to_key = ?` → powers one-hop graph
@@ -251,48 +235,64 @@ The store is **atomics-first**; generalization is derived, not stored.
 - **A sparse pointer tier** (`*-overview` notes) is allowed for routing/navigation only —
   pointers, not content; governed by "one home per fact, cross-link don't duplicate."
 - **Write policy** (guided via tool descriptions + a system instruction):
-  one fact per row · typed (`signpost|dictate|fact|profile`) · **provenance** in `source`
+  **smart-caveman** — drop filler, articles and glue words, keep high-signal words ·
+  one fact per row · **tags** name aspects of the subject · **provenance** in `source`
   (store the *derivation command*, not live state) · upsert-by-`key` · trim-on-edit
-  (never grow) · soft length guard on `body` · never store cheaply-derivable state.
-- **Read policy:** return **snippets + scores**, never dumps (tokens regress otherwise).
+  (never grow) · never store cheaply-derivable state.
+- **Read policy:** return **titles, tags and scores**, never dumps (tokens regress otherwise);
+  the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
+  at a small `k`, judged from titles/tags/distances, `memory_get` only the hit(s) you'll use,
+  widening (`k`) only if none fit.
 
 ## 10. Search
 
-- **Hybrid = FTS5 BM25 ∪ `vec0` KNN**, merged with **RRF (k=60)**. BM25 is mandatory — it
-  carries exact tokens (IDs, hostnames, paths) that embeddings fumble. The RRF constant is a
-  per-query knob (`rrf_k`, default 60) so `bench --sweep` can tune it (P10).
-- **Prefilter:** `scope` (default), tags are **OR-within / AND-across**.
-- **Params:** default `k=10`; `max_distance` optional (off); `mode = hybrid|vec|fts`.
-- **Returns:** `{id, key, scope, type, title, body, tags, score, distance}` so the caller can
-  judge confidence (mitigates the false-memory hazard, §14).
-- **`--expand N`:** pull N-hop link neighbourhoods into the result bundle (derived profiles).
+A search is a single **semantic phrase**. There are no key/tag constraints and no literal
+(regex) leg — `key` and `tags` are identity and lookup, and both are folded into the embedded
+document, so a phrase reaches them semantically.
+
+- The phrase is embedded (query-side instruction) and the KNN of the whole store is taken,
+  within a cosine-distance ceiling. One vector per row (§6).
+- **Params:** default `k=10`; `max_distance` optional, falling back to the configured
+  `default_max_distance` (`0.5`; `null` disables the cap). With no phrase, results are ordered
+  by `key` and uncapped. The KNN is taken over the whole store and `k` truncates the ranked
+  result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
+  loosening `max_distance`, else by raising `k`.
+- **Returns:** `{key, title, tags, distance}` — **never the body** (fetch it with
+  `memory_get`/`show`).
+- **`--expand N`:** pull N-hop link neighbourhoods into the result bundle (derived profiles);
+  neighbours keep their (snipped) bodies.
 
 ```sql
--- KNN leg
+-- Semantic phrase: KNN over the document vectors
 SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance;
--- BM25 leg (scoped)
-SELECT m.id, bm25(memory_fts) AS score FROM memory_fts
-  JOIN memory m ON m.id = memory_fts.rowid
-  WHERE memory_fts MATCH ?1 AND m.scope = ?2 ORDER BY score LIMIT ?3;
 ```
 
 ## 11. Interfaces
 
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_add`, `memory_update`,
 `memory_delete`, `memory_search`,
-`memory_get`, `memory_backlinks`, `memory_export`, `memory_import`. (Names TBD in detailed spec.)
+`memory_get`, `memory_backlinks`, `memory_list`.
+
+- The server also advertises the §9 write policy as its **instructions**, and each write tool
+  carries it in its description — that is what the model actually reads.
+- `memory_search` takes a semantic `phrase` and the ranking knobs `k`, `max_distance` and
+  `expand`; there are **no key/tag filters and no regex leg** — `key`/`tags` are not search
+  constraints, and `memory_get` reads a known key.
+- `memory_list` returns the store index (`key`, `tags`, `title`, no bodies) — cheap browsing (§9).
+- `memory_get` is the **only** read that returns a body, and the way to read a known `key`.
 
 **CLI** — three faces over one core:
 
 - `llmphant` → **REPL** (rustyline: history at `~/.llmphant/history`, completion;
-  bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `tags`, `link`,
-  `reembed`, `export`, `import`, `model`, `help`, `quit`.
+  bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `list`, `tags`,
+  `rename`, `reembed`, `links`, `model`, `help`, `quit`.
 - One-shot flags for scripting: `llmphant search "..." --json`.
+- `llmphant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
 - `llmphant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
 - `llmphant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
 
-**Export/import:** JSONL canonical (`{key,scope,type,title,body,source,tags,created,updated}`;
-no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embed on hash change.
+**Portability:** the store is one file (`~/.llmphant/memory.db`), so moving a machine is a copy.
+`reembed` rebuilds the vectors for a new model or dimension; `rename` fixes keys.
 
 ## 12. Config & paths
 
@@ -315,6 +315,7 @@ device     = "cpu"                        # cpu | metal
 instruction = "Given a question, retrieve relevant memories"
 dim        = 1024
 default_k  = 10
+default_max_distance = 0.5                # KNN cosine-distance ceiling; null = off
 port       = 8888                         # MCP HTTP port; `mcp --stdio` ignores it
 ```
 
@@ -329,20 +330,19 @@ any model is touched; flags are re-checked the same way after they override the 
   long-lived process. Warmup one throwaway embed at startup.
 - KNN at our scale (10^3–10^6 vectors) is sub-ms — the index is never the bottleneck.
 - **`bench` (P10)** replaces these estimates with numbers: it prints load time, embed latency
-  and hybrid-search latency (mean/p50/p95) at the store's current row count. `bench --golden`
-  scores a JSONL query set (recall@k + MRR, gate recall@3 ≥ 0.8); `bench --sweep` walks the
-  query-time knobs (`k`, RRF weight) and compares the embed projections. The seed set lives in
-  `tests/golden/`; the shipped defaults are the ones swept best (`k=10`, RRF `k=60`,
-  projection `title+body`).
+  and semantic-search latency (mean/p50/p95) at the store's current row count. `bench --golden`
+  scores a JSONL query set (recall@k + MRR, gate recall@3 ≥ 0.8); `bench --sweep` walks `k`. The
+  seed set lives in `tests/golden/`; the shipped default is `k=10`.
 
 ## 14. Risks
 
-- **False-memory hazard:** semantic neighbors can be confidently *wrong*. Mitigate: return
-  scores/distance, keep `scope` honest, don't over-trust, use one-hop expansion for context.
-- **Fat returns regress token cost** below plain `grep` — tight snippets is a *requirement*.
+- **False-memory hazard:** semantic neighbors can be confidently *wrong*. Mitigate: return the
+  distance, keep tags honest, don't over-trust, use one-hop expansion for context.
+- **Fat returns regress token cost** below plain `grep` — titles-not-bodies is a *requirement*.
 - **Write quality governs everything** — low friction means more (and sloppier) writes.
 - **bf16 CPU emulation** may be slow → `--precision f16`.
-- **Loss of greppability** (SQLite isn't `rg`); JSONL export is the escape hatch.
+- **Loss of greppability** (SQLite isn't `rg`) — retrieval is semantic; the store is one copyable
+  file, so external tools can still read it (or the JSON export).
 - **Key collisions / renames** — need deliberate keys and a real `rename` path.
 - **Model cache drift/corruption** — `main` moving, a truncated 1.2 GB download, a bad disk.
   Mitigate: sha-pinned revision + per-file sha256 in the manifest, atomic per-file writes,
@@ -351,9 +351,8 @@ any model is touched; flags are re-checked the same way after they override the 
 ## 15. Open questions (resolved during the build)
 
 1. **Golden eval set + `bench`** — shipped (P10): `tests/golden/` (corpus + ≥20 questions),
-   `bench` / `--golden` / `--sweep`; defaults `k=10`, RRF `k=60`, projection `title+body`;
-   recall@3 gate 0.8. Grown from real usage.
-2. **MCP tool schema + annotations** — shipped (P7): 8 tools with JSON-Schema params and
+   `bench` / `--golden` / `--sweep`; default `k=10`; recall@3 gate 0.8. Grown from real usage.
+2. **MCP tool schema + annotations** — shipped (P7): 7 tools with JSON-Schema params and
    read-only / destructive / idempotent hints (`src/mcp`).
 3. **Rename implementation + collision policy** — shipped (P9): one transaction rewrites
    `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).
@@ -361,8 +360,9 @@ any model is touched; flags are re-checked the same way after they override the 
    encoder warm, which is what the daemon would have bought (PLAN §2 #4).
 5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`; the first
    run bootstraps schema v1.
-6. **Tag governance** — shipped (P9): `tags prune` drops referenced-by-nothing tags; dangling
-   `[[key]]` targets are audited by `links`.
+6. **Tags** — decided: stored on each row (comma-joined) and folded into the document embedding;
+   `llmphant tags` derives the vocabulary and counts. Dangling `[[key]]` targets are audited by
+   `links`.
 7. **Persist `embed_text` vs recompute** — decided: recompute. The per-row `hash`
    (`store::row_hash`) decides when a re-embed is needed; nothing extra is stored.
 8. **`--expand` hop semantics + bundle shape** — shipped (P5): breadth-first over
@@ -375,25 +375,26 @@ any model is touched; flags are re-checked the same way after they override the 
 ## 16. Proposed build order
 
 1. Crate skeleton, config, paths, `meta`, logging.
-2. Migration 0001 (schema, triggers, indexes).
+2. Migration 0001 (schema, indexes).
 3. **Model cache** — fetch/pin/verify weights, offline, `model status|fetch|rm` (§6).
 4. Embedder: candle Qwen3 load + embed projection + pooling.
-5. Write path: upsert, tags, links, vec write (skip re-embed when `hash` unchanged).
-6. Read path: FTS leg → vec leg → RRF → hydrate.
+5. Write path: upsert, tags, links, one document vector (skip the re-embed when the document hash is unchanged).
+6. Read path: semantic phrase → KNN → hydrate.
 7. CLI REPL + one-shot flags.
 8. MCP server (HTTP default, stdio option).
-9. JSONL export/import; Markdown bundle.
-10. `reembed`, dangling-link audit, `rename`.
-11. `bench` + golden queries; tune.
+9. `reembed`, dangling-link audit, `rename`.
+10. `bench` + golden queries; tune.
 
 ## 17. Glossary
 
 - **Atomic / atom** — one memory row; a single fact. The storage + embedding unit.
 - **Derived view / profile** — a composed answer built at query time from atoms; never stored.
 - **Key** — the global-unique slug; identity *and* link target (wiki semantics).
-- **Scope** — the single bucket a memory lives in (`infra`, `projects`, …).
-- **Signpost / dictate / fact / profile** — memory `type`s: how-to-find, must-do rules, facts, pointers.
-- **store ≠ embed** — the row keeps full text; the vector is over a condensed projection.
-- **RRF** — Reciprocal Rank Fusion; merges the BM25 and KNN ranked lists.
+- **Title / body** — the one-liner and the fact; stored literally and folded into the document embedding.
+- **Tag** — an aspect of the subject (`storage`, `gotchas`); stored on the row and folded into the embedding.
+- **Smart-caveman** — the writing style: drop filler, articles and glue words; keep signal.
+- **Document** — the text embedded for a row: `key`, tags, title and the link-stripped body.
+- **store ≠ embed** — the row keeps full text; the vector is over a link-stripped projection.
+- **Semantic** — the phrase-match method: embed the query and take the KNN (the only leg).
 - **Model cache** — the external weights dir (`~/.llmphant/models/<owner>--<repo>/<sha>/`), a
   flat, sha-pinned, manifest-backed copy of the encoder's files; data, not code (§6.1).

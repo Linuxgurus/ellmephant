@@ -12,8 +12,6 @@ use crate::config::{Config, Paths};
 use crate::db;
 use crate::error::Result;
 use crate::model;
-use crate::search::{DEFAULT_RRF_K, Mode};
-use crate::store;
 
 use super::embed::load_embedder;
 
@@ -60,31 +58,13 @@ pub fn run(paths: &Paths, cfg: &Config, spec: &model::Spec, opts: &Options) -> R
     print_timings(&timings);
 
     if opts.golden || opts.sweep {
-        let eval = bench::evaluate(
-            &conn,
-            Some(&embedder),
-            &cases,
-            opts.k,
-            DEFAULT_RRF_K,
-            Mode::Hybrid,
-        )?;
-        print_eval("hybrid", &eval);
+        let eval = bench::evaluate(&conn, Some(&embedder), &cases, opts.k)?;
+        print_eval("semantic", &eval);
     }
 
     if opts.sweep {
-        let evals = bench::sweep(
-            &conn,
-            Some(&embedder),
-            &cases,
-            &bench::SWEEP_KS,
-            &bench::SWEEP_RRF_KS,
-            Mode::Hybrid,
-        )?;
+        let evals = bench::sweep(&conn, Some(&embedder), &cases, &bench::SWEEP_KS)?;
         print_sweep(&evals);
-
-        let corpus = store::all(&conn)?;
-        let scores = bench::sweep_projections(&embedder, &corpus, &cases, opts.k, DEFAULT_RRF_K)?;
-        print_projections(&scores);
     }
     Ok(())
 }
@@ -131,27 +111,14 @@ fn print_eval(label: &str, e: &bench::Eval) {
 }
 
 fn print_sweep(evals: &[bench::Eval]) {
-    println!("sweep (k x rrf, hybrid)");
+    println!("sweep (k, semantic)");
     for e in evals {
-        println!(
-            "  k={:<3} rrf={:<5.0} recall={:.3} mrr={:.3}",
-            e.k, e.rrf_k, e.recall, e.mrr
-        );
+        println!("  k={:<3} recall={:.3} mrr={:.3}", e.k, e.recall, e.mrr);
     }
     if let Some(best) = bench::best(evals) {
         println!(
-            "  best          k={} rrf={:.0} recall={:.3} mrr={:.3}",
-            best.k, best.rrf_k, best.recall, best.mrr
-        );
-    }
-}
-
-fn print_projections(scores: &[bench::ProjectionScore]) {
-    println!("sweep (projection, knn-only)");
-    for s in scores {
-        println!(
-            "  {:<11} recall@{} {:.3} mrr={:.3}",
-            s.projection, s.eval.k, s.eval.recall, s.eval.mrr
+            "  best          k={} recall={:.3} mrr={:.3}",
+            best.k, best.recall, best.mrr
         );
     }
 }

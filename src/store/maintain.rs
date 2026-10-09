@@ -1,9 +1,9 @@
 //! Rebuild the derived vector index from `memory` (PLAN §6 P9).
 //!
 //! The relational rows are the source of truth, so changing the encoder (or its dimension)
-//! is a *re-embed*, never a migration: walk `memory`, recompute each projection, rewrite the
-//! per-row `hash`/`model`/`dim`, and repopulate `memory_vec`. `meta` records what the vectors
-//! now correspond to so `doctor` can tell a swapped model from a corrupt one.
+//! is a *re-embed*, never a migration: walk `memory`, recompute the document projection,
+//! rewrite each row's `doc_hash`, and repopulate `memory_vec`. `meta` records what the
+//! vectors now correspond to so `doctor` can tell a swapped model from a corrupt one.
 
 use rusqlite::{Connection, params};
 
@@ -11,7 +11,7 @@ use crate::db::meta;
 use crate::embed::{Embedder, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::row_hash;
+use crate::store::{row_hash, tags_from_column};
 
 /// Rows embedded per `Embedder::embed` batch.
 const BATCH: usize = 16;
@@ -29,9 +29,9 @@ pub struct Report {
     pub model: String,
 }
 
-/// Recompute every vector and rebuild `memory_vec` (PLAN §6 P9). Handles a dimension change
-/// by dropping and recreating the table (the one path [`index::vec::ensure`] refuses), and
-/// records `dim`/`model`/`instruction` in `meta`.
+/// Recompute every vector and rebuild the vec0 table (PLAN §6 P9). Handles a dimension
+/// change by dropping and recreating the table (the one path [`index::vec::ensure`]
+/// refuses), and records `dim`/`model`/`instruction` in `meta`.
 pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) -> Result<Report> {
     let dim = embedder.dim();
     let rebuilt = index::vec::stored_dim(conn)? != Some(dim);
@@ -45,28 +45,36 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     meta::set(conn, meta::INSTRUCTION, instruction)?;
 
     // Snapshot the rows to embed before opening the write transaction.
-    let rows: Vec<(i64, String, String, String)> = {
-        let mut stmt = conn.prepare("SELECT id, scope, title, body FROM memory ORDER BY id")?;
-        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let rows: Vec<(i64, String, Vec<String>, String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, key, tags, title, body FROM memory ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| {
+            let tags: String = r.get(2)?;
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                tags_from_column(&tags),
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     let rows_count = rows.len();
-    let dim_col = dim as i64;
     // The batch embed stays inside the tx on purpose: a full rebuild wants one atomic swap
     // of the whole index, and it is a deliberate, rare maintenance command.
     let tx = conn.unchecked_transaction()?;
     for chunk in rows.chunks(BATCH) {
-        let texts: Vec<String> = chunk
+        let docs: Vec<String> = chunk
             .iter()
-            .map(|(_, _, title, body)| projection::embed_text(title, body))
+            .map(|(_, key, tags, title, body)| projection::embed_document(key, tags, title, body))
             .collect();
-        let vectors = embedder.embed(&texts)?;
-        for ((id, scope, _, _), (text, vector)) in chunk.iter().zip(texts.iter().zip(&vectors)) {
-            index::vec::upsert(&tx, *id, scope, vector)?;
+        let vectors = embedder.embed(&docs)?;
+        for (i, (id, _, _, _, _)) in chunk.iter().enumerate() {
+            index::vec::upsert(&tx, *id, &vectors[i])?;
             tx.execute(
-                "UPDATE memory SET hash = ?2, model = ?3, dim = ?4 WHERE id = ?1",
-                params![id, row_hash(embedder, text), embedder.model_id(), dim_col],
+                "UPDATE memory SET doc_hash = ?2 WHERE id = ?1",
+                params![id, row_hash(embedder, &docs[i])],
             )?;
         }
     }

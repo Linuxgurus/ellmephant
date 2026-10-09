@@ -239,6 +239,8 @@ pub fn run(cli: Cli) -> Result<()> {
     if let Some(precision) = cli.precision.clone() {
         cfg.precision = precision;
     }
+    // Flags override the file, so re-check here too (REFACTOR follow-up).
+    cfg.validate()?;
 
     // Flags override config (SPEC §12); `--model-dir` is inherently offline.
     let mut spec = crate::model::Spec::from_config(&cfg, &paths);

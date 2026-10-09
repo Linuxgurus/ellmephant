@@ -138,6 +138,17 @@ fn unimplemented_subcommands_fail_loudly() {
 }
 
 #[test]
+fn an_invalid_device_flag_is_rejected_before_any_model_load() {
+    // Flags override the config file, so they are validated too (REFACTOR follow-up):
+    // a bad `--device` must fail fast with one clear message, not at encoder load.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["--device", "tpu", "doctor"]);
+    assert!(!out.status.success(), "a bad device must not exit 0");
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("cpu|metal"), "got: {text}");
+}
+
+#[test]
 fn fts_search_needs_no_model_and_reports_no_matches() {
     // `--mode fts` must not load 1.2 GB of weights: a fresh store searches lexically and
     // exits cleanly with an empty result set.

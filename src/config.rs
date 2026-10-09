@@ -120,13 +120,39 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load `config.toml` if present, else defaults.
+    /// Load `config.toml` if present, else defaults, and reject an unusable config up front.
     pub fn load(paths: &Paths) -> Result<Self> {
         let path = paths.config();
-        if !path.exists() {
-            return Ok(Self::default());
+        let cfg = if path.exists() {
+            let text = std::fs::read_to_string(&path)?;
+            toml::from_str(&text)?
+        } else {
+            Self::default()
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject a bad `device`/`precision`/`dim` before anything opens a model, so the error
+    /// is one clear message instead of surfacing at encoder load (REFACTOR follow-up).
+    pub fn validate(&self) -> Result<()> {
+        const DEVICES: [&str; 2] = ["cpu", "metal"];
+        const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
+        if !DEVICES.contains(&self.device.as_str()) {
+            return Err(Error::Config(format!(
+                "invalid device {:?} (want cpu|metal)",
+                self.device
+            )));
         }
-        let text = std::fs::read_to_string(&path)?;
-        Ok(toml::from_str(&text)?)
+        if !PRECISIONS.contains(&self.precision.as_str()) {
+            return Err(Error::Config(format!(
+                "invalid precision {:?} (want bf16|f16|f32)",
+                self.precision
+            )));
+        }
+        if self.dim == 0 {
+            return Err(Error::Config("dim must be positive".into()));
+        }
+        Ok(())
     }
 }

@@ -7,8 +7,10 @@
 //! actually tuned.
 //!
 //! The store is one SQLite file behind a single connection (SPEC §15 #10), so the
-//! server holds the [`Session`] behind a mutex and serves requests serially. The
-//! `rmcp` runtime is tokio, but every tool body stays synchronous.
+//! server holds the [`Session`] behind a mutex and serves requests serially. SQLite and
+//! the encoder are synchronous and can hold the lock for a while, so each tool runs its
+//! store work on a blocking thread via [`tokio::task::spawn_blocking`] rather than
+//! occupying a tokio worker.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -187,16 +189,23 @@ impl MemoryServer {
         Self { session }
     }
 
-    /// Run `f` against the store under the lock, turning an [`Error`] into a tool-error string.
-    fn with_store<T>(
-        &self,
-        f: impl FnOnce(&mut Session) -> crate::error::Result<T>,
-    ) -> std::result::Result<T, String> {
-        let mut guard = self
-            .session
-            .lock()
-            .map_err(|_| "memory store lock poisoned".to_string())?;
-        f(&mut guard).map_err(|e| e.to_string())
+    /// Run `f` against the store on a blocking thread, turning an [`Error`] into a
+    /// tool-error string. SQLite and the encoder can hold the store lock for a while, so
+    /// this must not occupy a tokio worker (REFACTOR follow-up).
+    async fn with_store<T, F>(&self, f: F) -> std::result::Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Session) -> crate::error::Result<T> + Send + 'static,
+    {
+        let session = Arc::clone(&self.session);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = session
+                .lock()
+                .map_err(|_| "memory store lock poisoned".to_string())?;
+            f(&mut guard).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("memory store task failed: {e}"))?
     }
 }
 
@@ -219,11 +228,11 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_add(
+    async fn memory_add(
         &self,
         Parameters(p): Parameters<AddParams>,
     ) -> std::result::Result<String, String> {
-        let key = self.with_store(|s| s.add(&p.into_memory()))?;
+        let key = self.with_store(move |s| s.add(&p.into_memory())).await?;
         Ok(json_ok(
             serde_json::json!({ "status": "stored", "key": key }),
         ))
@@ -241,7 +250,7 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_update(
+    async fn memory_update(
         &self,
         Parameters(p): Parameters<AddParams>,
     ) -> std::result::Result<String, String> {
@@ -249,10 +258,12 @@ impl MemoryServer {
         if mem.key.trim().is_empty() {
             return Err("memory_update requires `key` (use memory_add to create)".to_string());
         }
-        let key = self.with_store(|s| {
-            s.show(&mem.key)?; // must exist: update never silently creates
-            s.add(&mem)
-        })?;
+        let key = self
+            .with_store(move |s| {
+                s.show(&mem.key)?; // must exist: update never silently creates
+                s.add(&mem)
+            })
+            .await?;
         Ok(json_ok(
             serde_json::json!({ "status": "updated", "key": key }),
         ))
@@ -270,16 +281,18 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_delete(
+    async fn memory_delete(
         &self,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        if self.with_store(|s| s.rm(&p.key))? {
+        let key = p.key;
+        let rm_key = key.clone();
+        if self.with_store(move |s| s.rm(&rm_key)).await? {
             Ok(json_ok(
-                serde_json::json!({ "status": "removed", "key": p.key }),
+                serde_json::json!({ "status": "removed", "key": key }),
             ))
         } else {
-            Err(format!("no such memory: {}", p.key))
+            Err(format!("no such memory: {key}"))
         }
     }
 
@@ -295,7 +308,7 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_search(
+    async fn memory_search(
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
@@ -303,17 +316,24 @@ impl MemoryServer {
             None => Mode::Hybrid,
             Some(m) => Mode::parse(m).map_err(|e| e.to_string())?,
         };
-        let bundle = self.with_store(|s| {
-            let q = Query {
-                text: p.query.clone(),
-                scope: p.scope.clone(),
-                k: p.k.unwrap_or_else(|| s.default_k()),
-                mode,
-                max_distance: p.max_distance,
-                expand: p.expand.unwrap_or(0),
-            };
-            s.search(&q)
-        })?;
+        let query = p.query;
+        let scope = p.scope;
+        let k = p.k;
+        let max_distance = p.max_distance;
+        let expand = p.expand.unwrap_or(0);
+        let bundle = self
+            .with_store(move |s| {
+                let q = Query {
+                    text: query,
+                    scope,
+                    k: k.unwrap_or_else(|| s.default_k()),
+                    mode,
+                    max_distance,
+                    expand,
+                };
+                s.search(&q)
+            })
+            .await?;
         serde_json::to_string(&bundle).map_err(|e| e.to_string())
     }
 
@@ -329,11 +349,11 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_get(
+    async fn memory_get(
         &self,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let mem = self.with_store(|s| s.show(&p.key))?;
+        let mem = self.with_store(move |s| s.show(&p.key)).await?;
         serde_json::to_string(&mem).map_err(|e| e.to_string())
     }
 
@@ -349,11 +369,13 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_backlinks(
+    async fn memory_backlinks(
         &self,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let links = self.with_store(|s| crate::store::links::backlinks(s.conn(), &p.key))?;
+        let links = self
+            .with_store(move |s| crate::store::links::backlinks(s.conn(), &p.key))
+            .await?;
         serde_json::to_string(&links).map_err(|e| e.to_string())
     }
 
@@ -369,11 +391,12 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_export(
+    async fn memory_export(
         &self,
         Parameters(p): Parameters<PathParams>,
     ) -> std::result::Result<String, String> {
-        let count = self.with_store(|s| s.export(Path::new(&p.path)))?;
+        let path = p.path.clone();
+        let count = self.with_store(move |s| s.export(Path::new(&path))).await?;
         Ok(json_ok(
             serde_json::json!({ "status": "exported", "path": p.path, "count": count }),
         ))
@@ -391,12 +414,15 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_import(
+    async fn memory_import(
         &self,
         Parameters(p): Parameters<ImportParams>,
     ) -> std::result::Result<String, String> {
         let dry_run = p.dry_run.unwrap_or(false);
-        let count = self.with_store(|s| s.import(Path::new(&p.path), dry_run))?;
+        let path = p.path.clone();
+        let count = self
+            .with_store(move |s| s.import(Path::new(&path), dry_run))
+            .await?;
         Ok(json_ok(serde_json::json!({
             "status": if dry_run { "dry-run" } else { "imported" },
             "path": p.path,

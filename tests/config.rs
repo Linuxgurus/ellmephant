@@ -59,6 +59,40 @@ fn unknown_and_malformed_config_are_rejected() {
 }
 
 #[test]
+fn validate_rejects_a_bad_device_precision_or_dim() {
+    // Defaults are valid, so a bare `validate` is a no-op.
+    Config::default().validate().expect("defaults are valid");
+
+    let bad_device = Config {
+        device: "gpu".to_string(),
+        ..Config::default()
+    };
+    let err = bad_device.validate().unwrap_err();
+    assert!(err.to_string().contains("cpu|metal"), "{err}");
+
+    let bad_precision = Config {
+        precision: "int8".to_string(),
+        ..Config::default()
+    };
+    let err = bad_precision.validate().unwrap_err();
+    assert!(err.to_string().contains("bf16|f16|f32"), "{err}");
+
+    let zero_dim = Config {
+        dim: 0,
+        ..Config::default()
+    };
+    assert!(zero_dim.validate().is_err(), "dim 0 is unusable");
+}
+
+#[test]
+fn load_rejects_an_invalid_config_file_before_any_model_load() {
+    let (_dir, paths) = temp_store();
+    std::fs::write(paths.config(), "device = \"tpu\"\n").expect("write");
+    let err = Config::load(&paths).unwrap_err();
+    assert!(err.to_string().contains("cpu|metal"), "got: {err}");
+}
+
+#[test]
 fn paths_hang_off_the_root_and_ensure_creates_the_layout() {
     let (_dir, paths) = temp_store();
     let root = paths.root();

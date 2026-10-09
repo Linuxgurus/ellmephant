@@ -5,7 +5,8 @@
 > Kept as the record of *what* changed and *why*; each step below is still the
 > recipe to reproduce or extend it.
 >
-> **Part 2** (steps 10–15, complexity reduction) follows at the end of this file.
+> **Part 2** (steps 10–15, complexity reduction), **Part 3** (steps 16–24, correctness),
+> and **Part 4** (steps 25–26, the deferred follow-ups) follow at the end of this file.
 
 Mechanical refactors only; **no behaviour change**. Every step is independently
 verifiable. Target audience: a smaller model — do the steps in order, run the
@@ -1113,14 +1114,14 @@ cargo check --no-default-features           # store-only build still compiles
 - [x] No `expect()` on a reachable branch in the CLI session.
 - [x] `cargo test` green; `cargo clippy -D warnings` clean; `cargo fmt --check` clean.
 
-## Follow-ups (not in this part)
+## Follow-ups (now closed — see Part 4)
 
-- **MCP blocks the tokio executor.** `src/mcp/mod.rs::with_store` holds a `std::sync::Mutex`
-  and runs synchronous SQLite/model work on a runtime worker. `block_in_place` is out
-  (`tests/mcp.rs` uses a current-thread runtime, where it panics), so this wants
-  `spawn_blocking` with an async tool body — a real change to the `#[tool]` fns.
-- **Config validation up front.** `device`/`precision`/`dim` are only checked at encoder
-  load; one clear message in `Config::load` would be friendlier.
+The two items surfaced here were done in **Part 4** below:
+
+- **MCP blocked the tokio executor** — `with_store` now runs store work on
+  `tokio::task::spawn_blocking` (step 25).
+- **Config validation up front** — `Config::validate` now rejects a bad
+  `device`/`precision`/`dim` at load (step 26).
 
 ## Incidental (outside the numbered steps)
 
@@ -1130,3 +1131,65 @@ cargo check --no-default-features           # store-only build still compiles
   of a fixed `$TMPDIR/llmphant-example` path.
 - **Docker healthcheck**: `Dockerfile` now probes `llmphant --version` instead of `doctor`,
   which opened and migrated the store on every 30 s poll.
+
+- **Docker healthcheck**: `Dockerfile` now probes `llmphant --version` instead of `doctor`,
+  which opened and migrated the store on every 30 s poll.
+
+
+---
+
+# Part 4 — the deferred follow-ups (steps 25–26)
+
+> **Status: applied.** These are the two items Part 3 deferred; unlike Parts 1–2 they
+> **do change behaviour** (an async MCP tool surface, an earlier config error) but no
+> output *strings* or the public API change. Same *verify* command as Part 1.
+
+## Step 25 — MCP store work off the tokio executor
+
+**Problem:** `src/mcp/mod.rs::with_store` held a `std::sync::Mutex` and ran synchronous
+SQLite/model work on a tokio worker, blocking it for the duration of the query (and, on a
+cold cache, a ~1 s encoder load). `block_in_place` is out — `tests/mcp.rs` uses a
+current-thread runtime, where it panics.
+
+**Do:**
+
+1. Make `with_store` `async`, generic over `T: Send + 'static` and
+   `F: FnOnce(&mut Session) -> Result<T> + Send + 'static`, and run the lock + closure on
+   `tokio::task::spawn_blocking` (cloning the `Arc<Mutex<Session>>` into it); map a
+   `JoinError` to `"memory store task failed: …"`.
+2. Make every `#[tool]` fn `async` and `.await` its `with_store` call (the macro wraps an
+   async body in `Box::pin(async move { … })`, so this needs no other change). Closures
+   capture owned copies of the params (`move`), cloning `key`/`path` where the value is
+   reused in the response.
+
+`spawn_blocking` works on a current-thread runtime (it uses the blocking pool), so
+`tests/mcp.rs` is unchanged.
+
+## Step 26 — validate config up front
+
+**Problem:** `device`/`precision`/`dim` were only checked at encoder load
+(`src/embed/qwen3.rs`), so a typo surfaced late with the model stack in the way.
+
+**Do:**
+
+1. Add `Config::validate(&self) -> Result<()>`: `device ∈ {cpu, metal}`,
+   `precision ∈ {bf16, f16, f32}`, `dim > 0`; each error mirrors the encoder's wording.
+2. Call it at the end of `Config::load` (file-derived config) **and** in `cli::run` after
+   the `--device`/`--precision` overrides, so flags are covered too.
+
+Tests: `tests/config.rs` (validate + load rejection) and a black-box
+`tests/cli.rs::an_invalid_device_flag_is_rejected_before_any_model_load`.
+
+## Acceptance (Part 4)
+
+```sh
+cargo fmt --all
+cargo test --locked
+cargo clippy --all-targets --all-features   # must be warning-free
+cargo check --no-default-features           # store-only build still compiles
+```
+
+- [x] No tool body blocks a tokio worker; the `rmcp` tool surface is async.
+- [x] A bad `device`/`precision`/`dim` fails at load with one clear message, flag or file.
+- [x] `tests/mcp.rs` unchanged and green; `cargo test` green; `clippy -D warnings` clean.
+

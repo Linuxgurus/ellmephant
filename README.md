@@ -144,7 +144,9 @@ Tools: `memory_add`, `memory_update`, `memory_delete`, `memory_search`, `memory_
 annotation, `memory_delete` is marked destructive, and the `memory_add`/`memory_update`
 descriptions carry the SPEC §9 write policy (one fact per row, provenance in `source`,
 upsert-by-key, trim-on-edit). `memory_search` returns scored snippets; the KNN leg loads the
-model lazily, so `mode=fts` runs with no weights and no network.
+model lazily, so `mode=fts` runs with no weights and no network. Requests are serialised
+through one store connection, and each tool runs its synchronous SQLite/model work on a
+blocking thread (`tokio::task::spawn_blocking`), so it never occupies a tokio worker.
 
 ## Build & test
 

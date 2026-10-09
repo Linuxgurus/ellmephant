@@ -314,6 +314,9 @@ dim        = 1024
 default_k  = 10
 ```
 
+Validated at load: an unknown `device`/`precision` or `dim = 0` fails with one message before
+any model is touched; flags are re-checked the same way after they override the file.
+
 ## 13. Performance expectations
 
 - Embed: ~0.3–1 s/short text on CPU, ~50–150 ms under Metal. Fine — writes are rare, search

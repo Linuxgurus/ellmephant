@@ -1,8 +1,8 @@
 # llmphant — Design Spec (decision record)
 
-> **Status:** seed spec / decision record. This captures *what we decided and why*, so a
-> fresh high-effort session can turn it into a detailed technical spec. Open questions are
-> collected in §15.
+> **Status:** decision record, v1 implemented. This captures *what we decided and why*; the
+> code is the authority for behaviour, and every phase of `PLAN.md` (P1–P10) has shipped.
+> §15 lists the questions that were open when this was written, each now resolved.
 >
 > **Name:** the crate/binary is **`llmphant`** (LLM + elephant — "never forgets"). The crate
 > name is **free on crates.io** (`elephant` was taken). Personal store root: `~/.llmphant`.
@@ -13,7 +13,8 @@ llmphant is a **single-binary, SQLite-backed long-term memory for AI agents**: t
 embedder engine is compiled into the binary, one SQLite file is the sole source of truth,
 and a *rebuildable* vector + full-text + link index sits on top of it. It speaks MCP (so
 any client — Cline, TypingMind — shares the same memory) and ships an interactive REPL for
-the human.
+the human. The name is LLM + elephant; the animal is the aspiration, the software is the
+attempt.
 
 ## 1. Why build it
 
@@ -345,20 +346,29 @@ any model is touched; flags are re-checked the same way after they override the 
   Mitigate: sha-pinned revision + per-file sha256 in the manifest, atomic per-file writes,
   load-time size check with `doctor --verify` for the full hash (§6.3–6.4).
 
-## 15. Open questions (for the detailed spec)
+## 15. Open questions (resolved during the build)
 
-1. ~~Golden **eval set** + `bench`~~ — **shipped (P10)**: `tests/golden/` (corpus + ≥20
-   questions), `bench`/`bench --golden`/`bench --sweep`; defaults `k=10`, RRF `k=60`,
-   projection `title+body`; recall@3 gate 0.8. Grown from real usage.
-2. Exact **MCP tool schema** + annotations (readOnly/destructive/idempotent).
-3. **Rename** implementation (rewrite bodies + edges) and collision policy.
-4. **Daemon vs not** for one-shot CLI latency.
-5. **Migration mechanics** (`user_version` steps) and first-run bootstrap.
-6. Tag governance (dangling/merge/prune of orphan tags).
-7. Whether to persist `embed_text` explicitly vs recompute.
-8. `--expand` hop semantics and result-bundle shape.
-9. Metal acceleration wiring in candle; thread/intra-op config.
-10. Concurrency: single writer + readers; `busy_timeout`.
+1. **Golden eval set + `bench`** — shipped (P10): `tests/golden/` (corpus + ≥20 questions),
+   `bench` / `--golden` / `--sweep`; defaults `k=10`, RRF `k=60`, projection `title+body`;
+   recall@3 gate 0.8. Grown from real usage.
+2. **MCP tool schema + annotations** — shipped (P7): 8 tools with JSON-Schema params and
+   read-only / destructive / idempotent hints (`src/mcp`).
+3. **Rename implementation + collision policy** — shipped (P9): one transaction rewrites
+   `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).
+4. **Daemon vs not** — decided: no daemon in v1. The REPL and the MCP server both keep the
+   encoder warm, which is what the daemon would have bought (PLAN §2 #4).
+5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`; the first
+   run bootstraps schema v1.
+6. **Tag governance** — shipped (P9): `tags prune` drops referenced-by-nothing tags; dangling
+   `[[key]]` targets are audited by `links`.
+7. **Persist `embed_text` vs recompute** — decided: recompute. The per-row `hash`
+   (`store::row_hash`) decides when a re-embed is needed; nothing extra is stored.
+8. **`--expand` hop semantics + bundle shape** — shipped (P5): breadth-first over
+   `memory_link` in both directions, surfaced as `search::Bundle { hits, neighbors }`.
+9. **Metal wiring** — shipped (P3): `--device cpu|metal`; CPU runs f32 (Accelerate), so
+   `--precision` applies to Metal only.
+10. **Concurrency** — shipped: one writer connection per `Session`; the MCP server serialises
+    requests through a mutex (SPEC §13 #10).
 
 ## 16. Proposed build order
 

@@ -1,6 +1,8 @@
-# golden eval set
+# the golden eval set (the lie detector)
 
-Seed set for `llmphant bench --golden` (PLAN §6 P10). Two files:
+Seed set for `llmphant bench --golden` (PLAN §6 P10). Search quality is one of those things
+everyone claims to have and nobody measures, so this directory is where the claims meet the
+recall number. Two files:
 
 - `memories.jsonl` — a canonical-JSONL corpus (the same shape `llmphant export` writes). The
   test harness imports it with the deterministic `HashEmbedder`; a real store uses its own rows.

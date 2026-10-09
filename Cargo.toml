@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Single-binary, SQLite-backed long-term memory for AI agents"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://example.invalid/llmphant"
 readme = "README.md"
 

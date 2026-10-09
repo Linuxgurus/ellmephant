@@ -87,12 +87,27 @@ fn doctor_bootstraps_a_fresh_home() {
 
 #[test]
 fn unimplemented_subcommands_fail_loudly() {
+    // `mcp` (P7) is still a stub; it must exit non-zero rather than pretend to serve.
     let dir = tempfile::tempdir().unwrap();
-    let out = run(dir.path(), &["search", "anything"]);
+    let out = run(dir.path(), &["mcp"]);
     assert!(
         !out.status.success(),
         "an unimplemented path must not exit 0"
     );
     let text = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(text.contains("not implemented"), "got: {text}");
+}
+
+#[test]
+fn fts_search_needs_no_model_and_reports_no_matches() {
+    // `--mode fts` must not load 1.2 GB of weights: a fresh store searches lexically and
+    // exits cleanly with an empty result set.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["search", "anything", "--mode", "fts"]);
+    assert!(
+        out.status.success(),
+        "fts search failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("no matches"), "got: {}", stdout(&out));
 }

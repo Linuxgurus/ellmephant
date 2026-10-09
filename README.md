@@ -10,9 +10,9 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phases 1, 2, 2.5, 3 and 4 are real and tested: bootstrap, schema + FTS triggers, the
-`sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, and the
-write path. Search (P5), REPL/MCP and the portability layers are still typed stubs that
+Phases 1, 2, 2.5, 3, 4 and 5 are real and tested: bootstrap, schema + FTS triggers, the
+`sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, the write
+path, and hybrid search. REPL/MCP and the portability layers are still typed stubs that
 return `NotImplemented`. `cargo test` needs no model and no network.
 
 | Area | State |
@@ -23,7 +23,8 @@ return `NotImplemented`. `cargo test` needs no model and no network.
 | `model` — weights cache: resolve, fetch, verify, offline (SPEC §6) | done |
 | `embed::qwen3` — candle encoder: last-token pool, L2, query instruction (P3) | done |
 | `store` — write path (upsert, tags, links, vec) | done |
-| search (P5), REPL (P6), MCP (P7), export/import (P8), bench (P10) | stubs |
+| `search` — hybrid BM25 ∪ KNN fused with RRF, `--expand`, `--max-distance` (P5) | done |
+| REPL (P6), MCP (P7), export/import (P8), bench (P10) | stubs |
 
 The encoder is behind the default-on `encoder` cargo feature; build with
 `--no-default-features` for a store-only binary that links no ML stack.
@@ -66,6 +67,22 @@ llmphant embed "where do the logs live" --query   # dim + load/embed latency + n
 
 `cargo test` never loads the model: the store/search layers inject the deterministic
 `HashEmbedder`, and the real-weights check is `#[ignore]`d (`tests/embed.rs`).
+
+## Search
+
+`hybrid` (the default) runs both legs and fuses them with RRF (k=60); `--mode vec|fts` runs
+one. `--mode fts` needs no weights and no network. `--expand N` appends the N-hop link
+neighbourhood; `--max-distance` caps the KNN leg; `--scope` prefilters both legs.
+
+```sh
+llmphant search "where do the logs live"            # hybrid, k=10
+llmphant search "portainer-notes-gw" --mode fts     # exact identifier, no model
+llmphant search "gateway" --scope infra --json
+llmphant search "backups" --expand 1                # + linked neighbours
+```
+
+Every hit carries its fused `score` (and `distance` when the KNN leg contributed) so the
+caller can judge confidence — the read policy is snippets + scores, never dumps (SPEC §10).
 
 ## Build & test
 

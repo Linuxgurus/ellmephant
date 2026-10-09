@@ -4,11 +4,29 @@
 //! `--json` and the human path stay interchangeable.
 
 use crate::error::Result;
-use crate::search::Hit;
+use crate::search::{Bundle, Hit};
 
 /// Serialise any hit list as a JSON array.
 pub fn hits_to_json(hits: &[Hit]) -> Result<String> {
     Ok(serde_json::to_string_pretty(hits)?)
+}
+
+/// Render a search bundle for a terminal (or `--json`), ranked first.
+pub fn render_bundle(bundle: &Bundle, json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(bundle)?);
+    }
+    let mut out = render_hits(&bundle.hits, false)?;
+    if !bundle.neighbors.is_empty() {
+        out.push_str(&format!("\n{} linked:\n", bundle.neighbors.len()));
+        for n in &bundle.neighbors {
+            out.push_str(&format!(
+                "  hop {}  [[{}]] -> {}  {}\n",
+                n.hop, n.via, n.memory.key, n.memory.title
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Render hits for a terminal, newest-ranked first.

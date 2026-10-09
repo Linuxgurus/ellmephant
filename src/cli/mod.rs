@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
-use crate::search::Mode;
+use crate::search::{self, Mode, Query};
 use crate::{db, embed, index, model};
 
 /// Top-level arguments. `--home` (or `LLMPHANT_HOME`) relocates the whole store,
@@ -90,6 +90,9 @@ pub enum Command {
         /// `hybrid|vec|fts`.
         #[arg(long, default_value = "hybrid")]
         mode: String,
+        /// Cosine-distance ceiling (KNN leg only).
+        #[arg(long)]
+        max_distance: Option<f32>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -205,10 +208,26 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Doctor => doctor(&paths, &cfg, &spec),
         Command::Model { command } => model_cmd(&spec, command),
         Command::Add { .. } => Err(Error::NotImplemented("add (PLAN.md P4)")),
-        Command::Search { mode, .. } => {
-            Mode::parse(&mode)?;
-            Err(Error::NotImplemented("search (PLAN.md P5)"))
-        }
+        Command::Search {
+            query,
+            scope,
+            k,
+            mode,
+            max_distance,
+            json,
+            expand,
+        } => search_cmd(
+            &paths,
+            &cfg,
+            &spec,
+            query,
+            scope,
+            k,
+            mode,
+            max_distance,
+            expand,
+            json,
+        ),
         Command::Show { .. } => Err(Error::NotImplemented("show (PLAN.md P4)")),
         Command::Rm { .. } => Err(Error::NotImplemented("rm (PLAN.md P4)")),
         Command::Tags => Err(Error::NotImplemented("tags (PLAN.md P9)")),
@@ -218,6 +237,44 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
         Command::Embed { text, query } => embed(&spec, &cfg, &text, query),
     }
+}
+
+/// `llmphant search "…"` — hybrid (or `--mode`) retrieval over the store.
+///
+/// The encoder is loaded *only* when the mode's KNN leg runs, so `--mode fts` works with
+/// no weights and no network.
+#[allow(clippy::too_many_arguments)]
+fn search_cmd(
+    paths: &Paths,
+    cfg: &Config,
+    spec: &model::Spec,
+    text: String,
+    scope: Option<String>,
+    k: Option<usize>,
+    mode: String,
+    max_distance: Option<f32>,
+    expand: u8,
+    json: bool,
+) -> Result<()> {
+    let mode = Mode::parse(&mode)?;
+    let conn = db::open(paths)?;
+    let query = Query {
+        text,
+        scope,
+        k: k.unwrap_or(cfg.default_k),
+        mode,
+        max_distance,
+        expand,
+    };
+
+    let embedder = if mode.needs_embedder() {
+        Some(load_embedder(spec, cfg)?)
+    } else {
+        None
+    };
+    let bundle = search::run(&conn, embedder.as_ref().map(|e| e as &dyn embed::Embedder), &query)?;
+    print!("{}", format::render_bundle(&bundle, json)?);
+    Ok(())
 }
 
 /// Build the production Qwen3 encoder from the resolved cache + config. This is the one

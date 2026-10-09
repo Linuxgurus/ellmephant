@@ -256,11 +256,24 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
 
 /// Fetch one memory (with tags) by key.
 pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
+    let id: Option<i64> = conn
+        .query_row("SELECT id FROM memory WHERE key = ?1", params![key], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    match id {
+        Some(id) => get_by_id(conn, id),
+        None => Ok(None),
+    }
+}
+
+/// Fetch one memory (with tags) by rowid — the hydration step of the read path (P5).
+pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<Memory>> {
     let row = conn
         .query_row(
             "SELECT id, key, scope, type, title, body, source, hash, created, updated
-               FROM memory WHERE key = ?1",
-            params![key],
+               FROM memory WHERE id = ?1",
+            params![id],
             |r| {
                 Ok(Memory {
                     id: Some(r.get(0)?),
@@ -282,7 +295,6 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
     let Some(mut mem) = row else {
         return Ok(None);
     };
-    let id = mem.id.unwrap_or_default();
     let mut stmt = conn.prepare(
         "SELECT t.name FROM tag t
            JOIN memory_tag mt ON mt.tag_id = t.id

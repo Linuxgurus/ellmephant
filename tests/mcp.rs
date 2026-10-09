@@ -171,3 +171,72 @@ async fn tools_round_trip_over_the_transport() {
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }
+
+#[tokio::test]
+async fn export_and_import_tools_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    for key in ["note-one", "note-two"] {
+        let added = call(
+            &client,
+            "memory_add",
+            serde_json::json!({
+                "key": key,
+                "scope": "infra",
+                "title": key,
+                "body": format!("body for {key}"),
+            }),
+        )
+        .await;
+        assert!(!added.is_error.unwrap_or(false), "{}", text(&added));
+    }
+
+    let dump = dir.path().join("dump.jsonl");
+    let exported = call(
+        &client,
+        "memory_export",
+        serde_json::json!({ "path": dump.to_str().unwrap() }),
+    )
+    .await;
+    assert!(!exported.is_error.unwrap_or(false), "{}", text(&exported));
+    assert!(
+        text(&exported).contains("\"count\":2"),
+        "{}",
+        text(&exported)
+    );
+    assert!(dump.is_file(), "export wrote no file");
+
+    // Importing the just-written dump is idempotent, so a dry-run reports zero changes.
+    let dry = call(
+        &client,
+        "memory_import",
+        serde_json::json!({ "path": dump.to_str().unwrap(), "dry_run": true }),
+    )
+    .await;
+    assert!(!dry.is_error.unwrap_or(false), "{}", text(&dry));
+    assert!(text(&dry).contains("\"count\":0"), "{}", text(&dry));
+
+    // A bad retrieval mode is a tool error, not a panic.
+    let bad = call(
+        &client,
+        "memory_search",
+        serde_json::json!({ "query": "anything", "mode": "knn" }),
+    )
+    .await;
+    assert_eq!(bad.is_error, Some(true));
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

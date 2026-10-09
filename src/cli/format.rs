@@ -221,6 +221,18 @@ mod tests {
     }
 
     #[test]
+    fn human_bytes_scales_and_never_abbreviates_small_values() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        // Beyond the last unit, the value keeps growing in GiB.
+        assert_eq!(human_bytes(2048 * 1024 * 1024 * 1024), "2048.0 GiB");
+    }
+
+    #[test]
     fn dangling_renders_and_serialises() {
         assert_eq!(render_dangling(&[], false).unwrap(), "(no dangling links)");
         let dangling = vec![Dangling {

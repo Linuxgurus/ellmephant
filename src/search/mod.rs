@@ -274,4 +274,27 @@ mod tests {
         // Truncation is on a char boundary, not a byte index.
         assert_eq!(snippet(&"á".repeat(5), 3), "ááá…");
     }
+
+    #[test]
+    fn mode_parses_case_insensitively_and_round_trips() {
+        for (text, mode) in [
+            ("hybrid", Mode::Hybrid),
+            ("VEC", Mode::Vec),
+            ("Fts", Mode::Fts),
+        ] {
+            assert_eq!(Mode::parse(text).unwrap(), mode);
+            assert_eq!(Mode::parse(mode.as_str()).unwrap(), mode);
+        }
+        assert!(
+            format!("{}", Mode::parse("knn").unwrap_err()).contains("hybrid"),
+            "the error should name the valid modes"
+        );
+    }
+
+    #[test]
+    fn only_vector_legs_need_an_embedder() {
+        assert!(Mode::Hybrid.needs_embedder());
+        assert!(Mode::Vec.needs_embedder());
+        assert!(!Mode::Fts.needs_embedder());
+    }
 }

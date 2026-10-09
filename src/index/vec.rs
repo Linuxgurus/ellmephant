@@ -278,6 +278,40 @@ mod tests {
     }
 
     #[test]
+    fn from_blob_ignores_a_trailing_partial_element() {
+        // 9 bytes = two whole f32 plus one stray byte; the tail must be dropped, not panic.
+        let mut bytes = to_blob(&[1.0f32, 2.0]);
+        bytes.push(0x7f);
+        assert_eq!(from_blob(&bytes), vec![1.0f32, 2.0]);
+    }
+
+    #[test]
+    fn zero_dim_is_rejected_by_ensure_and_recreate() {
+        let conn = conn();
+        assert!(ensure(&conn, 0).is_err());
+        assert!(recreate(&conn, 0).is_err());
+    }
+
+    #[test]
+    fn upsert_rejects_an_empty_vector() {
+        let conn = conn();
+        ensure(&conn, 2).unwrap();
+        assert!(upsert(&conn, 1, "infra", &[]).is_err());
+    }
+
+    #[test]
+    fn knn_rejects_an_empty_query() {
+        let conn = conn();
+        ensure(&conn, 2).unwrap();
+        let hint = Knn {
+            k: 1,
+            scope: None,
+            max_distance: None,
+        };
+        assert!(knn(&conn, &[], &hint).is_err());
+    }
+
+    #[test]
     fn knn_returns_nearest_first_and_honours_scope() {
         let conn = conn();
         ensure(&conn, 2).unwrap();

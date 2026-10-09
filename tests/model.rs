@@ -6,8 +6,9 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use llmphant::config::{Config, Paths};
 use llmphant::model::fetch::{self, Fetcher};
 use llmphant::model::{self, Spec};
 use llmphant::{Error, Result};
@@ -228,6 +229,87 @@ fn model_dir_is_used_verbatim_and_offline() {
     assert_eq!(
         status.files.iter().filter(|f| f.present).count(),
         model::REQUIRED_FILES.len()
+    );
+}
+
+#[test]
+fn spec_from_config_defaults_the_cache_to_home_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(dir.path());
+    let cfg = Config::default();
+
+    let spec = Spec::from_config(&cfg, &paths);
+    assert_eq!(spec.repo, cfg.model);
+    assert_eq!(spec.revision, cfg.revision);
+    assert_eq!(
+        spec.cache_root,
+        paths.models(),
+        "empty cache_dir means <home>/models"
+    );
+    assert_eq!(spec.model_dir, None);
+    assert!(!spec.offline);
+
+    // A configured cache_dir wins; `offline` rides along (SPEC §6.1, §6.4).
+    let cfg = Config {
+        cache_dir: "/tmp/elsewhere".to_string(),
+        offline: true,
+        ..cfg
+    };
+    let spec = Spec::from_config(&cfg, &paths);
+    assert_eq!(spec.cache_root, PathBuf::from("/tmp/elsewhere"));
+    assert!(spec.offline);
+}
+
+#[test]
+fn with_overrides_replaces_only_the_supplied_fields() {
+    let (_dir, spec) = temp();
+
+    let repo_only = spec.with_overrides(Some("other/repo".into()), None);
+    assert_eq!(repo_only.repo, "other/repo");
+    assert_eq!(repo_only.revision, spec.revision, "revision untouched");
+
+    let rev_only = spec.with_overrides(None, Some(SHA.into()));
+    assert_eq!(rev_only.repo, spec.repo, "repo untouched");
+    assert_eq!(rev_only.revision, SHA);
+
+    let unchanged = spec.with_overrides(None, None);
+    assert_eq!(unchanged.repo, spec.repo);
+    assert_eq!(unchanged.revision, spec.revision);
+}
+
+#[test]
+fn verify_errors_when_the_revision_never_resolved() {
+    // Cold cache, ref `main` unresolved: there is nothing to hash, so verify must say so
+    // rather than silently pass (SPEC §6.3).
+    let (_dir, spec) = temp();
+    let err = model::verify(&spec).unwrap_err();
+    assert!(err.to_string().contains("not resolved"), "{err}");
+}
+
+#[test]
+fn remove_all_clears_every_revision_and_the_refs_index() {
+    let (_dir, spec) = temp();
+    let dir = model::ensure(&spec, &FakeFetcher::new()).expect("fetch");
+    let refs = model::cache::refs_path(&spec.cache_root, REPO);
+    assert!(refs.is_file(), "resolving a ref should record it");
+
+    assert_eq!(model::remove(&spec, true).unwrap(), 1);
+    assert!(!dir.exists(), "revision dir survives `remove all`");
+    assert!(!refs.exists(), "the refs index should be dropped too");
+    assert_eq!(
+        model::remove(&spec, true).unwrap(),
+        0,
+        "a second remove is a no-op"
+    );
+}
+
+#[test]
+fn remove_refuses_a_model_dir() {
+    let (dir, mut spec) = temp();
+    spec.model_dir = Some(dir.path().to_path_buf());
+    assert!(
+        model::remove(&spec, false).is_err(),
+        "--model-dir is not ours to delete"
     );
 }
 

@@ -23,6 +23,14 @@ pub enum Error {
     #[error("no such memory: {0}")]
     NotFound(String),
 
+    /// Weights cache problem (missing/partial/corrupt; SPEC §6).
+    #[error("model error: {0}")]
+    Model(String),
+
+    /// Transport failure from the fetch client (SPEC §6.2).
+    #[error("http error: {0}")]
+    Http(String),
+
     #[error("home directory not found (set HOME or LLMPHANT_HOME)")]
     NoHome,
 

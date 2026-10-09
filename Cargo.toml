@@ -34,6 +34,10 @@ toml = "0.9"
 thiserror = "2"
 regex = "1"
 sha2 = "0.10"
+# Model fetch (SPEC §6.2). ureq 3 defaults to rustls ⇒ no OpenSSL dylib.
+ureq = "3"
+# Advisory `flock` on the cache lock file (SPEC §6.2).
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

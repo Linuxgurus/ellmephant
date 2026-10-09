@@ -110,10 +110,12 @@ baked into the binary, and never required at runtime *to run* — only to *fetch
 One flat dir per resolved revision, so `--model-dir` is a first-class alternative:
 
 ```
-~/.llmphant/models/<owner>--<repo>/<revision>/
-  manifest.json          # {repo, revision, created, files:{name:{sha256,size}}}
-  config.json  tokenizer.json  tokenizer_config.json  model.safetensors
-  .lock                  # advisory lock held for the duration of a fetch
+~/.llmphant/models/<owner>--<repo>/
+  refs.json              # {"main": "<sha>"} — a ref resolved once, then pinned
+  <sha>/
+    manifest.json        # {repo, revision, resolved, created, files:{name:{sha256,size}}}
+    config.json  tokenizer.json  tokenizer_config.json  model.safetensors
+    .lock                # advisory lock held for the duration of a fetch
 ```
 
 - `<owner>--<repo>`: `Qwen/Qwen3-Embedding-0.6B` → `Qwen--Qwen3-Embedding-0.6B`.

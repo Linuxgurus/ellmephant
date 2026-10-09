@@ -10,22 +10,41 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phase 1–2 skeleton. The tree, the store bootstrap, the schema and its FTS triggers
-are real and tested; the embedder, search, REPL, MCP server and portability layers
-are typed stubs that return `NotImplemented` until P3+ lands. Nothing here needs a
-model download or a network connection.
+Phases 1, 2, 2.5 and 4 are real and tested: bootstrap, schema + FTS triggers, the
+`sqlite-vec` (`vec0`) index, the model weights cache, and the write path. The candle
+Qwen3 encoder (P3), search (P5), REPL/MCP and portability layers are still typed stubs
+that return `NotImplemented`. `cargo test` needs no model and no network.
 
 | Area | State |
 |---|---|
 | `config`, `error`, `db` (pragmas + migration runner) | done |
 | `migrations/0001_init.sql` (schema, FTS triggers, links, meta) | done |
-| `embed::projection`, `store::{slug,links,tags}`, `search::rrf`, `HashEmbedder` | done |
-| candle Qwen3 encoder (P3), `sqlite-vec` / `vec0` (P2, P5) | stubs |
-| search, REPL, MCP, export/import, bench | stubs |
+| `index::vec` — in-process `sqlite-vec` (`vec0`), KNN | done |
+| `model` — weights cache: resolve, fetch, verify, offline (SPEC §6) | done |
+| `store` — write path (upsert, tags, links, vec) | done |
+| candle Qwen3 encoder (P3) | stub |
+| search (P5), REPL (P6), MCP (P7), export/import (P8), bench (P10) | stubs |
 
-`memory_vec` deliberately lives in a *later* migration than `0001_init.sql`: it needs
-the `sqlite-vec` extension registered in-process, and keeping the pure-SQLite schema
-separate is what lets `cargo test` run offline.
+`memory_vec` is a *derived* index created on demand by `index::vec::ensure` (its
+dimension is an embedder property, not schema); keeping it out of `0001_init.sql` is
+what lets `cargo test` run offline with no extension.
+
+## Model weights
+
+Weights are *data*: fetched on first use into `~/.llmphant/models/`, or supplied with
+`--model-dir`. The cache is flat and sha-pinned (`SPEC.md` §6), so once warm, runs need
+no network.
+
+```sh
+llmphant model status              # what is cached (never touches the network)
+llmphant model status --verify     # re-hash every file (slow)
+llmphant model fetch               # download / repair; idempotent
+llmphant model rm --all            # reclaim space
+llmphant --offline doctor          # opens no socket
+```
+
+`--model-dir DIR` uses an existing flat directory of weights and implies `--offline`;
+`LLMPHANT_OFFLINE=1` forces it globally. Fetching is the only network code in the binary.
 
 ## Build & test
 

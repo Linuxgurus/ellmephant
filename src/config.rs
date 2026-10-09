@@ -85,6 +85,12 @@ impl Paths {
 pub struct Config {
     /// Embedding model id (HF repo or local dir name).
     pub model: String,
+    /// Revision to load: a branch/tag (resolved once to a sha, then pinned) or a sha.
+    pub revision: String,
+    /// Weights cache root; empty means `<home>/models` (SPEC §6.1).
+    pub cache_dir: String,
+    /// Never open a socket; a cold cache is a hard error (SPEC §6.4).
+    pub offline: bool,
     /// Vector dimensionality; frozen at `CREATE`, MRL allows 32..=1024.
     pub dim: usize,
     /// `bf16` (default) or `f16`.
@@ -101,6 +107,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            revision: "main".to_string(),
+            cache_dir: String::new(),
+            offline: false,
             dim: 1024,
             precision: "bf16".to_string(),
             device: "cpu".to_string(),

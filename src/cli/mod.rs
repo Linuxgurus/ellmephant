@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
 use crate::search::Mode;
-use crate::{db, index};
+use crate::{db, index, model};
 
 /// Top-level arguments. `--home` (or `LLMPHANT_HOME`) relocates the whole store,
 /// which is what keeps tests hermetic.
@@ -25,6 +25,14 @@ pub struct Cli {
     /// Store root (defaults to `~/.llmphant`).
     #[arg(long, global = true, value_name = "DIR", env = "LLMPHANT_HOME")]
     pub home: Option<PathBuf>,
+
+    /// Never touch the network; a cold weights cache is an error (SPEC §6.4).
+    #[arg(long, global = true, env = "LLMPHANT_OFFLINE")]
+    pub offline: bool,
+
+    /// Use an existing flat weights directory instead of the cache (implies `--offline`).
+    #[arg(long, global = true, value_name = "DIR")]
+    pub model_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -98,11 +106,57 @@ pub enum Command {
     },
     /// Serve MCP over stdio.
     Mcp,
+    /// Weights cache: status | fetch | rm (SPEC §6.5).
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     /// Measure load/embed/search latency.
     Bench {
         /// Run the golden eval set too.
         #[arg(long)]
         golden: bool,
+    },
+}
+
+/// `llmphant model …` — the weights cache (SPEC §6.5).
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    /// Show the cache without touching the network.
+    Status {
+        /// Inspect this repo instead of the configured one.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Inspect this revision instead of the configured one.
+        #[arg(long)]
+        revision: Option<String>,
+        /// Recompute every file's sha256 (slow; SPEC §6.3).
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Download or repair the weights cache.
+    Fetch {
+        /// Override the configured repo id.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Override the configured revision (ref or sha).
+        #[arg(long)]
+        revision: Option<String>,
+        /// Re-download even if the cache looks complete.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove cached revisions.
+    Rm {
+        /// Target this repo instead of the configured one.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Revision to drop (default: the configured one).
+        #[arg(long)]
+        revision: Option<String>,
+        /// Drop every cached revision of the repo.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -112,9 +166,22 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(dir) => Paths::from_root(dir),
         None => Paths::discover()?,
     };
+    let cfg = Config::load(&paths)?;
+
+    // Flags override config (SPEC §12); `--model-dir` is inherently offline.
+    let mut spec = model::Spec::from_config(&cfg, &paths);
+    if cli.offline {
+        spec.offline = true;
+    }
+    if let Some(dir) = cli.model_dir {
+        spec.model_dir = Some(dir);
+        spec.offline = true;
+    }
+
     match cli.command.unwrap_or(Command::Repl) {
         Command::Repl => repl::run(&paths),
-        Command::Doctor => doctor(&paths),
+        Command::Doctor => doctor(&paths, &cfg, &spec),
+        Command::Model { command } => model_cmd(&spec, command),
         Command::Add { .. } => Err(Error::NotImplemented("add (PLAN.md P4)")),
         Command::Search { mode, .. } => {
             Mode::parse(&mode)?;
@@ -130,9 +197,120 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// `llmphant model …` — status / fetch / rm over the weights cache (SPEC §6.5).
+fn model_cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
+    match command {
+        ModelCommand::Status {
+            repo,
+            revision,
+            verify,
+        } => {
+            let mut spec = spec.clone();
+            if let Some(repo) = repo {
+                spec.repo = repo;
+            }
+            if let Some(revision) = revision {
+                spec.revision = revision;
+            }
+            let status = model::status(&spec)?;
+            print_model_status(&status);
+            if verify {
+                let bad = model::verify(&spec)?;
+                if bad.is_empty() {
+                    println!("  verify         ok (all sha256 match)");
+                } else {
+                    for line in &bad {
+                        println!("  verify         MISMATCH {line}");
+                    }
+                    return Err(Error::Model(format!(
+                        "{} file(s) failed verification",
+                        bad.len()
+                    )));
+                }
+            }
+            Ok(())
+        }
+        ModelCommand::Fetch {
+            repo,
+            revision,
+            force,
+        } => {
+            let mut spec = spec.clone();
+            if let Some(repo) = repo {
+                spec.repo = repo;
+            }
+            if let Some(revision) = revision {
+                spec.revision = revision;
+            }
+            spec.force = force;
+            let fetcher = model::fetch::UreqFetcher::from_env();
+            let dir = model::ensure(&spec, &fetcher)?;
+            println!("weights ready: {}", dir.display());
+            Ok(())
+        }
+        ModelCommand::Rm {
+            repo,
+            revision,
+            all,
+        } => {
+            let mut spec = spec.clone();
+            if let Some(repo) = repo {
+                spec.repo = repo;
+            }
+            if let Some(revision) = revision {
+                spec.revision = revision;
+            }
+            let removed = model::remove(&spec, all)?;
+            println!("removed {removed} revision(s)");
+            Ok(())
+        }
+    }
+}
+
+/// Render a [`model::Status`] as a human-readable block.
+fn print_model_status(status: &model::Status) {
+    let resolved = match &status.resolved {
+        Some(sha) => format!(" -> {sha}"),
+        None => " (unresolved)".to_string(),
+    };
+    println!("model          {}", status.repo);
+    println!("  revision     {}{resolved}", status.revision);
+    println!("  dir          {}", status.dir.display());
+    println!(
+        "  manifest     {}",
+        if status.manifest { "present" } else { "absent" }
+    );
+    let mut total = 0u64;
+    for file in &status.files {
+        match file.size {
+            Some(size) => {
+                total += size;
+                println!("    {:<24} {:>10}  ok", file.name, human(size));
+            }
+            None => println!("    {:<24} {:>10}  missing", file.name, "-"),
+        }
+    }
+    println!("  total        {}", human(total));
+}
+
+/// Bytes -> a short human string (`1.2 GiB`).
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// `llmphant doctor` — paths, schema version, table count, embedded-index status.
-pub fn doctor(paths: &Paths) -> Result<()> {
-    let cfg = Config::load(paths)?;
+pub fn doctor(paths: &Paths, cfg: &Config, spec: &model::Spec) -> Result<()> {
     paths.ensure()?;
     let conn = db::open(paths)?;
     let schema = db::migrate::version(&conn)?;
@@ -162,6 +340,23 @@ pub fn doctor(paths: &Paths) -> Result<()> {
     );
     println!("  objects        {objects}");
     println!("  model          {} dim={}", cfg.model, cfg.dim);
+
+    // Weights cache summary (no network; SPEC §6.5).
+    let weights = model::status(spec)?;
+    let present = weights.files.iter().filter(|f| f.present).count();
+    let bytes: u64 = weights.files.iter().filter_map(|f| f.size).sum();
+    let at = match &weights.resolved {
+        Some(sha) => format!("{}@{}", weights.repo, &sha[..sha.len().min(12)]),
+        None => format!("{}@{}", weights.repo, weights.revision),
+    };
+    println!(
+        "  weights        {}  {present}/{} files, {}{}",
+        at,
+        weights.files.len(),
+        human(bytes),
+        if weights.offline { " (offline)" } else { "" }
+    );
+
     let vec_status = match index::vec::stored_dim(&conn)? {
         Some(dim) => format!("vec0 dim={dim}, {} rows", index::vec::count(&conn)?),
         None => "registered (no vectors yet)".to_string(),

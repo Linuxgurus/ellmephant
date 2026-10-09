@@ -10,10 +10,11 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phases 1, 2, 2.5, 3, 4 and 5 are real and tested: bootstrap, schema + FTS triggers, the
+Phases 1, 2, 2.5, 3, 4, 5 and 6 are real and tested: bootstrap, schema + FTS triggers, the
 `sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, the write
-path, and hybrid search. REPL/MCP and the portability layers are still typed stubs that
-return `NotImplemented`. `cargo test` needs no model and no network.
+path, hybrid search, and the CLI (one-shot `add`/`search`/`show`/`rm`/`tags` plus an
+interactive REPL with history and tab-completion). MCP and the portability layers are
+still typed stubs that return `NotImplemented`. `cargo test` needs no model and no network.
 
 | Area | State |
 |---|---|
@@ -24,7 +25,8 @@ return `NotImplemented`. `cargo test` needs no model and no network.
 | `embed::qwen3` — candle encoder: last-token pool, L2, query instruction (P3) | done |
 | `store` — write path (upsert, tags, links, vec) | done |
 | `search` — hybrid BM25 ∪ KNN fused with RRF, `--expand`, `--max-distance` (P5) | done |
-| REPL (P6), MCP (P7), export/import (P8), bench (P10) | stubs |
+| `cli` — one-shot `add`/`show`/`rm`/`tags`, REPL with history + completion (P6) | done |
+| MCP (P7), export/import (P8), bench (P10) | stubs |
 
 The encoder is behind the default-on `encoder` cargo feature; build with
 `--no-default-features` for a store-only binary that links no ML stack.
@@ -125,7 +127,7 @@ src/
 ├── store/             add/get over memory + derived indexes (slug, tags, links)
 ├── index/             vec0 (KNN) and fts5 (BM25) legs
 ├── search/            hybrid orchestration + RRF
-├── cli/               one-shot subcommands, repl, output formatting
+├── cli/               subcommands, repl, session, output formatting
 ├── mcp/               MCP stdio server
 └── portable/          JSONL export/import
 migrations/            NNNN_*.sql, embedded with include_str!

@@ -56,12 +56,28 @@ fn vector_leg_ranks_the_closest_document_first() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    seed(&conn, &embedder, "alpha-note", "infra", "alpha beta gamma delta");
-    seed(&conn, &embedder, "other-note", "infra", "epsilon zeta eta theta");
+    seed(
+        &conn,
+        &embedder,
+        "alpha-note",
+        "infra",
+        "alpha beta gamma delta",
+    );
+    seed(
+        &conn,
+        &embedder,
+        "other-note",
+        "infra",
+        "epsilon zeta eta theta",
+    );
 
-    let hits = search::run(&conn, Some(&embedder), &query("alpha beta gamma", Mode::Vec))
-        .expect("vec search")
-        .hits;
+    let hits = search::run(
+        &conn,
+        Some(&embedder),
+        &query("alpha beta gamma", Mode::Vec),
+    )
+    .expect("vec search")
+    .hits;
 
     assert_eq!(hits[0].key, "alpha-note");
     assert!(
@@ -82,7 +98,13 @@ fn bm25_leg_finds_an_exact_identifier_without_a_model() {
         "infra",
         "the gateway answers at portainer-notes-gw.internal",
     );
-    seed(&conn, &embedder, "unrelated", "infra", "totally different content");
+    seed(
+        &conn,
+        &embedder,
+        "unrelated",
+        "infra",
+        "totally different content",
+    );
 
     // `None` = no embedder; a lexical query must still work (PLAN §6 P5).
     let hits = search::run(&conn, None, &query("portainer-notes-gw", Mode::Fts))
@@ -106,12 +128,26 @@ fn scope_filter_excludes_other_buckets() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    seed(&conn, &embedder, "infra-note", "infra", "shared zebra token");
-    seed(&conn, &embedder, "media-note", "media", "shared zebra token");
+    seed(
+        &conn,
+        &embedder,
+        "infra-note",
+        "infra",
+        "shared zebra token",
+    );
+    seed(
+        &conn,
+        &embedder,
+        "media-note",
+        "media",
+        "shared zebra token",
+    );
 
     let mut q = query("shared zebra token", Mode::Hybrid);
     q.scope = Some("media".to_string());
-    let hits = search::run(&conn, Some(&embedder), &q).expect("search").hits;
+    let hits = search::run(&conn, Some(&embedder), &q)
+        .expect("search")
+        .hits;
 
     assert!(!hits.is_empty());
     assert!(hits.iter().all(|h| h.scope == "media"), "got {hits:?}");
@@ -155,7 +191,9 @@ fn max_distance_filters_the_vector_leg() {
 
     let mut q = query("alpha beta gamma", Mode::Vec);
     q.max_distance = Some(0.0); // only a perfect match survives
-    let hits = search::run(&conn, Some(&embedder), &q).expect("search").hits;
+    let hits = search::run(&conn, Some(&embedder), &q)
+        .expect("search")
+        .hits;
     // The exact document is distance ~0; the unrelated one is filtered out.
     assert!(hits.iter().all(|h| h.distance.unwrap_or(1.0) <= 0.0));
 }

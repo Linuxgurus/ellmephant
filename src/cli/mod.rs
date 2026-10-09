@@ -2,6 +2,7 @@
 
 pub mod format;
 pub mod repl;
+pub mod session;
 
 use std::path::PathBuf;
 
@@ -9,8 +10,11 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
-use crate::search::{self, Mode, Query};
+use crate::search::{Mode, Query};
+use crate::store::{Memory, MemoryType};
 use crate::{db, embed, index, model};
+
+use self::session::Session;
 
 /// Top-level arguments. `--home` (or `LLMPHANT_HOME`) relocates the whole store,
 /// which is what keeps tests hermetic.
@@ -101,11 +105,20 @@ pub enum Command {
         expand: u8,
     },
     /// Print one memory by key.
-    Show { key: String },
+    Show {
+        key: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete one memory by key.
     Rm { key: String },
     /// List tags with counts.
-    Tags,
+    Tags {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Export the store to JSONL.
     Export { path: PathBuf },
     /// Import JSONL into the store.
@@ -204,10 +217,52 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Repl) {
-        Command::Repl => repl::run(&paths),
+        Command::Repl => {
+            let session = Session::open(paths, cfg, spec)?;
+            repl::run(session)
+        }
         Command::Doctor => doctor(&paths, &cfg, &spec),
         Command::Model { command } => model_cmd(&spec, command),
-        Command::Add { .. } => Err(Error::NotImplemented("add (PLAN.md P4)")),
+        Command::Embed { text, query } => embed(&spec, &cfg, &text, query),
+        Command::Mcp => Err(Error::NotImplemented("mcp server (PLAN.md P7)")),
+        Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
+        command => {
+            let mut session = Session::open(paths, cfg, spec)?;
+            execute(&mut session, command)
+        }
+    }
+}
+
+/// Run one already-parsed store command against a live [`Session`] — the shared core of
+/// the one-shot CLI and the REPL, so the two can never drift apart (PLAN §6 P6).
+pub fn execute(session: &mut Session, command: Command) -> Result<()> {
+    match command {
+        Command::Add {
+            key,
+            scope,
+            title,
+            body,
+            r#type,
+            source,
+            tags,
+        } => {
+            let mem = Memory {
+                id: None,
+                key: key.unwrap_or_default(),
+                scope,
+                type_: MemoryType::parse(&r#type),
+                title,
+                body: read_body(&body)?,
+                source,
+                hash: String::new(),
+                tags,
+                created: String::new(),
+                updated: String::new(),
+            };
+            let key = session.add(&mem)?;
+            println!("added {key}");
+            Ok(())
+        }
         Command::Search {
             query,
             scope,
@@ -216,70 +271,73 @@ pub fn run(cli: Cli) -> Result<()> {
             max_distance,
             json,
             expand,
-        } => search_cmd(
-            &paths,
-            &cfg,
-            &spec,
-            query,
-            scope,
-            k,
-            mode,
-            max_distance,
-            expand,
-            json,
-        ),
-        Command::Show { .. } => Err(Error::NotImplemented("show (PLAN.md P4)")),
-        Command::Rm { .. } => Err(Error::NotImplemented("rm (PLAN.md P4)")),
-        Command::Tags => Err(Error::NotImplemented("tags (PLAN.md P9)")),
+        } => {
+            let q = Query {
+                text: query,
+                scope,
+                k: k.unwrap_or_else(|| session.default_k()),
+                mode: Mode::parse(&mode)?,
+                max_distance,
+                expand,
+            };
+            let bundle = session.search(&q)?;
+            emit(format::render_bundle(&bundle, json)?);
+            Ok(())
+        }
+        Command::Show { key, json } => {
+            let mem = session.show(&key)?;
+            emit(format::render_memory(&mem, json)?);
+            Ok(())
+        }
+        Command::Rm { key } => {
+            if session.rm(&key)? {
+                println!("removed {key}");
+                Ok(())
+            } else {
+                Err(Error::NotFound(key))
+            }
+        }
+        Command::Tags { json } => {
+            let tags = session.tags()?;
+            emit(format::render_tags(&tags, json)?);
+            Ok(())
+        }
+        // Not store commands: the dispatcher above owns these, and the REPL rejects them.
+        Command::Repl | Command::Doctor | Command::Model { .. } | Command::Embed { .. } => {
+            Err(Error::Config("command is not available here".into()))
+        }
         Command::Export { .. } => Err(Error::NotImplemented("export (PLAN.md P8)")),
         Command::Import { .. } => Err(Error::NotImplemented("import (PLAN.md P8)")),
         Command::Mcp => Err(Error::NotImplemented("mcp server (PLAN.md P7)")),
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
-        Command::Embed { text, query } => embed(&spec, &cfg, &text, query),
     }
 }
 
-/// `llmphant search "…"` — hybrid (or `--mode`) retrieval over the store.
-///
-/// The encoder is loaded *only* when the mode's KNN leg runs, so `--mode fts` works with
-/// no weights and no network.
-#[allow(clippy::too_many_arguments)]
-fn search_cmd(
-    paths: &Paths,
-    cfg: &Config,
-    spec: &model::Spec,
-    text: String,
-    scope: Option<String>,
-    k: Option<usize>,
-    mode: String,
-    max_distance: Option<f32>,
-    expand: u8,
-    json: bool,
-) -> Result<()> {
-    let mode = Mode::parse(&mode)?;
-    let conn = db::open(paths)?;
-    let query = Query {
-        text,
-        scope,
-        k: k.unwrap_or(cfg.default_k),
-        mode,
-        max_distance,
-        expand,
-    };
+/// Print rendered output, guaranteeing a trailing newline so the next prompt starts clean.
+fn emit(text: String) {
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+}
 
-    let embedder = if mode.needs_embedder() {
-        Some(load_embedder(spec, cfg)?)
-    } else {
-        None
-    };
-    let bundle = search::run(&conn, embedder.as_ref().map(|e| e as &dyn embed::Embedder), &query)?;
-    print!("{}", format::render_bundle(&bundle, json)?);
-    Ok(())
+/// `--body -` reads the body from stdin (long, piped memories); anything else is literal.
+fn read_body(arg: &str) -> Result<String> {
+    if arg != "-" {
+        return Ok(arg.to_string());
+    }
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
 }
 
 /// Build the production Qwen3 encoder from the resolved cache + config. This is the one
 /// place the weights directory and the `Embedder` meet (PLAN §6 P3).
-fn load_embedder(spec: &model::Spec, cfg: &Config) -> Result<embed::qwen3::Qwen3Embedder> {
+pub(crate) fn load_embedder(
+    spec: &model::Spec,
+    cfg: &Config,
+) -> Result<embed::qwen3::Qwen3Embedder> {
     let fetcher = model::fetch::UreqFetcher::from_env();
     let dir = model::ensure(spec, &fetcher)?;
     let opts = embed::qwen3::Options::new(cfg.dim, &cfg.device, &cfg.precision, &cfg.instruction);

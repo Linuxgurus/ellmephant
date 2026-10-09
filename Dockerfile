@@ -28,8 +28,8 @@ RUN apt-get update \
 
 COPY --from=builder /src/target/release/llmphant /usr/local/bin/llmphant
 
-# The MCP server listens on a TCP port by default; bind all interfaces so the port is
-# reachable from outside the container.
+# The MCP server serves Streamable HTTP on a port by default; bind all interfaces so the port
+# is reachable from outside the container (localhost is the safer default off Docker).
 ENV LLMPHANT_HOME=/data \
     RUST_LOG=warn \
     LLMPHANT_MCP_HOST=0.0.0.0 \

@@ -61,11 +61,13 @@ tabled = "0.22"
 
 # --- P7: the MCP server (PLAN §4). `rmcp` is the official Rust MCP SDK (needs rustc 1.88,
 # hence the crate's rust-version bump). Default features bring the `#[tool]`/`#[tool_router]`
-# macros, the `server` runtime and JSON-Schema generation; `transport-io` adds stdio.
+# macros, the `server` runtime and JSON-Schema generation; `transport-io` adds stdio and
+# `transport-streamable-http-server` adds the networked MCP transport (SPEC §11).
 # `tokio` is the transport runtime — the rest of llmphant stays synchronous.
-# `net` backs the default TCP transport (`mcp`); `transport-io` keeps stdio available.
-rmcp = { version = "3.5.1", features = ["transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# Hosts rmcp's `StreamableHttpService` (a tower service) — MCP-over-HTTP is the `mcp` default.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 [features]
 default = ["encoder"]
@@ -83,6 +85,8 @@ tempfile = "3"
 # The in-process MCP round-trip test (tests/mcp.rs) needs the client half of the SDK.
 # Features union with the normal dependency, so `cargo build` still ships no client code.
 rmcp = { version = "3.5.1", features = ["client"] }
+# `oneshot` drives the HTTP router in-process — the MCP-over-HTTP test needs no socket or client.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

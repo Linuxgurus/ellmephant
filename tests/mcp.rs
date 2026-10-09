@@ -2,13 +2,16 @@
 //! transport with the deterministic `HashEmbedder`, so this needs no weights and no
 //! network, yet still exercises the real `rmcp` handshake, tool routing and schemas.
 
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
 use llmphant::cli::session::Session;
 use llmphant::config::{Config, Paths};
 use llmphant::embed::HashEmbedder;
-use llmphant::mcp::MemoryServer;
+use llmphant::mcp::{MemoryServer, http_router};
 use llmphant::model::Spec;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::{Peer, RoleClient, ServiceExt};
+use tower::ServiceExt as _;
 
 /// An open, offline session backed by the fake embedder.
 fn session(dir: &std::path::Path) -> Session {
@@ -172,53 +175,120 @@ async fn tools_round_trip_over_the_transport() {
     handle.await.expect("join");
 }
 
-/// The default `mcp` transport is TCP; prove a real socket handshake + tool call works.
-#[tokio::test]
-async fn tools_round_trip_over_tcp() {
-    let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+/// One MCP-over-HTTP POST to `/mcp`, returning status, `Mcp-Session-Id` (if any) and body.
+async fn post(
+    app: &axum::Router,
+    session_id: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, Option<String>, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(id) = session_id {
+        builder = builder.header("mcp-session-id", id);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
         .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let handle = tokio::spawn(async move {
-        let (stream, _peer) = listener.accept().await.expect("accept");
-        server
-            .serve(stream)
-            .await
-            .expect("serve")
-            .waiting()
-            .await
-            .expect("wait");
-    });
+        .expect("http request");
+    let status = response.status();
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .map(|v| v.to_str().unwrap().to_string());
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        session,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
 
-    let client =
-        ().serve(tokio::net::TcpStream::connect(addr).await.expect("connect"))
-            .await
-            .expect("client handshake over tcp");
+/// The server answers a POST with JSON or an SSE stream; pull the JSON-RPC payload out of
+/// whichever `data:` frame actually carries it (the stream opens with an empty one).
+fn payload(body: &str) -> serde_json::Value {
+    for frame in body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .filter(|frame| !frame.is_empty())
+    {
+        if let Ok(value) = serde_json::from_str(frame) {
+            return value;
+        }
+    }
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON-RPC: {e}: {body}"))
+}
 
-    let listed = client.list_tools(Default::default()).await.expect("list");
-    assert!(
-        listed.tools.iter().any(|t| t.name == "memory_add"),
-        "surface missing over tcp"
-    );
+/// The default `mcp` transport is Streamable HTTP; drive the real router (no socket, no client).
+#[tokio::test]
+async fn tools_round_trip_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = http_router(MemoryServer::new(session(dir.path())), "127.0.0.1");
 
-    let added = call(
-        &client,
-        "memory_add",
+    // initialize issues a session id.
+    let (status, session, body) = post(
+        &app,
+        None,
         serde_json::json!({
-            "key": "tcp-note",
-            "scope": "infra",
-            "title": "TCP note",
-            "body": "reached by socket"
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
         }),
     )
     .await;
-    assert!(!added.is_error.unwrap_or(false), "{}", text(&added));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let session = session.expect("Mcp-Session-Id header");
+    assert_eq!(payload(&body)["result"]["serverInfo"]["name"], "llmphant");
 
-    client.cancel().await.expect("cancel");
-    handle.await.expect("join");
+    // The initialized notification is accepted (202, empty body).
+    let (status, _, _) = post(
+        &app,
+        Some(&session),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+
+    // tools/list advertises the whole surface.
+    let (status, _, body) = post(
+        &app,
+        Some(&session),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        payload(&body)["result"]["tools"].as_array().unwrap().len(),
+        llmphant::mcp::TOOLS.len()
+    );
+
+    // A real write + read round-trips through the shared store.
+    let (status, _, body) = post(
+        &app,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "memory_add", "arguments": {
+                "key": "http-note", "scope": "infra",
+                "title": "HTTP note", "body": "reached over http"
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        payload(&body)["result"]["isError"],
+        serde_json::json!(false)
+    );
 }
 
 #[tokio::test]

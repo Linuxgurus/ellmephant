@@ -1,4 +1,4 @@
-//! MCP server (P7) on `rmcp`: newline-delimited JSON-RPC over TCP (default) or stdio.
+//! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_add`, `memory_update`, `memory_delete`, `memory_search`,
 //! `memory_get`, `memory_backlinks`, `memory_export`, `memory_import` — with
@@ -11,12 +11,19 @@
 //! the encoder are synchronous and can hold the lock for a while, so each tool runs its
 //! store work on a blocking thread via [`tokio::task::spawn_blocking`] rather than
 //! occupying a tokio worker.
+//!
+//! Two transports, both standard MCP: [`Transport::Http`] (the default) mounts the tool
+//! surface at `/mcp` on a listening port via `rmcp`'s `StreamableHttpService` + `axum`;
+//! [`Transport::Stdio`] keeps the client-launched pipe.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
@@ -445,12 +452,13 @@ impl ServerHandler for MemoryServer {
 pub enum Transport {
     /// Newline-delimited JSON-RPC over stdin/stdout (a client launches the process).
     Stdio,
-    /// Newline-delimited JSON-RPC over TCP — the default; `host:port` is a listening port.
-    Tcp { host: String, port: u16 },
+    /// MCP Streamable HTTP — the default networked transport. The tool surface is mounted at
+    /// `/mcp` on `host:port`.
+    Http { host: String, port: u16 },
 }
 
-/// Serve MCP on the chosen [`Transport`] until the client(s) disconnect (the `llmphant mcp`
-/// subcommand). TCP is the default; stdio stays available for client-launched setups.
+/// Serve MCP on the chosen [`Transport`] until it is stopped (the `llmphant mcp` subcommand).
+/// HTTP is the default; stdio stays available for client-launched setups.
 pub fn serve(
     paths: Paths,
     cfg: Config,
@@ -474,42 +482,62 @@ pub fn serve(
                     .map_err(|e| Error::Config(format!("mcp server task failed: {e}")))?;
                 Ok(())
             }
-            Transport::Tcp { host, port } => serve_tcp(server, &host, port).await,
+            Transport::Http { host, port } => serve_http(server, &host, port).await,
         }
     })
 }
 
-/// Bind `host:port` and serve every accepted connection on its own task, all sharing the one
-/// store behind the mutex (SPEC §15 #10). Returns only on a bind/accept failure.
-async fn serve_tcp(server: MemoryServer, host: &str, port: u16) -> crate::error::Result<()> {
-    let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    let addr = listener.local_addr()?;
-    tracing::info!(%addr, "llmphant mcp listening");
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let server = server.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_connection(server, stream).await {
-                tracing::warn!(%peer, "mcp connection ended: {e}");
-            }
-        });
-    }
+/// Mount the tool surface at `/mcp` as an `axum` router. Each MCP session gets its own
+/// `MemoryServer` clone, all sharing the one [`Session`] behind the mutex (SPEC §15 #10).
+///
+/// `bind_host` decides the DNS-rebinding guard: on a loopback bind the built-in allow-list
+/// (localhost / 127.0.0.1 / ::1) stands; any other bind (e.g. `0.0.0.0` in Docker) disables
+/// it, since remote clients arrive with a Host header we cannot enumerate. There is no auth —
+/// bind wide only behind a trusted network.
+pub fn http_router(server: MemoryServer, bind_host: &str) -> axum::Router {
+    let config = if is_loopback(bind_host) {
+        StreamableHttpServerConfig::default()
+    } else {
+        tracing::warn!(
+            host = bind_host,
+            "mcp http bound off-loopback; host-header checks off"
+        );
+        StreamableHttpServerConfig::default().disable_allowed_hosts()
+    };
+    let service: StreamableHttpService<MemoryServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(server.clone()),
+            LocalSessionManager::default().into(),
+            config,
+        );
+    axum::Router::new().nest_service("/mcp", service)
 }
 
-/// Serve one accepted TCP connection until that client disconnects.
-async fn serve_connection(
-    server: MemoryServer,
-    stream: tokio::net::TcpStream,
-) -> std::result::Result<(), String> {
-    let running = server
-        .serve(stream)
-        .await
-        .map_err(|e| format!("mcp initialize failed: {e}"))?;
-    running
-        .waiting()
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("mcp server task failed: {e}"))
+/// True for `localhost`, `127.0.0.0/8` and `::1`.
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Bind `host:port`, serve HTTP until Ctrl-C, and drain in-flight requests (SPEC §13).
+async fn serve_http(server: MemoryServer, host: &str, port: u16) -> crate::error::Result<()> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let addr = listener.local_addr()?;
+    tracing::info!(%addr, "llmphant mcp listening on http://{addr}/mcp");
+    let app = http_router(server, host);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+/// Resolves when the process is asked to stop, so `axum` can finish open requests.
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("mcp shutting down");
 }
 
 #[cfg(test)]

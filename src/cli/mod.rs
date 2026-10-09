@@ -152,12 +152,12 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Serve MCP over a TCP port (default) or stdio.
+    /// Serve MCP over Streamable HTTP (default) or stdio.
     Mcp {
-        /// Serve over stdio instead of a listening port.
+        /// Serve over stdio instead of HTTP.
         #[arg(long)]
         stdio: bool,
-        /// TCP bind address for the port transport.
+        /// HTTP bind address (use `0.0.0.0` in Docker).
         #[arg(
             long,
             value_name = "ADDR",
@@ -165,7 +165,7 @@ pub enum Command {
             default_value = "127.0.0.1"
         )]
         host: String,
-        /// TCP port (default: config `port`, else 8888).
+        /// HTTP port (default: config `port`, else 8888).
         #[arg(long, value_name = "PORT", env = "LLMPHANT_MCP_PORT")]
         port: Option<u16>,
     },
@@ -290,7 +290,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let transport = if stdio {
                 crate::mcp::Transport::Stdio
             } else {
-                crate::mcp::Transport::Tcp {
+                crate::mcp::Transport::Http {
                     host,
                     port: port.unwrap_or(cfg.port),
                 }

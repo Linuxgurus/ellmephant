@@ -79,7 +79,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 - **Crates:** `rusqlite` (feature `bundled`), `sqlite-vec` (auto-extension), `candle-core`
   + `candle-transformers` (encoder plumbing), `tokenizers` 0.22, `safetensors`,
   `ureq` (weights fetch, rustls), `rustyline` (REPL), `tabled`/`comfy-table` (output), `clap`,
-  `serde`/`serde_json`, `toml` + `serde` config, `sha2`, an MCP server (`rmcp`, TCP default).
+  `serde`/`serde_json`, `toml` + `serde` config, `sha2`, an MCP server (`rmcp`, HTTP default).
   (No `hf-hub` — see §6.2.)
 - **Process model:** one **long-lived** process (REPL or `mcp`) holds the model warm
   (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
@@ -278,7 +278,7 @@ SELECT m.id, bm25(memory_fts) AS score FROM memory_fts
 
 ## 11. Interfaces
 
-**MCP tools** (served over TCP by default, `--stdio` optional): `memory_add`, `memory_update`,
+**MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_add`, `memory_update`,
 `memory_delete`, `memory_search`,
 `memory_get`, `memory_backlinks`, `memory_export`, `memory_import`. (Names TBD in detailed spec.)
 
@@ -289,7 +289,7 @@ SELECT m.id, bm25(memory_fts) AS score FROM memory_fts
   `reembed`, `export`, `import`, `model`, `help`, `quit`.
 - One-shot flags for scripting: `llmphant search "..." --json`.
 - `llmphant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
-- `llmphant mcp` → MCP server; listens on TCP `port` (default 8888); `--stdio` for stdio.
+- `llmphant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
 
 **Export/import:** JSONL canonical (`{key,scope,type,title,body,source,tags,created,updated}`;
 no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embed on hash change.
@@ -315,7 +315,7 @@ device     = "cpu"                        # cpu | metal
 instruction = "Given a question, retrieve relevant memories"
 dim        = 1024
 default_k  = 10
-port       = 8888                         # MCP TCP port; `mcp --stdio` ignores it
+port       = 8888                         # MCP HTTP port; `mcp --stdio` ignores it
 ```
 
 Validated at load: an unknown `device`/`precision` or `dim = 0` fails with one message before
@@ -381,7 +381,7 @@ any model is touched; flags are re-checked the same way after they override the 
 5. Write path: upsert, tags, links, vec write (skip re-embed when `hash` unchanged).
 6. Read path: FTS leg → vec leg → RRF → hydrate.
 7. CLI REPL + one-shot flags.
-8. MCP server (TCP port default, stdio option).
+8. MCP server (HTTP default, stdio option).
 9. JSONL export/import; Markdown bundle.
 10. `reembed`, dangling-link audit, `rename`.
 11. `bench` + golden queries; tune.

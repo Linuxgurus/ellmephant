@@ -42,6 +42,21 @@ fn help_lists_the_subcommands() {
 }
 
 #[test]
+fn embed_offline_with_a_cold_cache_names_the_model() {
+    // No weights in a throwaway home, and `--offline` forbids fetching: the command must
+    // fail cleanly (cache layer, before any candle work) rather than hang or panic.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["--offline", "embed", "hello"]);
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("offline"), "got: {text}");
+    assert!(
+        text.contains("Qwen/Qwen3-Embedding-0.6B"),
+        "error should name the model: {text}"
+    );
+}
+
+#[test]
 fn doctor_bootstraps_a_fresh_home() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();

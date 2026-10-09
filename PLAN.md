@@ -52,6 +52,18 @@ and the safetensors/tokenizer load are ours to write.
 `--model-dir` and `--offline` stay first-class. This is a prerequisite of P3, so it is its own
 phase (**P2.5**) and is fleshed out in SPEC §6.
 
+**F4 — the HF file does not use candle's tensor names, and CPU is f32-only.** Two things
+only a real run exposes:
+`Qwen/Qwen3-Embedding-0.6B/model.safetensors` stores the transformer under **bare** names
+(`embed_tokens.weight`, `layers.0.…`), while `candle_transformers::models::qwen3::Model`
+asks for them under a `model.` prefix. We bridge this with a `SimpleBackend` that strips the
+prefix on lookup (`ModelPrefixBackend`) rather than rewriting the 1.2 GB file.
+Separately, candle's CPU matmul goes through **Accelerate, which supports `f32` only** — no
+`bf16`, no `f16`. The encoder therefore runs **f32 on CPU** regardless of `--precision`, and
+honours `bf16`/`f16` only on `--device metal`. (SPEC §6's "f16 native ARM CPU path" does not
+hold with the `accelerate` feature enabled; §4 keeps `accelerate` for speed.)
+→ **Decision: CPU = f32; GPU = `--precision`.** Captured in `embed::qwen3`.
+
 ## 2. Resolved open questions (SPEC §15)
 
 | # | Spec question | Decision |

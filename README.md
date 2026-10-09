@@ -10,10 +10,10 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phases 1, 2, 2.5 and 4 are real and tested: bootstrap, schema + FTS triggers, the
-`sqlite-vec` (`vec0`) index, the model weights cache, and the write path. The candle
-Qwen3 encoder (P3), search (P5), REPL/MCP and portability layers are still typed stubs
-that return `NotImplemented`. `cargo test` needs no model and no network.
+Phases 1, 2, 2.5, 3 and 4 are real and tested: bootstrap, schema + FTS triggers, the
+`sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, and the
+write path. Search (P5), REPL/MCP and the portability layers are still typed stubs that
+return `NotImplemented`. `cargo test` needs no model and no network.
 
 | Area | State |
 |---|---|
@@ -21,9 +21,12 @@ that return `NotImplemented`. `cargo test` needs no model and no network.
 | `migrations/0001_init.sql` (schema, FTS triggers, links, meta) | done |
 | `index::vec` — in-process `sqlite-vec` (`vec0`), KNN | done |
 | `model` — weights cache: resolve, fetch, verify, offline (SPEC §6) | done |
+| `embed::qwen3` — candle encoder: last-token pool, L2, query instruction (P3) | done |
 | `store` — write path (upsert, tags, links, vec) | done |
-| candle Qwen3 encoder (P3) | stub |
 | search (P5), REPL (P6), MCP (P7), export/import (P8), bench (P10) | stubs |
+
+The encoder is behind the default-on `encoder` cargo feature; build with
+`--no-default-features` for a store-only binary that links no ML stack.
 
 `memory_vec` is a *derived* index created on demand by `index::vec::ensure` (its
 dimension is an embedder property, not schema); keeping it out of `0001_init.sql` is
@@ -45,6 +48,24 @@ llmphant --offline doctor          # opens no socket
 
 `--model-dir DIR` uses an existing flat directory of weights and implies `--offline`;
 `LLMPHANT_OFFLINE=1` forces it globally. Fetching is the only network code in the binary.
+
+## Embeddings
+
+The encoder is Qwen3-Embedding-0.6B on candle — 1024-d, **last-token** pooling with left
+padding, L2-normalised (`SPEC.md` §6). Queries get the `Instruct: <task>\nQuery: <q>`
+prefix; documents are bare. `--device cpu|metal` and `--precision bf16|f16` override the
+config.
+
+Two realities (PLAN §1 F4): the Hub file names tensors without candle's `model.` prefix
+(bridged in `embed::qwen3`), and candle's CPU matmul runs through Accelerate, which is
+**f32-only** — so CPU always runs f32, and `--precision` applies to `--device metal`.
+
+```sh
+llmphant embed "where do the logs live" --query   # dim + load/embed latency + norm
+```
+
+`cargo test` never loads the model: the store/search layers inject the deterministic
+`HashEmbedder`, and the real-weights check is `#[ignore]`d (`tests/embed.rs`).
 
 ## Build & test
 
@@ -103,5 +124,5 @@ examples/              spikes and throwaway probes
   pragmas, migration idempotence, FTS trigger synchronisation, FK cascades, UNIQUE
   keys; plus black-box CLI tests via `CARGO_BIN_EXE_llmphant`.
 - **Fake embedder**: store/search tests inject `HashEmbedder`, so `cargo test` never
-  loads weights. Real-model and oracle comparisons are `#[ignore]`d and land in P3.
+  loads weights. Real-model checks are `#[ignore]`d (`tests/embed.rs`).
 - **Golden eval** (`tests/golden/queries.jsonl`): retrieval-quality gate for P10.

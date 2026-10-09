@@ -19,14 +19,20 @@ pub trait Embedder {
     fn dim(&self) -> usize;
     /// Stable model identifier, recorded in `meta` and folded into the row hash.
     fn model_id(&self) -> &str;
-    /// Embed a batch, one vector per input, same order.
+    /// Embed a batch of *documents*, one vector per input, same order.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
-    /// Convenience wrapper for a single string.
+    /// Convenience wrapper for a single document.
     fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut out = self.embed(std::slice::from_ref(&text.to_string()))?;
         out.pop()
             .ok_or_else(|| crate::error::Error::Config("empty embed batch".into()))
+    }
+
+    /// Embed a *query*. Asymmetric models (Qwen3) prepend an instruction here; symmetric
+    /// ones fall back to [`embed_one`](Self::embed_one) (SPEC §6).
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_one(text)
     }
 }
 

@@ -9,8 +9,11 @@ repository = "https://example.invalid/llmphant"
 readme = "README.md"
 
 # NOTE: this is the P1–P4 dependency set. `sqlite-vec` (in-process vec0) and `sha2`
-# (row hash) landed with P4. Candle/tokenizers/safetensors/hf-hub (the Qwen3 encoder,
-# P3) are still intentionally absent so `cargo test` stays fast/offline — see PLAN.md §4.
+# (row hash) landed with P4. The Qwen3 encoder (P3) adds candle + tokenizers +
+# safetensors; it is gated behind the default-on `encoder` feature so `cargo test
+# --no-default-features` can still build the store/search layers without the ML stack.
+# We deliberately do NOT depend on `hf-hub` (PLAN §1 F3) — the model cache (P2.5) owns
+# download, and we load safetensors/tokenizer files ourselves.
 
 [lib]
 name = "llmphant"
@@ -40,6 +43,26 @@ ureq = "3"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- P3: the Qwen3 encoder (PLAN §4). Optional so `--no-default-features` builds a
+# store-only binary with no ML stack. `metal`/`accelerate` are Apple-only no-ops elsewhere.
+candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+# Match candle-core 0.11's `^0.22` so only one `tokenizers` links (PLAN §1).
+tokenizers = { version = "0.22", optional = true }
+safetensors = { version = "0.8", optional = true }
+
+[features]
+default = ["encoder"]
+# The candle Qwen3 embedder. `cargo test --no-default-features` skips it.
+encoder = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:safetensors",
+]
 
 [dev-dependencies]
 tempfile = "3"

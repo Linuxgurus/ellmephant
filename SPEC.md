@@ -65,7 +65,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 | 4 | **`candle`** for inference (not `ort`/ONNX) | `ort` binds C++ ONNX Runtime (default: downloaded shared lib) — a sidecar. `candle` is pure Rust ⇒ truly in-binary |
 | 5 | **Qwen3-Embedding-0.6B**, 1024d, cosine | Best MTEB-multilingual of the candidates we compared (64.33 vs bge-m3 59.56), 32k context, MRL-capable, instruction-aware, and the only one with a **native candle path** (`fastembed`'s `Qwen3TextEmbedding`) |
 | 6 | **bf16** weights (f16 fallback) | ~1.2 GB resident; bf16 is fine under Metal; CPU kernels may emulate bf16 ⇒ `--precision f16` escape hatch |
-| 7 | Weights **external** (HF cache or `--model-dir`), `--offline` flag | Keeps the binary small; weights are data |
+| 7 | Weights **external**: our own flat cache under `~/.llmphant/models/`, or `--model-dir`; `--offline`; sha-pinned revision (§6.1–6.5) | Keeps the binary small; weights are data. We own the layout (not `HF_HOME`) so it is inspectable, `gc`-able, and integrity-checked |
 | 8 | **cosine**, L2-normalised both sides; **last-token pooling + left-pad** | Qwen3 is a decoder embedder — mean pooling (the candle BERT example) gives silently worse vectors |
 | 9 | Root `~/.llmphant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
 | 10 | Free-form tags; **single** `scope` | Tags give the many-to-many; scope is the one bucket (matches existing `infra-`/`projects-` prefixes) |
@@ -76,9 +76,10 @@ mcp-memory-service → typed edges + tag AND/OR).
 
 - **Language:** Rust (edition 2024+).
 - **Crates:** `rusqlite` (feature `bundled`), `sqlite-vec` (auto-extension), `candle-core`
-  + `candle-transformers` (bert-style encoder plumbing), `tokenizers`, `safetensors`,
-  `hf-hub`, `rustyline` (REPL), `tabled`/`comfy-table` (output), `clap`, `serde`/`serde_json`,
-  `toml` + `serde` config, an MCP stdio server (`rmcp` or hand-rolled JSON-RPC).
+  + `candle-transformers` (encoder plumbing), `tokenizers` 0.22, `safetensors`,
+  `ureq` (weights fetch, rustls), `rustyline` (REPL), `tabled`/`comfy-table` (output), `clap`,
+  `serde`/`serde_json`, `toml` + `serde` config, `sha2`, an MCP stdio server (`rmcp`).
+  (No `hf-hub` — see §6.2.)
 - **Process model:** one **long-lived** process (REPL or `mcp`) holds the model warm
   (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
   A shared daemon is *optional* and only if bare one-shot latency annoys us (see §15).
@@ -89,8 +90,8 @@ mcp-memory-service → typed edges + tag AND/OR).
 
 - **Model:** `Qwen/Qwen3-Embedding-0.6B`, output **1024** (MRL allows 32–1024; frozen at
   `CREATE`, choose 1024 — rebuildable later).
-- **Engine:** candle, pure Rust. **Weights:** HF cache (`~/.llmphant/models/` or `HF_HOME`)
-  or `--model-dir`; download on first run; `--offline` to forbid network.
+- **Engine:** candle, pure Rust. **Weights:** our own flat cache under `~/.llmphant/models/`
+  (not `HF_HOME`), or `--model-dir`; fetched on first run; `--offline` forbids network. See §6.1–6.5.
 - **Precision:** bf16 default; `--precision f16` for native ARM CPU path.
 - **Pooling:** last-token with **left** padding, then L2-normalise.
 - **Query instruction:** `Instruct: <task>\nQuery: <q>` on the query side; documents bare
@@ -98,6 +99,73 @@ mcp-memory-service → typed edges + tag AND/OR).
 - **store ≠ embed:** the *row* keeps the full `body`; the *vector* is computed over a
   **condensed projection** (`title` + canonical body, `[[links]]` stripped). Retrieval
   stays sharp while storage stays rich.
+
+### 6.1 Weights are data: the model cache
+
+The encoder needs **three required files** from `Qwen/Qwen3-Embedding-0.6B`: `config.json`,
+`tokenizer.json`, `model.safetensors` (~1.2 GB bf16). Optional: `tokenizer_config.json`,
+`generation_config.json`, `vocab.json`, `merges.txt`. Weights are **data, not code**: never
+baked into the binary, and never required at runtime *to run* — only to *fetch*.
+
+One flat dir per resolved revision, so `--model-dir` is a first-class alternative:
+
+```
+~/.llmphant/models/<owner>--<repo>/<revision>/
+  manifest.json          # {repo, revision, created, files:{name:{sha256,size}}}
+  config.json  tokenizer.json  tokenizer_config.json  model.safetensors
+  .lock                  # advisory lock held for the duration of a fetch
+```
+
+- `<owner>--<repo>`: `Qwen/Qwen3-Embedding-0.6B` → `Qwen--Qwen3-Embedding-0.6B`.
+- `<revision>`: the **commit sha**, not `main`. `main` is resolved once and recorded, so an
+  upstream move never silently changes our vectors.
+- `--model-dir <dir>` bypasses this entirely: a flat dir that must already hold the files
+  (implies `--offline`).
+- `cache_dir` overrides the root (default `~/.llmphant/models`). We do **not** reuse
+  `HF_HOME`/`HF_HUB_CACHE`: our layout, our manifest, one place to look (§12).
+
+### 6.2 Fetch protocol
+
+Fetching is **first-run, opt-in, and the only network code in the binary**.
+
+- Files come from `https://huggingface.co/<repo>/resolve/<sha>/<file>` (`HF_ENDPOINT`
+  overrides the host), sequentially, with a size-carrying progress line.
+- **Atomic per file**: download to `<file>.partial`, `fsync`, `rename(2)` into place. A crash
+  leaves no half-valid cache; `manifest.json` is written **last**, after every file verifies.
+- **Concurrency**: an advisory `.lock` (flock) is held for the fetch; a second process waits
+  or exits with a clear message. No resume in v1 — a partial file restarts.
+- Transport is `ureq` + **rustls**: pure-Rust TLS, so still no OpenSSL `.dylib` (§4 #4).
+  `HF_TOKEN` is sent when set (the repo is public, so it is optional).
+- We deliberately **do not depend on `hf-hub`**: `1.0` pulls in tokio+reqwest+hyper, `0.5` is
+  the legacy API, and `candle-core` 0.11 ships no `hub_load_safetensors` — the loader is ours
+  anyway. ~200 LOC buys a hermetic binary and a cache we can `doctor` and `gc`.
+
+### 6.3 Integrity
+
+- `manifest.json` records **sha256 + size** per file and the resolved revision.
+- Download-time: every file is hashed and compared *before* the manifest is written.
+- Load-time: **no full re-hash** — sha256 over 1.2 GB each start would erase the cold-start
+  budget (§13). We check size and rely on safetensors' self-describing header failing loudly
+  on truncation/corruption. `llmphant doctor --verify` does the full hash on demand.
+- A cache that fails to load names the file and prints the fix: `llmphant model fetch --force`.
+
+### 6.4 Offline & failure modes
+
+- `--offline` / `LLMPHANT_OFFLINE=1` / `offline = true` (§12): **never** opens a socket; a
+  missing or incomplete cache is a hard error naming the file and the online command.
+- `--model-dir` is always offline. Online (the default) uses the cache when complete, else
+  fetches once.
+- Disk-full mid-fetch → `.partial` discarded, no manifest, retried next run.
+- Revision is pinned by the recorded sha; moving `main` upstream is a no-op until `--force`.
+- Runtime network is **never required** once cached, so the §8 DoD holds.
+
+### 6.5 Surface
+
+- `llmphant model status` — repo, resolved revision, cache path, per-file presence/size, total
+  bytes, manifest ok/absent. This is the "model-cache status" `doctor` prints from P1 on.
+- `llmphant model fetch [--repo][--revision][--force]` — prefetch / repair.
+- `llmphant model rm [--revision]` — drop a revision to reclaim space.
+- `doctor` prints the same one-line summary.
 
 ## 7. Data model
 
@@ -213,8 +281,9 @@ SELECT m.id, bm25(memory_fts) AS score FROM memory_fts
 
 - `llmphant` → **REPL** (rustyline: history at `~/.llmphant/history`, completion;
   bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `tags`, `link`,
-  `reembed`, `export`, `import`, `help`, `quit`.
+  `reembed`, `export`, `import`, `model`, `help`, `quit`.
 - One-shot flags for scripting: `llmphant search "..." --json`.
+- `llmphant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
 - `llmphant mcp` → MCP stdio server.
 
 **Export/import:** JSONL canonical (`{key,scope,type,title,body,source,tags,created,updated}`;
@@ -224,9 +293,24 @@ no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embe
 
 - `~/.llmphant/memory.db` — the store.
 - `~/.llmphant/config.toml` — model, dim, precision, instruction, defaults (flags override).
-- `~/.llmphant/models/` — weights cache (or `HF_HOME`).
+- `~/.llmphant/models/` — weights cache, laid out per §6.1 (`<owner>--<repo>/<sha>/`). Not
+  `HF_HOME`: we own this layout so `doctor`/`gc` and `--model-dir` stay simple.
 - `~/.llmphant/history` — REPL history.
 - `meta` table mirrors model/dim/instruction for drift detection at startup.
+
+Model config keys (all optional; flags override, and `LLMPHANT_OFFLINE=1` overrides `offline`):
+
+```toml
+model      = "Qwen/Qwen3-Embedding-0.6B"  # HF repo id, or a dir name under models/
+revision   = "main"                       # resolved once to a commit sha and pinned
+cache_dir  = ""                           # default ~/.llmphant/models
+offline    = false                        # true == never open a socket (§6.4)
+precision  = "bf16"                       # bf16 | f16
+device     = "cpu"                        # cpu | metal
+instruction = "Given a question, retrieve relevant memories"
+dim        = 1024
+default_k  = 10
+```
 
 ## 13. Performance expectations
 
@@ -246,6 +330,9 @@ no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embe
 - **bf16 CPU emulation** may be slow → `--precision f16`.
 - **Loss of greppability** (SQLite isn't `rg`); JSONL export is the escape hatch.
 - **Key collisions / renames** — need deliberate keys and a real `rename` path.
+- **Model cache drift/corruption** — `main` moving, a truncated 1.2 GB download, a bad disk.
+  Mitigate: sha-pinned revision + per-file sha256 in the manifest, atomic per-file writes,
+  load-time size check with `doctor --verify` for the full hash (§6.3–6.4).
 
 ## 15. Open questions (for the detailed spec)
 
@@ -264,14 +351,15 @@ no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embe
 
 1. Crate skeleton, config, paths, `meta`, logging.
 2. Migration 0001 (schema, triggers, indexes).
-3. Embedder: candle Qwen3 load + embed projection + pooling.
-4. Write path: upsert, tags, links, vec write (skip re-embed when `hash` unchanged).
-5. Read path: FTS leg → vec leg → RRF → hydrate.
-6. CLI REPL + one-shot flags.
-7. MCP stdio server.
-8. JSONL export/import; Markdown bundle.
-9. `reembed`, dangling-link audit, `rename`.
-10. `bench` + golden queries; tune.
+3. **Model cache** — fetch/pin/verify weights, offline, `model status|fetch|rm` (§6).
+4. Embedder: candle Qwen3 load + embed projection + pooling.
+5. Write path: upsert, tags, links, vec write (skip re-embed when `hash` unchanged).
+6. Read path: FTS leg → vec leg → RRF → hydrate.
+7. CLI REPL + one-shot flags.
+8. MCP stdio server.
+9. JSONL export/import; Markdown bundle.
+10. `reembed`, dangling-link audit, `rename`.
+11. `bench` + golden queries; tune.
 
 ## 17. Glossary
 
@@ -282,3 +370,5 @@ no ids, no vectors); optional Markdown bundle. Import = upsert-by-`key`, re-embe
 - **Signpost / dictate / fact / profile** — memory `type`s: how-to-find, must-do rules, facts, pointers.
 - **store ≠ embed** — the row keeps full text; the vector is over a condensed projection.
 - **RRF** — Reciprocal Rank Fusion; merges the BM25 and KNN ranked lists.
+- **Model cache** — the external weights dir (`~/.llmphant/models/<owner>--<repo>/<sha>/`), a
+  flat, sha-pinned, manifest-backed copy of the encoder's files; data, not code (§6.1).

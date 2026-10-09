@@ -14,15 +14,18 @@ any TUI panes, multi-tenant/auth.
 | Thing | Version / finding |
 |---|---|
 | `rusqlite` | 0.40.2 — `bundled` gives SQLite **in-binary** |
-| `sqlite-vec` | 0.1.10-**alpha**.4 — pin exact; the C extension we register in-process |
+| `sqlite-vec` | **0.1.9** (pin exact). The planned `0.1.10-alpha.4` is **unbuildable from crates.io**: its `sqlite-vec.c` includes a missing `sqlite-vec-diskann.c` (`SQLITE_VEC_ENABLE_DISKANN` defaults to 1) |
 | `candle-core` / `-nn` / `-transformers` | 0.11.0 (must all match) |
 | `candle-transformers::models` | has **`qwen3`**, `qwen2`, `bert`, `quantized_qwen3` — native Qwen3 |
+| `candle-core::utils` | **no hub helpers** (only `barrier_pool` / `*_is_available` / `with_*`). We load safetensors ourselves via `safetensors` 0.8 |
+| `tokenizers` | candle-core 0.11 depends on `^0.22` — match **0.22** (the earlier `0.23` note would duplicate the crate) |
+| `hf-hub` | **not used** (§1 F3). `1.0.0` is async + reqwest + tokio; `0.5.0` is the legacy ureq API. We fetch with our own `ureq` code |
+| `ureq` + rustls | fetcher transport: pure-Rust TLS ⇒ still no OpenSSL `.dylib` |
 | `fastembed` | 7.1.1 — Qwen3 behind the **`qwen3` feature (candle backend)** |
-| `tokenizers` / `safetensors` / `hf-hub` | 1.0-rc / 0.8.0 / 1.0.0 (use `tokenizers` 0.23.x) |
 | `rmcp` | 3.5.1 — official Rust MCP SDK exists |
 | `rustyline` / `tabled` / `clap` | 18.0 / 0.22 / 4.6 |
 
-### Two findings that change the build
+### Findings that change the build
 
 **F1 — `fastembed` drags in `ort` unconditionally.** `ort = { version = "=2.0.0-rc.13", ... }`
 is a **non-optional** dependency of `fastembed`; only `qwen3` is feature-gated. Even with
@@ -39,6 +42,15 @@ specifies **last-token** pooling. The wrapper would silently deviate.
 
 Both findings push the same way: **own the encoder.** ~300–500 lines more code, but it is the
 only path that is both hermetic *and* reference-correct.
+
+**F3 — no hub loader, and `hf-hub` is now two crates.** `candle-core` 0.11's `utils` module
+has **no** `hub_load_safetensors` (earlier versions did); and `hf-hub` split into a legacy
+sync `0.5` (ureq) line and an async `1.0` (reqwest + tokio) rewrite. So *both* the download
+and the safetensors/tokenizer load are ours to write.
+→ **Decision: own the model cache.** A flat, sha-pinned, manifest-backed cache under
+`~/.llmphant/models/` (SPEC §6.1–6.5), fetched with `ureq` + rustls. No `hf-hub` dependency;
+`--model-dir` and `--offline` stay first-class. This is a prerequisite of P3, so it is its own
+phase (**P2.5**) and is fleshed out in SPEC §6.
 
 ## 2. Resolved open questions (SPEC §15)
 
@@ -69,6 +81,11 @@ llmphant/
 │   ├── lib.rs
 │   ├── error.rs           # thiserror
 │   ├── config.rs          # config.toml + ~/.llmphant paths, flag merge
+│   ├── model/             # weights cache: resolve, fetch, verify (SPEC §6)
+│   │   ├── mod.rs         # resolve repo+revision -> local dir; `model status|fetch|rm`
+│   │   ├── cache.rs       # layout ~/.llmphant/models/<owner>--<repo>/<sha>/, flock
+│   │   ├── fetch.rs       # ureq+rustls download, atomic per file (.partial -> rename)
+│   │   └── manifest.rs    # {repo,revision,files:{name:{sha256,size}}} record + verify
 │   ├── db/
 │   │   ├── mod.rs         # open, pragmas, migrate()
 │   │   └── migrate.rs
@@ -105,13 +122,13 @@ llmphant/
 ```toml
 [dependencies]
 rusqlite            = { version = "0.40", features = ["bundled"] }
-sqlite-vec          = "=0.1.10-alpha.4"        # alpha: pin exact
+sqlite-vec          = "=0.1.9"                 # pin exact; alpha.4 is unbuildable (§1)
 candle-core         = { version = "0.11", features = ["metal", "accelerate"] } # no-ops off Apple
 candle-nn           = "0.11"
 candle-transformers = "0.11"
-tokenizers          = "0.23"
+tokenizers          = "0.22"                   # match candle-core's ^0.22 (§1)
 safetensors         = "0.8"
-hf-hub              = { version = "0.5", features = ["ureq"] }
+ureq                = "3"                      # model fetch; rustls TLS default ⇒ no OpenSSL (§6.2)
 rmcp                = "3.5"
 rustyline           = "18"
 tabled              = "0.22"
@@ -130,8 +147,9 @@ fastembed           = { version = "7", default-features = false, features = ["qw
 tempfile            = "3"
 ```
 
-Alignment: `candle-{core,nn,transformers}` all 0.11.x; `tokenizers` 0.23.x (candle ecosystem,
-avoid the 1.0-rc). `metal`/`accelerate` are no-ops on non-Apple targets.
+Alignment: `candle-{core,nn,transformers}` all 0.11.x; `tokenizers` **0.22.x** (candle-core
+pins `^0.22`, so `0.23` would link a second copy). `metal`/`accelerate` are no-ops off Apple.
+**No `hf-hub`** (§1 F3) — `ureq` + our own cache replaces it.
 
 ## 5. Phase 0 — spikes (de-risk the two unknowns)
 
@@ -151,9 +169,10 @@ Throwaway code in `examples/`. **Gate: do not start Phase 1 until S0.1 and S0.2 
 **Why first:** DB/vector integration and model integration are the two things that can
 invalidate the architecture. Everything after is ordinary application code.
 
-## 6. Phases 1–10
+## 6. Phases
 
-Each phase: goal · tasks · acceptance · commit boundary.
+Each phase: goal · tasks · acceptance · commit boundary. (P2.5 is the model cache, inserted
+after P2 because P3 depends on it and it can be built and tested entirely offline.)
 
 ### P1 — Skeleton & bootstrap
 - **Goal:** the binary runs and creates a store.
@@ -171,12 +190,25 @@ Each phase: goal · tasks · acceptance · commit boundary.
   `memory_fts` in sync (assert via MATCH); FK cascade removes tags/links on delete.
 - **Commit:** `feat: schema v1 + fts triggers`
 
+### P2.5 — Model cache (weights fetch + integrity)
+- **Goal:** the encoder's files are on disk, verified and offline-safe, *before* any model code
+  runs. Implements SPEC §6.1–6.5.
+- **Tasks:** `model/cache.rs` (layout `<owner>--<repo>/<sha>/`, flock, `--model-dir` passthrough);
+  `model/manifest.rs` (per-file sha256+size, written last); `model/fetch.rs` (`ureq`+rustls;
+  `resolve/<sha>/<file>`; `.partial` → `rename`; progress; `HF_ENDPOINT`/`HF_TOKEN`); revision
+  resolution (`main` → sha, recorded then pinned); `--offline`/`LLMPHANT_OFFLINE`; config
+  `revision`/`cache_dir`/`offline`; CLI `model status|fetch|rm`; the `doctor` one-liner.
+- **Accept:** `model fetch` populates the cache and a re-run is a no-op; `--offline` loads a warm
+  cache and fails with the file named on a cold one; a truncated file fails the manifest check;
+  layout/sha/atomic-rename unit tests run **offline** (no network).
+- **Commit:** `feat: model cache (fetch, pin, verify, offline)`
+
 ### P3 — Embedder (production)
-- **Goal:** a working `Embedder` over the P0 spike code.
-- **Tasks:** `qwen3.rs` (load from `--model-dir` | `hf-hub` into `~/.llmphant/models/`; DType
-  bf16/f16; `--offline`); `tokenize.rs` (batch, left-pad, attention mask); last-token pool + L2;
-  `projection.rs` (strip `[[…]]`, join title+body); warmup on startup; `llmphant embed "…"`
-  debug command + timing.
+- **Goal:** a working `Embedder` over the P2.5 cache dir + the P0 spike code.
+- **Tasks:** `qwen3.rs` (load `config.json` + `model.safetensors` from the resolved cache dir;
+  DType bf16/f16; `--device`; `--offline`); `tokenize.rs` (batch, left-pad, attention mask);
+  last-token pool + L2; `projection.rs` (strip `[[…]]`, join title+body); warmup on startup;
+  `llmphant embed "…"` debug command + timing.
 - **Accept:** `llmphant embed` prints dim + ms; loads from cache with the network off; unit test
   that the projection strips links.
 - **Design note:** `Embedder` is a **trait** — store/search tests inject a deterministic fake
@@ -255,12 +287,15 @@ Each phase: goal · tasks · acceptance · commit boundary.
   trait — no model, fast, no network.
 - **Oracle (optional, `#[ignore]`):** compare our vectors against `fastembed` within tolerance.
 - **Golden eval:** regression gate for retrieval quality.
+- **Model cache (P2.5):** layout, manifest, sha256 and atomic-rename are unit-tested against a
+  **fake transport** — no network. A real `model fetch` is an `#[ignore]` test.
 - **Constraint:** `cargo test` passes **offline**; only `#[ignore]` tests touch the real model.
 
 ## 8. Definition of done (v1)
 
 - [ ] `cargo build --release` -> one binary, no dylibs, no runtime network requirement.
 - [ ] `llmphant doctor` green; `~/.llmphant/memory.db` at schema v1.
+- [ ] `llmphant model status` reports a complete, sha-verified cache; `--offline` runs against it.
 - [ ] add / search / update / delete round-trip; hybrid returns **scored snippets**.
 - [ ] wiki links + backlinks + `--expand` work.
 - [ ] REPL + one-shot + `mcp` all functional; MCP consumed by **Cline and TypingMind**.
@@ -272,21 +307,23 @@ Each phase: goal · tasks · acceptance · commit boundary.
 
 | Risk | Mitigation |
 |---|---|
-| `sqlite-vec` is 0.1.10-**alpha** | pin exact; S0.1 validates; encapsulate in `index::vec` so it can be swapped |
+| `sqlite-vec` is 0.1.x, pre-1.0 | pin exact (0.1.9); S0.1 validates; encapsulate in `index::vec` so it can be swapped |
 | Qwen3 pooling/padding mismatch | S0.4 + oracle test; last-token per the model card |
 | candle Qwen3 forward quirks (RoPE, sliding window) | S0.2 vs oracle; fall back to the `qwen2` arch if needed |
-| Model download UX (1.2 GB) | progress bar + `--model-dir` + `--offline`; document it |
+| Model download UX / integrity (1.2 GB) | own cache: sha-pinned revision, per-file sha256, atomic `.partial`→rename, progress; `--model-dir` + `--offline`; P2.5 / SPEC §6 |
+| Cache drift (`main` moves, partial file, bad disk) | pin the resolved sha; manifest written last; load-time size check; `doctor --verify` (SPEC §6.3) |
+| `hf-hub`/candle drift (deps, versions) | don't depend on `hf-hub`; pin `tokenizers` to candle's `0.22` (F3, §1) |
 | bf16 slow on CPU | `--precision f16`; S0.3 measures |
 | Embedder makes tests heavy | `Embedder` trait + fake; real-model tests `#[ignore]` |
 | `fastembed` temptation | dev-only dependency; see F1 |
 
 ## 10. Critical path & first PR
 
-**Critical path:** P0 (S0.1, S0.2) -> P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7.
-P8 / P9 / P10 parallelise after P5.
+**Critical path:** P0 (S0.1, S0.2) -> P1 -> P2 -> **P2.5** -> P3 -> P4 -> P5 -> P6 -> P7.
+P8 / P9 / P10 parallelise after P5. (P2.5 gates P3: the encoder loads *from* the cache.)
 
 **Suggested first PR:** Phase 0 spikes + P1 skeleton — it proves the hard part (a single
 binary that links `sqlite-vec` **and** candle and loads the model). Then P2–P5 is the
 "it actually stores and finds things" milestone, which is the first genuinely useful build.
 
-**Session kickoff order:** S0.1 -> S0.2 -> (S0.3/S0.4) -> P1 -> P2 -> P3 -> P4 -> P5.
+**Session kickoff order:** S0.1 -> S0.2 -> (S0.3/S0.4) -> P1 -> P2 -> P2.5 -> P3 -> P4 -> P5.

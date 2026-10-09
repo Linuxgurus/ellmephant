@@ -51,7 +51,8 @@ docker run --rm -it -v llmphant-data:/data llmphant:dev doctor
 ```
 
 The store lives at `/data` inside the container (`LLMPHANT_HOME=/data`). Weights are
-*data*, not code: mount or download them rather than baking ~1.2 GB into the image.
+*data*, not code: mount or `llmphant model fetch` them rather than baking ~1.2 GB into the
+image. The flat, sha-pinned cache layout is specified in `SPEC.md` §6.
 
 ## Layout
 
@@ -61,6 +62,7 @@ src/
 ├── lib.rs             module tree
 ├── error.rs           thiserror
 ├── config.rs          ~/.llmphant paths, config.toml
+├── model/             weights cache: resolve, fetch, verify (SPEC §6)
 ├── db/                open, pragmas, migrate()
 ├── embed/             Embedder trait, qwen3, tokenize, projection
 ├── store/             add/get over memory + derived indexes (slug, tags, links)

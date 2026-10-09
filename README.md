@@ -15,8 +15,9 @@ the `sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encod
 path, hybrid search, the CLI (one-shot `add`/`search`/`show`/`rm`/`tags`/`rename`/`reembed`/
 `links`/`export`/`import` plus an interactive REPL with history and tab-completion), the MCP
 stdio server (shared by Cline, TypingMind and anything else), the JSONL portability layer, and
-maintenance (`reembed`, `rename`, the dangling-link audit, `tags prune`, a deep `doctor`).
-`bench` is still ahead (P10). `cargo test` needs no model and no network.
+maintenance (`reembed`, `rename`, the dangling-link audit, `tags prune`, a deep `doctor`), and
+the benchmark (`bench`, the golden eval, and the `k`/RRF/projection sweeps). `cargo test` needs
+no model and no network.
 
 | Area | State |
 |---|---|
@@ -31,7 +32,7 @@ maintenance (`reembed`, `rename`, the dangling-link audit, `tags prune`, a deep 
 | `mcp` — MCP stdio server: 8 tools, schemas, annotations, write policy (P7) | done |
 | `portable` — JSONL export/import, upsert-by-key, re-embed on hash change (P8) | done |
 | maintenance — `reembed`, `rename`, link audit, `tags prune`, deep `doctor` (P9) | done |
-| bench (P10) | stub |
+| `bench` — load/embed/search timings, golden eval (recall@k + MRR), k/RRF/projection sweeps (P10) | done |
 
 The encoder is behind the default-on `encoder` cargo feature; build with
 `--no-default-features` for a store-only binary that links no ML stack.
@@ -125,6 +126,22 @@ row's `hash`/`model`/`dim`, and records `dim`/`model`/`instruction` in `meta`. `
 transaction — `[[…]]` is stripped from the embed projection, so it never invalidates a stored
 vector — and refuses to clobber an existing key.
 
+## Bench
+
+`bench` replaces the SPEC §13 estimates with numbers and gates retrieval quality (P10).
+
+```sh
+llmphant bench                            # load / embed / search latency at the current row count
+llmphant bench --golden                   # + recall@k & MRR over <home>/golden/queries.jsonl
+llmphant bench --golden --golden-file Q   # score a specific golden set
+llmphant bench --sweep                    # walk k × RRF weight; compare embed projections
+```
+
+The golden file is JSONL, one object per line — `{"query": "…", "expect": ["key", …], "k": 3}`
+(blank lines and `#` comments ignored). It loads the encoder, so it needs warm weights (or
+`--offline` against a populated cache). A seed corpus and ≥20 questions live in `tests/golden/`;
+grow them from real usage — synthetic queries measure the wrong thing.
+
 ## MCP
 
 `llmphant mcp` serves the same store to any MCP client over stdio, so Cline, TypingMind and
@@ -191,9 +208,10 @@ src/
 ├── search/            hybrid orchestration + RRF
 ├── cli/               subcommands, repl, session, output formatting
 ├── mcp/               MCP stdio server
-└── portable/          JSONL export/import
+├── portable/          JSONL export/import
+└── bench/             timings, golden eval (recall@k + MRR), k/RRF/projection sweeps
 migrations/            NNNN_*.sql, embedded with include_str!
-tests/                 integration tests + tests/golden/queries.jsonl
+tests/                 integration tests + tests/golden/{memories,queries}.jsonl
 examples/              spikes and throwaway probes
 ```
 
@@ -206,4 +224,5 @@ examples/              spikes and throwaway probes
   keys; plus black-box CLI tests via `CARGO_BIN_EXE_llmphant`.
 - **Fake embedder**: store/search tests inject `HashEmbedder`, so `cargo test` never
   loads weights. Real-model checks are `#[ignore]`d (`tests/embed.rs`).
-- **Golden eval** (`tests/golden/queries.jsonl`): retrieval-quality gate for P10.
+- **Bench & golden eval** (`tests/bench.rs`, `tests/golden/`): imports the seed corpus with
+  `HashEmbedder` and asserts recall@3 clears the 0.8 gate, plus the k/RRF and projection sweeps.

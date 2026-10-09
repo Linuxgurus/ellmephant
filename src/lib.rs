@@ -4,6 +4,7 @@
 //! derived and rebuildable. See `SPEC.md` for the decision record and `PLAN.md` for
 //! the phased build.
 
+pub mod bench;
 pub mod cli;
 pub mod config;
 pub mod db;

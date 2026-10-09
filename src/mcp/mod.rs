@@ -330,6 +330,7 @@ impl MemoryServer {
                     mode,
                     max_distance,
                     expand,
+                    rrf_k: crate::search::DEFAULT_RRF_K,
                 };
                 s.search(&q)
             })

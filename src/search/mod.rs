@@ -7,6 +7,10 @@
 
 pub mod rrf;
 
+/// The RRF constant used unless a caller overrides it (SPEC §10). Re-exported so callers
+/// that build a [`Query`] never reach into [`rrf`] directly.
+pub use rrf::DEFAULT_RRF_K;
+
 /// Characters of a body returned per search hit (SPEC §9/§14: snippets, not dumps).
 pub const SNIPPET_CHARS: usize = 280;
 
@@ -86,6 +90,8 @@ pub struct Query {
     pub max_distance: Option<f32>,
     /// Link-neighbourhood hops to include (0 = off).
     pub expand: u8,
+    /// RRF constant `k` for the fusion ([`DEFAULT_RRF_K`] in normal use; P10 sweeps it).
+    pub rrf_k: f64,
 }
 
 /// One hydrated hit. Scores are returned so the caller can judge confidence
@@ -169,7 +175,7 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         Mode::Fts => vec![fts_ranking],
         Mode::Hybrid => vec![vec_ranking, fts_ranking],
     };
-    let fused = rrf::fuse(&rankings, rrf::DEFAULT_RRF_K);
+    let fused = rrf::fuse(&rankings, q.rrf_k);
 
     let distances: HashMap<i64, f32> = vec_hits.into_iter().collect();
 

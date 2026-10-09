@@ -38,7 +38,7 @@ fn help_lists_the_subcommands() {
     assert!(out.status.success());
     let text = stdout(&out);
     for cmd in [
-        "doctor", "search", "add", "mcp", "export", "reembed", "rename", "links",
+        "doctor", "search", "add", "mcp", "export", "reembed", "rename", "links", "bench",
     ] {
         assert!(text.contains(cmd), "help is missing {cmd}: {text}");
     }
@@ -125,16 +125,37 @@ fn doctor_bootstraps_a_fresh_home() {
 }
 
 #[test]
-fn unimplemented_subcommands_fail_loudly() {
-    // `bench` (P10) is still a stub; it must exit non-zero rather than pretend to run.
+fn bench_help_lists_its_flags() {
+    // `bench` (P10) is a real command now; its flags must be discoverable.
     let dir = tempfile::tempdir().unwrap();
-    let out = run(dir.path(), &["bench"]);
+    let out = run(dir.path(), &["bench", "--help"]);
+    assert!(
+        out.status.success(),
+        "bench --help failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    for flag in ["--golden", "--golden-file", "--sweep", "--k"] {
+        assert!(text.contains(flag), "help is missing {flag}: {text}");
+    }
+}
+
+#[test]
+fn bench_offline_with_a_cold_cache_names_the_model() {
+    // `bench` loads the encoder first, so `--offline` against a throwaway home must fail
+    // cleanly in the cache layer (like `embed`), not hang or pretend to run.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["--offline", "bench"]);
     assert!(
         !out.status.success(),
-        "an unimplemented path must not exit 0"
+        "a cold offline bench must not exit 0"
     );
-    let text = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(text.contains("not implemented"), "got: {text}");
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("offline"), "got: {text}");
+    assert!(
+        text.contains("Qwen/Qwen3-Embedding-0.6B"),
+        "error should name the model: {text}"
+    );
 }
 
 #[test]

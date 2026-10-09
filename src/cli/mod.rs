@@ -1,5 +1,6 @@
 //! The CLI: one clap tree, three faces (REPL, one-shot, MCP) over one core.
 
+pub mod bench;
 pub mod doctor;
 pub mod embed;
 pub mod format;
@@ -158,11 +159,20 @@ pub enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Measure load/embed/search latency.
+    /// Measure load/embed/search latency; `--golden` scores retrieval quality.
     Bench {
         /// Run the golden eval set too.
         #[arg(long)]
         golden: bool,
+        /// Golden JSONL (default: `<home>/golden/queries.jsonl`).
+        #[arg(long, value_name = "FILE")]
+        golden_file: Option<PathBuf>,
+        /// Sweep the result count, the RRF weight and the embed projection.
+        #[arg(long)]
+        sweep: bool,
+        /// Result count for the timing search and the single-shot golden run.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
     },
     /// Embed a string and print dim + latency (debug; PLAN P3).
     Embed {
@@ -262,7 +272,22 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Embed { text, query } => embed::run(&spec, &cfg, &text, query),
         // MCP holds the store open and serves until the client disconnects (P7).
         Command::Mcp => crate::mcp::serve(paths, cfg, spec),
-        Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
+        Command::Bench {
+            golden,
+            golden_file,
+            sweep,
+            k,
+        } => bench::run(
+            &paths,
+            &cfg,
+            &spec,
+            &bench::Options {
+                golden,
+                golden_file,
+                sweep,
+                k,
+            },
+        ),
         command => {
             let mut session = Session::open(paths, cfg, spec)?;
             execute(&mut session, command)
@@ -312,6 +337,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
                 mode: Mode::parse(&mode)?,
                 max_distance,
                 expand,
+                rrf_k: crate::search::DEFAULT_RRF_K,
             };
             cmd_search(session, q, json)
         }
@@ -328,8 +354,8 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         | Command::Doctor { .. }
         | Command::Model { .. }
         | Command::Embed { .. }
+        | Command::Bench { .. }
         | Command::Mcp => Err(Error::Config("command is not available here".into())),
-        Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
     }
 }
 

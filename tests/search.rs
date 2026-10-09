@@ -38,6 +38,7 @@ fn query(text: &str, mode: Mode) -> Query {
         mode,
         max_distance: None,
         expand: 0,
+        rrf_k: llmphant::search::DEFAULT_RRF_K,
     }
 }
 

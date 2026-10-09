@@ -1,5 +1,24 @@
-{"query":"where are container images built for the cluster","expect":["projects-cluster-images"],"k":3}
-{"query":"how does the cluster get its gitops state","expect":["projects-k8s-iac","infra-gitops"],"k":3}
-{"query":"what backs up persistent volumes","expect":["infra-backups"],"k":3}
-{"query":"how do I reach the internal dns names","expect":["infra-network"],"k":3}
-{"query":"which hosts run the storage tier","expect":["infra-storage"],"k":3}
+{"query":"what is the gateway hostname portainer","expect":["infra-gateway"],"k":3}
+{"query":"how do deploys run through argocd","expect":["infra-argocd"],"k":3}
+{"query":"where do we push container images registryhost","expect":["infra-registry"],"k":3}
+{"query":"which database is pg-primary","expect":["infra-postgres"],"k":3}
+{"query":"how do nightly backups run restic","expect":["infra-backups"],"k":3}
+{"query":"where are secrets stored hashivault","expect":["infra-secrets"],"k":3}
+{"query":"what runs CI forgejo","expect":["infra-ci"],"k":3}
+{"query":"which metrics dashboards grafana","expect":["infra-monitoring"],"k":3}
+{"query":"what repos does news-kb span","expect":["projects-news-kb"],"k":3}
+{"query":"what does newsapi ingest","expect":["projects-newsapi"],"k":3}
+{"query":"how does go_news crawl feeds","expect":["projects-go-news"],"k":3}
+{"query":"what does llm-embedder batch","expect":["projects-llm-embedder"],"k":3}
+{"query":"how does typingmind connect","expect":["projects-typingmind"],"k":3}
+{"query":"which tool for code search ripgrep","expect":["tools-ripgrep"],"k":3}
+{"query":"how to run cargo test locked","expect":["tools-cargo"],"k":3}
+{"query":"how to enumerate cluster nodes mpssh","expect":["tools-mpssh"],"k":3}
+{"query":"how to fan out tasks justfile","expect":["tools-justfile"],"k":3}
+{"query":"how terse should notes be fragments","expect":["prefs-terse"],"k":3}
+{"query":"do we store dates history emphasis","expect":["prefs-no-dates"],"k":3}
+{"query":"what commit message prefixes conventional","expect":["prefs-commit"],"k":3}
+{"query":"where do broker holdings sync from","expect":["finance-broker"],"k":3}
+{"query":"where is the budget ledger2026","expect":["finance-budget"],"k":3}
+{"query":"what do we watch friday criterion","expect":["media-movie"],"k":3}
+{"query":"which camera body fujifilm","expect":["media-camera"],"k":3}

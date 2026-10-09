@@ -359,7 +359,8 @@ Verify: `cargo test --locked`
    - fix the two tests (`json_roundtrips`, `empty_is_explicit`) to exercise
      `render_bundle(&Bundle { hits: vec![hit()], ..Default::default() }, true)`.
 
-> Leave `Command::Bench` / `Error::NotImplemented` alone — that is P10.
+> `Command::Bench` is now implemented (P10, `src/bench`); `Error::NotImplemented` remains for
+> any future stub.
 
 Verify: `cargo test --locked`
 

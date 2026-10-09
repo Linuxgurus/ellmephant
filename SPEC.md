@@ -258,7 +258,8 @@ The store is **atomics-first**; generalization is derived, not stored.
 ## 10. Search
 
 - **Hybrid = FTS5 BM25 ∪ `vec0` KNN**, merged with **RRF (k=60)**. BM25 is mandatory — it
-  carries exact tokens (IDs, hostnames, paths) that embeddings fumble.
+  carries exact tokens (IDs, hostnames, paths) that embeddings fumble. The RRF constant is a
+  per-query knob (`rrf_k`, default 60) so `bench --sweep` can tune it (P10).
 - **Prefilter:** `scope` (default), tags are **OR-within / AND-across**.
 - **Params:** default `k=10`; `max_distance` optional (off); `mode = hybrid|vec|fts`.
 - **Returns:** `{id, key, scope, type, title, body, tags, score, distance}` so the caller can
@@ -324,7 +325,12 @@ any model is touched; flags are re-checked the same way after they override the 
 - **Cold start is the real cost:** ~1–3 s to load ~1.2 GB + build the graph. Hence the
   long-lived process. Warmup one throwaway embed at startup.
 - KNN at our scale (10^3–10^6 vectors) is sub-ms — the index is never the bottleneck.
-- `bench` subcommand + timing output to replace these estimates with real numbers.
+- **`bench` (P10)** replaces these estimates with numbers: it prints load time, embed latency
+  and hybrid-search latency (mean/p50/p95) at the store's current row count. `bench --golden`
+  scores a JSONL query set (recall@k + MRR, gate recall@3 ≥ 0.8); `bench --sweep` walks the
+  query-time knobs (`k`, RRF weight) and compares the embed projections. The seed set lives in
+  `tests/golden/`; the shipped defaults are the ones swept best (`k=10`, RRF `k=60`,
+  projection `title+body`).
 
 ## 14. Risks
 
@@ -341,7 +347,9 @@ any model is touched; flags are re-checked the same way after they override the 
 
 ## 15. Open questions (for the detailed spec)
 
-1. Golden **eval set** + `bench`: the instrument for tuning k / RRF weights / embed projection.
+1. ~~Golden **eval set** + `bench`~~ — **shipped (P10)**: `tests/golden/` (corpus + ≥20
+   questions), `bench`/`bench --golden`/`bench --sweep`; defaults `k=10`, RRF `k=60`,
+   projection `title+body`; recall@3 gate 0.8. Grown from real usage.
 2. Exact **MCP tool schema** + annotations (readOnly/destructive/idempotent).
 3. **Rename** implementation (rewrite bodies + edges) and collision policy.
 4. **Daemon vs not** for one-shot CLI latency.

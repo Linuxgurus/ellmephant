@@ -32,9 +32,10 @@ pub const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
 pub const MAX_DIM: usize = 1024;
 
 /// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance`
-/// (SPEC §10). Calibrated on the sample store: a genuinely relevant hit sits at ≲0.5 while
-/// the noise floor is ≳0.65, so this keeps the good hits and drops the paraphrase chaff.
-pub const DEFAULT_MAX_DISTANCE: f32 = 0.5;
+/// (SPEC §10). Calibrated on the sample store: the rank-1 hit for a relevant query sits
+/// ≲0.6 while the noise floor is ≳0.63, so 0.6 keeps every genuine hit (even a sloppy
+/// paraphrase) and still drops the chaff. High-precision callers can tighten toward 0.5.
+pub const DEFAULT_MAX_DISTANCE: f32 = 0.6;
 
 /// Resolved on-disk locations. `LLMPHANT_HOME` wins over `$HOME/.llmphant`, which
 /// keeps tests hermetic without touching the real store.
@@ -134,7 +135,7 @@ impl Default for Config {
             precision: "bf16".to_string(),
             device: "cpu".to_string(),
             instruction: DEFAULT_INSTRUCTION.to_string(),
-            default_k: 10,
+            default_k: 5,
             default_max_distance: Some(DEFAULT_MAX_DISTANCE),
             port: DEFAULT_PORT,
         }

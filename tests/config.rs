@@ -22,7 +22,7 @@ fn missing_config_file_yields_the_documented_defaults() {
     assert_eq!(cfg.dim, 1024);
     assert_eq!(cfg.precision, "bf16");
     assert_eq!(cfg.device, "cpu");
-    assert_eq!(cfg.default_k, 10);
+    assert_eq!(cfg.default_k, 5);
     assert_eq!(cfg.instruction, llmphant::config::DEFAULT_INSTRUCTION);
     // The MCP server listens on a high, unassigned port by default.
     assert_eq!(cfg.port, 8888);

@@ -113,7 +113,7 @@ prefix) and the KNN of the whole store is taken, capped by `--max-distance` and 
 regex leg — `key`/`tags` are identity and lookup, and are part of the embedded document.
 
 ```sh
-llmphant search "where do the logs live"             # semantic, k=10
+llmphant search "where do the logs live"             # semantic, k=5
 llmphant search "portainer-notes-gw"                 # key/tag tokens are in the embedding
 llmphant search "backups" --expand 1                 # + linked neighbours
 ```

@@ -9,6 +9,6 @@ dim = 1024                             # MRL allows 32..=1024; frozen at CREATE
 precision = "bf16"                     # bf16 (default) | f16
 device = "cpu"                         # cpu | metal
 instruction = "Given a question, retrieve relevant memories"  # query side only
-default_k = 10                         # search result count
-default_max_distance = 0.5             # cosine-distance ceiling when a search omits it; null = off
+default_k = 5                          # search result count
+default_max_distance = 0.6             # cosine-distance ceiling when a search omits it; null = off
 port = 8888                            # MCP HTTP port (`mcp --stdio` ignores it)

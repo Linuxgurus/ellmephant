@@ -1,8 +1,8 @@
 -- 0001_init — SPEC §7, minus the vec0 table.
 --
--- `memory_vec` (vec0) is added by a later migration, once the sqlite-vec extension is
--- registered in-process (PLAN §5, S0.1). Keeping the pure-SQLite schema separate means
--- `cargo test` runs with no extension, no dylib, offline.
+-- `memory_vec` (vec0) is a derived index created programmatically by `index::vec::ensure`
+-- (PLAN §5 S0.1): its dimension is a runtime property of the embedder, not schema. Keeping
+-- the pure-SQLite schema separate means `cargo test` runs with no extension, no dylib, offline.
 
 CREATE TABLE memory (
   id      INTEGER PRIMARY KEY,

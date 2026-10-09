@@ -162,12 +162,10 @@ pub fn doctor(paths: &Paths) -> Result<()> {
     );
     println!("  objects        {objects}");
     println!("  model          {} dim={}", cfg.model, cfg.dim);
-    println!(
-        "  vec0           {}",
-        match index::vec::register_extension() {
-            Ok(()) => "registered",
-            Err(_) => "pending (PLAN.md P2)",
-        }
-    );
+    let vec_status = match index::vec::stored_dim(&conn)? {
+        Some(dim) => format!("vec0 dim={dim}, {} rows", index::vec::count(&conn)?),
+        None => "registered (no vectors yet)".to_string(),
+    };
+    println!("  vec0           {vec_status}");
     Ok(())
 }

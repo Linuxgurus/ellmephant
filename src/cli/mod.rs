@@ -303,14 +303,26 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
             emit(format::render_tags(&tags, json)?);
             Ok(())
         }
+        Command::Export { path } => {
+            let count = session.export(&path)?;
+            println!("exported {count} memories to {}", path.display());
+            Ok(())
+        }
+        Command::Import { path, dry_run } => {
+            let count = session.import(&path, dry_run)?;
+            if dry_run {
+                println!("{count} memory change(s) pending from {}", path.display());
+            } else {
+                println!("imported {count} memory change(s) from {}", path.display());
+            }
+            Ok(())
+        }
         // Not store commands: the dispatcher above owns these, and the REPL rejects them.
         Command::Repl
         | Command::Doctor
         | Command::Model { .. }
         | Command::Embed { .. }
         | Command::Mcp => Err(Error::Config("command is not available here".into())),
-        Command::Export { .. } => Err(Error::NotImplemented("export (PLAN.md P8)")),
-        Command::Import { .. } => Err(Error::NotImplemented("import (PLAN.md P8)")),
         Command::Bench { .. } => Err(Error::NotImplemented("bench (PLAN.md P10)")),
     }
 }

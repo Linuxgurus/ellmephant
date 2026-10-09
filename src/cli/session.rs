@@ -4,6 +4,8 @@
 //! `--mode fts` and `show`/`rm` never pay for 1.2 GB of weights, while the REPL keeps the
 //! model warm across commands (the reason v1 has no daemon — PLAN §2 #4).
 
+use std::path::Path;
+
 use rusqlite::Connection;
 
 use crate::config::{Config, Paths};
@@ -11,6 +13,7 @@ use crate::db;
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::model;
+use crate::portable;
 use crate::search::{self, Bundle, Query};
 use crate::store::{self, Memory};
 
@@ -97,6 +100,19 @@ impl Session {
             self.ensure_embedder()?;
         }
         search::run(&self.conn, self.embedder(), q)
+    }
+
+    /// Write the whole store to `path` as canonical JSONL; returns the row count (P8).
+    pub fn export(&self, path: &Path) -> Result<usize> {
+        portable::export::to_jsonl(&self.conn, path)
+    }
+
+    /// Upsert canonical JSONL from `path`; returns the number of new/changed records.
+    /// This is the only path that touches the weights cache outside `add`/`search`.
+    pub fn import(&mut self, path: &Path, dry_run: bool) -> Result<usize> {
+        self.ensure_embedder()?;
+        let embedder = self.embedder.as_deref().expect("encoder was just loaded");
+        portable::import::from_jsonl(&self.conn, embedder, path, dry_run)
     }
 
     /// Every tag with its reference count, alphabetical.

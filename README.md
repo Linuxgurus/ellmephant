@@ -10,12 +10,13 @@ anything else share one memory) and ships a REPL for the human.
 
 ## Status
 
-Phases 1, 2, 2.5, 3, 4, 5, 6 and 7 are real and tested: bootstrap, schema + FTS triggers, the
-`sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, the write
-path, hybrid search, the CLI (one-shot `add`/`search`/`show`/`rm`/`tags` plus an interactive
-REPL with history and tab-completion), and the MCP stdio server (shared by Cline, TypingMind
-and anything else). The portability layer (JSONL export/import) is still a typed stub that
-returns `NotImplemented`. `cargo test` needs no model and no network.
+Phases 1, 2, 2.5, 3, 4, 5, 6, 7 and 8 are real and tested: bootstrap, schema + FTS triggers,
+the `sqlite-vec` (`vec0`) index, the model weights cache, the candle Qwen3 encoder, the write
+path, hybrid search, the CLI (one-shot `add`/`search`/`show`/`rm`/`tags`/`export`/`import` plus
+an interactive REPL with history and tab-completion), the MCP stdio server (shared by Cline,
+TypingMind and anything else), and the JSONL portability layer. Maintenance (`reembed`,
+`rename`, link audit) and `bench` are still ahead (P9–P10). `cargo test` needs no model and no
+network.
 
 | Area | State |
 |---|---|
@@ -28,7 +29,8 @@ returns `NotImplemented`. `cargo test` needs no model and no network.
 | `search` — hybrid BM25 ∪ KNN fused with RRF, `--expand`, `--max-distance` (P5) | done |
 | `cli` — one-shot `add`/`show`/`rm`/`tags`, REPL with history + completion (P6) | done |
 | `mcp` — MCP stdio server: 8 tools, schemas, annotations, write policy (P7) | done |
-| export/import (P8), bench (P10) | stubs |
+| `portable` — JSONL export/import, upsert-by-key, re-embed on hash change (P8) | done |
+| bench (P10) | stub |
 
 The encoder is behind the default-on `encoder` cargo feature; build with
 `--no-default-features` for a store-only binary that links no ML stack.
@@ -87,6 +89,20 @@ llmphant search "backups" --expand 1                # + linked neighbours
 
 Every hit carries its fused `score` (and `distance` when the KNN leg contributed) so the
 caller can judge confidence — the read policy is snippets + scores, never dumps (SPEC §10).
+
+## Portable
+
+Export/import is JSONL of canonical fields (`key,scope,type,title,body,source,tags,created,updated`)
+— no ids, no vectors, so a dump survives a different machine, model revision or dimension.
+
+```sh
+llmphant export memory.jsonl            # no model needed
+llmphant import memory.jsonl --dry-run  # report pending changes, write nothing
+llmphant import memory.jsonl            # upsert by key; re-embed only on hash change
+```
+
+Import re-embeds, so it loads the encoder; a second import of the same file is a no-op
+(it returns `0` changes). Export is ordered by `key`, so equal content exports byte-identical.
 
 ## MCP
 

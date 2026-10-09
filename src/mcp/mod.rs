@@ -66,7 +66,9 @@ are re-derived from `[[…]]` in the new body.";
 pub struct AddParams {
     /// Stable slug; omit to derive one from `scope` + `title`.
     #[serde(default)]
-    #[schemars(description = "Stable slug. Omit to derive one from scope+title. Re-using a key replaces that memory.")]
+    #[schemars(
+        description = "Stable slug. Omit to derive one from scope+title. Re-using a key replaces that memory."
+    )]
     pub key: Option<String>,
     /// Single bucket, e.g. `infra`.
     #[schemars(description = "Single bucket, e.g. `infra` or `projects`.")]
@@ -79,11 +81,15 @@ pub struct AddParams {
     pub body: String,
     /// Usage class; default `fact`.
     #[serde(rename = "type", default)]
-    #[schemars(description = "Usage class: signpost | dictate | fact | profile. Defaults to fact.")]
+    #[schemars(
+        description = "Usage class: signpost | dictate | fact | profile. Defaults to fact."
+    )]
     pub type_: Option<String>,
     /// Provenance.
     #[serde(default)]
-    #[schemars(description = "Provenance: the command/path/repo that derives this — never live state.")]
+    #[schemars(
+        description = "Provenance: the command/path/repo that derives this — never live state."
+    )]
     pub source: Option<String>,
     /// Free-form tags.
     #[serde(default)]
@@ -398,8 +404,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<PathParams>,
     ) -> std::result::Result<String, String> {
-        let count =
-            self.with_store(|s| crate::portable::export::to_jsonl(s.conn(), Path::new(&p.path)))?;
+        let count = self.with_store(|s| s.export(Path::new(&p.path)))?;
         Ok(json_ok(
             serde_json::json!({ "status": "exported", "path": p.path, "count": count }),
         ))
@@ -422,9 +427,7 @@ impl MemoryServer {
         Parameters(p): Parameters<ImportParams>,
     ) -> std::result::Result<String, String> {
         let dry_run = p.dry_run.unwrap_or(false);
-        let count = self.with_store(|s| {
-            crate::portable::import::from_jsonl(s.conn(), Path::new(&p.path), dry_run)
-        })?;
+        let count = self.with_store(|s| s.import(Path::new(&p.path), dry_run))?;
         Ok(json_ok(serde_json::json!({
             "status": if dry_run { "dry-run" } else { "imported" },
             "path": p.path,
@@ -488,7 +491,11 @@ mod tests {
             "memory_backlinks",
             "memory_export",
         ] {
-            assert_eq!(ann(name).read_only_hint, Some(true), "{name} must be read-only");
+            assert_eq!(
+                ann(name).read_only_hint,
+                Some(true),
+                "{name} must be read-only"
+            );
         }
         // Delete is the destructive one; add/update are idempotent upserts.
         assert_eq!(ann("memory_delete").destructive_hint, Some(true));
@@ -502,4 +509,3 @@ mod tests {
         assert!(add.contains("source"), "{add}");
     }
 }
-

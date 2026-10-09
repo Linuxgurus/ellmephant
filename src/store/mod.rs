@@ -161,6 +161,10 @@ fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> 
 
 /// Upsert a memory by `key`, keeping the row, its tags, its links and its vector in one
 /// transaction (SPEC §7, PLAN §6 P4). Re-embeds only when the row hash changes.
+///
+/// A non-empty `mem.created`/`mem.updated` is honoured (import preserves timestamps);
+/// empty strings fall back to `datetime('now')`, which is what the CLI/MCP write path
+/// passes.
 pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i64> {
     let key = resolve_key(conn, mem)?;
     let text = projection::embed_text(&mem.title, &mem.body);
@@ -191,7 +195,8 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i
             tx.execute(
                 "UPDATE memory
                     SET scope = ?2, type = ?3, title = ?4, body = ?5, source = ?6,
-                        hash = ?7, model = ?8, dim = ?9, updated = datetime('now')
+                        hash = ?7, model = ?8, dim = ?9,
+                        updated = COALESCE(NULLIF(?10, ''), datetime('now'))
                   WHERE id = ?1",
                 params![
                     id,
@@ -202,15 +207,19 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i
                     mem.source,
                     hash,
                     embedder.model_id(),
-                    dim
+                    dim,
+                    mem.updated
                 ],
             )?;
             id
         }
         None => {
             tx.execute(
-                "INSERT INTO memory (key, scope, type, title, body, source, hash, model, dim)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO memory (key, scope, type, title, body, source, hash, model, dim,
+                                     created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                         COALESCE(NULLIF(?10, ''), datetime('now')),
+                         COALESCE(NULLIF(?11, ''), datetime('now')))",
                 params![
                     key,
                     mem.scope,
@@ -220,7 +229,9 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i
                     mem.source,
                     hash,
                     embedder.model_id(),
-                    dim
+                    dim,
+                    mem.created,
+                    mem.updated
                 ],
             )?;
             tx.last_insert_rowid()

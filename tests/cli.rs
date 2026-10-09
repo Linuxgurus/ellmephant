@@ -46,8 +46,8 @@ fn help_lists_the_subcommands() {
 
 #[test]
 fn maintenance_commands_behave_on_a_fresh_store() {
-    // P9 commands must work without the model: `rename`, `links` and `tags prune` touch
-    // only the relational store, so a cold home is enough to exercise them end to end.
+    // The maintenance commands must work without the model: `rename`, `links` and `tags`
+    // touch only the relational store, so a cold home is enough to exercise them end to end.
     let dir = tempfile::tempdir().unwrap();
 
     let out = run(dir.path(), &["links"]);

@@ -81,7 +81,8 @@ mod real {
             "metal" => Device::new_metal(0)
                 .map_err(|e| Error::Config(format!("cannot open metal device 0: {e}"))),
             other => Err(Error::Config(format!(
-                "invalid device {other:?} (want cpu|metal)"
+                "invalid device {other:?} (want {})",
+                crate::config::DEVICES.join("|")
             ))),
         }
     }
@@ -93,7 +94,8 @@ mod real {
             "f16" => Ok(DType::F16),
             "f32" => Ok(DType::F32),
             other => Err(Error::Config(format!(
-                "invalid precision {other:?} (want bf16|f16|f32)"
+                "invalid precision {other:?} (want {})",
+                crate::config::PRECISIONS.join("|")
             ))),
         }
     }
@@ -320,7 +322,7 @@ mod stub {
         /// Always fails: this build has no candle backend.
         pub fn load(_dir: &Path, opts: &Options<'_>) -> Result<Self> {
             let _ = opts;
-            Err(Error::NotImplemented(
+            Err(Error::Unsupported(
                 "built without the `encoder` feature (rebuild with `--features encoder`)",
             ))
         }
@@ -341,7 +343,7 @@ mod stub {
         }
 
         fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            Err(Error::NotImplemented(
+            Err(Error::Unsupported(
                 "built without the `encoder` feature (rebuild with `--features encoder`)",
             ))
         }

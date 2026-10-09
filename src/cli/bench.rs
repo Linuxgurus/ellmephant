@@ -1,8 +1,8 @@
 //! `llmphant bench` — real latency numbers and the golden eval (PLAN §6 P10).
 //!
-//! `bench` loads the encoder (that *is* the measured cold start), times embed and hybrid
+//! `bench` loads the encoder (that *is* the measured cold start), times embed and semantic
 //! search, and — with `--golden` — scores a JSONL query set. `--sweep` additionally walks the
-//! query-time knobs (result count, RRF weight) and compares the embed projections.
+//! result count `k`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -22,7 +22,7 @@ pub struct Options {
     pub golden: bool,
     /// Golden JSONL path (default: `<home>/golden/queries.jsonl`).
     pub golden_file: Option<PathBuf>,
-    /// Sweep k, the RRF weight and the embed projection.
+    /// Sweep the result count `k`.
     pub sweep: bool,
     /// Result count for the timing search and the single-shot golden run.
     pub k: usize,

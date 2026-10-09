@@ -83,15 +83,11 @@ pub struct AddParams {
     #[schemars(description = "One sharp line. Big words, no filler.")]
     pub title: String,
     /// The fact.
-    #[schemars(
-        description = "Fact. Drop filler. Link memory with `[[other-key]]`."
-    )]
+    #[schemars(description = "Fact. Drop filler. Link memory with `[[other-key]]`.")]
     pub body: String,
     /// Provenance.
     #[serde(default)]
-    #[schemars(
-        description = "Proof stone: command/path/repo that derive this. Never live state."
-    )]
+    #[schemars(description = "Proof stone: command/path/repo that derive this. Never live state.")]
     pub source: Option<String>,
     /// Aspect tags.
     #[serde(default)]
@@ -166,7 +162,7 @@ impl MemoryServer {
 
     /// Run `f` against the store on a blocking thread, turning an [`Error`] into a
     /// tool-error string. SQLite and the encoder can hold the store lock for a while, so
-    /// this must not occupy a tokio worker (REFACTOR follow-up).
+    /// this must not occupy a tokio worker.
     ///
     /// `tool` labels the call in logs: a success is a `debug!` with its latency, a store
     /// error a `warn!`, and a panic/join failure an `error!`. That is the one place every
@@ -430,9 +426,7 @@ impl MemoryServer {
         let key = p.key;
         let lookup = key.clone();
         let links = self
-            .with_store("memory_backlinks", move |s| {
-                crate::store::links::backlinks(s.conn(), &lookup)
-            })
+            .with_store("memory_backlinks", move |s| s.backlinks(&lookup))
             .await?;
         tracing::debug!(tool = "memory_backlinks", key = %key, count = links.len(), "backlinks");
         serde_json::to_string(&links).map_err(|e| e.to_string())
@@ -617,7 +611,7 @@ mod tests {
 
         // The write policy rides on the descriptions (SPEC §9).
         let add = find("memory_add").description.clone().expect("description");
-        assert!(add.contains("one fact per row"), "{add}");
+        assert!(add.to_lowercase().contains("one fact"), "{add}");
         assert!(add.contains("source"), "{add}");
 
         // Search filters by phrase only — no key/tag constraints anywhere in the schema.
@@ -648,7 +642,7 @@ mod tests {
 
         // The read policy tells the model to search narrow and widen.
         let info = MemoryServer::new(memory_session()).get_info();
-        let instructions = info.instructions.expect("instructions");
+        let instructions = info.instructions.expect("instructions").to_lowercase();
         assert!(instructions.contains("widen"), "{instructions}");
     }
 

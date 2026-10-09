@@ -24,6 +24,13 @@ pub const DEFAULT_INSTRUCTION: &str = "Given a question, retrieve relevant memor
 /// Default TCP port for the MCP server (SPEC §11). High and unassigned.
 pub const DEFAULT_PORT: u16 = 8888;
 
+/// Accepted `device` values — the one list `Config::validate` and the encoder both consult.
+pub const DEVICES: [&str; 2] = ["cpu", "metal"];
+/// Accepted `precision` values — likewise shared with the encoder.
+pub const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
+/// Largest embedding dimension MRL allows (SPEC §6); the frozen `vec0` width.
+pub const MAX_DIM: usize = 1024;
+
 /// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance`
 /// (SPEC §10). Calibrated on the sample store: a genuinely relevant hit sits at ≲0.5 while
 /// the noise floor is ≳0.65, so this keeps the good hits and drops the paraphrase chaff.
@@ -99,9 +106,9 @@ pub struct Config {
     pub cache_dir: String,
     /// Never open a socket; a cold cache is a hard error (SPEC §6.4).
     pub offline: bool,
-    /// Vector dimensionality; frozen at `CREATE`, MRL allows 32..=1024.
+    /// Vector dimensionality; frozen at `CREATE`. MRL allows 32..=1024 and the cap is enforced.
     pub dim: usize,
-    /// `bf16` (default) or `f16`.
+    /// `bf16` (default), `f16` or `f32` (CPU forces `f32`).
     pub precision: String,
     /// `cpu` or `metal`.
     pub device: String,
@@ -149,24 +156,27 @@ impl Config {
     }
 
     /// Reject a bad `device`/`precision`/`dim` before anything opens a model, so the error
-    /// is one clear message instead of surfacing at encoder load (REFACTOR follow-up).
+    /// is one clear message instead of surfacing at encoder load.
     pub fn validate(&self) -> Result<()> {
-        const DEVICES: [&str; 2] = ["cpu", "metal"];
-        const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
         if !DEVICES.contains(&self.device.as_str()) {
             return Err(Error::Config(format!(
-                "invalid device {:?} (want cpu|metal)",
-                self.device
+                "invalid device {:?} (want {})",
+                self.device,
+                DEVICES.join("|")
             )));
         }
         if !PRECISIONS.contains(&self.precision.as_str()) {
             return Err(Error::Config(format!(
-                "invalid precision {:?} (want bf16|f16|f32)",
-                self.precision
+                "invalid precision {:?} (want {})",
+                self.precision,
+                PRECISIONS.join("|")
             )));
         }
-        if self.dim == 0 {
-            return Err(Error::Config("dim must be positive".into()));
+        if self.dim == 0 || self.dim > MAX_DIM {
+            return Err(Error::Config(format!(
+                "dim must be 1..={MAX_DIM} (got {})",
+                self.dim
+            )));
         }
         Ok(())
     }

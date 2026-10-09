@@ -299,7 +299,7 @@ async fn tools_round_trip_over_http() {
 
 #[tokio::test]
 async fn list_tool_reports_the_index_without_bodies() {
-    // `memory_list` is the read-out surface: the store index (no bodies), optionally scoped.
+    // `memory_list` is the read-out surface: the whole store index, no bodies.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path()));
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);

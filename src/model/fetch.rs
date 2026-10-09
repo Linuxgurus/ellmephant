@@ -4,11 +4,21 @@
 //! without a socket. Production uses [`UreqFetcher`] (ureq + rustls).
 
 use std::io::Write;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 
 /// Default Hub host; `HF_ENDPOINT` overrides it (mirrors, air-gapped proxies).
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
+
+/// DNS lookup ceiling — a hung resolver must not stall a fetch forever.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP/TLS connect ceiling.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time to first response byte (headers).
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Whole-request ceiling; generous because weights files run to ~1.2 GB.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// URL of one file at a revision: `<endpoint>/<repo>/resolve/<rev>/<file>`.
 pub fn file_url(endpoint: &str, repo: &str, rev: &str, file: &str) -> String {
@@ -40,6 +50,18 @@ pub trait Fetcher {
     fn resolve_ref(&self, url: &str) -> Result<String>;
 }
 
+/// The shared blocking agent: connection timeouts bound a hung mirror, while the generous
+/// whole-request ceiling still lets large weights files finish.
+fn build_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_resolve(Some(RESOLVE_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 /// Blocking HTTP fetcher. Reads `HF_ENDPOINT`/`HF_TOKEN`-style config at construction.
 pub struct UreqFetcher {
     token: Option<String>,
@@ -55,7 +77,7 @@ impl UreqFetcher {
             .filter(|t| !t.is_empty());
         Self {
             token,
-            agent: ureq::Agent::new_with_defaults(),
+            agent: build_agent(),
         }
     }
 
@@ -63,7 +85,7 @@ impl UreqFetcher {
     pub fn with_token(token: Option<String>) -> Self {
         Self {
             token,
-            agent: ureq::Agent::new_with_defaults(),
+            agent: build_agent(),
         }
     }
 

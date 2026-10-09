@@ -69,7 +69,7 @@ fn add_writes_row_one_vector_tags_and_links() {
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
 
-    let id = store::add(
+    let (id, _) = store::add(
         &conn,
         &embedder,
         &memory(
@@ -117,11 +117,11 @@ fn identical_readd_does_not_re_embed() {
     let embedder = CountingEmbedder::new();
 
     let m = memory("note", "Note", "same words here", &["k8s"]);
-    let first = store::add(&conn, &embedder, &m).expect("add");
+    let (first, _) = store::add(&conn, &embedder, &m).expect("add");
     assert_eq!(embedder.calls(), 1, "first add embeds the document");
     let vector_before = vec::get(&conn, first).unwrap();
 
-    let again = store::add(&conn, &embedder, &m).expect("re-add");
+    let (again, _) = store::add(&conn, &embedder, &m).expect("re-add");
     assert_eq!(again, first, "same key => same row");
     assert_eq!(embedder.calls(), 1, "unchanged row must not re-embed");
     assert_eq!(vec::get(&conn, first).unwrap(), vector_before);
@@ -134,11 +134,12 @@ fn changed_body_reembeds_the_document() {
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
 
-    let first = store::add(&conn, &embedder, &memory("note", "Note", "alpha", &[])).expect("add");
+    let (first, _) =
+        store::add(&conn, &embedder, &memory("note", "Note", "alpha", &[])).expect("add");
     let vector_before = vec::get(&conn, first).unwrap().unwrap();
     assert_eq!(embedder.calls(), 1);
 
-    let second =
+    let (second, _) =
         store::add(&conn, &embedder, &memory("note", "Note", "beta gamma", &[])).expect("update");
     assert_eq!(second, first, "upsert keeps the row id");
     assert_eq!(embedder.calls(), 2, "a changed document re-embeds");

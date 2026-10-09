@@ -93,23 +93,6 @@ fn resolve_key(conn: &Connection, mem: &Memory) -> Result<String> {
     Ok(slug::unique_slug(&base, &taken_variants(conn, &base)?))
 }
 
-/// The `memory.tags` column value: the normalised tag set, comma-joined. Sorted and de-duped
-/// so re-ordering tags never changes the stored string (and so never forces a re-embed).
-fn tags_column(mem: &Memory) -> String {
-    let mut tags: Vec<String> = mem.tags.iter().filter_map(|t| tags::normalize(t)).collect();
-    tags.sort();
-    tags.dedup();
-    tags.join(",")
-}
-
-/// Split a `memory.tags` column value back into names.
-fn tags_from_column(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// Replace the outgoing `[[key]]` edges for `id` with those parsed from `body`.
 fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> {
     conn.execute("DELETE FROM memory_link WHERE from_id = ?1", params![id])?;
@@ -128,9 +111,12 @@ fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> 
 /// Upsert a memory by `key`, keeping the row, its tags, its links and its vector in one
 /// transaction (SPEC §7, PLAN §6 P4). Re-embeds the document only when its hash changes.
 ///
+/// Returns the rowid and the resolved key (the slug may differ from `mem.key` when it was
+/// derived from the title), so the caller never has to re-read the row.
+///
 /// A non-empty `mem.created`/`mem.updated` is honoured; empty strings fall back to
 /// `datetime('now')`, which is what the CLI/MCP write path passes.
-pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i64> {
+pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(i64, String)> {
     let prepared = prepare(conn, embedder, mem)?;
     // Create the vec table before the tx so its DDL is not inside it.
     index::vec::ensure(conn, embedder.dim())?;
@@ -143,7 +129,7 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<i
     let tx = conn.unchecked_transaction()?;
     let id = apply(&tx, mem, &prepared, vector.as_deref())?;
     tx.commit()?;
-    Ok(id)
+    Ok((id, prepared.key))
 }
 
 /// A write resolved *outside* the transaction: the key, the embedded document, its hash, and
@@ -221,7 +207,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, doc_hash: &str) -> Result<
             id,
             mem.title,
             mem.body,
-            tags_column(mem),
+            tags::encode(&mem.tags),
             mem.source,
             doc_hash,
             mem.updated
@@ -241,7 +227,7 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory, doc_hash: &str) -> Resul
             key,
             mem.title,
             mem.body,
-            tags_column(mem),
+            tags::encode(&mem.tags),
             mem.source,
             doc_hash,
             mem.created,
@@ -293,7 +279,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         key: r.get(1)?,
         title: r.get(2)?,
         body: r.get(3)?,
-        tags: tags_from_column(&tags),
+        tags: tags::decode(&tags),
         source: r.get(5)?,
         doc_hash: r.get(6)?,
         created: r.get(7)?,
@@ -336,7 +322,7 @@ pub fn summaries(conn: &Connection) -> Result<Vec<Summary>> {
         Ok(Summary {
             key: r.get(0)?,
             title: r.get(1)?,
-            tags: tags_from_column(&tags),
+            tags: tags::decode(&tags),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

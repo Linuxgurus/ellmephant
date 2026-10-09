@@ -32,8 +32,9 @@ pub enum Error {
     #[error("home directory not found (set HOME or LLMPHANT_HOME)")]
     NoHome,
 
-    #[error("{0} is not implemented yet (see PLAN.md)")]
-    NotImplemented(&'static str),
+    /// A capability this build does not carry (e.g. the encoder behind a disabled feature).
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 /// Crate-wide result alias.

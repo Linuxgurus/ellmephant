@@ -1,8 +1,8 @@
 //! One live store session shared by the one-shot commands and the REPL (PLAN §6 P6).
 //!
 //! It owns a single writer connection (SPEC §15 #10) and loads the Qwen3 encoder lazily:
-//! `--mode fts` and `show`/`rm` never pay for 1.2 GB of weights, while the REPL keeps the
-//! model warm across commands (the reason v1 has no daemon — PLAN §2 #4).
+//! `show`/`rm` and the link/tag maintenance commands never pay for 1.2 GB of weights, while
+//! the REPL keeps the model warm across commands (the reason v1 has no daemon — PLAN §2 #4).
 
 use rusqlite::Connection;
 
@@ -46,11 +46,6 @@ impl Session {
     /// The resolved store paths.
     pub fn paths(&self) -> &Paths {
         &self.paths
-    }
-
-    /// The raw connection (used by `doctor`-style introspection).
-    pub fn conn(&self) -> &Connection {
-        &self.conn
     }
 
     /// Default result count for searches with no explicit `-k` (SPEC §12 config).
@@ -100,9 +95,8 @@ impl Session {
     pub fn add(&mut self, mem: &Memory) -> Result<String> {
         self.ensure_embedder()?;
         let embedder = self.embedder()?;
-        let id = store::add(&self.conn, embedder, mem)?;
-        let stored = store::get_by_id(&self.conn, id)?.ok_or(Error::NotFound(mem.key.clone()))?;
-        Ok(stored.key)
+        let (_id, key) = store::add(&self.conn, embedder, mem)?;
+        Ok(key)
     }
 
     /// Fetch one memory by key, or [`Error::NotFound`].
@@ -150,6 +144,11 @@ impl Session {
     /// `[[key]]` targets with no matching row, grouped by target (P9 audit).
     pub fn dangling(&self) -> Result<Vec<links::Dangling>> {
         links::dangling(&self.conn)
+    }
+
+    /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.
+    pub fn backlinks(&self, key: &str) -> Result<Vec<links::Backlink>> {
+        links::backlinks(&self.conn, key)
     }
 
     /// Every tag with its reference count, alphabetical.

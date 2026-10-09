@@ -236,7 +236,7 @@ pub fn run(cli: Cli) -> Result<()> {
     if let Some(precision) = cli.precision.clone() {
         cfg.precision = precision;
     }
-    // Flags override the file, so re-check here too (REFACTOR follow-up).
+    // Flags override the file, so re-check here too.
     cfg.validate()?;
 
     // Flags override config (SPEC §12); `--model-dir` is inherently offline.

@@ -23,7 +23,9 @@ fn memory(key: &str, body: &str, tags_: &[&str]) -> Memory {
 }
 
 fn add(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str, tags_: &[&str]) -> i64 {
-    store::add(conn, embedder, &memory(key, body, tags_)).expect("add")
+    store::add(conn, embedder, &memory(key, body, tags_))
+        .expect("add")
+        .0
 }
 
 fn meta(conn: &Connection, key: &str) -> Option<String> {

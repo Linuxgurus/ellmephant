@@ -11,7 +11,7 @@ use crate::db::meta;
 use crate::embed::{Embedder, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::{row_hash, tags_from_column};
+use crate::store::{row_hash, tags};
 
 /// Rows embedded per `Embedder::embed` batch.
 const BATCH: usize = 16;
@@ -52,7 +52,7 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
             Ok((
                 r.get(0)?,
                 r.get(1)?,
-                tags_from_column(&tags),
+                tags::decode(&tags),
                 r.get(3)?,
                 r.get(4)?,
             ))

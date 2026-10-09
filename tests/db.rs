@@ -34,7 +34,7 @@ fn fresh_store_is_at_schema_v1_with_every_object() {
     for name in ["memory", "memory_link", "meta"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
-    // One embedding per row, so no per-field vector tables, no BM25 index, no tag tables.
+    // v2 keeps one embedding per row: guard against a BM25/tag table being reintroduced.
     for name in ["memory_fts", "tag", "memory_tag"] {
         assert!(
             !object_exists(&conn, "table", name),

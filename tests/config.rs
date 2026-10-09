@@ -86,6 +86,13 @@ fn validate_rejects_a_bad_device_precision_or_dim() {
         ..Config::default()
     };
     assert!(zero_dim.validate().is_err(), "dim 0 is unusable");
+
+    let huge_dim = Config {
+        dim: llmphant::config::MAX_DIM + 1,
+        ..Config::default()
+    };
+    let err = huge_dim.validate().unwrap_err();
+    assert!(err.to_string().contains("1024"), "{err}");
 }
 
 #[test]

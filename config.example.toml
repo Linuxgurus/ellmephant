@@ -10,3 +10,4 @@ precision = "bf16"                     # bf16 (default) | f16
 device = "cpu"                         # cpu | metal
 instruction = "Given a question, retrieve relevant memories"  # query side only
 default_k = 10                         # search result count
+port = 8888                            # MCP TCP port (`mcp --stdio` ignores it)

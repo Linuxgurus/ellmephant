@@ -21,6 +21,9 @@ pub const HISTORY_FILE: &str = "history";
 /// The default instruction prefix applied to the *query* side only (SPEC §6).
 pub const DEFAULT_INSTRUCTION: &str = "Given a question, retrieve relevant memories";
 
+/// Default TCP port for the MCP server (SPEC §11). High and unassigned.
+pub const DEFAULT_PORT: u16 = 8888;
+
 /// Resolved on-disk locations. `LLMPHANT_HOME` wins over `$HOME/.llmphant`, which
 /// keeps tests hermetic without touching the real store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +104,8 @@ pub struct Config {
     pub instruction: String,
     /// Default number of results for search.
     pub default_k: usize,
+    /// TCP port for the MCP server (SPEC §11); `llmphant mcp` listens here by default.
+    pub port: u16,
 }
 
 impl Default for Config {
@@ -115,6 +120,7 @@ impl Default for Config {
             device: "cpu".to_string(),
             instruction: DEFAULT_INSTRUCTION.to_string(),
             default_k: 10,
+            port: DEFAULT_PORT,
         }
     }
 }

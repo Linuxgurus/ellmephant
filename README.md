@@ -12,7 +12,7 @@ the elephant in the corner that remembers all of it:
   older than some nation-states;
 - one **SQLite file** is the sole source of truth, wearing a *rebuildable* full-text + vector
   + link index like a tasteful hat;
-- it speaks **[MCP](https://modelcontextprotocol.io)** over stdio, so Cline, TypingMind and
+- it speaks **[MCP](https://modelcontextprotocol.io)** over a TCP port (or stdio), so Cline, TypingMind and
   whatever you adopt next quarter all read and write the **same** memory instead of keeping
   three private diaries about you;
 - there's a **REPL** for you and a **one-shot CLI** for your scripts, because you contain
@@ -103,7 +103,7 @@ The decisions the code actually obeys (the long, self-important version is in `S
    clients                                    you
    Cline · TypingMind · any MCP client        REPL · one-shot CLI
               │                                        │
-              │  MCP over stdio                        │  one shared core
+              │  MCP over TCP (or stdio)               │  one shared core
               └───────────────────┬────────────────────┘
                                   ▼
                  Session  —  one writer connection, lazy encoder
@@ -133,7 +133,7 @@ Five layers, one crate:
 | Storage | `db`, `migrations/` | open SQLite, pragmas, schema + FTS triggers, `meta` kv |
 | Write path | `store`, `embed`, `index/vec` | upsert a row: key, hash, tags, links, vector |
 | Read path | `search`, `index/fts`, `search/rrf` | hybrid BM25 ∪ KNN, RRF fusion, snippets |
-| Interfaces | `cli`, `mcp`, `portable` | REPL + one-shot, MCP stdio server, JSONL in/out |
+| Interfaces | `cli`, `mcp`, `portable` | REPL + one-shot, MCP server (TCP default, stdio option), JSONL in/out |
 | Tooling | `model`, `bench` | weights cache, latency + golden-eval measurements |
 
 ---
@@ -222,21 +222,30 @@ docker run --rm -it -v llmphant-data:/data \
                     llmphant:dev search "where do the logs live"
 ```
 
-**MCP from Docker.** MCP is stdio, so keep stdin attached and don't allocate a TTY — that last
-`-t` is the classic way to have a perfectly good protocol fail to speak.
+**MCP from Docker.** The image's default command is the MCP server on TCP port **8888**
+(bound to `0.0.0.0` inside the container), so publish the port:
 
 ```sh
-docker run --rm -i -v llmphant-data:/data llmphant:dev mcp
+docker run --rm -p 8888:8888 -v llmphant-data:/data llmphant:dev
 ```
 
-A client can launch it directly — the whole incantation *is* the server:
+Point a client at the URL (`http://localhost:8888`); the transport is newline-delimited
+JSON-RPC over a raw socket. For a client that wants to *launch* the server, use the stdio
+transport instead (`mcp --stdio`) — keep stdin attached and don't allocate a TTY, which is the
+classic way to have a perfectly good protocol fail to speak:
+
+```sh
+docker run --rm -i -v llmphant-data:/data llmphant:dev mcp --stdio
+```
+
+A client can launch that directly — the whole incantation *is* the server:
 
 ```jsonc
 {
   "mcpServers": {
     "llmphant": {
       "command": "docker",
-      "args": ["run", "--rm", "-i", "-v", "llmphant-data:/data", "llmphant:dev", "mcp"]
+      "args": ["run", "--rm", "-i", "-v", "llmphant-data:/data", "llmphant:dev", "mcp", "--stdio"]
     }
   }
 }
@@ -249,9 +258,11 @@ services:
   llmphant:
     build: .
     image: llmphant:dev
+    ports:
+      - "8888:8888"          # MCP over TCP
     volumes:
       - llmphant-data:/data
-    # MCP server: keep stdin open
+    # For the stdio transport instead: `command: ["mcp", "--stdio"]` + `stdin_open: true`
     stdin_open: true
     command: ["mcp"]
 
@@ -332,7 +343,8 @@ llmphant model fetch  [--force]  [--repo R] [--revision REV]
 llmphant model rm     [--all]    [--repo R] [--revision REV]
 llmphant embed "TEXT" [--query]          # debug: dim + load/embed latency + norm
 llmphant bench [--golden] [--golden-file F] [--sweep] [--k N]
-llmphant mcp                             # MCP stdio server
+llmphant mcp                             # MCP server on TCP 127.0.0.1:8888
+llmphant mcp --stdio                     # ...or over stdio (client-launched)
 llmphant                                 # REPL
 ```
 
@@ -352,6 +364,7 @@ precision   = "bf16"                         # bf16 | f16 (CPU is always f32; se
 device      = "cpu"                          # cpu | metal
 instruction = "Given a question, retrieve relevant memories"   # query side only
 default_k   = 10                             # search result count
+port        = 8888                           # MCP TCP port (`mcp --stdio` ignores it)
 ```
 
 A bad `device`/`precision` or `dim = 0` is rejected up front, before any model work — so you
@@ -476,14 +489,24 @@ you invented, which is a lovely hobby and tells you almost nothing.
 
 ## MCP
 
-`llmphant mcp` serves the same store to any MCP client over stdio, so Cline, TypingMind and the
-REPL all read and write one memory. Register it once per client (point `command` at the built
-binary; the client launches it and keeps it on a leash):
+`llmphant mcp` serves the same store to any MCP client, so Cline, TypingMind and the REPL all
+read and write one memory. It **listens on a TCP port by default** — `127.0.0.1:8888` unless
+`port` in `config.toml` or `--port`/`LLMPHANT_MCP_PORT` says otherwise (`--host` /
+`LLMPHANT_MCP_HOST` picks the interface). One port serves many clients; each connection runs on
+its own task, all sharing the single store.
+
+```sh
+llmphant mcp                                # listen on 127.0.0.1:8888
+llmphant mcp --host 0.0.0.0 --port 9000     # bind wider / elsewhere
+```
+
+For clients that *launch* the server and talk over a pipe, `--stdio` keeps the classic
+transport — point the client's `command` at the built binary and it keeps it on a leash:
 
 ```jsonc
 {
   "mcpServers": {
-    "llmphant": { "command": "/absolute/path/to/llmphant", "args": ["mcp"] }
+    "llmphant": { "command": "/absolute/path/to/llmphant", "args": ["mcp", "--stdio"] }
   }
 }
 ```
@@ -512,7 +535,7 @@ src/
 ├── index/             vec0 (KNN) and fts5 (BM25) legs
 ├── search/            hybrid orchestration + RRF
 ├── cli/               subcommands, repl, session, output formatting
-├── mcp/               MCP stdio server
+├── mcp/               MCP server (TCP default; stdio option)
 ├── portable/          JSONL export/import
 └── bench/             timings, golden eval (recall@k + MRR), sweeps
 migrations/            NNNN_*.sql, embedded with include_str!

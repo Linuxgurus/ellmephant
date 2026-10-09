@@ -28,15 +28,22 @@ RUN apt-get update \
 
 COPY --from=builder /src/target/release/llmphant /usr/local/bin/llmphant
 
+# The MCP server listens on a TCP port by default; bind all interfaces so the port is
+# reachable from outside the container.
 ENV LLMPHANT_HOME=/data \
-    RUST_LOG=warn
+    RUST_LOG=warn \
+    LLMPHANT_MCP_HOST=0.0.0.0 \
+    LLMPHANT_MCP_PORT=8888
 RUN install -d -o llmphant -g llmphant /data
 VOLUME ["/data"]
 USER llmphant
+
+EXPOSE 8888
 
 # Liveness only: `doctor` opens/migrates the store (a write) on every poll, which is both
 # wasted work and a failure on a read-only volume.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["llmphant", "--version"]
 
 ENTRYPOINT ["llmphant"]
-CMD ["doctor"]
+# Default to the MCP server on `LLMPHANT_MCP_PORT`; use `mcp --stdio` for the stdio transport.
+CMD ["mcp"]

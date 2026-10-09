@@ -172,6 +172,55 @@ async fn tools_round_trip_over_the_transport() {
     handle.await.expect("join");
 }
 
+/// The default `mcp` transport is TCP; prove a real socket handshake + tool call works.
+#[tokio::test]
+async fn tools_round_trip_over_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.expect("accept");
+        server
+            .serve(stream)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+
+    let client =
+        ().serve(tokio::net::TcpStream::connect(addr).await.expect("connect"))
+            .await
+            .expect("client handshake over tcp");
+
+    let listed = client.list_tools(Default::default()).await.expect("list");
+    assert!(
+        listed.tools.iter().any(|t| t.name == "memory_add"),
+        "surface missing over tcp"
+    );
+
+    let added = call(
+        &client,
+        "memory_add",
+        serde_json::json!({
+            "key": "tcp-note",
+            "scope": "infra",
+            "title": "TCP note",
+            "body": "reached by socket"
+        }),
+    )
+    .await;
+    assert!(!added.is_error.unwrap_or(false), "{}", text(&added));
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}
+
 #[tokio::test]
 async fn export_and_import_tools_round_trip() {
     let dir = tempfile::tempdir().unwrap();

@@ -63,8 +63,9 @@ tabled = "0.22"
 # hence the crate's rust-version bump). Default features bring the `#[tool]`/`#[tool_router]`
 # macros, the `server` runtime and JSON-Schema generation; `transport-io` adds stdio.
 # `tokio` is the transport runtime — the rest of llmphant stays synchronous.
+# `net` backs the default TCP transport (`mcp`); `transport-io` keeps stdio available.
 rmcp = { version = "3.5.1", features = ["transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 
 [features]
 default = ["encoder"]

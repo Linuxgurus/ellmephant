@@ -24,6 +24,9 @@ fn missing_config_file_yields_the_documented_defaults() {
     assert_eq!(cfg.device, "cpu");
     assert_eq!(cfg.default_k, 10);
     assert_eq!(cfg.instruction, llmphant::config::DEFAULT_INSTRUCTION);
+    // The MCP server listens on a high, unassigned port by default.
+    assert_eq!(cfg.port, 8888);
+    assert_eq!(cfg.port, llmphant::config::DEFAULT_PORT);
 }
 
 #[test]
@@ -31,7 +34,7 @@ fn config_toml_overrides_only_the_keys_it_names() {
     let (_dir, paths) = temp_store();
     std::fs::write(
         paths.config(),
-        "model = \"local/tiny\"\ndim = 256\noffline = true\ndefault_k = 3\n",
+        "model = \"local/tiny\"\ndim = 256\noffline = true\ndefault_k = 3\nport = 9999\n",
     )
     .expect("write config");
 
@@ -40,6 +43,7 @@ fn config_toml_overrides_only_the_keys_it_names() {
     assert_eq!(cfg.dim, 256);
     assert!(cfg.offline);
     assert_eq!(cfg.default_k, 3);
+    assert_eq!(cfg.port, 9999);
     // Unnamed keys keep their defaults (serde `default`).
     assert_eq!(cfg.revision, "main");
     assert_eq!(cfg.device, "cpu");

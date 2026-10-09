@@ -1,4 +1,4 @@
-//! MCP stdio server (P7) on `rmcp`.
+//! MCP server (P7) on `rmcp`: newline-delimited JSON-RPC over TCP (default) or stdio.
 //!
 //! Tools: `memory_add`, `memory_update`, `memory_delete`, `memory_search`,
 //! `memory_get`, `memory_backlinks`, `memory_export`, `memory_import` — with
@@ -441,23 +441,75 @@ impl ServerHandler for MemoryServer {
     }
 }
 
-/// Serve MCP over stdio until the client disconnects (the `llmphant mcp` subcommand).
-pub fn serve(paths: Paths, cfg: Config, spec: model::Spec) -> crate::error::Result<()> {
+/// How `llmphant mcp` reaches its client.
+pub enum Transport {
+    /// Newline-delimited JSON-RPC over stdin/stdout (a client launches the process).
+    Stdio,
+    /// Newline-delimited JSON-RPC over TCP — the default; `host:port` is a listening port.
+    Tcp { host: String, port: u16 },
+}
+
+/// Serve MCP on the chosen [`Transport`] until the client(s) disconnect (the `llmphant mcp`
+/// subcommand). TCP is the default; stdio stays available for client-launched setups.
+pub fn serve(
+    paths: Paths,
+    cfg: Config,
+    spec: model::Spec,
+    transport: Transport,
+) -> crate::error::Result<()> {
     let server = MemoryServer::new(Session::open(paths, cfg, spec)?);
-    // rmcp is async; the rest of llmphant is not, so own the runtime here. `waiting()` keeps
-    // the process alive until the client closes the pipe.
+    // rmcp is async; the rest of llmphant is not, so own the runtime here.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let running = server
-            .serve(rmcp::transport::stdio())
-            .await
-            .map_err(|e| Error::Config(format!("mcp initialize failed: {e}")))?;
-        running
-            .waiting()
-            .await
-            .map_err(|e| Error::Config(format!("mcp server task failed: {e}")))?;
-        Ok(())
+        match transport {
+            Transport::Stdio => {
+                // `waiting()` keeps the process alive until the client closes the pipe.
+                let running = server
+                    .serve(rmcp::transport::stdio())
+                    .await
+                    .map_err(|e| Error::Config(format!("mcp initialize failed: {e}")))?;
+                running
+                    .waiting()
+                    .await
+                    .map_err(|e| Error::Config(format!("mcp server task failed: {e}")))?;
+                Ok(())
+            }
+            Transport::Tcp { host, port } => serve_tcp(server, &host, port).await,
+        }
     })
+}
+
+/// Bind `host:port` and serve every accepted connection on its own task, all sharing the one
+/// store behind the mutex (SPEC §15 #10). Returns only on a bind/accept failure.
+async fn serve_tcp(server: MemoryServer, host: &str, port: u16) -> crate::error::Result<()> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let addr = listener.local_addr()?;
+    tracing::info!(%addr, "llmphant mcp listening");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let server = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_connection(server, stream).await {
+                tracing::warn!(%peer, "mcp connection ended: {e}");
+            }
+        });
+    }
+}
+
+/// Serve one accepted TCP connection until that client disconnects.
+async fn serve_connection(
+    server: MemoryServer,
+    stream: tokio::net::TcpStream,
+) -> std::result::Result<(), String> {
+    let running = server
+        .serve(stream)
+        .await
+        .map_err(|e| format!("mcp initialize failed: {e}"))?;
+    running
+        .waiting()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("mcp server task failed: {e}"))
 }
 
 #[cfg(test)]

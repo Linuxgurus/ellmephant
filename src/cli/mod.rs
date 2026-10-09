@@ -152,8 +152,23 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Serve MCP over stdio.
-    Mcp,
+    /// Serve MCP over a TCP port (default) or stdio.
+    Mcp {
+        /// Serve over stdio instead of a listening port.
+        #[arg(long)]
+        stdio: bool,
+        /// TCP bind address for the port transport.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            env = "LLMPHANT_MCP_HOST",
+            default_value = "127.0.0.1"
+        )]
+        host: String,
+        /// TCP port (default: config `port`, else 8888).
+        #[arg(long, value_name = "PORT", env = "LLMPHANT_MCP_PORT")]
+        port: Option<u16>,
+    },
     /// Weights cache: status | fetch | rm (SPEC §6.5).
     Model {
         #[command(subcommand)]
@@ -271,7 +286,17 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Model { command } => model::cmd(&spec, command),
         Command::Embed { text, query } => embed::run(&spec, &cfg, &text, query),
         // MCP holds the store open and serves until the client disconnects (P7).
-        Command::Mcp => crate::mcp::serve(paths, cfg, spec),
+        Command::Mcp { stdio, host, port } => {
+            let transport = if stdio {
+                crate::mcp::Transport::Stdio
+            } else {
+                crate::mcp::Transport::Tcp {
+                    host,
+                    port: port.unwrap_or(cfg.port),
+                }
+            };
+            crate::mcp::serve(paths, cfg, spec, transport)
+        }
         Command::Bench {
             golden,
             golden_file,
@@ -355,7 +380,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         | Command::Model { .. }
         | Command::Embed { .. }
         | Command::Bench { .. }
-        | Command::Mcp => Err(Error::Config("command is not available here".into())),
+        | Command::Mcp { .. } => Err(Error::Config("command is not available here".into())),
     }
 }
 

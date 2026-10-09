@@ -1,0 +1,22 @@
+//! llmphant — single-binary, SQLite-backed long-term memory for AI agents.
+//!
+//! One SQLite file is the source of truth; vector, full-text and link indexes are
+//! derived and rebuildable. See `SPEC.md` for the decision record and `PLAN.md` for
+//! the phased build.
+
+pub mod cli;
+pub mod config;
+pub mod db;
+pub mod embed;
+pub mod error;
+pub mod index;
+pub mod mcp;
+pub mod portable;
+pub mod search;
+pub mod store;
+
+pub use config::{Config, Paths};
+pub use error::{Error, Result};
+
+/// Semantic version of the crate, reported by `llmphant --version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,0 +1,5 @@
+{"query":"where are container images built for the cluster","expect":["projects-cluster-images"],"k":3}
+{"query":"how does the cluster get its gitops state","expect":["projects-k8s-iac","infra-gitops"],"k":3}
+{"query":"what backs up persistent volumes","expect":["infra-backups"],"k":3}
+{"query":"how do I reach the internal dns names","expect":["infra-network"],"k":3}
+{"query":"which hosts run the storage tier","expect":["infra-storage"],"k":3}

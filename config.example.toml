@@ -1,0 +1,9 @@
+# Copy to ~/.llmphant/config.toml and edit. Flags override these; these override the
+# built-in defaults. Every field is optional.
+
+model = "Qwen/Qwen3-Embedding-0.6B"   # HF repo id, or a directory name under models/
+dim = 1024                             # MRL allows 32..=1024; frozen at CREATE
+precision = "bf16"                     # bf16 (default) | f16
+device = "cpu"                         # cpu | metal
+instruction = "Given a question, retrieve relevant memories"  # query side only
+default_k = 10                         # search result count

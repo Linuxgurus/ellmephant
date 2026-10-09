@@ -2,4 +2,12 @@
 *.db
 *.db-wal
 *.db-shm
+models/
+.llmphant/
+.env
+
+# editor / OS noise
 .DS_Store
+*.swp
+*.swo
+

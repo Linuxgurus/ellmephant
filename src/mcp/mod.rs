@@ -47,31 +47,28 @@ pub const TOOLS: &[&str] = &[
 
 /// Server-level instruction: the read/write policy every client should follow (SPEC §9).
 const INSTRUCTIONS: &str = "\
-llmphant is a shared, atomic long-term memory. Write smart-caveman: drop filler, articles \
-and glue words; keep high-signal words. One fact per row. Tag aspects of the subject (the \
-key and tags are embedded with the prose, so naming them well aids recall). Put provenance \
-in `source` (the command/path/repo that derives the fact, never live state). Upsert by \
-`key`: trim on edit, never grow; never store cheaply-derivable state. \
-Recall: search, judge, then fetch. `memory_search` a semantic phrase with a small `k` to \
-get the likeliest keys — titles, tags and distances, never bodies. Read the titles; \
-`memory_get` only the hit(s) you'll use. If none fit, widen (raise `k`) rather than \
-concluding \"not stored\" after one narrow miss. If you already know the `key`, \
-`memory_get` it directly.";
+llmphant = memory-rock. Clever caveman share it. \
+WRITE: big words in, small words out. Drop filler. Drop articles. Drop glue. One fact, one \
+row. Key + tags live inside prose — name sharp. Sharp name, sharp recall. `source` = proof \
+stone: command/path/repo that prove fact. Never live state. Live state change; memory not \
+change. Reuse `key` — old memory die. Trim, never grow. Cheap to derive? Do not store. \
+FIND: hunt, judge, fetch. `memory_search` one phrase, small `k`. Back come keys, titles, \
+tags, distance. No bodies. Read titles. `memory_get` only hit you use. None fit? Widen. \
+Raise `k`. One small miss is not \"not there\" — never grunt that. Know `key` already? \
+`memory_get` straight. No hunt.";
 
 /// `memory_add` description. The write policy lives here because this is what the model reads.
 const ADD_DESCRIPTION: &str = "\
-Store one memory (upsert by `key`). Write smart-caveman: drop filler, articles and glue \
-words; keep high-signal words; one fact per row. `key` is a slug and the wiki-link target. \
-`tags` name aspects of the subject (e.g. storage, gotchas). `source` holds provenance (the \
-command/path/repo that derives the fact), never live state. Re-using a `key` replaces that \
-memory — trim on edit, never grow. `title` is a salient one-liner, `body` the fact; wiki \
-links are `[[other-key]]`.";
+Store one memory (upsert by `key`). WRITE smart-caveman: big words in, small words out. \
+Drop filler, articles, glue. One fact, one row. `key` = slug = wiki-link target. `tags` = \
+aspect of thing (storage, gotchas). `source` = command/path/repo that prove it — never live \
+state. Reuse `key` — old memory die. Trim, never grow. `title` = one sharp line. `body` = \
+fact. Link memory: `[[other-key]]`.";
 
 /// `memory_update` description.
 const UPDATE_DESCRIPTION: &str = "\
-Replace an existing memory; `key` must already exist (use memory_add to create). Same \
-smart-caveman write policy as memory_add: the body is replaced wholesale, so trim rather \
-than append, and links are re-derived from `[[…]]` in the new body.";
+Replace memory that already live. `key` must exist — new key? memory_add. Same smart-caveman \
+law. Body die whole, born new — trim, no pile on. Links re-hunt from `[[…]]` in new body.";
 
 /// Parameters for [`MemoryServer::memory_add`] / [`MemoryServer::memory_update`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -79,21 +76,21 @@ pub struct AddParams {
     /// Stable slug; omit to derive one from the title.
     #[serde(default)]
     #[schemars(
-        description = "Stable slug. Omit to derive one from the title. Re-using a key replaces that memory."
+        description = "Stable slug. Omit it, one grow from title. Reuse key, old memory die."
     )]
     pub key: Option<String>,
     /// Salient one-liner.
-    #[schemars(description = "A salient one-liner (smart-caveman: high-signal words).")]
+    #[schemars(description = "One sharp line. Big words, no filler.")]
     pub title: String,
     /// The fact.
     #[schemars(
-        description = "The fact (smart-caveman: drop filler). Wiki links are written `[[other-key]]`."
+        description = "Fact. Drop filler. Link memory with `[[other-key]]`."
     )]
     pub body: String,
     /// Provenance.
     #[serde(default)]
     #[schemars(
-        description = "Provenance: the command/path/repo that derives this — never live state."
+        description = "Proof stone: command/path/repo that derive this. Never live state."
     )]
     pub source: Option<String>,
     /// Aspect tags.
@@ -121,19 +118,19 @@ impl AddParams {
 pub struct SearchParams {
     /// The phrase to match.
     #[serde(default)]
-    #[schemars(description = "The phrase to match against the embedded document.")]
+    #[schemars(description = "Phrase to hunt with. Matched against embedded document.")]
     pub query: Option<String>,
     /// Result count.
     #[serde(default)]
-    #[schemars(description = "Maximum hits (defaults to the configured k).")]
+    #[schemars(description = "Most hits bring back (default = configured k).")]
     pub k: Option<usize>,
     /// Cosine-distance ceiling.
     #[serde(default)]
-    #[schemars(description = "Optional cosine-distance ceiling.")]
+    #[schemars(description = "Cosine-distance ceiling. Smaller = closer.")]
     pub max_distance: Option<f32>,
     /// Link-neighbourhood hops.
     #[serde(default)]
-    #[schemars(description = "Link-neighbourhood hops to include (0 = off).")]
+    #[schemars(description = "Link-neighbour hops drag in (0 = off).")]
     pub expand: Option<u8>,
 }
 
@@ -141,7 +138,7 @@ pub struct SearchParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KeyParams {
     /// The memory's key.
-    #[schemars(description = "The memory's key (slug).")]
+    #[schemars(description = "Memory key. Slug.")]
     pub key: String,
 }
 
@@ -314,7 +311,7 @@ impl MemoryServer {
     /// Delete one memory by key.
     #[tool(
         name = "memory_delete",
-        description = "Delete one memory by `key`. Irreversible.",
+        description = "Kill one memory by `key`. No undo. Gone.",
         annotations(
             title = "Delete memory",
             read_only_hint = false,
@@ -346,7 +343,7 @@ impl MemoryServer {
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
-        description = "Search memory by semantic phrase — the whole document (key, tags, title, body) is embedded, so a phrase matching any of them can surface the memory. Returns the likeliest keys as {title, tags, distance} — never bodies. Start with a small `k`; read the titles and `memory_get` only the hit(s) you'll use. If none fit, widen — raise `k` (loosen `max_distance` if the result was empty). If you know the `key`, use memory_get instead.",
+        description = "Hunt memory by meaning. Whole document (key, tags, title, body) sit in embedding. Phrase touch any part, memory rise. Back come likeliest keys: {title, tags, distance}. No bodies. Start small `k`. Read titles. `memory_get` only hit you use. None fit? Widen. Raise `k`. Empty? Loosen `max_distance`. Know `key`? memory_get instead.",
         annotations(
             title = "Search memory",
             read_only_hint = true,
@@ -392,7 +389,7 @@ impl MemoryServer {
     /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
-        description = "Fetch one memory in full by `key`. Call it only for a hit you intend to use.",
+        description = "Pull one memory whole by `key`. Only for hit you use.",
         annotations(
             title = "Get memory",
             read_only_hint = true,
@@ -417,7 +414,7 @@ impl MemoryServer {
     /// List the memories whose bodies link to `key`.
     #[tool(
         name = "memory_backlinks",
-        description = "List the memories whose bodies link to `key` via `[[…]]`.",
+        description = "List memories whose body point at `key` with `[[…]]`.",
         annotations(
             title = "Backlinks",
             read_only_hint = true,
@@ -444,7 +441,7 @@ impl MemoryServer {
     /// List the store's index (no bodies).
     #[tool(
         name = "memory_list",
-        description = "List the store's index — key, tags and title for every memory, without bodies. Use it to browse or to pick keys before get/search.",
+        description = "List whole index: key, tags, title every memory. No bodies. Browse. Pick keys before get/search.",
         annotations(
             title = "List memories",
             read_only_hint = true,

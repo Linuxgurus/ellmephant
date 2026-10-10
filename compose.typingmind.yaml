@@ -1,0 +1,42 @@
+# TypingMind setup: Ellmephant + TypingMind's open-source MCP Connector, in one stack.
+#
+#   MCP_AUTH_TOKEN="$(openssl rand -hex 32)" podman compose -f compose.typingmind.yaml up -d
+#
+# Ellmephant is NOT published to the host — only the connector is, on 127.0.0.1. The connector
+# reaches Ellmephant over the internal network at http://ellmephant:8888/mcp, so Ellmephant never
+# has to face the public internet.
+#
+# Connector source: https://github.com/TypingMind/typingmind-mcp
+
+services:
+  ellmephant:
+    image: ghcr.io/jdblack/ellmephant:latest
+    volumes:
+      - ellmephant-data:/data
+    command: ["mcp"]         # MCP over HTTP on 0.0.0.0:8888, reachable on this network only
+    # No `ports:` on purpose — Ellmephant must stay unreachable from outside this stack.
+
+  mcp-connector:
+    # The connector has no official published image, so we run the npm package. To build the
+    # project's own Dockerfile instead, drop `image`/`command` and use:
+    #   build: https://github.com/TypingMind/typingmind-mcp.git#main
+    image: node:lts-slim
+    command: ["npx", "-y", "@typingmind/mcp@latest"]
+    environment:
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN to a random secret}"
+      PORT: "50880"
+      HOSTNAME: "0.0.0.0"       # the connector binds to $HOSTNAME; force all interfaces
+      # Browsers block an HTTPS page (TypingMind) from calling plain http://localhost, so some
+      # setups — Safari especially — need the connector on HTTPS. Make a cert (`mkcert localhost`),
+      # mount it, and uncomment both paths:
+      # CERTFILE: "/certs/localhost.pem"
+      # KEYFILE: "/certs/localhost-key.pem"
+    # volumes:
+    #   - ./certs:/certs:ro
+    ports:
+      - "127.0.0.1:50880:50880"   # where TypingMind connects
+    depends_on:
+      - ellmephant
+
+volumes:
+  ellmephant-data:

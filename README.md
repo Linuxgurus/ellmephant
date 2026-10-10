@@ -2,295 +2,260 @@
 
 **Long-term memory for AI agents: one binary, one SQLite file, local-first.**
 
-ellmephant gives AI assistants a shared, persistent memory that runs entirely on your machine:
+ellmephant gives your AI assistants a shared memory that lives entirely on your own machine. Save
+a fact once, and later any assistant hooked up to Ellmephant can dig it back up *by meaning* — you
+don't have to remember the exact words you used.
 
-- the [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) encoder is compiled
-  into the binary; no Python or external runtime is required;
-- one SQLite file is the source of truth, with rebuildable vector and link indexes;
-- it speaks [MCP](https://modelcontextprotocol.io) over Streamable HTTP (or stdio), so Cline,
-  TypingMind, and other MCP clients read and write the same memory;
-- there is an interactive REPL and a one-shot CLI for scripting and cron jobs.
+- Under the hood, an **embedder** (Qwen3-Embedding by default) turns everything into vectors. That's
+  what makes "search by meaning" actually work.
+- One SQLite file is the source of truth. The vector index and the link graph are just derived from
+  it — nuke them and they rebuild themselves.
+- It speaks **MCP**, so any chatbot that can reach it (Cline, say) can talk to it. Web-based
+  chatbots like TypingMind work too, as long as whatever MCP connector they rely on can reach
+  Ellmephant.
 
-It contacts the network once, to fetch model weights, and runs offline afterwards.
+## Contents
 
-## Documentation
+- [Getting started](#getting-started) — follow these in order
+- [Connect an AI assistant](#connect-an-ai-assistant)
+- [Don't lose your data](#dont-lose-your-data)
+- [Optional: Podman Compose](#optional-podman-compose)
+- [Using TypingMind](#using-typingmind)
+- [Troubleshooting](#troubleshooting)
+- [FAQ](#faq)
+- [For the curious and the engineers](#for-the-curious-and-the-engineers)
 
-- **Install** → [`INSTALL.md`](INSTALL.md)
-- **Engineering / internals** → [`ENGINEERING.md`](ENGINEERING.md)
-- **Development / releases** → [`DEVELOPMENT.md`](DEVELOPMENT.md)
-- **Specification** → [`SPEC.md`](SPEC.md)
-- **Design plan / history** → [`PLAN.md`](PLAN.md)
+---
 
-## Why
+## Getting started
 
-Agents forget, and the tools used to make them remember are the wrong shape:
+We use **Podman** below, but it all works exactly the same with Docker — just swap the command
+name (see Step 0). Set aside about 15 minutes, most of which is downloads.
 
-- **`grep` over Markdown does not scale.** It matches strings, not meaning, and returns whole
-  files rather than the one fact you wanted.
-- **Memory trapped inside one client is not shared.** What you store in one assistant is
-  invisible to the next.
-- **Cloud memory and hosted vector databases add a network hop, an account, and a bill** to a
-  problem that fits in a single local file.
+### Step 0 — Install Podman (skip if you already have Docker)
 
-ellmephant is the local answer: one file, one process, one shared memory.
+- **macOS / Windows:** install [Podman Desktop](https://podman-desktop.io/) and start it — it sets
+  up the little Linux VM Podman needs.
+- **Linux:** `sudo apt install podman` (Debian/Ubuntu) or `sudo dnf install podman` (Fedora).
 
-## Quick start
-
-```sh
-ellmephant doctor            # create ~/.ellmephant/ and the schema
-ellmephant model fetch       # one-time ~1.2 GB weights download
-ellmephant add --title "Gateway hostname" \
-  --body "gateway = portainer-notes-gw.internal :8443" --tag network
-ellmephant search "which host is the internal gateway"
-ellmephant                   # REPL
-```
-
-See [`INSTALL.md`](INSTALL.md) for building the binary and for Docker setup.
-
-## Usage on a host
-
-### CLI and REPL
-
-Every command works one-shot and is mirrored in the REPL. Global flags — `--home DIR`,
-`--offline`, `--model-dir DIR`, `--device cpu|metal`, `--precision bf16|f16` — may appear before
-any subcommand. `--json` prints the machine-readable form where a command provides one.
-
-### Command reference
-
-**Memory**
+On macOS and Windows you only have to kick that VM awake once:
 
 ```sh
-ellmephant add    --title T --body B [--key K] [--source SRC] [--tag TAG]...
-                                                   # --body - reads stdin; upsert by key
-ellmephant search ["PHRASE"] [--k N] [--max-distance D] [--expand N] [--json]
-ellmephant show   KEY [--json]
-ellmephant rm     KEY
-ellmephant list   [--json]
-ellmephant tags   [--json]
-ellmephant stats  [--json]      # digest: counts, size, tags, links, activity (alias summary)
+podman machine init      # first time only; Podman Desktop may already have done this
+podman machine start
 ```
 
-`add` upserts by `key`; running it twice with the same key yields one memory. Write in
-**smart-caveman**: drop filler, articles and glue words; keep high-signal words. One fact per
-row, `--tag` the aspect of the subject (`storage`, `gotchas`), and put provenance in `--source`.
-
-**Maintenance**
+Confirm it's alive:
 
 ```sh
-ellmephant reembed                 # recompute every vector; needed after a model/dim change
-ellmephant rename OLD NEW          # rewrite [[OLD]] in bodies and repoint link edges
-ellmephant links [--json]          # list dangling [[key]] targets
-ellmephant doctor [--verify]       # paths, schema, index health; --verify re-hashes weights
+podman --version
 ```
 
-**Model, embeddings, benchmarks, interfaces**
+> **Already have Docker?** Everything below works as-is if you swap `podman` for `docker` —
+> `docker pull`, `docker run`, `docker compose`, and so on. Podman is a drop-in replacement, so
+> the rest of this guide applies verbatim.
+
+### Running Ellmephant
+
+**IMPORTANT** Ellmephant really wants a data volume to keep its memories. Without one it runs in
+ephemeral mode, and everything it remembers vanishes the moment it stops.
+
+You can run it either way: use the [Podman Compose setup](#optional-podman-compose) described
+below, or just run this command:
 
 ```sh
-ellmephant model status [--verify] [--repo R] [--revision REV]
-ellmephant model fetch  [--force]  [--repo R] [--revision REV]
-ellmephant model rm     [--all]    [--repo R] [--revision REV]
-ellmephant embed "TEXT" [--query]          # debug: dimension + latency + norm
-ellmephant bench [--golden] [--golden-file F] [--sweep] [--k N]
-ellmephant mcp                             # MCP over HTTP at http://127.0.0.1:8888/mcp
-ellmephant mcp --stdio                     # MCP over stdio
-ellmephant                                 # REPL
+podman run -d --rm -p 8888:8888 -v ellmephant-data:/data ghcr.io/jdblack/ellmephant:latest
+# Or docker, if you're not on podman yet
 ```
 
-### Configuration
+That first start takes a few minutes — Ellmephant has to set up its data storage and pull down the
+LLM embedder it uses to encode your memories.
 
-`~/.ellmephant/config.toml` is optional. Flags override it, and it overrides the built-in defaults.
-Start from `config.example.toml`:
+The embedder — the model that turns memories into vectors — defaults to
+**`Qwen/Qwen3-Embedding-0.6B`** (~1.2 GB) and downloads once, on first use. You never have to
+fetch, verify, or rebuild it by hand; the server takes care of it. If you like to tinker, the
+advanced knobs live in [`ENGINEERING.md`](ENGINEERING.md) and
+[`config.example.toml`](config.example.toml).
 
-```toml
-model       = "Qwen/Qwen3-Embedding-0.6B"   # HF repo id, or a dir name under models/
-revision    = "main"                         # branch/tag (resolved once to a sha) or a sha
-cache_dir   = ""                             # weights root; empty = ~/.ellmephant/models
-offline     = false                          # true = never open a socket
-dim         = 1024                           # frozen at CREATE; MRL allows 32..=1024
-precision   = "bf16"                         # bf16 | f16 (CPU is always f32)
-device      = "cpu"                          # cpu | metal
-instruction = "Given a question, retrieve relevant memories"   # query side only
-default_k   = 5                              # search result count
-default_max_distance = 0.6                   # cosine-distance ceiling; null disables it
-port        = 8888                           # MCP HTTP port (`mcp --stdio` ignores it)
-```
+---
 
-An invalid `device`, `precision`, or `dim = 0` is rejected before any model work.
+## Connect an AI assistant
 
-### Model weights
-
-Weights are fetched on first use into `~/.ellmephant/models/`, or supplied with `--model-dir`. The
-cache is flat and sha-pinned. Once warm, runs need no network.
-
-```sh
-ellmephant model status              # report what is cached (no network)
-ellmephant model status --verify     # re-hash every file
-ellmephant model fetch               # download or repair; idempotent
-ellmephant model rm --all            # remove cached revisions
-ellmephant --offline doctor          # open no socket
-```
-
-`--model-dir DIR` uses an existing flat weights directory and implies `--offline`;
-`ELLMEPHANT_OFFLINE=1` forces offline globally. Fetching is the only network operation.
-
-### Search
-
-A search matches a single **semantic phrase** — there are no key or tag filters and no regex
-leg. Each memory is embedded as one **document** (`key` + tags + `title` + body), so a phrase
-that shares words with the key or a tag can surface the memory too. `--k` caps the results
-within `--max-distance`; with no phrase, results are unranked (key order). A result carries
-`key`, `title`, `tags` and `distance` — never the body; fetch it with `show`, which is also how
-you read a known key directly.
-
-```sh
-ellmephant search "where do the logs live"                  # semantic, k=5
-ellmephant search "portainer-notes-gw"                      # key/tag tokens are in the embedding
-ellmephant search "backups" --expand 1                      # + linked neighbours
-```
-
-### Wiki links
-
-Author links inline in the body as `[[key]]`. They become link edges on write; `--expand` walks
-them and `ellmephant links` reports dangling targets. Links are by key, never by id, so they
-survive a `reembed` or a `rename`.
-
-### MCP over HTTP (default)
-
-`ellmephant mcp` listens on `127.0.0.1:8888` and serves the MCP tool surface at `/mcp`. The port
-comes from `port` in `config.toml`, or `--port` / `ELLMEPHANT_MCP_PORT`; the interface comes from
-`--host` / `ELLMEPHANT_MCP_HOST`. Multiple clients are served from the one store.
-
-```sh
-ellmephant mcp                                       # http://127.0.0.1:8888/mcp
-ellmephant mcp --host 0.0.0.0 --port 9000            # bind all interfaces / another port
-```
-
-Point a client at `http://<host>:8888/mcp`. The default bind is localhost. There is no
-authentication or TLS, so bind `0.0.0.0` or a public address only on a trusted network.
-
-### MCP over stdio
-
-For clients that launch the server themselves, use `--stdio`: the client starts the binary and
-communicates over stdin/stdout.
-
-```sh
-ellmephant mcp --stdio
-```
-
-```jsonc
-{
-  "mcpServers": {
-    "ellmephant": { "command": "/absolute/path/to/ellmephant", "args": ["mcp", "--stdio"] }
-  }
-}
-```
-
-### MCP tools
-
-`memory_add`, `memory_update`, `memory_delete`, `memory_search`, `memory_get`,
-`memory_backlinks`, `memory_list`, `memory_useful`. Read tools are annotated read-only and
-`memory_delete` is annotated destructive. Each `memory_get` counts a `visits` read on the row;
-`memory_useful` bumps a `was_useful` counter so an agent can flag a memory that earned its keep
-(the count is independent of a fetch — a great title alone can earn it). `memory_search` matches a semantic `phrase` (the whole document — key,
-tags, title, body — is embedded), with `k` and `max_distance`; there are **no key/tag filters
-and no regex leg**, and hits carry titles, tags and distances, never bodies. The list-shaped
-reads return compact **positional JSON** — a top-level `cols` header names the fields and each
-row is a bare array, **one row per line** (so a raw result is scannable, not one blob), meaning
-field names aren't repeated per row while the payload stays self-describing. `memory_search` →
-`{"cols":["key","title","tags","distance"],"hits":[[…],…]}`;
-`memory_list` → `{"cols":["key","title","tags"],"count":N,"memories":[[…],…]}`;
-`memory_backlinks` → `{"cols":["key","title"],"backlinks":[[…],…]}`. The server also advertises
-the write policy and the search strategy as its `instructions`.
-
-## Usage in Docker
-
-Build the image first (see [`INSTALL.md`](INSTALL.md)). The image's default command is the MCP
-server; name a command to run anything else. The store is the `ellmephant-data` volume at `/data`.
-
-### One-off commands
-
-```sh
-docker run --rm -v ellmephant-data:/data ellmephant:dev doctor
-docker run --rm -v ellmephant-data:/data ellmephant:dev model fetch
-docker run --rm -v ellmephant-data:/data ellmephant:dev search "internal gateway hostname"
-docker run --rm -it -v ellmephant-data:/data ellmephant:dev      # REPL
-```
+MCP (the Model Context Protocol) is how clients read and write the store. There are two
+transports: HTTP, where the client connects to a server that's already running, and stdio, where
+the client launches the server itself. Our examples use Podman, so we'll stick with HTTP.
 
 ### MCP over HTTP
 
-Inside the container the server binds `0.0.0.0:8888`; publish the port and point a client at
-`http://<host>:8888/mcp`:
+With the server running (see [Running Ellmephant](#running-ellmephant)), point your client at
+`http://localhost:8888/mcp`, set it to the **Remote** / **Streamable HTTP** transport, and leave
+authentication off.
 
-```sh
-docker run --rm -p 8888:8888 -v ellmephant-data:/data ellmephant:dev
-```
+**Cline CLI** — run `cline mcp`, pick *Add server*, and fill in the fields:
 
-### Logging
+![Adding Ellmephant as a remote MCP server with the Cline CLI](Docs/Cline%20CLI%20setup.png)
 
-The image ships `RUST_LOG=ellmephant=info,rmcp=info,warn`, so `docker logs` shows a startup
-banner (version, store path, model, dim, device), each `memory_search` (the query, hit count and
-`elapsed_ms`) with every returned hit — `key`, `tags`, `distance` — plus the serialized response
-size in bytes, each write
-(`memory_add`/`memory_update`/`memory_delete`, with `key`, `tags`, `body_bytes`) and each
-`memory_list` (count). The first semantic operation logs `loading encoder` /
-`encoder loaded` around the ~1.2 GB weight load, and every tool failure is logged as a
-`tool error`. `rmcp` at info surfaces client connect/disconnect. Override `RUST_LOG` to
-quieten or deepen it, e.g. `-e RUST_LOG=warn` or `-e RUST_LOG=ellmephant=debug`.
+**Cline UI** — open *Settings → MCP Servers*, hit *Add MCP Server*, and use the same URL:
 
-### MCP over stdio
+![Adding Ellmephant as a remote MCP server in the Cline UI](Docs/Cline%20UI%20setup.png)
 
-Keep stdin attached and do not allocate a TTY:
+### MCP over stdio (e.g. standard in and out)
 
-```sh
-docker run --rm -i -v ellmephant-data:/data ellmephant:dev mcp --stdio
-```
-
-A client can launch that directly:
+If your client would rather launch the server itself, drop this into its MCP config — no
+long-running container needed:
 
 ```jsonc
 {
   "mcpServers": {
     "ellmephant": {
-      "command": "docker",
-      "args": ["run", "--rm", "-i", "-v", "ellmephant-data:/data", "ellmephant:dev", "mcp", "--stdio"]
+      "command": "podman",
+      "args": ["run", "--rm", "-i", "-v", "ellmephant-data:/data",
+               "ghcr.io/jdblack/ellmephant:latest", "mcp", "--stdio"]
     }
   }
 }
 ```
 
-### Docker Compose
+### What the assistant gets
 
-```yaml
-services:
-  ellmephant:
-    build: .
-    image: ellmephant:dev
-    ports:
-      - "8888:8888"          # MCP over HTTP at http://localhost:8888/mcp
-    volumes:
-      - ellmephant-data:/data
-    command: ["mcp"]         # default; HTTP transport
-    # stdio instead: `command: ["mcp", "--stdio"]` with `stdin_open: true`
-    stdin_open: true
+Your assistant gets a whole toolbox for memories — it can add, update and delete them as you talk.
+You never run any of it yourself; just say things like "What do you remember about kubernetes?" or
+"Save the important parts of this conversation to memory!" and it takes care of the rest.
+Maintenance is the same story: adding, updating, linking, deleting — it all happens through the
+assistant, in conversation. There are no commands for you to run.
 
-volumes:
-  ellmephant-data:
+---
+
+## Don't lose your data
+
+Your store is the Podman volume `ellmephant-data`, mounted at `/data`. Two rules:
+
+1. Always pass `-v ellmephant-data:/data`.
+2. Never run `podman volume rm ellmephant-data` unless you actually mean to erase everything.
+
+---
+
+## Optional: Podman Compose
+
+If you'd rather describe the container in a file than type long commands, Compose is your friend.
+(On Docker, the same file works with `docker compose`.) The repo ships a ready-made
+[`compose.yaml`](compose.yaml) with the server, the published port and the `ellmephant-data`
+volume already wired up. So the whole workflow shrinks to:
+
+```sh
+podman compose up -d     # start the server
+podman compose down      # stop the server
 ```
+
+> `podman compose` needs a provider installed — the `podman-compose` package or `docker-compose`.
+> Most desktop installs already include one.
+
+---
+
+## Using TypingMind
+
+TypingMind can use Ellmephant, but it needs a connector to do it — and the safe way is a private
+connector running next to Ellmephant, **not** TypingMind's hosted one. We ship a two-container
+stack for exactly that. The full walkthrough — starting it, wiring it into TypingMind, and the
+usual gotchas — lives in [`TYPINGMIND.md`](TYPINGMIND.md).
+
+---
+
+## Troubleshooting
+
+**`Cannot connect to the Podman socket`, or `command not found: podman`.**
+Podman isn't running. Fire up Podman Desktop, or on macOS/Windows run `podman machine start`. If
+the command itself is missing, Podman isn't installed — see Step 0.
+
+**Memories "disappeared".**
+Nine times out of ten it's a missing `-v ellmephant-data:/data`. Your data is still in the volume;
+add the flag back and it reappears.
+
+**The first memory operation pauses for a while.**
+That's the embedder. The very first time it's downloading ~1.2 GB (a few minutes); after that it's
+just loading into memory (10–20 seconds). One-time either way — the logs say `loading encoder` /
+`encoder loaded` around it.
+
+**The client can't reach `localhost:8888`.**
+Check the server container is still up (`podman ps`). If port 8888 is already taken, publish a
+different host port — `-p 8899:8888` — and use `http://localhost:8899/mcp`.
+
+**On Apple Silicon.**
+The published image is multi-arch (`linux/amd64` + `linux/arm64`), so an M-series Mac pulls the
+native arm64 build automatically — no emulation.
+
+**Logs.**
+The container's output records startup, every search and every write. The image logs at
+`RUST_LOG=ellmephant=info,rmcp=info,warn`; stick `-e RUST_LOG=warn` on the run command to quieten
+it, or `-e RUST_LOG=ellmephant=debug` to get nosy.
+
+**Still stuck?**
+Start with the logs above; if that doesn't explain it, open an issue and paste what you see.
+
+---
 
 ## FAQ
 
-**Is it a vector database?** It includes a vector index, but it is also a relational store and a
-link graph. The `memory` table is the source of truth; the indexes are derived and rebuildable.
+**Does my data leave the machine?**
+Only to and from wherever you host Ellmephant. Run it on localhost and your memories stay on your
+machine; host it in a k8s cluster and, of course, they go there =) The one other network call is
+the one-time ~1.2 GB embedder download, which `--offline` disables.
 
-**Does it send my data anywhere?** No. The only outbound request is the one-time weights
-download, which can be disabled with `--offline` and a local cache.
+**Is this a database I have to administer?**
+Nope. It's one volume. Nothing to install, tune, or babysit.
 
-**How do I back up or move the store?** Copy `~/.ellmephant/memory.db` (with any `-wal`/`-shm`
-sidecars); it is the whole store. Everything else there is a rebuildable cache.
+**Why is the embedder a separate download?**
+It's ~1.2 GB of data, not code. Keeping it out of the binary keeps the image small and lets you
+swap in your own weights.
 
-**Why are the weights fetched separately?** They are ~1.2 GB of data, not code, so they live in
-the store directory rather than in the binary.
+**Can several assistants share one memory?**
+Yes — that's the whole point. Point as many clients as you like at the same server; they all share
+one store.
+
+**How much disk does it use?**
+Roughly 1.2 GB for the weights, plus the store (one small SQLite file).
+
+**Can I move or restore a store?**
+Yep. Copy `memory.db` (along with any `-wal`/`-shm` sidecars) into a volume — that file *is* the
+whole store. Everything else in the volume is a rebuildable cache.
+
+---
+
+## For the curious and the engineers
+
+- **Install without a container / build from source** → [`INSTALL.md`](INSTALL.md)
+- **How it works inside** → [`ENGINEERING.md`](ENGINEERING.md)
+- **Development and releases** → [`DEVELOPMENT.md`](DEVELOPMENT.md)
+- **Specification** → [`SPEC.md`](SPEC.md)
+- **Design plan and history** → [`PLAN.md`](PLAN.md)
+
+### Building the image yourself
+
+The published image is what everyone pulls. Want your own? Grab a checkout and build it:
+
+```sh
+git clone https://github.com/jdblack/ellmephant.git && cd ellmephant
+podman build -t ellmephant:dev .
+```
+
+Then use `ellmephant:dev` wherever this guide says `ghcr.io/jdblack/ellmephant:latest`. Fair
+warning: that first build compiles the whole ML stack (the SQLite/`sqlite-vec` C sources, the
+candle stack, ~400 crates) and can take 5–20 minutes. [`DEVELOPMENT.md`](DEVELOPMENT.md) has the
+full workflow.
+
+### Notes for those who like the details
+
+- One static binary, one SQLite file. The Qwen3 encoder runs in-process via candle — no Python, no
+  ONNX Runtime, no sidecar.
+- The `memory` table is the source of truth. The vector index (`sqlite-vec` `vec0`) and the link
+  graph are derived and rebuildable.
+- Store directory is `/data` (`ELLMEPHANT_HOME=/data`); the image's default command is the MCP
+  server, binding `0.0.0.0:8888`.
+- Weights cache at `<home>/models/`, sha-pinned per revision; `--offline` forbids network and
+  `--model-dir` uses a pre-fetched flat directory.
+- No auth or TLS on the MCP server — only publish its port on a trusted network.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE). The software is provided without warranty of any kind.
+MIT — see [`LICENSE`](LICENSE). Provided without warranty of any kind.
+

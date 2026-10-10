@@ -2,9 +2,9 @@
 # Publish the current commit to Harbor - the in-cluster registry that GitHub runners cannot
 # reach (it is LAN-only), which is the whole reason this runs locally.
 #
-# Two artifacts go up:
-#   1. the chart, as an OCI artifact (local content, pushed immediately);
-#   2. the image, tagged `edge` and `sha-<short>`.
+# Two artifacts go up, under SEPARATE repos so their tags never collide:
+#   1. the chart, as an OCI artifact at `.../library/charts/ellmephant` (pushed immediately);
+#   2. the image at `.../library/ellmephant`, tagged `edge` and `sha-<short>`.
 #
 # The image is MIRRORED from GHCR by default rather than built here. CI already built the exact
 # linux/amd64 artifact for this commit (`sha-<short>`), so pulling it takes seconds, whereas
@@ -22,6 +22,9 @@ cd "$(git rev-parse --show-toplevel)"
 
 HARBOR=${HARBOR:-harbor.vn.linuxguru.net/library}
 HARBOR_IMAGE=${HARBOR_IMAGE:-$HARBOR/ellmephant}
+# The chart gets its own nested repo so its tags never share a namespace with the image tags
+# (a chart version like `1.0.0` would otherwise collide with the image tag `1.0.0`).
+HARBOR_CHART=${HARBOR_CHART:-$HARBOR/charts}
 GHCR_IMAGE=${GHCR_IMAGE:-ghcr.io/jdblack/ellmephant}
 CHART=${CHART:-charts/ellmephant}
 PLATFORM=${PLATFORM:-linux/amd64}
@@ -45,8 +48,8 @@ else
   log "packaging $CHART"
   helm package "$CHART" --destination .tmp/harbor-chart > /dev/null
   pkg=$(ls .tmp/harbor-chart/*.tgz)
-  log "pushing $(basename "$pkg") -> oci://$HARBOR"
-  helm push "$pkg" "oci://$HARBOR"
+  log "pushing $(basename "$pkg") -> oci://$HARBOR_CHART"
+  helm push "$pkg" "oci://$HARBOR_CHART"
 fi
 
 # --- image ------------------------------------------------------------------------------------

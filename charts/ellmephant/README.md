@@ -25,7 +25,7 @@ Or from an OCI mirror, if one exists (see [`DEVELOPMENT.md`](../../DEVELOPMENT.m
 recipe):
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/ellmephant --version 0.1.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.1.0
 ```
 
 Then point an MCP client at the Service, path `/mcp`:

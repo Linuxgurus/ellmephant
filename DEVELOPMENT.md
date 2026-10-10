@@ -161,7 +161,7 @@ to it: this step is local by necessity. `dev` is wired to publish itself.
 
 On a commit to `dev`, `.githooks/post-commit` backgrounds `scripts/harbor-publish.sh`, which:
 
-1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library`;
+1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library/charts`;
 2. mirrors the image - it waits for CI to publish `sha-<short>` to GHCR, then pulls the
    `linux/amd64` variant and pushes it to Harbor as `edge` + `sha-<short>`.
 
@@ -192,16 +192,20 @@ Point the cluster at the mirror with:
 --set image.repository=harbor.vn.linuxguru.net/library/ellmephant
 ```
 
-The chart installs from the same project over OCI - the closest thing to a `helm repo add` here,
-and the path the cluster would actually use:
+The chart installs from its own nested repo over OCI - the closest thing to a `helm repo add`
+here, and the path the cluster would actually use:
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/ellmephant --version 0.1.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.1.0
 ```
 
-Harbor holds an OCI chart and a container image under the same repository name happily (unlike
-GHCR, where a chart tag colliding with an image tag is a rejected push), so the house convention
-of `oci://<project>` with the chart named after the app is safe here.
+The chart and the image live under *separate* Harbor repos - `library/charts/ellmephant` versus
+`library/ellmephant`. Harbor would happily co-locate an OCI chart and a container image under one
+repository name, but sharing a repo means sharing a tag namespace, and the chart's own SemVer
+(`0.1.0` today, `1.0.0` eventually) would collide with an image tag. Separate paths rule that out.
+Because `helm push` derives the final path segment from the chart's `name`, the split is a
+different *parent* path, not a renamed chart: the chart stays `ellmephant`, so its labels, selectors
+and resource names are unchanged.
 
 ## Pre-releases
 

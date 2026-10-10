@@ -1,0 +1,20 @@
+# Compose definition for Ellmephant. Works with `podman compose` or `docker compose`.
+#
+#   podman compose up -d            # start the MCP server in the background
+#
+# The store lives in the `ellmephant-data` volume at /data. Keep it, or memories vanish.
+#
+# Using TypingMind? There's a second stack that adds the MCP connector — see
+# `compose.typingmind.yaml`.
+services:
+  ellmephant:
+    image: ghcr.io/jdblack/ellmephant:latest
+    ports:
+      - "8888:8888"          # MCP over HTTP at http://localhost:8888/mcp
+    volumes:
+      - ellmephant-data:/data
+    command: ["mcp"]         # the MCP server; the image default
+    stdin_open: true         # for `command: ["mcp", "--stdio"]`
+
+volumes:
+  ellmephant-data:

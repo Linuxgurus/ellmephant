@@ -17,6 +17,7 @@ It contacts the network once, to fetch model weights, and runs offline afterward
 
 - **Install** → [`INSTALL.md`](INSTALL.md)
 - **Engineering / internals** → [`ENGINEERING.md`](ENGINEERING.md)
+- **Development / releases** → [`DEVELOPMENT.md`](DEVELOPMENT.md)
 - **Specification** → [`SPEC.md`](SPEC.md)
 - **Design plan / history** → [`PLAN.md`](PLAN.md)
 

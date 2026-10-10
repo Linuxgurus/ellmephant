@@ -8,7 +8,7 @@ normative specification see [`SPEC.md`](SPEC.md).
 - [The two workflows](#the-two-workflows)
 - [Day to day: when to commit and push](#day-to-day-when-to-commit-and-push)
 - [Versioning](#versioning)
-- [Cutting a release](#cutting-a-release)
+- [Publishing a release](#publishing-a-release)
 - [Pre-releases](#pre-releases)
 - [Hotfixes](#hotfixes)
 - [Gotchas](#gotchas)
@@ -17,43 +17,48 @@ normative specification see [`SPEC.md`](SPEC.md).
 
 | Branch | Role | Publishing |
 |---|---|---|
-| `main` | Stable. Always reflects the last release. | None. CI only. |
+| `main` | Stable. Also the release trigger: a version bump merged here publishes. | `X.Y.Z`, `X.Y`, `X`, `latest` |
 | `dev` | Integration. Where work lands first. | `edge`, `sha-<commit>` |
-| topic branches | One feature/fix, off `dev`, merged back into `dev` | None |
+| topic branches | One feature/fix, off `dev`, merged back into `dev` | none |
 
-`main` is a merge target, never a workspace. Do not commit to it directly: land work on `dev`,
-then merge `dev` into `main` when a release is due. A push to `main` runs the test suite but
-publishes no image - images come from tags (below).
+Work lands on `dev` first. Merging `dev` into `main` is a deliberate act that marks the code
+release-grade - and, if the version was bumped, publishes an image.
 
 ## The two workflows
 
 - **`.github/workflows/ci.yml`** - runs on every push to `main` and every pull request. Format,
   clippy, tests (both feature sets), and a no-push Docker build. Gate, not publisher.
-- **`.github/workflows/docker-release.yml`** - the publisher. Fires on a push to `dev`, on a
-  `v*` tag, or manually. Builds and pushes the image to `ghcr.io/<owner>/ellmephant`.
+- **`.github/workflows/docker-release.yml`** - the publisher. Fires on a push to `main`, a push
+  to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the image
+  to `ghcr.io/<owner>/ellmephant`.
 
 What the publisher emits, per event:
 
-| Event | Ref | Image tag(s) | Carries a version? |
-|---|---|---|---|
-| push to `dev` | `refs/heads/dev` | `edge`, `sha-<commit>` | no |
-| push tag `v1.1.0-rc.1` | `refs/tags/v*` | `1.1.0-rc.1` | pre-release |
-| push tag `v1.1.0` | `refs/tags/v*` | `1.1.0`, `1.1`, `1`, `latest` | stable |
-| push to `main` | `refs/heads/main` | *(nothing)* | - |
-| manual dispatch | any branch | `edge`, `sha-<commit>` | no |
+| Event | Condition | Image tag(s) |
+|---|---|---|
+| push to `main` | `Cargo.toml` version bumped, `vX.Y.Z` not yet tagged | `X.Y.Z`, `X.Y`, `X`, `latest` |
+| push to `main` | `Cargo.toml` version already tagged | *(nothing - a no-op)* |
+| push to `main` | version is a pre-release, e.g. `1.1.0-rc.1` | `1.1.0-rc.1` only |
+| push to `dev` | always | `edge`, `sha-<commit>` |
+| push tag `v1.1.0` | - | `1.1.0`, `1.1`, `1`, `latest` |
+| push tag `v1.1.0-rc.1` | - | `1.1.0-rc.1` only |
+| manual dispatch | - | `edge`, `sha-<commit>` |
 
-`edge` is a **moving** tag: it always points at the newest `dev` build. It is not a version and
-the `-dev` suffix is deliberately not used - a per-commit version would be meaningless and would
+On a release it also creates and pushes the annotated tag `vX.Y.Z`, so the git history records
+the release without a separate step.
+
+`edge` is a **moving** tag: it always points at the newest `dev` build. It is not a version, and
+a `-dev` suffix is deliberately not used - a version per commit would be meaningless and would
 churn. `sha-<commit>` pins one exact build if you need to go back.
 
 ## Day to day: when to commit and push
 
 - **Commit and push to `dev` freely.** Small, self-contained commits. Every push runs CI and
   republishes `edge`. If it builds and the tests pass, it may go in.
-- **Merge `dev` -> `main` only when a release is due.** This is a deliberate act, not a sync.
-  It marks the code release-grade and runs CI; it does **not** publish an image.
-- **Tag only what you intend to ship.** A tag is immutable and is the trigger for a published
-  image. Tag at milestones, not per commit.
+- **Merge `dev` -> `main` when you want to release.** Bump the version first (see below); if the
+  version is unchanged, the merge publishes nothing.
+- **Tag by hand only for out-of-band releases** - a pre-release cut from `dev`, or a hotfix. The
+  normal path needs no manual tag.
 
 Feature work is one topic branch off `dev`, PR'd back into `dev`:
 
@@ -66,11 +71,9 @@ git push -u origin fix-search-ranking      # open a PR into dev
 
 ## Versioning
 
-Versions are [SemVer](https://semver.org/), and `Cargo.toml`'s `version` is the source of truth
-for `ellmephant --version`. The `Cargo.lock` entry for the crate must agree.
-
-The tag and the manifest must match: tag `v1.1.0` on a commit whose `Cargo.toml` says `1.1.0`.
-Bump the manifest in the same commit you are about to tag, then tag that commit.
+Versions are [SemVer](https://semver.org/), and `Cargo.toml`'s `version` is the source of truth:
+for `ellmephant --version`, and for the release workflow. The `Cargo.lock` entry for the crate
+must agree. **Bumping this version is what triggers a release.**
 
 - `MAJOR` - incompatible change to the CLI, the MCP tool surface, or the on-disk schema.
 - `MINOR` - new, backwards-compatible capability.
@@ -78,41 +81,47 @@ Bump the manifest in the same commit you are about to tag, then tag that commit.
 
 Pre-release suffixes are ordered: `1.1.0-alpha.1 < 1.1.0-beta.1 < 1.1.0-rc.1 < 1.1.0`.
 
-## Cutting a release
+## Publishing a release
 
-1. Bump `Cargo.toml` (and `Cargo.lock`) to the release version; commit it on `dev`.
-2. Merge `dev` into `main`; push.
-3. Verify CI is green on `main`.
-4. Create an annotated tag on the `main` commit and push it.
+The workflow does the tagging and the image; you only bump the version and merge.
+
+1. On `dev`, bump `version` in `Cargo.toml` (and its `Cargo.lock` entry); commit and push.
+2. Merge `dev` into `main` and push.
+3. The workflow reads the version, tags `vX.Y.Z`, and publishes `X.Y.Z`, `X.Y`, `X`, `latest`.
 
 ```sh
-# release version already bumped and on main
-git switch main && git pull
-git tag -a v1.1.0 -m 'ellmephant 1.1.0'
-git push origin v1.1.0                     # -> image 1.1.0, 1.1, 1, latest
+# version already bumped and committed on dev
+git switch main && git merge --no-ff dev && git push origin main
+# -> tag v1.1.0 created; image 1.1.0, 1.1, 1, latest published
 ```
 
-5. Mark the GitHub Release (optional but conventional):
+4. Optionally publish a GitHub Release for the new tag:
 
 ```sh
 gh release create v1.1.0 --title 'v1.1.0' --generate-notes
 ```
 
+If you merge to `main` without changing the version, the workflow detects that `vX.Y.Z` already
+exists and does nothing. Only a version bump publishes.
+
 ## Pre-releases
 
-A pre-release is a versioned, immutable artifact for testing ahead of a stable release. Cut it
-when you want testers on a specific build, not on the moving `edge`.
+A pre-release is a versioned, immutable artifact for testing ahead of a stable release.
+
+**Automatic (preferred):** set the `Cargo.toml` version to the pre-release and merge to `main`,
+exactly as for a stable release. A `-rc`/`-beta`/`-alpha` version publishes **only its own tag**
+- it never moves `latest`, `1`, or `1.1`, so a broken candidate cannot leak into production
+pulls. To promote it, bump the version to the final one and merge again.
+
+**Manual:** tag a `dev` (or `main`) commit directly, when you do not want to touch the manifest:
 
 ```sh
-# off dev (or a main commit about to ship)
 git switch dev && git pull
 git tag -a v1.1.0-rc.1 -m 'ellmephant 1.1.0-rc.1'
 git push origin v1.1.0-rc.1                # -> image 1.1.0-rc.1 ONLY
 ```
 
-A pre-release tag publishes **only its own tag**. It never moves `latest`, `1`, or `1.1` - those
-stay on the last stable release, so a broken candidate cannot leak into production pulls. To
-promote a candidate, merge its commit to `main` and tag the same version without the suffix.
+Mark pre-release GitHub Releases accordingly so they do not claim "Latest":
 
 ```sh
 gh release create v1.1.0-rc.1 --prerelease --generate-notes
@@ -120,26 +129,32 @@ gh release create v1.1.0-rc.1 --prerelease --generate-notes
 
 ## Hotfixes
 
-A stable release is broken. Do not touch `dev` first; base the fix on the tag.
+A stable release is broken. Base the fix on the tag, not on `dev`.
 
 ```sh
 git switch -c hotfix-1.0.1 v1.0.0
-# ...fix, bump Cargo.toml to 1.0.1, commit...
+# ...fix, bump Cargo.toml (and Cargo.lock) to 1.0.1, commit...
 git switch main && git merge --no-ff hotfix-1.0.1
-git push origin main
-git tag -a v1.0.1 -m 'ellmephant 1.0.1' && git push origin v1.0.1
+git push origin main                       # -> tag v1.0.1 + image 1.0.1 published
 git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from regressing
 ```
 
 ## Gotchas
 
+- **A version bump is the release trigger.** A merge to `main` that does not change `Cargo.toml`
+  publishes nothing. Bump to release.
+- **The auto-created tag does not start a second run.** The workflow pushes `vX.Y.Z` with the
+  built-in `GITHUB_TOKEN`, and GitHub does not let `GITHUB_TOKEN`-triggered pushes start new
+  workflow runs. That is why the image is published in the same run; you get one run, not two.
+- **Workflow permissions must allow writes.** This workflow asks for `contents: write` and
+  `packages: write`. If the repository or organisation sets *Settings -> Actions -> Workflow
+  permissions* to read-only, the block cannot elevate and the tag push / image push fails.
 - **A tag builds the workflow as of the tagged commit.** A tag-triggered run uses the workflow
   file that exists *at that tag*. Tag a commit that already contains the workflow, or nothing
   fires.
 - **Never add a raw `latest` tag rule.** `latest` is owned by `type=semver`'s `latest=auto`, which
   skips pre-releases. A hand-rolled `latest` rule would move it onto an `-rc`.
-- **`main` is silent by design.** Merging to `main` publishes nothing. Tag to publish.
 - **ghcr packages start private.** After the first publish, set visibility under Package settings
   if anonymous pulls are wanted.
-- **Platforms.** Images are `linux/amd64` only. Add `linux/arm64` in
-  `docker-release.yml` if native arm pulls are needed.
+- **Platforms.** Images are `linux/amd64` only. Add `linux/arm64` in `docker-release.yml` if
+  native arm pulls are needed.

@@ -1,13 +1,14 @@
 name: docker-release
 
-# Publish images to ghcr.io. Three sources, one rule each:
-#   version tag    v1.1.0       -> 1.1.0, 1.1, 1, latest
-#   pre-release    v1.1.0-rc.1  -> 1.1.0-rc.1               (stable aliases untouched)
-#   dev branch                   -> edge, sha-<commit>       (moving, carries no version)
-# `main` never publishes: it is the merge target, not a release. Images come from tags.
+# Publish images to ghcr.io. The trigger is the version:
+#   push to main    -> reads Cargo.toml; if vX.Y.Z is untagged, tags it and publishes
+#                      X.Y.Z, X.Y, X, latest  (bump the version to release; no bump = no-op)
+#   version tag     -> v1.1.0      -> 1.1.0, 1.1, 1, latest
+#   pre-release tag -> v1.1.0-rc.1 -> 1.1.0-rc.1             (stable aliases untouched)
+#   push to dev     -> edge, sha-<commit>                    (moving, carries no version)
 on:
   push:
-    branches: [dev]
+    branches: [main, dev]
     tags: ["v*"]
   workflow_dispatch: # manual build; publishes `edge` + `sha-<commit>`
 
@@ -18,12 +19,44 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # create + push the release tag on a main push
       packages: write # push to ghcr.io with the built-in GITHUB_TOKEN
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
+
+      # Resolve the release. `version` always comes from Cargo.toml; on a push to main we also
+      # check whether that version is already tagged, so releases stay idempotent (a merge that
+      # does not bump the version publishes nothing).
+      - id: rel
+        run: |
+          version=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::could not read version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::v$version already released; bump Cargo.toml to publish"
+            else
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A merge to main that bumps the version cuts the tag automatically. The push uses
+      # GITHUB_TOKEN, which by design does not re-trigger workflows - we publish in this same
+      # run, so nothing is lost. (A hand-pushed tag still triggers its own run.)
+      - name: Tag the release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rel.outputs.publish == 'true'
+        run: |
+          git tag -a "v${{ steps.rel.outputs.version }}" -m "ellmephant ${{ steps.rel.outputs.version }}"
+          git push origin "v${{ steps.rel.outputs.version }}"
 
       # ghcr.io requires a lowercase image path; the repo owner may not be.
       - name: Lowercase image name
@@ -38,21 +71,25 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # `latest` is owned by `type=semver`'s default `latest=auto`: it fires only for a stable
-      # tag, never for `-rc`/`-beta`/`-alpha`. Do NOT add a raw `latest` rule - it would move
+      # version, never for `-rc`/`-beta`/`-alpha`. Do NOT add a raw `latest` rule - it would move
       # `latest` onto a pre-release. Pre-releases get only their exact tag.
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}},value=v${{ steps.rel.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.rel.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{major}},value=v${{ steps.rel.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=edge,branch=dev
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=sha,enable=${{ startsWith(github.ref, 'refs/heads/') }}
+            type=sha,enable=${{ github.ref == 'refs/heads/dev' || github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
+        if: steps.rel.outputs.publish == 'true'
         with:
           context: .
           push: true

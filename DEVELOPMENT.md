@@ -156,5 +156,5 @@ git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from r
   skips pre-releases. A hand-rolled `latest` rule would move it onto an `-rc`.
 - **ghcr packages start private.** After the first publish, set visibility under Package settings
   if anonymous pulls are wanted.
-- **Platforms.** Images are `linux/amd64` only. Add `linux/arm64` in `docker-release.yml` if
-  native arm pulls are needed.
+- **Platforms.** Images are published for `linux/amd64` and `linux/arm64` (QEMU on the runner),
+  so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.

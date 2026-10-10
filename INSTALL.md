@@ -10,6 +10,7 @@ in the container) and the model weights are fetched into it once, then reused of
 - [Store-only build](#store-only-build)
 - [Create the store and fetch weights](#create-the-store-and-fetch-weights)
 - [Docker](#docker)
+- [Kubernetes (Helm)](#kubernetes-helm)
 - [Verify the installation](#verify-the-installation)
 
 ## Prerequisites
@@ -91,6 +92,35 @@ docker run --rm -it -v ellmephant-data:/data \
 ```
 
 See the [README](README.md) for usage, including the MCP server on a host and in Docker.
+
+## Kubernetes (Helm)
+
+A chart ships in [`charts/ellmephant/`](charts/ellmephant/): one Deployment, a store PVC, and an
+optional separate weights-cache PVC, serving MCP over HTTP on port 8888. It defaults to the public
+image `ghcr.io/jdblack/ellmephant`.
+
+```sh
+helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
+```
+
+Releases are cut by [`helm/chart-releaser`](.github/workflows/chart-release.yml) — a GitHub
+Release plus a `gh-pages` Helm repo index, no container registry:
+
+```sh
+helm repo add ellmephant https://jdblack.github.io/ellmephant
+helm install ellmephant ellmephant/ellmephant --version 0.1.0
+```
+
+Point the MCP client at `http://ellmephant.ellmephant.svc:8888/mcp`. The store lives on the
+`ellmephant-data` claim — keep it, or the memories die with the pod. First start downloads the
+embedder (~1.2 GB) on first use; pre-fetch it with `models.fetch.enabled=true`, or mount a warm
+cache read-only.
+
+The chart also knows about this house's neighbours: `gateway.enabled` renders the Gateway API
+`ListenerSet` / `ReferenceGrant` / `HTTPRoute` trio (NGINX Gateway Fabric, cert-manager,
+external-dns) instead of an Ingress, and `mcpConnector.enabled=true` adds the TypingMind MCP
+connector, cribbed from the `mcp` namespace Terraform module. Every value is documented in
+[`charts/ellmephant/README.md`](charts/ellmephant/README.md).
 
 ## Verify the installation
 

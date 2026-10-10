@@ -5,10 +5,12 @@ How work moves through this repository and how releases are cut. For internals s
 normative specification see [`SPEC.md`](SPEC.md).
 
 - [Branch model](#branch-model)
-- [The two workflows](#the-two-workflows)
+- [The workflows](#the-workflows)
 - [Day to day: when to commit and push](#day-to-day-when-to-commit-and-push)
 - [Versioning](#versioning)
 - [Publishing a release](#publishing-a-release)
+- [Releasing the chart](#releasing-the-chart)
+- [Mirroring to Harbor](#mirroring-to-harbor)
 - [Pre-releases](#pre-releases)
 - [Hotfixes](#hotfixes)
 - [Gotchas](#gotchas)
@@ -24,13 +26,18 @@ normative specification see [`SPEC.md`](SPEC.md).
 Work lands on `dev` first. Merging `dev` into `main` is a deliberate act that marks the code
 release-grade - and, if the version was bumped, publishes an image.
 
-## The two workflows
+## The workflows
 
 - **`.github/workflows/ci.yml`** - runs on every push to `main` and every pull request. Format,
-  clippy, tests (both feature sets), and a no-push Docker build. Gate, not publisher.
-- **`.github/workflows/docker-release.yml`** - the publisher. Fires on a push to `main`, a push
-  to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the image
-  to `ghcr.io/<owner>/ellmephant`.
+  clippy, tests (both feature sets), a no-push Docker build, and the chart gate (lint, render
+  every value shape, the token guard, and the two version guards). Gate, not publisher.
+- **`.github/workflows/docker-release.yml`** - the image publisher. Fires on a push to `main`, a
+  push to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the
+  image to `ghcr.io/<owner>/ellmephant`.
+- **`.github/workflows/chart-release.yml`** - the chart publisher. Fires on a push to `main` that
+  touches `charts/**`. Runs [`helm/chart-releaser`](https://github.com/helm/chart-releaser-action),
+  which packages the chart, cuts a GitHub Release with the `.tgz` attached, and refreshes the
+  `gh-pages` Helm repo index. No container registry involved.
 
 What the publisher emits, per event:
 
@@ -81,6 +88,20 @@ must agree. **Bumping this version is what triggers a release.**
 
 Pre-release suffixes are ordered: `1.1.0-alpha.1 < 1.1.0-beta.1 < 1.1.0-rc.1 < 1.1.0`.
 
+### The chart carries two numbers
+
+The Helm chart has its own version, deliberately **not** locked to the crate:
+
+| Field | Meaning | Rule |
+|---|---|---|
+| `version` (e.g. `0.1.0`) | the chart's own SemVer | bump it in the same PR that touches `charts/**` |
+| `appVersion` (e.g. `1.0.0`) | the app release the chart defaults to | keep it equal to `Cargo.toml`'s `version` |
+
+`image.tag` is empty by default, so it resolves to `appVersion` - a stale `appVersion` silently
+ships a stale image. CI enforces both: `appVersion` must equal `Cargo.toml`, and a chart change
+must touch `Chart.yaml` (otherwise `chart-releaser` no-ops on the existing version and publishes
+nothing). Staying on `0.x` until the values surface settles is intentional.
+
 ## Publishing a release
 
 The workflow does the tagging and the image; you only bump the version and merge.
@@ -103,6 +124,68 @@ gh release create v1.1.0 --title 'v1.1.0' --generate-notes
 
 If you merge to `main` without changing the version, the workflow detects that `vX.Y.Z` already
 exists and does nothing. Only a version bump publishes.
+
+## Releasing the chart
+
+The chart lives in [`charts/ellmephant/`](charts/ellmephant/) and is published to a GitHub-hosted
+Helm repo by [`chart-release.yml`](.github/workflows/chart-release.yml), using
+[`helm/chart-releaser`](https://github.com/helm/chart-releaser-action). There is no container
+registry in this path - releases are a GitHub Release plus a `gh-pages` index.
+
+**One-time setup (manual, once):** enable Pages - *Settings -> Pages -> Source: Deploy from a
+branch -> `gh-pages` / `(root)`*. The branch is created by the first chart-releaser run, so enable
+this after that run if Pages refuses a branch that does not exist yet.
+
+Then, to cut a chart release:
+
+1. Bump `version` in `charts/ellmephant/Chart.yaml` (patch is almost always right).
+2. Commit and merge into `main`.
+
+`chart-releaser` packages every chart under `charts/`, skips any version it has already released,
+creates the Release `ellmephant-<version>` with the `.tgz` attached, and refreshes `gh-pages`.
+Users then:
+
+```sh
+helm repo add ellmephant https://jdblack.github.io/ellmephant
+helm repo update
+helm install ellmephant ellmephant/ellmephant --version 0.1.1
+```
+
+Local sanity before you push (also what CI runs):
+
+```sh
+make chart-lint
+make chart-template
+```
+
+## Mirroring to Harbor
+
+The in-cluster registry is `harbor.vn.linuxguru.net`. Both artifacts can be mirrored there - the
+image for a cluster that should not reach GHCR, and the chart as an OCI artifact. Neither path
+touches CI; they are `podman`/`helm` one-liners.
+
+```sh
+# 1. Image: take the published multi-arch amd64 variant and re-tag it into Harbor.
+podman pull --platform linux/amd64 ghcr.io/jdblack/ellmephant:1.0.0
+podman tag  ghcr.io/jdblack/ellmephant:1.0.0 harbor.vn.linuxguru.net/library/ellmephant:1.0.0
+podman tag  ghcr.io/jdblack/ellmephant:1.0.0 harbor.vn.linuxguru.net/library/ellmephant:latest
+podman push harbor.vn.linuxguru.net/library/ellmephant:1.0.0
+podman push harbor.vn.linuxguru.net/library/ellmephant:latest
+
+# 2. Chart, as an OCI artifact under the same project.
+helm registry login harbor.vn.linuxguru.net
+make chart-push          # packages, then `helm push ... oci://harbor.vn.linuxguru.net/library`
+```
+
+Point the chart at the mirror with:
+
+```sh
+--set image.repository=harbor.vn.linuxguru.net/library/ellmephant
+```
+
+Harbor holds an OCI chart and a container image under the same repository name happily (unlike
+GHCR, where a chart tag colliding with an image tag is a rejected push), so the house convention
+of `oci://<project>` with the chart named after the app is safe here.
 
 ## Pre-releases
 
@@ -158,3 +241,11 @@ git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from r
   if anonymous pulls are wanted.
 - **Platforms.** Images are published for `linux/amd64` and `linux/arm64` (QEMU on the runner),
   so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
+- **A chart change without a version bump publishes nothing.** `chart-releaser` skips a version
+  it has already released, silently. CI fails the PR instead - but only on a PR, so a direct push
+  to `main` gets the silent no-op.
+- **The chart release cannot hang off the `v*` tag.** `docker-release.yml` pushes that tag with
+  `GITHUB_TOKEN`, which does not start other workflows - so `chart-release.yml` triggers on the
+  `charts/**` push to `main` instead, and fires independently of app releases.
+- **Pages is a one-time manual step.** No workflow can create it; see
+  [Releasing the chart](#releasing-the-chart).

@@ -1,7 +1,12 @@
 CARGO ?= cargo
 IMAGE ?= ellmephant:dev
+CHART ?= charts/ellmephant
+HARBOR ?= harbor.vn.linuxguru.net/library
+# Pinned so lint/render do not inherit Helm 3's v1.20.0 default, which the chart's kubeVersion rejects.
+KUBE_VERSION ?= 1.34.0
 
-.PHONY: build release test fmt clippy lint doc docker-build docker-run clean
+.PHONY: build release test fmt clippy lint doc docker-build docker-run clean \
+        chart-lint chart-template chart-package chart-push
 
 build:        ## debug build
 	$(CARGO) build
@@ -28,6 +33,19 @@ docker-build: ## build the runtime image
 
 docker-run:   ## run doctor against a named volume
 	docker run --rm -it -v ellmephant-data:/data $(IMAGE) doctor
+
+chart-lint:      ## lint the chart (strict)
+	helm lint --strict $(CHART) --kube-version $(KUBE_VERSION)
+
+chart-template:  ## render the chart with default values
+	helm template ellmephant $(CHART) --kube-version $(KUBE_VERSION)
+
+chart-package:   ## package the chart -> ellmephant-<version>.tgz
+	helm package $(CHART)
+
+chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: helm registry login)
+	helm push ellmephant-*.tgz "oci://$(HARBOR)"
+	@rm -f ellmephant-*.tgz
 
 clean:
 	$(CARGO) clean

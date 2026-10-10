@@ -1,10 +1,15 @@
 name: docker-release
 
-# Cut a published image from a version tag: `git push origin v1.0.0` -> ghcr.io/<owner>/ellmephant:1.0.0
+# Publish images to ghcr.io. Three sources, one rule each:
+#   version tag    v1.1.0       -> 1.1.0, 1.1, 1, latest
+#   pre-release    v1.1.0-rc.1  -> 1.1.0-rc.1               (stable aliases untouched)
+#   dev branch                   -> edge, sha-<commit>       (moving, carries no version)
+# `main` never publishes: it is the merge target, not a release. Images come from tags.
 on:
   push:
+    branches: [dev]
     tags: ["v*"]
-  workflow_dispatch: # manual dry-run; tags the image `edge` instead of `latest`
+  workflow_dispatch: # manual build; publishes `edge` + `sha-<commit>`
 
 env:
   REGISTRY: ghcr.io
@@ -32,7 +37,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # v3.5.1 -> 3.5.1, 3.5, 3, latest. A manual run only gets `edge`.
+      # `latest` is owned by `type=semver`'s default `latest=auto`: it fires only for a stable
+      # tag, never for `-rc`/`-beta`/`-alpha`. Do NOT add a raw `latest` rule - it would move
+      # `latest` onto a pre-release. Pre-releases get only their exact tag.
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -41,8 +48,9 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=edge,branch=dev
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=sha,enable=${{ startsWith(github.ref, 'refs/heads/') }}
 
       - uses: docker/build-push-action@v6
         with:

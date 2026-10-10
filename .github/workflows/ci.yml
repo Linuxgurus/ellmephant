@@ -77,7 +77,13 @@ jobs:
             echo "::error::Chart.yaml appVersion ($chart_app) != Cargo.toml version ($cargo_v)"
             exit 1
           fi
-          echo "appVersion $chart_app matches the crate"
+          # artifacthub.io/images names the image tag by hand, so it drifts on its own.
+          hub_img=$(grep -m1 -E '^[[:space:]]*image: ' "$CHART/Chart.yaml" | sed -E 's/.*:([^:]+)$/\1/')
+          if [ "$hub_img" != "$cargo_v" ]; then
+            echo "::error::Chart.yaml artifacthub.io/images tag ($hub_img) != Cargo.toml version ($cargo_v)"
+            exit 1
+          fi
+          echo "appVersion $chart_app and artifacthub image tag $hub_img match the crate"
       # chart-release skips a `<chart>-<version>` release that already exists, so a chart change
       # without a version bump would ship nothing at all.
       - name: Chart changes must bump the chart version

@@ -6,7 +6,7 @@ HARBOR ?= harbor.vn.linuxguru.net/library
 KUBE_VERSION ?= 1.34.0
 
 .PHONY: build release test fmt clippy lint doc docker-build docker-run clean \
-        chart-lint chart-template chart-package chart-push
+        chart-lint chart-template chart-package chart-push harbor-publish harbor-hooks
 
 build:        ## debug build
 	$(CARGO) build
@@ -46,6 +46,13 @@ chart-package:   ## package the chart -> ellmephant-<version>.tgz
 chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: helm registry login)
 	helm push ellmephant-*.tgz "oci://$(HARBOR)"
 	@rm -f ellmephant-*.tgz
+
+harbor-publish:  ## push this commit to Harbor: chart + image (mirrors the CI-built image)
+	scripts/harbor-publish.sh
+
+harbor-hooks:    ## install the repo's git hooks into this clone (core.hooksPath)
+	git config core.hooksPath .githooks
+	@echo "hooks installed: core.hooksPath -> .githooks"
 
 clean:
 	$(CARGO) clean

@@ -10,7 +10,7 @@ normative specification see [`SPEC.md`](SPEC.md).
 - [Versioning](#versioning)
 - [Publishing a release](#publishing-a-release)
 - [Releasing the chart](#releasing-the-chart)
-- [Mirroring to Harbor](#mirroring-to-harbor)
+- [Dev publishing to Harbor](#dev-publishing-to-harbor)
 - [Pre-releases](#pre-releases)
 - [Hotfixes](#hotfixes)
 - [Gotchas](#gotchas)
@@ -154,33 +154,46 @@ make chart-lint
 make chart-template
 ```
 
-## Mirroring to Harbor
+## Dev publishing to Harbor
 
-The in-cluster registry is `harbor.vn.linuxguru.net`. Both artifacts can be mirrored there - the
-image for a cluster that should not reach GHCR, and the chart as an OCI artifact. Neither path
-touches CI; they are `podman`/`helm` one-liners.
+Harbor is `harbor.vn.linuxguru.net`, reachable only from the LAN, so a GitHub runner cannot push
+to it: this step is local by necessity. `dev` is wired to publish itself.
+
+On a commit to `dev`, `.githooks/post-commit` backgrounds `scripts/harbor-publish.sh`, which:
+
+1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library`;
+2. mirrors the image - it waits for CI to publish `sha-<short>` to GHCR, then pulls the
+   `linux/amd64` variant and pushes it to Harbor as `edge` + `sha-<short>`.
+
+Mirroring instead of building is deliberate: CI has already built the exact amd64 image for that
+commit, so copying it takes seconds, while `podman build` on Apple Silicon is an emulated Rosetta
+rebuild that takes half an hour. `HARBOR_IMAGE_MODE=build` builds locally instead (no CI, no GHCR);
+`HARBOR_IMAGE_MODE=skip` skips the image.
+
+One-time, per clone:
 
 ```sh
-# 1. Image: take the published multi-arch amd64 variant and re-tag it into Harbor.
-podman pull --platform linux/amd64 ghcr.io/jdblack/ellmephant:1.0.0
-podman tag  ghcr.io/jdblack/ellmephant:1.0.0 harbor.vn.linuxguru.net/library/ellmephant:1.0.0
-podman tag  ghcr.io/jdblack/ellmephant:1.0.0 harbor.vn.linuxguru.net/library/ellmephant:latest
-podman push harbor.vn.linuxguru.net/library/ellmephant:1.0.0
-podman push harbor.vn.linuxguru.net/library/ellmephant:latest
-
-# 2. Chart, as an OCI artifact under the same project.
-helm registry login harbor.vn.linuxguru.net
-make chart-push          # packages, then `helm push ... oci://harbor.vn.linuxguru.net/library`
+make harbor-hooks                               # git config core.hooksPath .githooks
+helm registry login harbor.vn.linuxguru.net     # podman already holds its own credential
 ```
 
-Point the chart at the mirror with:
+Watch it, skip it, or run it by hand:
+
+```sh
+tail -f .tmp/harbor-publish.log
+SKIP_HARBOR=1 git commit -m '...'               # one commit, no publish
+make harbor-publish                             # run it now
+SOURCE_TAG=1.0.1 make harbor-publish            # mirror a released main image
+```
+
+Point the cluster at the mirror with:
 
 ```sh
 --set image.repository=harbor.vn.linuxguru.net/library/ellmephant
 ```
 
-The chart itself installs from the same project over OCI - which is the closest thing to a
-`helm repo add` this setup has, and the path the cluster would actually use:
+The chart installs from the same project over OCI - the closest thing to a `helm repo add` here,
+and the path the cluster would actually use:
 
 ```sh
 helm install ellmephant oci://harbor.vn.linuxguru.net/library/ellmephant --version 0.1.0
@@ -254,3 +267,11 @@ git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from r
   `helm repo add` does not apply: install by asset URL, or from the Harbor OCI mirror.
 - **Chart releases must not claim "Latest".** `--latest=false` keeps a chart release from taking
   the repository's "Latest release" badge away from the app's `v*` releases.
+- **The Harbor hook is per clone.** `core.hooksPath` is local config, not committed - run
+  `make harbor-hooks` in a fresh clone or the hook silently does not exist.
+- **The Harbor hook waits for CI.** It mirrors `sha-<short>` from GHCR, which CI only publishes
+  after the push - so a commit you never push times out after 30 minutes. `SKIP_HARBOR=1` skips it.
+- **Harbor needs its own login for helm.** podman and helm keep separate credential stores; the
+  hook's chart push fails until `helm registry login harbor.vn.linuxguru.net` has been run once.
+- **`artifacthub.io/images` is guarded too.** CI asserts the tag it names equals `Cargo.toml`'s
+  version, so a bump that misses it fails the build instead of shipping a stale reference.

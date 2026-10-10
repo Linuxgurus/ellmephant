@@ -1,0 +1,17 @@
+#!/bin/sh
+# dev only: push the commit to Harbor (chart now, image once CI has built it).
+#
+# Backgrounded so `git commit` stays instant. Watch it with:
+#   tail -f .tmp/harbor-publish.log
+# Skip one commit with:
+#   SKIP_HARBOR=1 git commit ...
+#
+# Installed per clone with `make harbor-hooks` (git config core.hooksPath .githooks).
+set -u
+
+[ "${SKIP_HARBOR:-0}" = "1" ] && exit 0
+[ "$(git symbolic-ref --short HEAD 2>/dev/null || true)" = "dev" ] || exit 0
+
+mkdir -p .tmp
+nohup scripts/harbor-publish.sh >> .tmp/harbor-publish.log 2>&1 < /dev/null &
+exit 0

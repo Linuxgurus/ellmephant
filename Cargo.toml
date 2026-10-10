@@ -1,11 +1,11 @@
 [package]
 name = "ellmephant"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Single-binary, SQLite-backed long-term memory for AI agents"
 license = "MIT"
-repository = "https://example.invalid/ellmephant"
+repository = "https://github.com/jdblack/ellmephant"
 readme = "README.md"
 
 # NOTE: this is the P1–P4 dependency set. `sqlite-vec` (in-process vec0) and `sha2`

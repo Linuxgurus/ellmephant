@@ -12,14 +12,20 @@ PVC. No sidecars, no operators.
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-Releases are cut by [`helm/chart-releaser`](../../.github/workflows/chart-release.yml) — a GitHub
-Release with the `.tgz` attached plus a `gh-pages` Helm repo index (the same pattern as the
-`wordpress` repo). No container registry involved:
+[`chart-release.yml`](../../.github/workflows/chart-release.yml) packages the chart and attaches it
+to a GitHub Release tagged `ellmephant-<version>` — release assets only, so there is no Helm repo
+index and nothing to `helm repo add`. Install straight from the asset URL:
 
 ```sh
-helm repo add ellmephant https://jdblack.github.io/ellmephant
-helm repo update
-helm install ellmephant ellmephant/ellmephant --version 0.1.0
+helm install ellmephant \
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.0/ellmephant-0.1.0.tgz
+```
+
+Or from an OCI mirror, if one exists (see [`DEVELOPMENT.md`](../../DEVELOPMENT.md) for the Harbor
+recipe):
+
+```sh
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/ellmephant --version 0.1.0
 ```
 
 Then point an MCP client at the Service, path `/mcp`:

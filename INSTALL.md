@@ -103,12 +103,13 @@ image `ghcr.io/jdblack/ellmephant`.
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-Releases are cut by [`helm/chart-releaser`](.github/workflows/chart-release.yml) — a GitHub
-Release plus a `gh-pages` Helm repo index, no container registry:
+Releases are cut by [`chart-release.yml`](.github/workflows/chart-release.yml): the packaged chart
+is attached to a GitHub Release tagged `ellmephant-<version>`. Release assets only — no registry
+and no Helm repo index — so install straight from the asset URL:
 
 ```sh
-helm repo add ellmephant https://jdblack.github.io/ellmephant
-helm install ellmephant ellmephant/ellmephant --version 0.1.0
+helm install ellmephant \
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.0/ellmephant-0.1.0.tgz
 ```
 
 Point the MCP client at `http://ellmephant.ellmephant.svc:8888/mcp`. The store lives on the

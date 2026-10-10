@@ -1,13 +1,16 @@
 name: chart-release
 
-# Package the Helm chart, cut a GitHub Release with the .tgz attached, and refresh the gh-pages
-# Helm repo index — the same chart-releaser pattern as the `wordpress` repo. No registry, no OCI.
-# Once Pages is enabled on the `gh-pages` branch, users install with:
-#   helm repo add ellmephant https://jdblack.github.io/ellmephant
-#   helm install ellmephant ellmephant/ellmephant --version <chart version>
+# Package each chart under charts/ and attach it to a GitHub Release tagged `<chart>-<version>`.
+# Release assets only: no Pages, no gh-pages branch, no container registry, no third-party action.
+# Users install straight from the asset URL:
+#   helm install ellmephant \
+#     https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.0/ellmephant-0.1.0.tgz
 #
-# Publishing is keyed off the Chart.yaml `version`: bump it, or chart-releaser finds the
-# `ellmephant-<version>` release already present and quietly does nothing. (CI guards the bump.)
+# Publishing is keyed off `Chart.yaml`'s `version`: if the `<chart>-<version>` release already
+# exists the chart is skipped, so this stays a no-op unless the version moved. (CI guards the bump.)
+#
+# Note: the tags this creates are chart tags (`ellmephant-0.1.0`), distinct from the app's `v1.0.0`.
+# `--latest=false` keeps a chart release from claiming the repository's "Latest release" badge.
 on:
   push:
     branches: [main]
@@ -20,21 +23,42 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the release + push the gh-pages branch
+      contents: write # create the release + its tag
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Configure Git
+      - uses: azure/setup-helm@v4
+
+      - name: Package every chart
         run: |
-          git config user.name "$GITHUB_ACTOR"
-          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          set -euo pipefail
+          for chart in charts/*/; do
+            helm package "$chart" --destination .tmp/chart-packages
+          done
 
-      - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.7.0
-        with:
-          charts_dir: charts
+      - name: Attach each chart to its release
         env:
-          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          published=0
+          for pkg in .tmp/chart-packages/*.tgz; do
+            # `helm package` names the file <chart>-<version>.tgz, which is exactly the tag.
+            tag=$(basename "$pkg" .tgz)
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "release $tag already exists — bump that chart's version to publish"
+              continue
+            fi
+            echo "publishing $tag"
+            gh release create "$tag" "$pkg" \
+              --title "$tag" \
+              --latest=false \
+              --notes "Helm chart ${tag} (chart version, not the app release).
+
+          Install directly from this asset:
+
+              helm install ellmephant https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/$(basename "$pkg")"
+            published=$((published + 1))
+          done
+          echo "published ${published} chart release(s)"

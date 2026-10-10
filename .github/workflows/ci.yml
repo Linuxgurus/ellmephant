@@ -78,8 +78,8 @@ jobs:
             exit 1
           fi
           echo "appVersion $chart_app matches the crate"
-      # chart-releaser keys off Chart.yaml and quietly no-ops on an existing version, so a chart
-      # change without a bump would ship nothing at all.
+      # chart-release skips a `<chart>-<version>` release that already exists, so a chart change
+      # without a version bump would ship nothing at all.
       - name: Chart changes must bump the chart version
         if: github.event_name == 'pull_request'
         run: |
@@ -90,6 +90,6 @@ jobs:
             echo "no chart changes"; exit 0
           fi
           if git diff --quiet "$base" -- "$CHART/Chart.yaml"; then
-            echo "::error::charts/ changed but Chart.yaml was untouched — bump its version, or chart-releaser will no-op"
+            echo "::error::charts/ changed but Chart.yaml was untouched — bump its version, or the release will be skipped"
             exit 1
           fi

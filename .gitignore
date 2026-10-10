@@ -5,6 +5,7 @@
 models/
 .ellmephant/
 .env
+.tmp/
 
 # editor / OS noise
 .DS_Store

@@ -255,8 +255,10 @@ git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from r
   skips pre-releases. A hand-rolled `latest` rule would move it onto an `-rc`.
 - **ghcr packages start private.** After the first publish, set visibility under Package settings
   if anonymous pulls are wanted.
-- **Platforms.** Images are published for `linux/amd64` and `linux/arm64` (QEMU on the runner),
-  so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
+- **Platforms.** Versioned releases are published for `linux/amd64` and `linux/arm64` (QEMU on the
+  runner), so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
+  `dev`/`edge` builds are **amd64 only** - the cluster is amd64, and the arm64 half roughly
+  triples the build time, which the local Harbor hook would then sit waiting on.
 - **A chart change without a version bump publishes nothing.** `chart-release.yml` skips a
   `<chart>-<version>` release that already exists, silently. CI fails the PR instead - but only on
   a PR, so a direct push to `main` gets the silent no-op.

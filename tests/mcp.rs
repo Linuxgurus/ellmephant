@@ -212,6 +212,20 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     assert_eq!(gone.is_error, Some(true));
 
+    // `memory_stats` is the read-only digest: one keyed JSON object, no bodies.
+    let stats = call(&client, "memory_stats", serde_json::json!({})).await;
+    assert!(!stats.is_error.unwrap_or(false), "{}", text(&stats));
+    let raw = text(&stats);
+    let stats: serde_json::Value = serde_json::from_str(&raw).expect("stats json");
+    // Only `infra-observability` survives (it carried no tags; `infra-logs` was deleted).
+    assert_eq!(stats["memories"], serde_json::json!(1));
+    assert_eq!(stats["tag_assignments"], serde_json::json!(0));
+    assert_eq!(stats["visits_total"], serde_json::json!(0));
+    assert!(
+        !raw.contains("\"body\""),
+        "stats must not carry bodies: {raw}"
+    );
+
     // An unknown argument is ignored (serde default), so the search still succeeds.
     let extra = call(
         &client,

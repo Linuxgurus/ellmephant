@@ -272,7 +272,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_add`, `memory_update`,
 `memory_delete`, `memory_search`,
-`memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`.
+`memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`, `memory_stats`.
 
 - The server also advertises the §9 write policy as its **instructions**, and each write tool
   carries it in its description — that is what the model actually reads.
@@ -289,6 +289,9 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   `{"cols":["key","title","tags"],"count":N,"memories":[[…],…]}`. `memory_backlinks` →
   `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
 - `memory_list` returns the store index (`key`, `tags`, `title`, no bodies) — cheap browsing (§9).
+- `memory_stats` returns the read-only store digest (counts, size, tag/link shape, top tags, usage
+  counters, most-useful memories, age) as one keyed JSON object — the same `Stats` the `stats` CLI
+  command emits (`store::stats::compute`); no bodies.
 - `memory_get` is the **only** read that returns a body, and the way to read a known `key`.
 
 **CLI** — three faces over one core:
@@ -365,7 +368,7 @@ any model is touched; flags are re-checked the same way after they override the 
 
 1. **Golden eval set + `bench`** — shipped (P10): `tests/golden/` (corpus + ≥20 questions),
    `bench` / `--golden` / `--sweep`; default `k=10`; recall@3 gate 0.8. Grown from real usage.
-2. **MCP tool schema + annotations** — shipped (P7): 8 tools with JSON-Schema params and
+2. **MCP tool schema + annotations** — shipped (P7): 9 tools with JSON-Schema params and
    read-only / destructive / idempotent hints (`src/mcp`).
 3. **Rename implementation + collision policy** — shipped (P9): one transaction rewrites
    `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).

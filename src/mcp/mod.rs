@@ -1,8 +1,8 @@
 //! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_add`, `memory_update`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_list`, `memory_useful` — with read-only
-//! annotations on the read tools and destructive on `delete`. The tool descriptions carry the
+//! `memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`, `memory_stats` — with
+//! read-only annotations on the read tools and destructive on `delete`. The tool descriptions carry the
 //! SPEC §9 write policy; that is where memory quality is actually tuned. `memory_get` counts a
 //! `visits` read and `memory_useful` bumps the `was_useful` feedback counter.
 //!
@@ -47,6 +47,7 @@ pub const TOOLS: &[&str] = &[
     "memory_backlinks",
     "memory_list",
     "memory_useful",
+    "memory_stats",
 ];
 
 /// Server-level instruction: the read/write policy every client should follow (SPEC §9).
@@ -492,6 +493,27 @@ impl MemoryServer {
         tracing::info!(tool = "memory_list", count = memories.len(), "listed");
         summaries_to_wire_json(&memories).map_err(|e| e.to_string())
     }
+
+    /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
+    #[tool(
+        name = "memory_stats",
+        description = "Read-only digest of whole store: counts, size, tag/link shape, top tags, usage (visits/was_useful), top useful, age. One keyed JSON object. No bodies. The lay of the land — glance store before big hunt.",
+        annotations(
+            title = "Store stats",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_stats(
+        &self,
+        Parameters(_): Parameters<ListParams>,
+    ) -> std::result::Result<String, String> {
+        let stats = self.with_store("memory_stats", move |s| s.stats()).await?;
+        tracing::info!(tool = "memory_stats", memories = stats.memories, "stats");
+        serde_json::to_string(&stats).map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler]
@@ -635,6 +657,7 @@ mod tests {
             "memory_get",
             "memory_backlinks",
             "memory_list",
+            "memory_stats",
         ] {
             assert_eq!(
                 ann(name).read_only_hint,

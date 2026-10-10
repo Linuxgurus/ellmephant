@@ -1,0 +1,2 @@
+# Packaged charts (`helm package` from this directory) — never commit a .tgz.
+*.tgz

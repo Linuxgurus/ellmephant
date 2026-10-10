@@ -1,0 +1,336 @@
+# Defaults for the ellmephant chart. Every knob is documented here; `values.schema.json` is
+# deliberately absent to keep upgrades frictionless, so read this file.
+
+# The store is one SQLite file with a single writer connection. Keep this at 1: a second pod
+# during a rollout would contend with the first for `memory.db` (hence the Recreate strategy).
+replicaCount: 1
+
+image:
+  repository: ghcr.io/jdblack/ellmephant
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ellmephant
+
+# The binary needs no Kubernetes API access at all: no token.
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# The image runs as uid/gid 10001 (`ellmephant`). fsGroup makes the PVC writable by that group.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# The only writable paths are the store volume and /tmp (see `HOME=/tmp` in the env).
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# The image entrypoint is `ellmephant`; its default command is the MCP server over HTTP.
+command: ["ellmephant"]
+args: ["mcp"]
+
+# MCP transport. `host: 0.0.0.0` so the Service reaches it; `port` is the container port and the
+# default for both the Service and the probes.
+mcp:
+  host: 0.0.0.0
+  port: 8888
+
+service:
+  type: ClusterIP
+  port: 8888
+  annotations: {}
+
+ingress:
+  # A classic `networking.k8s.io/v1` Ingress. On a Gateway API cluster this renders nothing useful
+  # — use `gateway` below (or `extraObjects`) instead.
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ellmephant.local
+      paths:
+        - path: /mcp
+          pathType: Prefix
+  tls: []
+
+# Gateway API exposure (NGINX Gateway Fabric here; not Ingress). Renders the same trio the
+# in-house `network/gateway/expose` module does: a ListenerSet on a shared Gateway, the
+# cert-manager cluster-issuer annotation on the listener, ReferenceGrants when the Gateway is in
+# another namespace, and an HTTPRoute carrying the external-dns hostname annotation.
+gateway:
+  enabled: false
+  # The shared Gateway to attach the ListenerSet to (`private`, `public`, ... on this cluster).
+  gatewayName: private
+  gatewayNamespace: kube-network
+  protocol: HTTPS
+  port: 443
+  # cert-manager ClusterIssuer for the listener's TLS certificate.
+  certIssuer: ""
+  # Hostname is `<domain>`-qualified unless overridden: `<listenerName>.<domain>`.
+  domain: ""
+  hostname: ""
+  # ListenerSet name; defaults to the release's fullname.
+  listenerName: ""
+  # One HTTPRoute per entry. An empty list renders a single catch-all route to the Service.
+  httpRoutes: []
+  #  - name: ""              # defaults to the ListenerSet name
+  #    sectionName: ""       # defaults to the ListenerSet name
+  #    hostnames: []         # defaults to [<hostname>]
+  #    backendName: ""       # defaults to the app Service
+  #    backendPort: 0        # defaults to service.port
+  #    annotations: {}       # merged over the external-dns hostname annotation
+  #    filters: []           # e.g. RequestHeaderModifier, or Authentik forward-auth wiring
+
+# The source of truth. Without it ellmephant forgets everything on restart. Small, hot, single
+# writer: a synchronous replicated class is the right home (Longhorn on this cluster). Back it up
+# with Velero through `annotations` (e.g. velero.io/exclude-from-backup) if a shared schedule
+# does not already cover it.
+persistence:
+  enabled: true
+  # Reuse a pre-made claim instead of creating one.
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 2Gi
+  annotations: {}
+
+# The weights cache (~1.2 GB for the default embedder). Off by default: it then lives under
+# `<store>/models` on the data volume. Turn it on to park the fat, mostly read-only cache on a
+# cheaper/larger class (`seaweedfs-csi` on this cluster, or trivially shared RWX), or to share one
+# warm cache across stores.
+models:
+  enabled: false
+  # Reuse a pre-made claim (e.g. a cache populated elsewhere).
+  existingClaim: ""
+  # Or mount a node-local directory (pods then pin to that node).
+  hostPath: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 3Gi
+  # Mount the cache read-only — required with `offline: true` or after a pre-fetch.
+  readOnly: false
+  annotations: {}
+  # Fetch the weights on startup. Needs egress to the Hub; off so an air-gapped cluster boots.
+  fetch:
+    enabled: false
+    repo: ""
+    revision: ""
+    force: false
+
+# Init containers.
+initContainers:
+  # Run `ellmephant doctor` once to create/migrate the store before the server opens it.
+  store:
+    enabled: true
+  resources: {}
+    # limits:
+    #   cpu: "1"
+    #   memory: 1Gi
+
+# `config.toml` at <store>/config.toml. Flags and env override it (SPEC §12). The file rejects
+# unknown keys, so only real settings belong in `toml` below.
+config:
+  create: true
+  existingConfigMap: ""
+  toml: |
+    # Defaults mirror src/config.rs; uncomment to override.
+    model = "Qwen/Qwen3-Embedding-0.6B"
+    revision = "main"
+    dim = 1024
+    precision = "bf16"
+    device = "cpu"
+    default_k = 5
+    default_max_distance = 0.6
+    instruction = "Given a question, retrieve relevant memories"
+
+# Never open a socket; a cold weights cache is then a hard error (SPEC §6.4).
+offline: false
+
+# Optional HuggingFace token. The repo is public, so this is only needed for rate limits or a
+# private mirror. `optional: true`, so a missing key is not fatal.
+huggingFaceToken:
+  secretName: ""
+  secretKey: HF_TOKEN
+
+logging:
+  # `ellmephant` at info (startup, writes, searches, encoder load), `rmcp` at info (client
+  # session lifecycle); warn for everything else. Matches the image default.
+  rustLog: "ellmephant=info,rmcp=info,warn"
+
+# Extra env vars, appended after the built-ins (list of EnvVar).
+env: []
+# Extra env sources (secretRef / configMapRef).
+envFrom: []
+
+# TCP probes on the MCP port. There is no health HTTP route — the only path is /mcp, an MCP
+# handshake — so a port check is the honest signal (and matches the image's own HEALTHCHECK
+# philosophy of never writing to the store from a probe).
+probes:
+  liveness:
+    tcpSocket:
+      port: mcp
+    initialDelaySeconds: 15
+    periodSeconds: 30
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    tcpSocket:
+      port: mcp
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startup:
+    tcpSocket:
+      port: mcp
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+
+# Embedding on CPU wants memory, not much CPU. Raise the limit for a large store.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# Overrides the Recreate strategy (leave unset).
+updateStrategy: {}
+
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Free-form NetworkPolicy rules; only rendered when enabled. Empty list = deny that direction.
+networkPolicy:
+  enabled: false
+  ingress: []
+  egress: []
+
+# Optional TypingMind MCP connector. Mirrors the in-house `modules/mcp/typingmind` deployment:
+# its own bearer-token-gated HTTP endpoint that TypingMind points at, hardened the same way (non
+# root, read-only rootfs, no API token, internet egress only). Off by default.
+mcpConnector:
+  enabled: false
+  nameOverride: ""
+  fullnameOverride: ""
+  replicaCount: 1
+
+  image:
+    # The upstream connector is published only as an npm package, so run it with npx by default.
+    # For the pinned, air-gapped-friendly in-house build instead, set:
+    #   repository: harbor.vn.linuxguru.net/library/typingmind-mcp
+    #   tag: v1.0.3
+    # and `command: []` so the image entrypoint is used.
+    repository: node
+    tag: lts-slim
+    pullPolicy: IfNotPresent
+  command: ["npx", "-y", "@typingmind/mcp@latest"]
+  args: []
+
+  port: 8080
+  # Caps a single tool call; upstream's 60s default is tight for anything that thinks.
+  timeoutMs: 120000
+
+  # The endpoint is bearer-gated: set `value`, or point at an existing Secret. With neither, the
+  # template fails rather than deploy an unauthenticated connector.
+  authToken:
+    value: ""
+    secretName: ""
+    secretKey: MCP_AUTH_TOKEN
+
+  podAnnotations: {}
+  podLabels: {}
+
+  # Same shape as the server pod but a different uid: the connector image runs as 1000.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  # The spawned stdio servers need a writable /tmp, and get nothing else.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  service:
+    type: ClusterIP
+    annotations: {}
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # TCP, not /ping: every connector route is bearer-gated, so a headerless probe reads 401.
+  probes:
+    readiness:
+      tcpSocket:
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+    liveness:
+      tcpSocket:
+        port: http
+      initialDelaySeconds: 60
+      periodSeconds: 30
+
+  env: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # The connector runs commands chosen elsewhere, so it gets the internet only — never the LAN.
+  networkPolicy:
+    enabled: false
+    ingress: []
+    egress: []
+
+  # Expose it on the shared Gateway. Same contract as the top-level `gateway` block.
+  # On this cluster the connector should sit on the *private* gateway: the browser calls it for
+  # every tool call, so there is no reason to face the WAN.
+  gateway:
+    enabled: false
+    gatewayName: private
+    gatewayNamespace: kube-network
+    protocol: HTTPS
+    port: 443
+    certIssuer: ""
+    domain: ""
+    hostname: ""
+    listenerName: ""
+    httpRoutes: []
+
+# Arbitrary manifests rendered verbatim (Velero schedules, extra Gateway API objects, ...).
+extraObjects: []

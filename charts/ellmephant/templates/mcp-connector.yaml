@@ -1,0 +1,170 @@
+{{- if .Values.mcpConnector.enabled }}
+{{- include "ellmephant.connector.validate" . }}
+{{- if and .Values.mcpConnector.authToken.value (not .Values.mcpConnector.authToken.secretName) }}
+{{/*
+The token lives in a Secret, never in a ConfigMap. Rotating it means editing the value and
+upgrading; the pod-template checksum below then forces the connector to pick up the new token.
+*/}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "ellmephant.connector.secretName" . }}
+  labels:
+    {{- include "ellmephant.connector.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ .Values.mcpConnector.authToken.secretKey }}: {{ .Values.mcpConnector.authToken.value | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ellmephant.connector.fullname" . }}
+  labels:
+    {{- include "ellmephant.connector.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.mcpConnector.replicaCount }}
+  # The connector holds its MCP clients in memory, so a rolling update would orphan every session
+  # TypingMind is holding. One pod, replaced. (Same call as modules/mcp/typingmind.)
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ellmephant.connector.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if and .Values.mcpConnector.authToken.value (not .Values.mcpConnector.authToken.secretName) }}
+        checksum/secret: {{ .Values.mcpConnector.authToken.value | sha256sum }}
+        {{- end }}
+        {{- with .Values.mcpConnector.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "ellmephant.connector.labels" . | nindent 8 }}
+        {{- with .Values.mcpConnector.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # This pod runs MCP servers chosen elsewhere; it gets no API credentials at all.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.mcpConnector.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mcp-connector
+          securityContext:
+            {{- toYaml .Values.mcpConnector.securityContext | nindent 12 }}
+          image: "{{ .Values.mcpConnector.image.repository }}:{{ .Values.mcpConnector.image.tag }}"
+          imagePullPolicy: {{ .Values.mcpConnector.image.pullPolicy }}
+          {{- with .Values.mcpConnector.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.mcpConnector.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcpConnector.port }}
+              protocol: TCP
+          env:
+            # The connector is not what writes here — the stdio servers it spawns are, and under a
+            # read-only root filesystem they still need a HOME and an npm cache that can write.
+            - name: HOME
+              value: /tmp
+            - name: npm_config_cache
+              value: /tmp/.npm
+            # Kubernetes sets HOSTNAME to the pod name; connectors that bind it by default must be
+            # shoved at 0.0.0.0 or the port never opens. Harmless for builds that already do.
+            - name: HOSTNAME
+              value: 0.0.0.0
+            - name: PORT
+              value: {{ .Values.mcpConnector.port | quote }}
+            - name: TIMEOUT
+              value: {{ .Values.mcpConnector.timeoutMs | quote }}
+            - name: {{ .Values.mcpConnector.authToken.secretKey }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ellmephant.connector.secretName" . }}
+                  key: {{ .Values.mcpConnector.authToken.secretKey }}
+            {{- with .Values.mcpConnector.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            {{- toYaml .Values.mcpConnector.probes.readiness | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.mcpConnector.probes.liveness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.mcpConnector.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.mcpConnector.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcpConnector.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcpConnector.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ellmephant.connector.fullname" . }}
+  labels:
+    {{- include "ellmephant.connector.labels" . | nindent 4 }}
+  {{- with .Values.mcpConnector.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.mcpConnector.service.type }}
+  ports:
+    - port: {{ .Values.mcpConnector.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "ellmephant.connector.selectorLabels" . | nindent 4 }}
+{{- if .Values.mcpConnector.networkPolicy.enabled }}
+---
+{{/*
+Free-form, like the app's: the connector's egress is what lets it reach the internet, and its
+ingress should be the gateway pod only. Empty list denies that direction.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ellmephant.connector.fullname" . }}
+  labels:
+    {{- include "ellmephant.connector.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ellmephant.connector.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- with .Values.mcpConnector.networkPolicy.ingress }}
+  ingress:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.mcpConnector.networkPolicy.egress }}
+  egress:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

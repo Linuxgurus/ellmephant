@@ -39,3 +39,63 @@ jobs:
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  chart:
+    runs-on: ubuntu-latest
+    env:
+      CHART: charts/ellmephant
+      # Pinned so the render is deterministic whatever Helm the action installs: Helm 3 still
+      # defaults to v1.20.0 capabilities, which the chart's kubeVersion floor would reject.
+      KUBE_VERSION: "1.34.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the version-bump guard diffs the chart against the base branch
+      - uses: azure/setup-helm@v4
+      - run: helm lint --strict "$CHART" --kube-version "$KUBE_VERSION"
+      # Render the shapes that actually differ (ephemeral store, separate weight cache, Gateway
+      # API, the connector and its token paths) so a change cannot break one silently.
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" > /dev/null
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --set persistence.enabled=false > /dev/null
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --set models.enabled=true --set models.fetch.enabled=true > /dev/null
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --set networkPolicy.enabled=true --set 'networkPolicy.egress[0]={}' > /dev/null
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --namespace ellmephant --set gateway.enabled=true --set gateway.domain=example.test --set gateway.certIssuer=letsencrypt > /dev/null
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --namespace ellmephant --set mcpConnector.enabled=true --set mcpConnector.authToken.value=ci-token > /dev/null
+      - run: helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --namespace ellmephant --set mcpConnector.enabled=true --set mcpConnector.authToken.secretName=x --set mcpConnector.gateway.enabled=true --set mcpConnector.gateway.domain=example.test --set mcpConnector.networkPolicy.enabled=true > /dev/null
+      # The connector must refuse to render without a token; a green build here means the guard works.
+      - run: |
+          if helm template ellmephant "$CHART" --kube-version "$KUBE_VERSION" --set mcpConnector.enabled=true > /dev/null 2>&1; then
+            echo "::error::connector rendered without a token"; exit 1
+          fi
+      # `image.tag` defaults to appVersion, so a stale appVersion silently ships a stale image.
+      - name: appVersion must match the crate version
+        run: |
+          set -euo pipefail
+          cargo_v=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          chart_app=$(grep -m1 -E '^appVersion:' "$CHART/Chart.yaml" | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$cargo_v" != "$chart_app" ]; then
+            echo "::error::Chart.yaml appVersion ($chart_app) != Cargo.toml version ($cargo_v)"
+            exit 1
+          fi
+          # artifacthub.io/images names the image tag by hand, so it drifts on its own.
+          hub_img=$(grep -m1 -E '^[[:space:]]*image: ' "$CHART/Chart.yaml" | sed -E 's/.*:([^:]+)$/\1/')
+          if [ "$hub_img" != "$cargo_v" ]; then
+            echo "::error::Chart.yaml artifacthub.io/images tag ($hub_img) != Cargo.toml version ($cargo_v)"
+            exit 1
+          fi
+          echo "appVersion $chart_app and artifacthub image tag $hub_img match the crate"
+      # chart-release skips a `<chart>-<version>` release that already exists, so a chart change
+      # without a version bump would ship nothing at all.
+      - name: Chart changes must bump the chart version
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          if git diff --quiet "$base" -- charts/; then
+            echo "no chart changes"; exit 0
+          fi
+          if git diff --quiet "$base" -- "$CHART/Chart.yaml"; then
+            echo "::error::charts/ changed but Chart.yaml was untouched — bump its version, or the release will be skipped"
+            exit 1
+          fi

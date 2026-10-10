@@ -1,0 +1,12 @@
+{{/*
+Arbitrary manifests rendered verbatim from .Values.extraObjects.
+
+Same convention as the sibling charts in this house: the Gateway API objects that expose the app
+(ListenerSet + ReferenceGrant + HTTPRoute) are passed in as values by the deploying Application,
+rather than living in this chart. The `ingress` template above cannot expose anything on a
+Gateway API cluster, where the shared gateways only serve HTTPS through app-declared ListenerSets.
+*/}}
+{{- range .Values.extraObjects }}
+---
+{{ toYaml . }}
+{{- end }}

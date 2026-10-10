@@ -1,0 +1,35 @@
+apiVersion: v2
+name: ellmephant
+description: Single-binary, SQLite-backed long-term memory for AI agents (MCP over HTTP)
+type: application
+version: 0.1.0
+appVersion: "1.0.1"
+home: https://github.com/jdblack/ellmephant
+sources:
+  - https://github.com/jdblack/ellmephant
+keywords:
+  - mcp
+  - memory
+  - embeddings
+  - ai
+  - sqlite
+maintainers:
+  - name: James Blackwell
+    email: jblack@linuxguru.net
+# Everything the chart needs (seccompProfile, fsGroupChangePolicy, named targetPort) is stock
+# since 1.19; 1.25 is the honest floor for a supported cluster.
+kubeVersion: ">=1.25.0-0"
+annotations:
+  artifacthub.io/category: ai-machine-learning
+  artifacthub.io/license: MIT
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/jdblack/ellmephant
+    - name: docs
+      url: https://github.com/jdblack/ellmephant/blob/main/README.md
+  artifacthub.io/images: |
+    - name: ellmephant
+      image: ghcr.io/jdblack/ellmephant:1.0.1
+  artifacthub.io/changes: |
+    - kind: added
+      description: "Initial chart: MCP server over HTTP, Gateway API exposure, optional TypingMind connector"

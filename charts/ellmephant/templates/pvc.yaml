@@ -1,0 +1,51 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+{{/*
+The store: one SQLite file (`memory.db`). Keep it, or every memory vanishes with the pod
+(README, "Running Ellmephant"). Single writer, so ReadWriteOnce is enough.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ellmephant.fullname" . }}-data
+  labels:
+    {{- include "ellmephant.labels" . | nindent 4 }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}
+{{- if and .Values.models.enabled (not .Values.models.existingClaim) (not .Values.models.hostPath) }}
+---
+{{/*
+The weights cache (~1.2 GB for the default Qwen3 embedder). A separate volume so the fat, mostly
+read-only cache can sit on a different storage class than the small hot DB.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ellmephant.fullname" . }}-models
+  labels:
+    {{- include "ellmephant.labels" . | nindent 4 }}
+  {{- with .Values.models.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.models.accessModes | nindent 4 }}
+  {{- with .Values.models.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.models.size | quote }}
+{{- end }}

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "ellmephant.fullname" . }}-test-connection"
+  labels:
+    {{- include "ellmephant.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    # The only HTTP route is /mcp (an MCP handshake), so a plain GET proves nothing. Open the
+    # TCP port instead — the same signal the probes use.
+    - name: tcp-check
+      image: busybox
+      command: ["sh", "-c"]
+      args:
+        - "nc -z -w 5 {{ include "ellmephant.fullname" . }} {{ .Values.service.port }} && echo 'ellmephant MCP port is open'"

@@ -5,10 +5,12 @@ How work moves through this repository and how releases are cut. For internals s
 normative specification see [`SPEC.md`](SPEC.md).
 
 - [Branch model](#branch-model)
-- [The two workflows](#the-two-workflows)
+- [The workflows](#the-workflows)
 - [Day to day: when to commit and push](#day-to-day-when-to-commit-and-push)
 - [Versioning](#versioning)
 - [Publishing a release](#publishing-a-release)
+- [Releasing the chart](#releasing-the-chart)
+- [Dev publishing to Harbor](#dev-publishing-to-harbor)
 - [Pre-releases](#pre-releases)
 - [Hotfixes](#hotfixes)
 - [Gotchas](#gotchas)
@@ -24,13 +26,18 @@ normative specification see [`SPEC.md`](SPEC.md).
 Work lands on `dev` first. Merging `dev` into `main` is a deliberate act that marks the code
 release-grade - and, if the version was bumped, publishes an image.
 
-## The two workflows
+## The workflows
 
 - **`.github/workflows/ci.yml`** - runs on every push to `main` and every pull request. Format,
-  clippy, tests (both feature sets), and a no-push Docker build. Gate, not publisher.
-- **`.github/workflows/docker-release.yml`** - the publisher. Fires on a push to `main`, a push
-  to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the image
-  to `ghcr.io/<owner>/ellmephant`.
+  clippy, tests (both feature sets), a no-push Docker build, and the chart gate (lint, render
+  every value shape, the token guard, and the two version guards). Gate, not publisher.
+- **`.github/workflows/docker-release.yml`** - the image publisher. Fires on a push to `main`, a
+  push to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the
+  image to `ghcr.io/<owner>/ellmephant`.
+- **`.github/workflows/chart-release.yml`** - the chart publisher. Fires on a push to `main` that
+  touches `charts/**`. Packages each chart and attaches it to a GitHub Release tagged
+  `<chart>-<version>` (`--latest=false`, so a chart release never claims the repository's "Latest
+  release"). Release assets only: no Pages, no `gh-pages`, no registry, no third-party action.
 
 What the publisher emits, per event:
 
@@ -81,6 +88,20 @@ must agree. **Bumping this version is what triggers a release.**
 
 Pre-release suffixes are ordered: `1.1.0-alpha.1 < 1.1.0-beta.1 < 1.1.0-rc.1 < 1.1.0`.
 
+### The chart carries two numbers
+
+The Helm chart has its own version, deliberately **not** locked to the crate:
+
+| Field | Meaning | Rule |
+|---|---|---|
+| `version` (e.g. `0.1.0`) | the chart's own SemVer | bump it in the same PR that touches `charts/**` |
+| `appVersion` (e.g. `1.0.0`) | the app release the chart defaults to | keep it equal to `Cargo.toml`'s `version` |
+
+`image.tag` is empty by default, so it resolves to `appVersion` - a stale `appVersion` silently
+ships a stale image. CI enforces both: `appVersion` must equal `Cargo.toml`, and a chart change
+must touch `Chart.yaml` (otherwise the `<chart>-<version>` release already exists, the job skips
+it, and nothing publishes). Staying on `0.x` until the values surface settles is intentional.
+
 ## Publishing a release
 
 The workflow does the tagging and the image; you only bump the version and merge.
@@ -103,6 +124,84 @@ gh release create v1.1.0 --title 'v1.1.0' --generate-notes
 
 If you merge to `main` without changing the version, the workflow detects that `vX.Y.Z` already
 exists and does nothing. Only a version bump publishes.
+
+## Releasing the chart
+
+The chart lives in [`charts/ellmephant/`](charts/ellmephant/).
+[`chart-release.yml`](.github/workflows/chart-release.yml) packages each chart under `charts/` and
+attaches it to a GitHub Release tagged `<chart>-<version>`. That is the whole publish path:
+`helm package` plus the preinstalled `gh` CLI, so there is **nothing to set up by hand** - no
+Pages, no `gh-pages` branch, no registry.
+
+To cut a chart release:
+
+1. Bump `version` in `charts/ellmephant/Chart.yaml` (patch is almost always right).
+2. Commit and merge into `main`.
+
+The workflow skips a `<chart>-<version>` release that already exists, so it is a no-op unless the
+version moved. There is no `index.yaml`, so `helm repo add` does not apply - users install the
+asset directly:
+
+```sh
+helm install ellmephant \
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.1/ellmephant-0.1.1.tgz
+```
+
+Local sanity before you push (also what CI runs):
+
+```sh
+make chart-lint
+make chart-template
+```
+
+## Dev publishing to Harbor
+
+Harbor is `harbor.vn.linuxguru.net`, reachable only from the LAN, so a GitHub runner cannot push
+to it: this step is local by necessity. `dev` is wired to publish itself.
+
+On a commit to `dev`, `.githooks/post-commit` backgrounds `scripts/harbor-publish.sh`, which:
+
+1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library`;
+2. mirrors the image - it waits for CI to publish `sha-<short>` to GHCR, then pulls the
+   `linux/amd64` variant and pushes it to Harbor as `edge` + `sha-<short>`.
+
+Mirroring instead of building is deliberate: CI has already built the exact amd64 image for that
+commit, so copying it takes seconds, while `podman build` on Apple Silicon is an emulated Rosetta
+rebuild that takes half an hour. `HARBOR_IMAGE_MODE=build` builds locally instead (no CI, no GHCR);
+`HARBOR_IMAGE_MODE=skip` skips the image.
+
+One-time, per clone:
+
+```sh
+make harbor-hooks                               # git config core.hooksPath .githooks
+helm registry login harbor.vn.linuxguru.net     # podman already holds its own credential
+```
+
+Watch it, skip it, or run it by hand:
+
+```sh
+tail -f .tmp/harbor-publish.log
+SKIP_HARBOR=1 git commit -m '...'               # one commit, no publish
+make harbor-publish                             # run it now
+SOURCE_TAG=1.0.1 make harbor-publish            # mirror a released main image
+```
+
+Point the cluster at the mirror with:
+
+```sh
+--set image.repository=harbor.vn.linuxguru.net/library/ellmephant
+```
+
+The chart installs from the same project over OCI - the closest thing to a `helm repo add` here,
+and the path the cluster would actually use:
+
+```sh
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/ellmephant --version 0.1.0
+```
+
+Harbor holds an OCI chart and a container image under the same repository name happily (unlike
+GHCR, where a chart tag colliding with an image tag is a rejected push), so the house convention
+of `oci://<project>` with the chart named after the app is safe here.
 
 ## Pre-releases
 
@@ -158,3 +257,21 @@ git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from r
   if anonymous pulls are wanted.
 - **Platforms.** Images are published for `linux/amd64` and `linux/arm64` (QEMU on the runner),
   so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
+- **A chart change without a version bump publishes nothing.** `chart-release.yml` skips a
+  `<chart>-<version>` release that already exists, silently. CI fails the PR instead - but only on
+  a PR, so a direct push to `main` gets the silent no-op.
+- **The chart release cannot hang off the `v*` tag.** `docker-release.yml` pushes that tag with
+  `GITHUB_TOKEN`, which does not start other workflows - so `chart-release.yml` triggers on the
+  `charts/**` push to `main` instead, and fires independently of app releases.
+- **Chart releases are release assets, not a Helm repo.** There is no `index.yaml`, so
+  `helm repo add` does not apply: install by asset URL, or from the Harbor OCI mirror.
+- **Chart releases must not claim "Latest".** `--latest=false` keeps a chart release from taking
+  the repository's "Latest release" badge away from the app's `v*` releases.
+- **The Harbor hook is per clone.** `core.hooksPath` is local config, not committed - run
+  `make harbor-hooks` in a fresh clone or the hook silently does not exist.
+- **The Harbor hook waits for CI.** It mirrors `sha-<short>` from GHCR, which CI only publishes
+  after the push - so a commit you never push times out after 30 minutes. `SKIP_HARBOR=1` skips it.
+- **Harbor needs its own login for helm.** podman and helm keep separate credential stores; the
+  hook's chart push fails until `helm registry login harbor.vn.linuxguru.net` has been run once.
+- **`artifacthub.io/images` is guarded too.** CI asserts the tag it names equals `Cargo.toml`'s
+  version, so a bump that misses it fails the build instead of shipping a stale reference.

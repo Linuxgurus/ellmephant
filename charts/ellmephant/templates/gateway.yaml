@@ -14,19 +14,3 @@
       "backendPort" .Values.service.port
       "labels" (include "ellmephant.labels" .)) }}
 {{- end }}
-{{- if and .Values.mcpConnector.enabled .Values.mcpConnector.gateway.enabled }}
-{{- if and (not .Values.mcpConnector.gateway.domain) (not .Values.mcpConnector.gateway.hostname) }}
-{{- fail "mcpConnector.gateway.enabled=true needs a domain or hostname" }}
-{{- end }}
-{{- $cgw := deepCopy .Values.mcpConnector.gateway }}
-{{- if not $cgw.httpRoutes }}
-{{- $_ := set $cgw "httpRoutes" (list (dict)) }}
-{{- end }}
-{{- include "ellmephant.gateway.expose" (dict
-      "root" $
-      "cfg" $cgw
-      "name" (.Values.mcpConnector.gateway.listenerName | default (include "ellmephant.connector.fullname" .))
-      "backendName" (include "ellmephant.connector.fullname" .)
-      "backendPort" .Values.mcpConnector.port
-      "labels" (include "ellmephant.connector.labels" .)) }}
-{{- end }}

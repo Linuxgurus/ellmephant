@@ -22,22 +22,6 @@ The MCP endpoint is Streamable HTTP at:
 
   http://{{ include "ellmephant.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/mcp
 
-{{- if .Values.mcpConnector.enabled }}
-
-TypingMind MCP connector:
-
-  http://{{ include "ellmephant.connector.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.mcpConnector.port }}
-
-Point TypingMind's connector settings at that URL with the bearer token held in Secret
-{{ include "ellmephant.connector.secretName" . }} (key {{ .Values.mcpConnector.authToken.secretKey }}).
-{{- if .Values.mcpConnector.gateway.enabled }}
-It is published on the `{{ .Values.mcpConnector.gateway.gatewayName }}` gateway as
-{{ .Values.mcpConnector.gateway.hostname | default (printf "%s.%s" (include "ellmephant.connector.fullname" .) .Values.mcpConnector.gateway.domain) }}.
-{{- else }}
-With no gateway here, reach it with: kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ellmephant.connector.fullname" . }} 8080:{{ .Values.mcpConnector.port }}
-{{- end }}
-{{- end }}
-
 Point an MCP client at it (Remote / Streamable HTTP, no auth). To poke it from your laptop:
 
   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ellmephant.fullname" . }} 8888:{{ .Values.service.port }}

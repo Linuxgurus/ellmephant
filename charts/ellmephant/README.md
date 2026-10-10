@@ -18,14 +18,14 @@ index and nothing to `helm repo add`. Install straight from the asset URL:
 
 ```sh
 helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.0/ellmephant-0.1.0.tgz
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.0/ellmephant-0.2.0.tgz
 ```
 
 Or from an OCI mirror, if one exists (see [`DEVELOPMENT.md`](../../DEVELOPMENT.md) for the Harbor
 recipe):
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.1.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
 ```
 
 Then point an MCP client at the Service, path `/mcp`:
@@ -121,38 +121,6 @@ renders manifests verbatim.
 conventions (the gateway pod selector `gateway.networking.k8s.io/gateway-name`, node IPs for
 kubelet probes, DNS, the Hub) win over anything this chart could guess. Empty list denies that
 direction.
-
-## TypingMind MCP connector (optional)
-
-`mcpConnector.enabled=true` adds the connector TypingMind needs to reach an MCP server, cribbed
-from the in-house `modules/mcp/typingmind` deployment and hardened the same way:
-
-- its own Deployment (`Recreate` — it holds MCP clients in memory), Service, and bearer-token
-  Secret;
-- **no** ServiceAccount token, uid/gid 1000, read-only root filesystem, all caps dropped, a
-  writable `emptyDir` at `/tmp` with `HOME=/tmp` and `npm_config_cache=/tmp/.npm` for the stdio
-  servers it spawns;
-- **TCP** probes (every connector route is bearer-gated, so a headerless `/ping` reads 401);
-- a `checksum/secret` pod annotation so rotating the token rolls the pod.
-
-The token is required — `authToken.value` (chart-created Secret) or `authToken.secretName`
-(existing Secret). With neither, the render **fails** rather than deploy an open connector.
-
-```yaml
-mcpConnector:
-  enabled: true
-  authToken:
-    value: "…"                    # or secretName: typingmind-mcp-auth
-  gateway:
-    enabled: true                 # its own ListenerSet + HTTPRoute, private gateway
-    domain: vn.linuxguru.net
-    certIssuer: letsencrypt
-```
-
-The default image is the upstream npm package (`node:lts-slim` + `npx @typingmind/mcp`). For the
-pinned in-house build, set `image.repository: harbor.vn.linuxguru.net/library/typingmind-mcp`,
-`image.tag: v1.0.3`, and `command: []` (use the image entrypoint). Set
-`mcpConnector.fullnameOverride: typingmind-mcp` to keep the existing Service name.
 
 ## Compatibility notes
 

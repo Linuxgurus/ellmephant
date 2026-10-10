@@ -119,8 +119,7 @@ cache read-only.
 
 The chart also knows about this house's neighbours: `gateway.enabled` renders the Gateway API
 `ListenerSet` / `ReferenceGrant` / `HTTPRoute` trio (NGINX Gateway Fabric, cert-manager,
-external-dns) instead of an Ingress, and `mcpConnector.enabled=true` adds the TypingMind MCP
-connector, cribbed from the `mcp` namespace Terraform module. Every value is documented in
+external-dns) instead of an Ingress. Every value is documented in
 [`charts/ellmephant/README.md`](charts/ellmephant/README.md).
 
 ## Verify the installation

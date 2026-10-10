@@ -30,7 +30,7 @@ release-grade - and, if the version was bumped, publishes an image.
 
 - **`.github/workflows/ci.yml`** - runs on every push to `main` and every pull request. Format,
   clippy, tests (both feature sets), a no-push Docker build, and the chart gate (lint, render
-  every value shape, the token guard, and the two version guards). Gate, not publisher.
+  every value shape, and the two version guards). Gate, not publisher.
 - **`.github/workflows/docker-release.yml`** - the image publisher. Fires on a push to `main`, a
   push to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the
   image to `ghcr.io/<owner>/ellmephant`.

@@ -128,7 +128,9 @@ fn doctor_bootstraps_a_fresh_home() {
     );
 
     let text = stdout(&out);
-    for needle in ["schema", "v1", "memory.db", "model"] {
+    // Track the binary's own schema version rather than hard-coding it.
+    let schema = format!("v{}", llmphant::db::migrate::latest());
+    for needle in ["schema", schema.as_str(), "memory.db", "model"] {
         assert!(
             text.contains(needle),
             "doctor output missing {needle:?}: {text}"

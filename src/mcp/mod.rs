@@ -1,9 +1,10 @@
 //! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_add`, `memory_update`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_list` — with read-only annotations on the
-//! read tools and destructive on `delete`. The tool descriptions carry the SPEC §9 write
-//! policy; that is where memory quality is actually tuned.
+//! `memory_get`, `memory_backlinks`, `memory_list`, `memory_useful` — with read-only
+//! annotations on the read tools and destructive on `delete`. The tool descriptions carry the
+//! SPEC §9 write policy; that is where memory quality is actually tuned. `memory_get` counts a
+//! `visits` read and `memory_useful` bumps the `was_useful` feedback counter.
 //!
 //! The store is one SQLite file behind a single connection (SPEC §15 #10), so the
 //! server holds the [`Session`] behind a mutex and serves requests serially. SQLite and
@@ -45,6 +46,7 @@ pub const TOOLS: &[&str] = &[
     "memory_get",
     "memory_backlinks",
     "memory_list",
+    "memory_useful",
 ];
 
 /// Server-level instruction: the read/write policy every client should follow (SPEC §9).
@@ -57,7 +59,8 @@ change. Reuse `key` — old memory die. Trim, never grow. Cheap to derive? Do no
 FIND: hunt, judge, fetch. `memory_search` one phrase, small `k`. Back come keys, titles, \
 tags, distance. No bodies. Read titles. `memory_get` only hit you use. None fit? Widen. \
 Raise `k`. One small miss is not \"not there\" — never grunt that. Know `key` already? \
-`memory_get` straight. No hunt.";
+`memory_get` straight. No hunt. \
+USE: memory helped the task? Bump `memory_useful`. Cheap truth, no flattery — sharp store learn gold.";
 
 /// `memory_add` description. The write policy lives here because this is what the model reads.
 const ADD_DESCRIPTION: &str = "\
@@ -71,6 +74,12 @@ fact. Link memory: `[[other-key]]`.";
 const UPDATE_DESCRIPTION: &str = "\
 Replace memory that already live. `key` must exist — new key? memory_add. Same smart-caveman \
 law. Body die whole, born new — trim, no pile on. Links re-hunt from `[[…]]` in new body.";
+
+/// `memory_useful` description. The nudge to give feedback lives here and in the instructions.
+const USEFUL_DESCRIPTION: &str = "\
+Bump `was_useful` on a memory that earned its keep. Call it when a memory you pulled actually \
+helped the task — sharp truth, no flattery. Cheap signal; how the store learns its gold. \
+`key` must exist.";
 
 /// Parameters for [`MemoryServer::memory_add`] / [`MemoryServer::memory_update`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -403,10 +412,37 @@ impl MemoryServer {
         let key = p.key;
         let lookup = key.clone();
         let mem = self
-            .with_store("memory_get", move |s| s.show(&lookup))
+            .with_store("memory_get", move |s| s.fetch(&lookup))
             .await?;
         tracing::debug!(tool = "memory_get", key = %key, "memory fetched");
         serde_json::to_string(&mem).map_err(|e| e.to_string())
+    }
+
+    /// Bump the `was_useful` counter on a memory that helped the task.
+    #[tool(
+        name = "memory_useful",
+        description = USEFUL_DESCRIPTION,
+        annotations(
+            title = "Mark memory useful",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_useful(
+        &self,
+        Parameters(p): Parameters<KeyParams>,
+    ) -> std::result::Result<String, String> {
+        let key = p.key;
+        let bump = key.clone();
+        let total = self
+            .with_store("memory_useful", move |s| s.record_useful(&bump))
+            .await?;
+        tracing::info!(tool = "memory_useful", key = %key, was_useful = total, "marked useful");
+        Ok(json_ok(
+            serde_json::json!({ "status": "useful", "key": key, "was_useful": total }),
+        ))
     }
 
     /// List the memories whose bodies link to `key`.
@@ -609,6 +645,9 @@ mod tests {
         // Delete is the destructive one; add/update are idempotent upserts.
         assert_eq!(ann("memory_delete").destructive_hint, Some(true));
         assert_eq!(ann("memory_delete").read_only_hint, Some(false));
+        // Feedback writes but is neither read-only nor destructive.
+        assert_eq!(ann("memory_useful").read_only_hint, Some(false));
+        assert_eq!(ann("memory_useful").destructive_hint, Some(false));
         assert_eq!(ann("memory_add").idempotent_hint, Some(true));
         assert_eq!(ann("memory_update").idempotent_hint, Some(true));
 

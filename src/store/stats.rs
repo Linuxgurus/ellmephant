@@ -4,6 +4,7 @@
 //! Everything here is cheap: counts and `length()` aggregates run in SQLite, and the tag shape
 //! reuses the same column scan as `tags::list`. No bodies are ever loaded.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -14,6 +15,9 @@ use crate::store::{links, tags};
 
 /// How many of the busiest tags the digest carries.
 pub const TOP_TAGS: usize = 10;
+
+/// How many of the most-useful memories the digest carries.
+pub const TOP_USEFUL: usize = 5;
 
 /// A read-only digest of the store (`llmphant stats`).
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +42,8 @@ pub struct Stats {
     pub distinct_tags: i64,
     /// Memories with at least one tag.
     pub tagged: i64,
+    /// Memories with no tags at all (bare).
+    pub untagged: i64,
     /// Tags used by exactly one memory.
     pub singleton_tags: i64,
     /// The busiest tags, count-desc then name — at most [`TOP_TAGS`] of them.
@@ -50,6 +56,16 @@ pub struct Stats {
     pub orphans: i64,
     /// `[[key]]` targets with no matching row.
     pub dangling: i64,
+    /// Connected components of the link graph with two or more memories (the dense clusters).
+    pub link_components: i64,
+    /// Memories in the largest link component (`0` for an empty store).
+    pub largest_component: i64,
+    /// Sum of `visits` across the store.
+    pub visits_total: i64,
+    /// Sum of `was_useful` across the store.
+    pub useful_total: i64,
+    /// The most-useful memories (key, `was_useful`), count-desc then key — at most [`TOP_USEFUL`].
+    pub top_useful: Vec<(String, i64)>,
     /// Oldest `created` timestamp, or `None` for an empty store.
     pub oldest: Option<String>,
     /// Newest `created` timestamp, or `None` for an empty store.
@@ -145,6 +161,24 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         |r| r.get(0),
     )?;
 
+    // Usage telemetry: the two counters, plus the most-useful memories (the store's own gold).
+    let (visits_total, useful_total): (i64, i64) = conn.query_row(
+        "SELECT coalesce(sum(visits), 0), coalesce(sum(was_useful), 0) FROM memory",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let top_useful: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT key, was_useful FROM memory WHERE was_useful > 0 \
+             ORDER BY was_useful DESC, key LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([TOP_USEFUL as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Dense clusters: connected components of the (undirected) link graph.
+    let (link_components, largest_component) = component_sizes(conn)?;
+
     Ok(Stats {
         memories,
         db_bytes: 0,
@@ -156,17 +190,81 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         tag_assignments,
         distinct_tags,
         tagged,
+        untagged: memories - tagged,
         singleton_tags,
         top_tags: counts,
         edges,
         linked: memories - orphans,
         orphans,
         dangling,
+        link_components,
+        largest_component,
+        visits_total,
+        useful_total,
+        top_useful,
         oldest,
         newest,
         added_7d,
         added_30d,
     })
+}
+
+/// Link-graph shape as `(components, largest)`: the number of connected components holding two
+/// or more memories, and the size of the largest component (`0` for an empty store). Isolated
+/// memories are the `orphans` count, ignored here. Edges to a dangling `[[key]]` don't connect.
+fn component_sizes(conn: &Connection) -> Result<(i64, i64)> {
+    let mut nodes: Vec<i64> = Vec::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT id, key FROM memory")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, key) = row?;
+        by_key.insert(key, nodes.len());
+        nodes.push(id);
+    }
+    let pos: HashMap<i64, usize> = nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
+    let mut parent: Vec<usize> = (0..nodes.len()).collect();
+    let mut stmt = conn.prepare("SELECT from_id, to_key FROM memory_link")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (from_id, to_key) = row?;
+        if let (Some(&a), Some(&b)) = (pos.get(&from_id), by_key.get(&to_key)) {
+            union(&mut parent, a, b);
+        }
+    }
+
+    let mut sizes: HashMap<usize, i64> = HashMap::new();
+    for i in 0..parent.len() {
+        let root = find(&mut parent, i);
+        *sizes.entry(root).or_default() += 1;
+    }
+    let mut components = 0;
+    let mut largest = 0;
+    for &size in sizes.values() {
+        if size >= 2 {
+            components += 1;
+        }
+        largest = largest.max(size);
+    }
+    Ok((components, largest))
+}
+
+/// Union-find root with path halving.
+fn find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Merge the sets holding `a` and `b`.
+fn union(parent: &mut [usize], a: usize, b: usize) {
+    let (ra, rb) = (find(parent, a), find(parent, b));
+    if ra != rb {
+        parent[ra] = rb;
+    }
 }
 
 /// On-disk size of the store: the `.db` file plus any `-wal`/`-shm` sidecars, in bytes.
@@ -196,12 +294,18 @@ mod tests {
             tag_assignments,
             distinct_tags,
             tagged: 2,
+            untagged: 0,
             singleton_tags: 0,
             top_tags: Vec::new(),
             edges: 0,
             linked: 0,
             orphans: 0,
             dangling: 0,
+            link_components: 0,
+            largest_component: 0,
+            visits_total: 0,
+            useful_total: 0,
+            top_useful: Vec::new(),
             oldest: None,
             newest: None,
             added_7d: 0,

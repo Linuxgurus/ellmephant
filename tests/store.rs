@@ -219,3 +219,44 @@ fn get_missing_is_none() {
     let conn = db::open(&paths).expect("open");
     assert!(store::get(&conn, "nope").unwrap().is_none());
 }
+
+#[test]
+fn visit_and_useful_counters_bump_by_key() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = CountingEmbedder::new();
+    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+
+    // A fresh row starts at zero.
+    let got = store::get(&conn, "a").unwrap().unwrap();
+    assert_eq!((got.visits, got.was_useful), (0, 0));
+
+    // Reads count; each call returns the new total.
+    assert_eq!(store::record_visit(&conn, "a").unwrap(), 1);
+    assert_eq!(store::record_visit(&conn, "a").unwrap(), 2);
+    // `was_useful` is independent of a fetch.
+    assert_eq!(store::record_useful(&conn, "a").unwrap(), 1);
+
+    let got = store::get(&conn, "a").unwrap().unwrap();
+    assert_eq!((got.visits, got.was_useful), (2, 1));
+
+    // An unknown key is an error, not a silent zero.
+    assert!(store::record_visit(&conn, "ghost").is_err());
+    assert!(store::record_useful(&conn, "ghost").is_err());
+}
+
+#[test]
+fn upsert_preserves_counters() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = CountingEmbedder::new();
+    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    store::record_visit(&conn, "a").unwrap();
+    store::record_useful(&conn, "a").unwrap();
+
+    // Re-writing the same key must not reset its telemetry.
+    store::add(&conn, &embedder, &memory("a", "A2", "body a2", &["k8s"])).unwrap();
+    let got = store::get(&conn, "a").unwrap().unwrap();
+    assert_eq!(got.title, "A2");
+    assert_eq!((got.visits, got.was_useful), (1, 1));
+}

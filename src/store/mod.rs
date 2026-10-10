@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::embed::{Embedder, projection};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index;
 
 /// One atomic memory: the storage *and* embedding unit. `Default` is the draft baseline the
@@ -47,6 +47,12 @@ pub struct Memory {
     /// Last-update timestamp.
     #[serde(default)]
     pub updated: String,
+    /// Times the row was read whole (`memory_get`/`show`); runtime counter, never in the embed.
+    #[serde(default)]
+    pub visits: i64,
+    /// Explicit positive feedback from an agent that found this memory useful; runtime counter.
+    #[serde(default)]
+    pub was_useful: i64,
 }
 
 /// One row's index entry: identity and shape, without the body (the `list` surface, SPEC §14).
@@ -256,6 +262,36 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Bump the `visits` counter for `key` and return the new total (telemetry on read).
+/// Errors with [`Error::NotFound`] when the key is unknown.
+pub fn record_visit(conn: &Connection, key: &str) -> Result<i64> {
+    bump(conn, key, "visits")
+}
+
+/// Bump the `was_useful` counter for `key` and return the new total (explicit agent
+/// feedback). Errors with [`Error::NotFound`] when the key is unknown.
+pub fn record_useful(conn: &Connection, key: &str) -> Result<i64> {
+    bump(conn, key, "was_useful")
+}
+
+/// Increment `column` (`visits` or `was_useful`) for `key` and read it back. `column` is a
+/// hard-coded literal, never user input.
+fn bump(conn: &Connection, key: &str, column: &str) -> Result<i64> {
+    let updated = conn.execute(
+        &format!("UPDATE memory SET {column} = {column} + 1 WHERE key = ?1"),
+        params![key],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    let total = conn.query_row(
+        &format!("SELECT {column} FROM memory WHERE key = ?1"),
+        params![key],
+        |r| r.get(0),
+    )?;
+    Ok(total)
+}
+
 /// Fetch one memory (with tags) by key.
 pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
     let id: Option<i64> = conn
@@ -270,7 +306,8 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
 }
 
 /// The canonical column list shared by `get_by_id` and `all`.
-const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, doc_hash, created, updated";
+const MEMORY_COLUMNS: &str =
+    "id, key, title, body, tags, source, doc_hash, created, updated, visits, was_useful";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -285,6 +322,8 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         doc_hash: r.get(6)?,
         created: r.get(7)?,
         updated: r.get(8)?,
+        visits: r.get(9)?,
+        was_useful: r.get(10)?,
     })
 }
 

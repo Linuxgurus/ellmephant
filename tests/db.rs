@@ -24,12 +24,12 @@ fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
 }
 
 #[test]
-fn fresh_store_is_at_schema_v1_with_every_object() {
+fn fresh_store_is_at_latest_schema_with_every_object() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
-    assert_eq!(db::migrate::version(&conn).unwrap(), 1);
-    assert_eq!(db::migrate::latest(), 1);
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
+    assert!(db::migrate::latest() >= 2, "telemetry migration exists");
 
     for name in ["memory", "memory_link", "meta"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
@@ -73,7 +73,7 @@ fn migrations_are_idempotent_across_reopen() {
     drop(conn);
 
     let conn = db::open(&paths).expect("second open");
-    assert_eq!(db::migrate::version(&conn).unwrap(), 1);
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 1);
 }
 

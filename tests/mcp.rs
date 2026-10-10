@@ -104,6 +104,42 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert!(text(&got).contains("Logs ship to ns1"), "{}", text(&got));
+    // A fetch counted exactly one visit.
+    assert!(text(&got).contains("\"visits\":1"), "{}", text(&got));
+
+    // Feedback is independent of a fetch (a bare title can earn it) and bumps `was_useful`.
+    let useful = call(
+        &client,
+        "memory_useful",
+        serde_json::json!({ "key": "infra-logs" }),
+    )
+    .await;
+    assert!(!useful.is_error.unwrap_or(false), "{}", text(&useful));
+    assert!(
+        text(&useful).contains("\"was_useful\":1"),
+        "{}",
+        text(&useful)
+    );
+
+    // A second fetch shows both counters riding on the row.
+    let again = call(
+        &client,
+        "memory_get",
+        serde_json::json!({ "key": "infra-logs" }),
+    )
+    .await;
+    let again: serde_json::Value = serde_json::from_str(&text(&again)).expect("memory json");
+    assert_eq!(again["visits"], serde_json::json!(2));
+    assert_eq!(again["was_useful"], serde_json::json!(1));
+
+    // An unknown key is a tool error (not a silent zero).
+    let bogus = call(
+        &client,
+        "memory_useful",
+        serde_json::json!({ "key": "ghost" }),
+    )
+    .await;
+    assert_eq!(bogus.is_error, Some(true));
 
     let found = call(
         &client,

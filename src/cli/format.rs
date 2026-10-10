@@ -71,6 +71,10 @@ pub fn render_memory(mem: &Memory, json: bool) -> Result<String> {
         out.push_str(&format!("  source  {source}\n"));
     }
     out.push_str(&format!("  times   {} -> {}\n", mem.created, mem.updated));
+    out.push_str(&format!(
+        "  use     {} visit(s), {} useful\n",
+        mem.visits, mem.was_useful
+    ));
     out.push_str("  body\n");
     for line in mem.body.lines() {
         out.push_str(&format!("    {line}\n"));
@@ -194,6 +198,10 @@ pub fn render_stats(s: &Stats, json: bool) -> Result<String> {
         s.memories,
         pct(s.tagged, s.memories)
     ));
+    out.push_str(&format!(
+        "  bare           {} memories with no tag\n",
+        s.untagged
+    ));
     out.push_str(&format!("  singletons     {}\n", s.singleton_tags));
     if s.top_tags.is_empty() {
         out.push_str("  top            (none)\n");
@@ -217,6 +225,25 @@ pub fn render_stats(s: &Stats, json: bool) -> Result<String> {
     ));
     out.push_str(&format!("  orphans        {}\n", s.orphans));
     out.push_str(&format!("  dangling       {}\n", s.dangling));
+    out.push_str(&format!(
+        "  clusters       {} component(s), largest {}\n",
+        s.link_components, s.largest_component
+    ));
+
+    out.push_str("\nuse\n");
+    out.push_str(&format!("  visits         {}\n", s.visits_total));
+    out.push_str(&format!("  useful         {}\n", s.useful_total));
+    if s.top_useful.is_empty() {
+        out.push_str("  top useful     (none)\n");
+    } else {
+        let top = s
+            .top_useful
+            .iter()
+            .map(|(key, n)| format!("{key} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("  top useful     {top}\n"));
+    }
 
     Ok(out)
 }
@@ -313,6 +340,8 @@ mod tests {
             tags: vec!["k8s".into()],
             created: "2026-01-01 00:00:00".into(),
             updated: "2026-01-02 00:00:00".into(),
+            visits: 3,
+            was_useful: 1,
         }
     }
 

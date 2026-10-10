@@ -104,6 +104,19 @@ impl Session {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
+    /// Fetch one memory and count the read (the `visits` telemetry). The read path uses this;
+    /// the write path's existence check uses [`show`](Self::show), which must not count.
+    pub fn fetch(&self, key: &str) -> Result<Memory> {
+        let mut mem = self.show(key)?;
+        mem.visits = store::record_visit(&self.conn, key)?;
+        Ok(mem)
+    }
+
+    /// Bump the `was_useful` counter for `key` (explicit agent feedback); returns the new total.
+    pub fn record_useful(&self, key: &str) -> Result<i64> {
+        store::record_useful(&self.conn, key)
+    }
+
     /// Delete one memory by key; `false` means there was nothing to delete.
     pub fn rm(&self, key: &str) -> Result<bool> {
         store::delete(&self.conn, key)

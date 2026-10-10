@@ -9,11 +9,18 @@ use crate::error::Result;
 
 /// `(version, sql, label)` in ascending order. SQL is embedded at compile time so
 /// the binary carries its own schema.
-const MIGRATIONS: &[(i32, &str, &str)] = &[(
-    1,
-    include_str!("../../migrations/0001_init.sql"),
-    "init: memory, links, meta",
-)];
+const MIGRATIONS: &[(i32, &str, &str)] = &[
+    (
+        1,
+        include_str!("../../migrations/0001_init.sql"),
+        "init: memory, links, meta",
+    ),
+    (
+        2,
+        include_str!("../../migrations/0002_telemetry.sql"),
+        "telemetry: visits, was_useful",
+    ),
+];
 
 /// Current schema version recorded in the file.
 pub fn version(conn: &Connection) -> Result<i32> {

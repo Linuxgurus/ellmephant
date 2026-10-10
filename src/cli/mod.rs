@@ -109,6 +109,8 @@ pub enum Command {
     },
     /// Delete one memory by key.
     Rm { key: String },
+    /// Bump a memory's `was_useful` counter (it earned its keep).
+    Useful { key: String },
     /// List the memory index (key, tags, title) without bodies.
     List {
         /// Emit JSON.
@@ -339,6 +341,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         }
         Command::Show { key, json } => cmd_show(session, &key, json),
         Command::Rm { key } => cmd_rm(session, &key),
+        Command::Useful { key } => cmd_useful(session, &key),
         Command::List { json } => cmd_list(session, json),
         Command::Tags { json } => cmd_tags(session, json),
         Command::Stats { json } => cmd_stats(session, json),
@@ -368,8 +371,15 @@ fn cmd_search(session: &mut Session, q: Query, json: bool) -> Result<()> {
 }
 
 fn cmd_show(session: &Session, key: &str, json: bool) -> Result<()> {
-    let mem = session.show(key)?;
+    // The read path counts a visit (telemetry); the write path's existence check does not.
+    let mem = session.fetch(key)?;
     emit(format::render_memory(&mem, json)?);
+    Ok(())
+}
+
+fn cmd_useful(session: &Session, key: &str) -> Result<()> {
+    let total = session.record_useful(key)?;
+    println!("useful {key} ({total})");
     Ok(())
 }
 

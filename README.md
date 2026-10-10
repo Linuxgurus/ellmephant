@@ -187,8 +187,10 @@ llmphant mcp --stdio
 ### MCP tools
 
 `memory_add`, `memory_update`, `memory_delete`, `memory_search`, `memory_get`,
-`memory_backlinks`, `memory_list`. Read tools are annotated read-only and `memory_delete` is
-annotated destructive. `memory_search` matches a semantic `phrase` (the whole document — key,
+`memory_backlinks`, `memory_list`, `memory_useful`. Read tools are annotated read-only and
+`memory_delete` is annotated destructive. Each `memory_get` counts a `visits` read on the row;
+`memory_useful` bumps a `was_useful` counter so an agent can flag a memory that earned its keep
+(the count is independent of a fetch — a great title alone can earn it). `memory_search` matches a semantic `phrase` (the whole document — key,
 tags, title, body — is embedded), with `k` and `max_distance`; there are **no key/tag filters
 and no regex leg**, and hits carry titles, tags and distances, never bodies. The list-shaped
 reads return compact **positional JSON** — a top-level `cols` header names the fields and each

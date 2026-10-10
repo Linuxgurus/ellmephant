@@ -68,6 +68,18 @@ fn digest_counts_spread_tags_and_links() {
     assert_eq!(s.orphans, 1);
     assert_eq!(s.linked, 2);
 
+    // dense clusters: one component of two (a -> b); c is a lone orphan
+    assert_eq!(s.link_components, 1);
+    assert_eq!(s.largest_component, 2);
+
+    // bare tags: c carries none
+    assert_eq!(s.untagged, 1);
+
+    // no usage recorded yet
+    assert_eq!(s.visits_total, 0);
+    assert_eq!(s.useful_total, 0);
+    assert!(s.top_useful.is_empty());
+
     // The CLI-supplied on-disk size is positive once the file exists.
     assert!(stats::disk_bytes(&paths.db()) > 0);
 }
@@ -86,3 +98,27 @@ fn an_empty_store_is_all_zeroes_not_a_panic() {
     assert_eq!(s.avg_body_chars(), 0.0);
     assert!(s.top_tags.is_empty());
 }
+
+#[test]
+fn telemetry_totals_and_top_useful() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    store::add(&conn, &embedder, &memory("a", "body a", &["k8s"])).expect("add a");
+    store::add(&conn, &embedder, &memory("b", "body b", &["k8s"])).expect("add b");
+
+    store::record_visit(&conn, "a").unwrap();
+    store::record_visit(&conn, "a").unwrap();
+    store::record_visit(&conn, "b").unwrap();
+    store::record_useful(&conn, "b").unwrap();
+    store::record_useful(&conn, "b").unwrap();
+    store::record_useful(&conn, "a").unwrap();
+
+    let s = stats::compute(&conn).expect("stats");
+    assert_eq!(s.visits_total, 3);
+    assert_eq!(s.useful_total, 3);
+    // Busiest first: b (2) then a (1).
+    assert_eq!(s.top_useful.first(), Some(&("b".to_string(), 2)));
+}
+

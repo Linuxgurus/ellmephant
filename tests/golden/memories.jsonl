@@ -3,14 +3,14 @@
 {"key":"infra-registry","title":"Container registry","body":"Push container images to registryhost with the latest tag.","source":"tests/golden","tags":["registry"]}
 {"key":"infra-postgres","title":"Primary database","body":"The database is pg-primary; it listens on port 5432.","source":"tests/golden","tags":["db"]}
 {"key":"infra-backups","title":"Nightly backups","body":"Nightly backups run with restic into the vaultbucket.","source":"tests/golden","tags":["backup"]}
-{"key":"infra-secrets","title":"Secrets","body":"Secrets live in hashivault under secret/llmphant.","source":"tests/golden","tags":["security"]}
+{"key":"infra-secrets","title":"Secrets","body":"Secrets live in hashivault under secret/ellmephant.","source":"tests/golden","tags":["security"]}
 {"key":"infra-ci","title":"CI pipeline","body":"CI runs on forgejo with docker-linux runners.","source":"tests/golden","tags":["ci"]}
 {"key":"infra-monitoring","title":"Monitoring","body":"Metrics flow through prometheus and grafana dashboards.","source":"tests/golden","tags":["observability"]}
 {"key":"projects-news-kb","title":"news-kb overview","body":"news-kb spans several ingest and embedding repos.","source":"tests/golden","tags":["news-kb"]}
 {"key":"projects-newsapi","title":"newsapi","body":"newsapi ingests headlines into the warehouse.","source":"tests/golden","tags":["news-kb"]}
 {"key":"projects-go-news","title":"go_news","body":"go_news crawls RSS feeds using goroutines.","source":"tests/golden","tags":["news-kb"]}
 {"key":"projects-llm-embedder","title":"llm-embedder","body":"llm-embedder batches embeddings over grpc.","source":"tests/golden","tags":["news-kb"]}
-{"key":"projects-typingmind","title":"TypingMind bridge","body":"TypingMind speaks to llmphant through the mcp server.","source":"tests/golden","tags":["mcp"]}
+{"key":"projects-typingmind","title":"TypingMind bridge","body":"TypingMind speaks to ellmephant through the mcp server.","source":"tests/golden","tags":["mcp"]}
 {"key":"tools-ripgrep","title":"Code search","body":"Prefer ripgrep for code search instead of grepping.","source":"tests/golden","tags":["cli"]}
 {"key":"tools-cargo","title":"Test command","body":"Run cargo test locked; the suite needs no network.","source":"tests/golden","tags":["rust"]}
 {"key":"tools-mpssh","title":"Node inventory","body":"Enumerate cluster nodes with mpssh hostname.","source":"tests/golden","tags":["ops"]}

@@ -8,11 +8,11 @@ mod common;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{count, temp_store};
-use llmphant::Result;
-use llmphant::db;
-use llmphant::embed::{Embedder, HashEmbedder};
-use llmphant::index::vec;
-use llmphant::store::{self, Memory};
+use ellmephant::Result;
+use ellmephant::db;
+use ellmephant::embed::{Embedder, HashEmbedder};
+use ellmephant::index::vec;
+use ellmephant::store::{self, Memory};
 use rusqlite::params;
 
 const DIM: usize = 8;

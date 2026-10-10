@@ -1,11 +1,11 @@
-//! `llmphant model …` — the weights cache: status / fetch / rm (SPEC §6.5).
+//! `ellmephant model …` — the weights cache: status / fetch / rm (SPEC §6.5).
 
 use super::ModelCommand;
 use super::format::human_bytes;
 use crate::error::{Error, Result};
 use crate::model;
 
-/// `llmphant model …` — status / fetch / rm over the weights cache (SPEC §6.5).
+/// `ellmephant model …` — status / fetch / rm over the weights cache (SPEC §6.5).
 pub fn cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
     match command {
         ModelCommand::Status {

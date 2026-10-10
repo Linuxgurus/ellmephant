@@ -195,7 +195,7 @@ mod real {
             let weights = dir.join("model.safetensors");
             if !weights.is_file() {
                 return Err(Error::Model(format!(
-                    "weights missing: {} (run `llmphant model fetch --force`)",
+                    "weights missing: {} (run `ellmephant model fetch --force`)",
                     weights.display()
                 )));
             }

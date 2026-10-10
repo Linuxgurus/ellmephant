@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use llmphant::config::Paths;
+use ellmephant::config::Paths;
 use rusqlite::Connection;
 use tempfile::TempDir;
 

@@ -3,12 +3,12 @@
 //! Runs offline. `Config::load` merges `config.toml` over the defaults; `Paths` owns the
 //! store layout. Neither `Config::discover` nor `Paths::discover` is exercised here —
 //! both read process-global env vars, so their behaviour is proven through the black-box
-//! CLI tests (tests/cli.rs), which set `LLMPHANT_HOME` on a child process.
+//! CLI tests (tests/cli.rs), which set `ELLMEPHANT_HOME` on a child process.
 
 mod common;
 
 use common::temp_store;
-use llmphant::config::{Config, Paths};
+use ellmephant::config::{Config, Paths};
 
 #[test]
 fn missing_config_file_yields_the_documented_defaults() {
@@ -23,10 +23,10 @@ fn missing_config_file_yields_the_documented_defaults() {
     assert_eq!(cfg.precision, "bf16");
     assert_eq!(cfg.device, "cpu");
     assert_eq!(cfg.default_k, 5);
-    assert_eq!(cfg.instruction, llmphant::config::DEFAULT_INSTRUCTION);
+    assert_eq!(cfg.instruction, ellmephant::config::DEFAULT_INSTRUCTION);
     // The MCP server listens on a high, unassigned port by default.
     assert_eq!(cfg.port, 8888);
-    assert_eq!(cfg.port, llmphant::config::DEFAULT_PORT);
+    assert_eq!(cfg.port, ellmephant::config::DEFAULT_PORT);
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn validate_rejects_a_bad_device_precision_or_dim() {
     assert!(zero_dim.validate().is_err(), "dim 0 is unusable");
 
     let huge_dim = Config {
-        dim: llmphant::config::MAX_DIM + 1,
+        dim: ellmephant::config::MAX_DIM + 1,
         ..Config::default()
     };
     let err = huge_dim.validate().unwrap_err();

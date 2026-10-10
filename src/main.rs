@@ -1,16 +1,16 @@
-//! `llmphant` binary: parse arguments and hand off to the CLI.
+//! `ellmephant` binary: parse arguments and hand off to the CLI.
 
 use std::process::ExitCode;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use llmphant::cli::Cli;
+use ellmephant::cli::Cli;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // `RUST_LOG=llmphant=debug`; silent by default so stdout stays machine-readable.
+    // `RUST_LOG=ellmephant=debug`; silent by default so stdout stays machine-readable.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -18,7 +18,7 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match llmphant::cli::run(cli) {
+    match ellmephant::cli::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");

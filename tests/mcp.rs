@@ -4,11 +4,11 @@
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use llmphant::cli::session::Session;
-use llmphant::config::{Config, Paths};
-use llmphant::embed::HashEmbedder;
-use llmphant::mcp::{MemoryServer, http_router};
-use llmphant::model::Spec;
+use ellmephant::cli::session::Session;
+use ellmephant::config::{Config, Paths};
+use ellmephant::embed::HashEmbedder;
+use ellmephant::mcp::{MemoryServer, http_router};
+use ellmephant::model::Spec;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::{Peer, RoleClient, ServiceExt};
 use tower::ServiceExt as _;
@@ -297,7 +297,7 @@ async fn tools_round_trip_over_http() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let session = session.expect("Mcp-Session-Id header");
-    assert_eq!(payload(&body)["result"]["serverInfo"]["name"], "llmphant");
+    assert_eq!(payload(&body)["result"]["serverInfo"]["name"], "ellmephant");
 
     // The initialized notification is accepted (202, empty body).
     let (status, _, _) = post(
@@ -318,7 +318,7 @@ async fn tools_round_trip_over_http() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         payload(&body)["result"]["tools"].as_array().unwrap().len(),
-        llmphant::mcp::TOOLS.len()
+        ellmephant::mcp::TOOLS.len()
     );
 
     // A real write + read round-trips through the shared store.

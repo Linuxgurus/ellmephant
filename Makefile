@@ -1,5 +1,5 @@
 CARGO ?= cargo
-IMAGE ?= llmphant:dev
+IMAGE ?= ellmephant:dev
 
 .PHONY: build release test fmt clippy lint doc docker-build docker-run clean
 
@@ -27,7 +27,7 @@ docker-build: ## build the runtime image
 	docker build -t $(IMAGE) .
 
 docker-run:   ## run doctor against a named volume
-	docker run --rm -it -v llmphant-data:/data $(IMAGE) doctor
+	docker run --rm -it -v ellmephant-data:/data $(IMAGE) doctor
 
 clean:
 	$(CARGO) clean

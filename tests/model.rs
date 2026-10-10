@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use llmphant::config::{Config, Paths};
-use llmphant::model::fetch::{self, Fetcher};
-use llmphant::model::{self, Spec};
-use llmphant::{Error, Result};
+use ellmephant::config::{Config, Paths};
+use ellmephant::model::fetch::{self, Fetcher};
+use ellmephant::model::{self, Spec};
+use ellmephant::{Error, Result};
 use tempfile::TempDir;
 
 const REPO: &str = "Qwen/Qwen3-Embedding-0.6B";

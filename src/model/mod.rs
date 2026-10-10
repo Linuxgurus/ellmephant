@@ -5,7 +5,7 @@
 //! inspectable, `gc`-able and `--model-dir`-compatible.
 //!
 //! ```text
-//! ~/.llmphant/models/<owner>--<repo>/<sha>/{manifest.json, config.json, ..., model.safetensors}
+//! ~/.ellmephant/models/<owner>--<repo>/<sha>/{manifest.json, config.json, ..., model.safetensors}
 //! ```
 
 pub mod cache;
@@ -161,7 +161,7 @@ fn resolve_sha(spec: &Spec, fetcher: Option<&dyn Fetcher>) -> Result<String> {
             Ok(sha)
         }
         _ => Err(Error::Model(format!(
-            "revision {:?} of {} is not resolved and we are offline; run `llmphant model fetch` \
+            "revision {:?} of {} is not resolved and we are offline; run `ellmephant model fetch` \
              once online, or pin a commit sha",
             spec.revision, spec.repo
         ))),
@@ -195,7 +195,7 @@ pub fn ensure(spec: &Spec, fetcher: &dyn Fetcher) -> Result<PathBuf> {
     if spec.offline {
         return Err(Error::Model(format!(
             "offline and the weights cache is incomplete for {}@{}: {}. \
-             Run `llmphant model fetch` once with network.",
+             Run `ellmephant model fetch` once with network.",
             spec.repo,
             sha,
             missing_required(&dir).join(", ")

@@ -2,8 +2,8 @@
 //!
 //! `cargo run --example db_bootstrap`
 
-use llmphant::config::Paths;
-use llmphant::db;
+use ellmephant::config::Paths;
+use ellmephant::db;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?; // removed on drop

@@ -1,14 +1,14 @@
 //! Encoder tests (P3). The default suite is offline and model-free; the real Qwen3 check
-//! at the bottom is `#[ignore]`d and needs `LLMPHANT_TEST_MODEL_DIR` pointing at a flat,
-//! already-fetched weights directory (see `LLMPHANT_TEST_TEXT` to override the sample).
+//! at the bottom is `#[ignore]`d and needs `ELLMEPHANT_TEST_MODEL_DIR` pointing at a flat,
+//! already-fetched weights directory (see `ELLMEPHANT_TEST_TEXT` to override the sample).
 
-use llmphant::embed::qwen3::Options;
-use llmphant::embed::{Embedder, HashEmbedder};
+use ellmephant::embed::qwen3::Options;
+use ellmephant::embed::{Embedder, HashEmbedder};
 
 #[test]
 fn options_default_to_the_documented_model_and_length() {
     let opts = Options::new(1024, "cpu", "bf16", "");
-    assert_eq!(opts.model_id, llmphant::embed::qwen3::MODEL_ID);
+    assert_eq!(opts.model_id, ellmephant::embed::qwen3::MODEL_ID);
     assert_eq!(opts.dim, 1024);
     assert_eq!(opts.device, "cpu");
     assert_eq!(opts.precision, "bf16");
@@ -31,17 +31,18 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Real weights. Run with:
-/// `LLMPHANT_TEST_MODEL_DIR=~/.llmphant/models/Qwen--Qwen3-Embedding-0.6B/<sha> \
+/// `ELLMEPHANT_TEST_MODEL_DIR=~/.ellmephant/models/Qwen--Qwen3-Embedding-0.6B/<sha> \
 ///  cargo test --test embed -- --ignored`
 #[test]
-#[ignore = "needs downloaded Qwen3 weights (LLMPHANT_TEST_MODEL_DIR)"]
+#[ignore = "needs downloaded Qwen3 weights (ELLMEPHANT_TEST_MODEL_DIR)"]
 fn qwen3_is_deterministic_normalised_and_self_similar() {
-    let dir = std::env::var("LLMPHANT_TEST_MODEL_DIR")
-        .expect("set LLMPHANT_TEST_MODEL_DIR to a flat weights dir");
-    let text = std::env::var("LLMPHANT_TEST_TEXT").unwrap_or_else(|_| "the quick brown fox".into());
+    let dir = std::env::var("ELLMEPHANT_TEST_MODEL_DIR")
+        .expect("set ELLMEPHANT_TEST_MODEL_DIR to a flat weights dir");
+    let text =
+        std::env::var("ELLMEPHANT_TEST_TEXT").unwrap_or_else(|_| "the quick brown fox".into());
 
     let opts = Options::new(1024, "cpu", "bf16", "");
-    let embedder = llmphant::embed::qwen3::Qwen3Embedder::load(std::path::Path::new(&dir), &opts)
+    let embedder = ellmephant::embed::qwen3::Qwen3Embedder::load(std::path::Path::new(&dir), &opts)
         .expect("load encoder");
 
     let a = embedder.embed_one(&text).expect("embed a");

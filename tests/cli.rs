@@ -1,20 +1,20 @@
-//! Black-box CLI tests. `LLMPHANT_HOME` points every run at a throwaway store, so
-//! these never touch the real `~/.llmphant`.
+//! Black-box CLI tests. `ELLMEPHANT_HOME` points every run at a throwaway store, so
+//! these never touch the real `~/.ellmephant`.
 
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Output};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_llmphant"))
+    Command::new(env!("CARGO_BIN_EXE_ellmephant"))
 }
 
 fn run(home: &Path, args: &[&str]) -> Output {
     bin()
         .args(args)
-        .env("LLMPHANT_HOME", home)
+        .env("ELLMEPHANT_HOME", home)
         .output()
-        .expect("spawn llmphant")
+        .expect("spawn ellmephant")
 }
 
 fn stdout(out: &Output) -> String {
@@ -27,7 +27,7 @@ fn version_reports_the_package_version() {
     let out = run(dir.path(), &["--version"]);
     assert!(out.status.success());
     let text = stdout(&out);
-    assert!(text.contains("llmphant"), "got: {text}");
+    assert!(text.contains("ellmephant"), "got: {text}");
     assert!(text.contains(env!("CARGO_PKG_VERSION")), "got: {text}");
 }
 
@@ -129,7 +129,7 @@ fn doctor_bootstraps_a_fresh_home() {
 
     let text = stdout(&out);
     // Track the binary's own schema version rather than hard-coding it.
-    let schema = format!("v{}", llmphant::db::migrate::latest());
+    let schema = format!("v{}", ellmephant::db::migrate::latest());
     for needle in ["schema", schema.as_str(), "memory.db", "model"] {
         assert!(
             text.contains(needle),
@@ -238,7 +238,7 @@ fn repl_records_history_across_sessions() {
 
     std::fs::write(&script, "tags\nhelp\nquit\n").unwrap();
     let first = bin()
-        .env("LLMPHANT_HOME", home)
+        .env("ELLMEPHANT_HOME", home)
         .stdin(File::open(&script).unwrap())
         .output()
         .expect("spawn repl");
@@ -254,7 +254,7 @@ fn repl_records_history_across_sessions() {
     // A second session loads the previous history and appends to it.
     std::fs::write(&script, "quit\n").unwrap();
     bin()
-        .env("LLMPHANT_HOME", home)
+        .env("ELLMEPHANT_HOME", home)
         .stdin(File::open(&script).unwrap())
         .output()
         .expect("spawn repl");

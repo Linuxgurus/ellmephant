@@ -26,7 +26,7 @@ The decisions the code obeys:
   title + link-stripped body) is embedded. The embedding strategy can change without losing what
   was written.
 - **Everything but `memory` is derived.** The vector index and the link graph are rebuildable
-  from the rows (`llmphant reembed`). The relational store must never lie; there is no FTS index
+  from the rows (`ellmephant reembed`). The relational store must never lie; there is no FTS index
   and no tag table to keep in sync.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
@@ -53,7 +53,7 @@ The decisions the code obeys:
       SQLite  memory.db  —  `memory` rows are the source of truth
       derived & rebuildable:  memory_vec · memory_link
                                   ▼
-      embed::qwen3  (candle, in-binary)  —  weights under ~/.llmphant/models/
+      embed::qwen3  (candle, in-binary)  —  weights under ~/.ellmephant/models/
 ```
 
 Read bottom-up: the encoder turns text into vectors; SQLite holds the rows and the derived
@@ -102,7 +102,7 @@ Two implementation notes:
 invalidates a stored vector.
 
 ```sh
-llmphant embed "where do the logs live" --query   # dim + load/embed latency + norm
+ellmephant embed "where do the logs live" --query   # dim + load/embed latency + norm
 ```
 
 ## Search
@@ -113,9 +113,9 @@ prefix) and the KNN of the whole store is taken, capped by `--max-distance` and 
 regex leg — `key`/`tags` are identity and lookup, and are part of the embedded document.
 
 ```sh
-llmphant search "where do the logs live"             # semantic, k=5
-llmphant search "portainer-notes-gw"                 # key/tag tokens are in the embedding
-llmphant search "backups" --expand 1                 # + linked neighbours
+ellmephant search "where do the logs live"             # semantic, k=5
+ellmephant search "portainer-notes-gw"                 # key/tag tokens are in the embedding
+ellmephant search "backups" --expand 1                 # + linked neighbours
 ```
 
 Results are ordered by ascending distance. Each hit carries `key`, `title`, `tags` and
@@ -127,7 +127,7 @@ Results are ordered by ascending distance. Each hit carries `key`, `title`, `tag
 Links are authored inline in the body as `[[key]]`. At write time they become a derived
 `memory_link` edge; search finds forward links and backlinks, and `--expand` walks them. Links
 are **by key, never by id**, so they survive a `reembed` and forward references. A `[[key]]`
-with no target is reported by `llmphant links` as a warning rather than an error. `llmphant
+with no target is reported by `ellmephant links` as a warning rather than an error. `ellmephant
 rename OLD NEW` rewrites the tokens and repoints the edges in one transaction.
 
 ## Maintenance
@@ -143,7 +143,7 @@ The `memory` table is the source of truth; every index on top of it is rebuildab
 ## Model weights cache
 
 Weights are data, fetched into a flat, sha-pinned cache and then used offline (`SPEC.md` §6). The
-layout is our own (`~/.llmphant/models/<owner>--<repo>/<sha>/`, or `$HF_HOME`-style if configured)
+layout is our own (`~/.ellmephant/models/<owner>--<repo>/<sha>/`, or `$HF_HOME`-style if configured)
 rather than `HF_HOME`, so `doctor`, `gc`, and `--model-dir` stay simple. Only the fetch is network
 code; `--offline` and `--model-dir DIR` (which implies offline) never open a socket. A corrupt
 file is detected via the manifest rather than silently fed into the vectors.
@@ -153,10 +153,10 @@ file is detected via the manifest rather than silently fed into the vectors.
 `bench` measures load/embed/search latency and gates retrieval quality.
 
 ```sh
-llmphant bench                            # load / embed / search latency at the current row count
-llmphant bench --golden                   # + recall@k & MRR over <home>/golden/queries.jsonl
-llmphant bench --golden --golden-file Q   # score a specific golden set
-llmphant bench --sweep                    # walk k
+ellmephant bench                            # load / embed / search latency at the current row count
+ellmephant bench --golden                   # + recall@k & MRR over <home>/golden/queries.jsonl
+ellmephant bench --golden --golden-file Q   # score a specific golden set
+ellmephant bench --sweep                    # walk k
 ```
 
 The golden file is JSONL, one object per line: `{"query": "…", "expect": ["key", …], "k": 3}`
@@ -197,10 +197,10 @@ cargo run --example db_bootstrap
 ```
 
 CI runs the same checks plus a Docker build. `doctor` (and every command) honours
-`LLMPHANT_HOME`, so you can exercise a throwaway store without touching `~/.llmphant`:
+`ELLMEPHANT_HOME`, so you can exercise a throwaway store without touching `~/.ellmephant`:
 
 ```sh
-LLMPHANT_HOME=/tmp/lp cargo run -- doctor
+ELLMEPHANT_HOME=/tmp/lp cargo run -- doctor
 ```
 
 Tests never load weights: the store and search layers inject the deterministic `HashEmbedder`

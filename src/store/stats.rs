@@ -1,4 +1,4 @@
-//! Store statistics for `llmphant stats` (aliases `summary`/`stat`): size, spread, tag and link
+//! Store statistics for `ellmephant stats` (aliases `summary`/`stat`): size, spread, tag and link
 //! shape, and recent activity — read-only aggregates over `memory` and its derived indexes.
 //!
 //! Everything here is cheap: counts and `length()` aggregates run in SQLite, and the tag shape
@@ -19,7 +19,7 @@ pub const TOP_TAGS: usize = 10;
 /// How many of the most-useful memories the digest carries.
 pub const TOP_USEFUL: usize = 5;
 
-/// A read-only digest of the store (`llmphant stats`).
+/// A read-only digest of the store (`ellmephant stats`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     /// Rows in `memory`.

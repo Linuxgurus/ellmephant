@@ -7,10 +7,10 @@
 mod common;
 
 use common::temp_store;
-use llmphant::db;
-use llmphant::embed::HashEmbedder;
-use llmphant::search::{self, Hit, Neighbor, Query};
-use llmphant::store::{self, Memory};
+use ellmephant::db;
+use ellmephant::embed::HashEmbedder;
+use ellmephant::search::{self, Hit, Neighbor, Query};
+use ellmephant::store::{self, Memory};
 use rusqlite::Connection;
 
 const DIM: usize = 64;

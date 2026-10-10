@@ -1,4 +1,4 @@
-//! Interactive REPL (PLAN §6 P6): rustyline, history at `~/.llmphant/history`, tab
+//! Interactive REPL (PLAN §6 P6): rustyline, history at `~/.ellmephant/history`, tab
 //! completion for commands and keys.
 //!
 //! Commands are parsed by the *same* clap tree as the one-shot CLI ([`Command`]), so the
@@ -24,14 +24,14 @@ use super::session::Session;
 
 /// Verbs offered by tab-completion: the REPL's own plus the one-shot tree.
 const COMMANDS: &[&str] = &[
-    "add", "search", "show", "rm", "useful", "list", "tags", "stats", "rename", "reembed",
-    "links", "help", "quit", "exit",
+    "add", "search", "show", "rm", "useful", "list", "tags", "stats", "rename", "reembed", "links",
+    "help", "quit", "exit",
 ];
 
 /// A REPL line, parsed with the exact `Command` tree the one-shot CLI uses.
 #[derive(Debug, Parser)]
 #[command(
-    name = "llmphant",
+    name = "ellmephant",
     no_binary_name = true,
     disable_help_flag = true,
     disable_version_flag = true
@@ -104,13 +104,13 @@ pub fn run(mut session: Session) -> Result<()> {
     let _ = editor.load_history(&history); // no history yet is fine
 
     println!(
-        "llmphant {} — `help` for commands, `quit` to exit.\nstore: {}",
+        "ellmephant {} — `help` for commands, `quit` to exit.\nstore: {}",
         crate::VERSION,
         session.paths().root().display()
     );
 
     loop {
-        match editor.readline("llmphant> ") {
+        match editor.readline("ellmephant> ") {
             Ok(line) => {
                 // Recorded explicitly rather than via `auto_add_history`, which rustyline
                 // only applies on a TTY — this keeps history deterministic under a pipe too.

@@ -1,6 +1,6 @@
 # the golden eval set (the lie detector)
 
-Seed set for `llmphant bench --golden` (PLAN §6 P10). Search quality is one of those things
+Seed set for `ellmephant bench --golden` (PLAN §6 P10). Search quality is one of those things
 everyone claims to have and nobody measures, so this directory is where the claims meet the
 recall number. Two files:
 
@@ -17,7 +17,7 @@ recall number. Two files:
 lands in the top `k`, and MRR uses the rank of the first. `k` is optional (the run's cutoff
 applies when absent).
 
-`llmphant bench --golden` scores the live store, so every `expect` key must exist there. The
+`ellmephant bench --golden` scores the live store, so every `expect` key must exist there. The
 seed corpus is keyword-anchored on purpose — the offline `HashEmbedder` only sees tokens, so
 questions share their target's distinctive terms. Grow this toward ≥20 *real* questions from
 actual usage and replace the corpus with your own memories; synthetic queries measure the

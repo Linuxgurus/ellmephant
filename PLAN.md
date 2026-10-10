@@ -1,4 +1,4 @@
-# llmphant — Build Plan
+# ellmephant — Build Plan
 
 > Companion to `SPEC.md`. This is the *how*: verified facts, resolved open questions, repo
 > layout, dependencies, and a phased build with acceptance criteria. Target is **v1** = the
@@ -55,7 +55,7 @@ has **no** `hub_load_safetensors` (earlier versions did); and `hf-hub` split int
 sync `0.5` (ureq) line and an async `1.0` (reqwest + tokio) rewrite. So *both* the download
 and the safetensors/tokenizer load are ours to write.
 → **Decision: own the model cache.** A flat, sha-pinned, manifest-backed cache under
-`~/.llmphant/models/` (SPEC §6.1–6.5), fetched with `ureq` + rustls. No `hf-hub` dependency;
+`~/.ellmephant/models/` (SPEC §6.1–6.5), fetched with `ureq` + rustls. No `hf-hub` dependency;
 `--model-dir` and `--offline` stay first-class. This is a prerequisite of P3, so it is its own
 phase (**P2.5**) and is fleshed out in SPEC §6.
 
@@ -75,12 +75,12 @@ hold with the `accelerate` feature enabled; §4 keeps `accelerate` for speed.)
 
 | # | Spec question | Decision |
 |---|---|---|
-| 1 | Golden eval + bench | `tests/golden/queries.jsonl`; `llmphant bench [--golden]`; a gate, not a vibe |
+| 1 | Golden eval + bench | `tests/golden/queries.jsonl`; `ellmephant bench [--golden]`; a gate, not a vibe |
 | 2 | MCP tool schema | `rmcp` tools, explicit schemas + annotations: read-only on `search/get/backlinks/export`, destructive on `delete` |
 | 3 | Rename | `rename <old> <new>` in one tx: update `memory.key`, `UPDATE memory SET body=replace(body,'[[old]]','[[new]]')`, repoint `memory_link.to_key` |
 | 4 | Daemon vs not | **No daemon in v1.** REPL + MCP hold the model warm; one-shot pays one cold start. Revisit only if painful |
 | 5 | Migrations | `migrations/NNNN_*.sql` via `include_str!`, applied against `user_version` inside a tx |
-| 6 | Tag governance | prune orphan tags on delete; `llmphant tags` (counts), `tags prune`, `tags rename` |
+| 6 | Tag governance | prune orphan tags on delete; `ellmephant tags` (counts), `tags prune`, `tags rename` |
 | 7 | Persist `embed_text`? | **No** — recompute deterministically from (`title`,`body`); persist only `hash` |
 | 8 | `--expand` semantics | N hops both directions over `memory_link`; bundle `{hits:[…], neighbors:[{hop, via, memory}]}` |
 | 9 | Metal / threads | candle `metal` + `accelerate` features (Apple); `--device cpu\|metal`, `--threads N` |
@@ -91,7 +91,7 @@ hold with the `accelerate` feature enabled; §4 keeps `accelerate` for speed.)
 Single crate (no workspace) — the binary is the product.
 
 ```
-llmphant/
+ellmephant/
 ├── Cargo.toml
 ├── SPEC.md  PLAN.md  README.md
 ├── migrations/0001_init.sql
@@ -99,10 +99,10 @@ llmphant/
 │   ├── main.rs            # clap dispatch: repl | <one-shot> | mcp | bench | doctor
 │   ├── lib.rs
 │   ├── error.rs           # thiserror
-│   ├── config.rs          # config.toml + ~/.llmphant paths, flag merge
+│   ├── config.rs          # config.toml + ~/.ellmephant paths, flag merge
 │   ├── model/             # weights cache: resolve, fetch, verify (SPEC §6)
 │   │   ├── mod.rs         # resolve repo+revision -> local dir; `model status|fetch|rm`
-│   │   ├── cache.rs       # layout ~/.llmphant/models/<owner>--<repo>/<sha>/, flock
+│   │   ├── cache.rs       # layout ~/.ellmephant/models/<owner>--<repo>/<sha>/, flock
 │   │   ├── fetch.rs       # ureq+rustls download, atomic per file (.partial -> rename)
 │   │   └── manifest.rs    # {repo,revision,files:{name:{sha256,size}}} record + verify
 │   ├── db/
@@ -194,8 +194,8 @@ after P2 because P3 depends on it and it can be built and tested entirely offlin
 - **Goal:** the binary runs and creates a store.
 - **Tasks:** crate; clap scaffold; `config.rs` (paths, `config.toml` load/merge, flags override);
   `error.rs`; `tracing`; db open with pragmas (WAL, FK, `busy_timeout`); `migrate()` runner.
-- **Accept:** `llmphant --version`; `llmphant doctor` prints paths, db version, model-cache
-  status; `~/.llmphant/` created; `user_version` = 1.
+- **Accept:** `ellmephant --version`; `ellmephant doctor` prints paths, db version, model-cache
+  status; `~/.ellmephant/` created; `user_version` = 1.
 - **Commit:** `feat: crate skeleton, config, db bootstrap`
 
 ### P2 — Migration 0001
@@ -212,7 +212,7 @@ after P2 because P3 depends on it and it can be built and tested entirely offlin
 - **Tasks:** `model/cache.rs` (layout `<owner>--<repo>/<sha>/`, flock, `--model-dir` passthrough);
   `model/manifest.rs` (per-file sha256+size, written last); `model/fetch.rs` (`ureq`+rustls;
   `resolve/<sha>/<file>`; `.partial` → `rename`; progress; `HF_ENDPOINT`/`HF_TOKEN`); revision
-  resolution (`main` → sha, recorded then pinned); `--offline`/`LLMPHANT_OFFLINE`; config
+  resolution (`main` → sha, recorded then pinned); `--offline`/`ELLMEPHANT_OFFLINE`; config
   `revision`/`cache_dir`/`offline`; CLI `model status|fetch|rm`; the `doctor` one-liner.
 - **Accept:** `model fetch` populates the cache and a re-run is a no-op; `--offline` loads a warm
   cache and fails with the file named on a cold one; a truncated file fails the manifest check;
@@ -224,8 +224,8 @@ after P2 because P3 depends on it and it can be built and tested entirely offlin
 - **Tasks:** `qwen3.rs` (load `config.json` + `model.safetensors` from the resolved cache dir;
   DType bf16/f16; `--device`; `--offline`); `tokenize.rs` (batch, left-pad, attention mask);
   last-token pool + L2; `projection.rs` (strip `[[…]]`, join title+body); warmup on startup;
-  `llmphant embed "…"` debug command + timing.
-- **Accept:** `llmphant embed` prints dim + ms; loads from cache with the network off; unit test
+  `ellmephant embed "…"` debug command + timing.
+- **Accept:** `ellmephant embed` prints dim + ms; loads from cache with the network off; unit test
   that the projection strips links.
 - **Design note:** `Embedder` is a **trait** — store/search tests inject a deterministic fake
   (hashed bag-of-words), so the DB layers are testable without loading 1.2 GB.
@@ -252,10 +252,10 @@ after P2 because P3 depends on it and it can be built and tested entirely offlin
 
 ### P6 — CLI
 - **Goal:** REPL + one-shot.
-- **Tasks:** `repl.rs` (rustyline; history at `~/.llmphant/history`; tab-complete commands+keys);
+- **Tasks:** `repl.rs` (rustyline; history at `~/.ellmephant/history`; tab-complete commands+keys);
   commands `add search show rm tags link reembed export import help quit`; `format.rs` (tabled
   tables + `--json`); one-shot subcommands mirroring the REPL.
-- **Accept:** interactive add->search->show->rm round-trips; `llmphant search "…" --json` emits
+- **Accept:** interactive add->search->show->rm round-trips; `ellmephant search "…" --json` emits
   valid JSON; history persists across sessions.
 - **Commit:** `feat: repl + one-shot cli`
 
@@ -310,8 +310,8 @@ after P2 because P3 depends on it and it can be built and tested entirely offlin
 ## 8. Definition of done (v1)
 
 - [ ] `cargo build --release` -> one binary, no dylibs, no runtime network requirement.
-- [ ] `llmphant doctor` green; `~/.llmphant/memory.db` at schema v1.
-- [ ] `llmphant model status` reports a complete, sha-verified cache; `--offline` runs against it.
+- [ ] `ellmephant doctor` green; `~/.ellmephant/memory.db` at schema v1.
+- [ ] `ellmephant model status` reports a complete, sha-verified cache; `--offline` runs against it.
 - [ ] add / search / update / delete round-trip; hybrid returns **scored snippets**.
 - [ ] wiki links + backlinks + `--expand` work.
 - [ ] REPL + one-shot + `mcp` all functional; MCP consumed by **Cline and TypingMind**.

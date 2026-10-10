@@ -20,7 +20,7 @@ pub(crate) fn load_embedder(
     embed::qwen3::Qwen3Embedder::load(&dir, &opts)
 }
 
-/// `llmphant embed "…" [--query]` — load the encoder and report dim + latency (P3).
+/// `ellmephant embed "…" [--query]` — load the encoder and report dim + latency (P3).
 pub fn run(spec: &model::Spec, cfg: &Config, text: &str, query: bool) -> Result<()> {
     use crate::embed::Embedder;
 

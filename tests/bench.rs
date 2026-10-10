@@ -8,10 +8,10 @@
 mod common;
 
 use common::temp_store;
-use llmphant::bench;
-use llmphant::db;
-use llmphant::embed::HashEmbedder;
-use llmphant::store::{self, Memory};
+use ellmephant::bench;
+use ellmephant::db;
+use ellmephant::embed::HashEmbedder;
+use ellmephant::store::{self, Memory};
 
 const DIM: usize = 512;
 

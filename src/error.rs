@@ -1,6 +1,6 @@
 //! Error type shared across the crate.
 
-/// Everything that can go wrong in llmphant.
+/// Everything that can go wrong in ellmephant.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("io error: {0}")]
@@ -29,7 +29,7 @@ pub enum Error {
     #[error("http error: {0}")]
     Http(String),
 
-    #[error("home directory not found (set HOME or LLMPHANT_HOME)")]
+    #[error("home directory not found (set HOME or ELLMEPHANT_HOME)")]
     NoHome,
 
     /// A capability this build does not carry (e.g. the encoder behind a disabled feature).

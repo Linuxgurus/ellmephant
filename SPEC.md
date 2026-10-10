@@ -1,15 +1,15 @@
-# llmphant — Design Spec (decision record)
+# ellmephant — Design Spec (decision record)
 
 > **Status:** decision record, v1 implemented. This captures *what we decided and why*; the
 > code is the authority for behaviour, and every phase of `PLAN.md` (P1–P10) has shipped.
 > §15 lists the questions that were open when this was written, each now resolved.
 >
-> **Name:** the crate/binary is **`llmphant`** (LLM + elephant — "never forgets"). The crate
-> name is **free on crates.io** (`elephant` was taken). Personal store root: `~/.llmphant`.
+> **Name:** the crate/binary is **`ellmephant`** (LLM + elephant — "never forgets"). The crate
+> name is **free on crates.io** (`elephant` was taken). Personal store root: `~/.ellmephant`.
 
 ## 0. One-liner
 
-llmphant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
+ellmephant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
 embedder engine is compiled into the binary, one SQLite file is the sole source of truth,
 and a *rebuildable* vector + full-text + link index sits on top of it. It speaks MCP (so
 any client — Cline, TypingMind — shares the same memory) and ships an interactive REPL for
@@ -28,7 +28,7 @@ attempt.
 **Goals**
 
 - Hermetic Rust binary: no Python/Node runtime, no external service, no cloud.
-- SQLite is the single source of truth (one file, `~/.llmphant/memory.db`).
+- SQLite is the single source of truth (one file, `~/.ellmephant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
 - Retrieval as a single **phrase** matched semantically (KNN) or by regex over `title`/`body` —
   `key`/`tags` are identity and lookup, not search.
@@ -67,9 +67,9 @@ mcp-memory-service → typed edges + tag AND/OR).
 | 4 | **`candle`** for inference (not `ort`/ONNX) | `ort` binds C++ ONNX Runtime (default: downloaded shared lib) — a sidecar. `candle` is pure Rust ⇒ truly in-binary |
 | 5 | **Qwen3-Embedding-0.6B**, 1024d, cosine | Best MTEB-multilingual of the candidates we compared (64.33 vs bge-m3 59.56), 32k context, MRL-capable, instruction-aware, and the only one with a **native candle path** (`fastembed`'s `Qwen3TextEmbedding`) |
 | 6 | **bf16** weights (f16 fallback) | ~1.2 GB resident; bf16 is fine under Metal; CPU kernels may emulate bf16 ⇒ `--precision f16` escape hatch |
-| 7 | Weights **external**: our own flat cache under `~/.llmphant/models/`, or `--model-dir`; `--offline`; sha-pinned revision (§6.1–6.5) | Keeps the binary small; weights are data. We own the layout (not `HF_HOME`) so it is inspectable, `gc`-able, and integrity-checked |
+| 7 | Weights **external**: our own flat cache under `~/.ellmephant/models/`, or `--model-dir`; `--offline`; sha-pinned revision (§6.1–6.5) | Keeps the binary small; weights are data. We own the layout (not `HF_HOME`) so it is inspectable, `gc`-able, and integrity-checked |
 | 8 | **cosine**, L2-normalised both sides; **last-token pooling + left-pad** | Qwen3 is a decoder embedder — mean pooling (the candle BERT example) gives silently worse vectors |
-| 9 | Root `~/.llmphant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
+| 9 | Root `~/.ellmephant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
 | 10 | **Tags** name aspects of a subject (e.g. `storage`, `gotchas`); no `scope`, no `type` | Tags are a facet and part of the embedded document, so a tag token is retrievable; a bucket/type taxonomy adds vocabulary without adding recall |
 | 11 | `key` = **global-unique slug**, optional to supply | Identity (upsert target) and link target; auto-slugged from the title when omitted |
 | 12 | **Smart-caveman** writing; **one** document embedding over `key` + tags + `title` + `body` | Terse text embeds sharply, and one vector per row is simpler to build and rebuild; terseness keeps the body from swamping the title |
@@ -92,7 +92,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 
 - **Model:** `Qwen/Qwen3-Embedding-0.6B`, output **1024** (MRL allows 32–1024; frozen at
   `CREATE`, choose 1024 — rebuildable later).
-- **Engine:** candle, pure Rust. **Weights:** our own flat cache under `~/.llmphant/models/`
+- **Engine:** candle, pure Rust. **Weights:** our own flat cache under `~/.ellmephant/models/`
   (not `HF_HOME`), or `--model-dir`; fetched on first run; `--offline` forbids network. See §6.1–6.5.
 - **Precision:** bf16 default; `--precision f16` for native ARM CPU path.
 - **Pooling:** last-token with **left** padding, then L2-normalise.
@@ -112,7 +112,7 @@ baked into the binary, and never required at runtime *to run* — only to *fetch
 One flat dir per resolved revision, so `--model-dir` is a first-class alternative:
 
 ```
-~/.llmphant/models/<owner>--<repo>/
+~/.ellmephant/models/<owner>--<repo>/
   refs.json              # {"main": "<sha>"} — a ref resolved once, then pinned
   <sha>/
     manifest.json        # {repo, revision, resolved, created, files:{name:{sha256,size}}}
@@ -125,7 +125,7 @@ One flat dir per resolved revision, so `--model-dir` is a first-class alternativ
   upstream move never silently changes our vectors.
 - `--model-dir <dir>` bypasses this entirely: a flat dir that must already hold the files
   (implies `--offline`).
-- `cache_dir` overrides the root (default `~/.llmphant/models`). We do **not** reuse
+- `cache_dir` overrides the root (default `~/.ellmephant/models`). We do **not** reuse
   `HF_HOME`/`HF_HUB_CACHE`: our layout, our manifest, one place to look (§12).
 
 ### 6.2 Fetch protocol
@@ -150,12 +150,12 @@ Fetching is **first-run, opt-in, and the only network code in the binary**.
 - Download-time: every file is hashed and compared *before* the manifest is written.
 - Load-time: **no full re-hash** — sha256 over 1.2 GB each start would erase the cold-start
   budget (§13). We check size and rely on safetensors' self-describing header failing loudly
-  on truncation/corruption. `llmphant doctor --verify` does the full hash on demand.
-- A cache that fails to load names the file and prints the fix: `llmphant model fetch --force`.
+  on truncation/corruption. `ellmephant doctor --verify` does the full hash on demand.
+- A cache that fails to load names the file and prints the fix: `ellmephant model fetch --force`.
 
 ### 6.4 Offline & failure modes
 
-- `--offline` / `LLMPHANT_OFFLINE=1` / `offline = true` (§12): **never** opens a socket; a
+- `--offline` / `ELLMEPHANT_OFFLINE=1` / `offline = true` (§12): **never** opens a socket; a
   missing or incomplete cache is a hard error naming the file and the online command.
 - `--model-dir` is always offline. Online (the default) uses the cache when complete, else
   fetches once.
@@ -165,10 +165,10 @@ Fetching is **first-run, opt-in, and the only network code in the binary**.
 
 ### 6.5 Surface
 
-- `llmphant model status` — repo, resolved revision, cache path, per-file presence/size, total
+- `ellmephant model status` — repo, resolved revision, cache path, per-file presence/size, total
   bytes, manifest ok/absent. This is the "model-cache status" `doctor` prints from P1 on.
-- `llmphant model fetch [--repo][--revision][--force]` — prefetch / repair.
-- `llmphant model rm [--revision]` — drop a revision to reclaim space.
+- `ellmephant model fetch [--repo][--revision][--force]` — prefetch / repair.
+- `ellmephant model rm [--revision]` — drop a revision to reclaim space.
 - `doctor` prints the same one-line summary.
 
 ## 7. Data model
@@ -293,35 +293,35 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 
 **CLI** — three faces over one core:
 
-- `llmphant` → **REPL** (rustyline: history at `~/.llmphant/history`, completion;
+- `ellmephant` → **REPL** (rustyline: history at `~/.ellmephant/history`, completion;
   bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `list`, `tags`,
   `stats`, `rename`, `reembed`, `links`, `model`, `help`, `quit`.
-- One-shot flags for scripting: `llmphant search "..." --json`.
-- `llmphant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
-- `llmphant stats [--json]` (alias `summary`) → a read-only digest: counts, on-disk size and
+- One-shot flags for scripting: `ellmephant search "..." --json`.
+- `ellmephant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
+- `ellmephant stats [--json]` (alias `summary`) → a read-only digest: counts, on-disk size and
   body/title spread, tag shape (distinct, placements, singletons, top-N, per-memory / per-tag
   averages, coverage), link shape (edges, linked, orphans, dangling) and recent activity (§14).
-- `llmphant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
-- `llmphant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
+- `ellmephant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
+- `ellmephant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
 
-**Portability:** the store is one file (`~/.llmphant/memory.db`), so moving a machine is a copy.
+**Portability:** the store is one file (`~/.ellmephant/memory.db`), so moving a machine is a copy.
 `reembed` rebuilds the vectors for a new model or dimension; `rename` fixes keys.
 
 ## 12. Config & paths
 
-- `~/.llmphant/memory.db` — the store.
-- `~/.llmphant/config.toml` — model, dim, precision, instruction, defaults (flags override).
-- `~/.llmphant/models/` — weights cache, laid out per §6.1 (`<owner>--<repo>/<sha>/`). Not
+- `~/.ellmephant/memory.db` — the store.
+- `~/.ellmephant/config.toml` — model, dim, precision, instruction, defaults (flags override).
+- `~/.ellmephant/models/` — weights cache, laid out per §6.1 (`<owner>--<repo>/<sha>/`). Not
   `HF_HOME`: we own this layout so `doctor`/`gc` and `--model-dir` stay simple.
-- `~/.llmphant/history` — REPL history.
+- `~/.ellmephant/history` — REPL history.
 - `meta` table mirrors model/dim/instruction for drift detection at startup.
 
-Model config keys (all optional; flags override, and `LLMPHANT_OFFLINE=1` overrides `offline`):
+Model config keys (all optional; flags override, and `ELLMEPHANT_OFFLINE=1` overrides `offline`):
 
 ```toml
 model      = "Qwen/Qwen3-Embedding-0.6B"  # HF repo id, or a dir name under models/
 revision   = "main"                       # resolved once to a commit sha and pinned
-cache_dir  = ""                           # default ~/.llmphant/models
+cache_dir  = ""                           # default ~/.ellmephant/models
 offline    = false                        # true == never open a socket (§6.4)
 precision  = "bf16"                       # bf16 | f16
 device     = "cpu"                        # cpu | metal
@@ -374,7 +374,7 @@ any model is touched; flags are re-checked the same way after they override the 
 5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`; the first
    run bootstraps schema v1.
 6. **Tags** — decided: stored on each row (comma-joined) and folded into the document embedding;
-   `llmphant tags` derives the vocabulary and counts. Dangling `[[key]]` targets are audited by
+   `ellmephant tags` derives the vocabulary and counts. Dangling `[[key]]` targets are audited by
    `links`.
 7. **Persist `embed_text` vs recompute** — decided: recompute. The per-row `hash`
    (`store::row_hash`) decides when a re-embed is needed; nothing extra is stored.
@@ -409,5 +409,5 @@ any model is touched; flags are re-checked the same way after they override the 
 - **Document** — the text embedded for a row: `key`, tags, title and the link-stripped body.
 - **store ≠ embed** — the row keeps full text; the vector is over a link-stripped projection.
 - **Semantic** — the phrase-match method: embed the query and take the KNN (the only leg).
-- **Model cache** — the external weights dir (`~/.llmphant/models/<owner>--<repo>/<sha>/`), a
+- **Model cache** — the external weights dir (`~/.ellmephant/models/<owner>--<repo>/<sha>/`), a
   flat, sha-pinned, manifest-backed copy of the encoder's files; data, not code (§6.1).

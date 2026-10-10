@@ -1,4 +1,4 @@
-//! `llmphant doctor` — paths, schema version and the health of every *derived* index
+//! `ellmephant doctor` — paths, schema version and the health of every *derived* index
 //! (links, tags, vectors), plus `--verify` for a full re-hash of the weights (PLAN §6 P9).
 
 use rusqlite::Connection;
@@ -32,7 +32,7 @@ pub fn run(paths: &Paths, cfg: &Config, spec: &model::Spec, verify: bool) -> Res
 
 /// Paths, schema version and the configured model (PLAN §6 P9).
 fn print_env(paths: &Paths, cfg: &Config, schema: i32, objects: i64) {
-    println!("llmphant {}", crate::VERSION);
+    println!("ellmephant {}", crate::VERSION);
     println!("  root           {}", paths.root().display());
     println!("  db             {}", paths.db().display());
     println!(

@@ -1,9 +1,9 @@
-# Copy to ~/.llmphant/config.toml and edit. Flags override these; these override the
+# Copy to ~/.ellmephant/config.toml and edit. Flags override these; these override the
 # built-in defaults. Every field is optional.
 
 model = "Qwen/Qwen3-Embedding-0.6B"   # HF repo id, or a directory name under models/
 revision = "main"                      # branch/tag (resolved once to a sha) or a pinned sha
-cache_dir = ""                         # weights cache root; empty = ~/.llmphant/models
+cache_dir = ""                         # weights cache root; empty = ~/.ellmephant/models
 offline = false                        # true = never open a socket (SPEC §6.4)
 dim = 1024                             # MRL allows 32..=1024; frozen at CREATE
 precision = "bf16"                     # bf16 (default) | f16

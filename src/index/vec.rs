@@ -86,7 +86,7 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
     match stored_dim(conn)? {
         Some(existing) if existing != dim => {
             return Err(Error::Config(format!(
-                "vector dim changed ({existing} -> {dim}); run `llmphant reembed` (PLAN.md P9)"
+                "vector dim changed ({existing} -> {dim}); run `ellmephant reembed` (PLAN.md P9)"
             )));
         }
         Some(_) => {}

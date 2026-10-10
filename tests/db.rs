@@ -5,7 +5,7 @@
 mod common;
 
 use common::{count, temp_store};
-use llmphant::db;
+use ellmephant::db;
 use rusqlite::{Connection, params};
 
 fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {

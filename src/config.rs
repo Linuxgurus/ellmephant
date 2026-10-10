@@ -1,4 +1,4 @@
-//! Paths and configuration: `~/.llmphant/`, `config.toml`, and the merge of
+//! Paths and configuration: `~/.ellmephant/`, `config.toml`, and the merge of
 //! defaults <- file <- flags.
 
 use std::path::{Path, PathBuf};
@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Directory name under `$HOME` unless `LLMPHANT_HOME` overrides it.
-pub const APP_DIR: &str = ".llmphant";
+/// Directory name under `$HOME` unless `ELLMEPHANT_HOME` overrides it.
+pub const APP_DIR: &str = ".ellmephant";
 /// The single source of truth.
 pub const DB_FILE: &str = "memory.db";
 /// Optional user config.
@@ -37,7 +37,7 @@ pub const MAX_DIM: usize = 1024;
 /// paraphrase) and still drops the chaff. High-precision callers can tighten toward 0.5.
 pub const DEFAULT_MAX_DISTANCE: f32 = 0.6;
 
-/// Resolved on-disk locations. `LLMPHANT_HOME` wins over `$HOME/.llmphant`, which
+/// Resolved on-disk locations. `ELLMEPHANT_HOME` wins over `$HOME/.ellmephant`, which
 /// keeps tests hermetic without touching the real store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -47,7 +47,7 @@ pub struct Paths {
 impl Paths {
     /// Discover the store root from the environment.
     pub fn discover() -> Result<Self> {
-        if let Some(home) = std::env::var_os("LLMPHANT_HOME") {
+        if let Some(home) = std::env::var_os("ELLMEPHANT_HOME") {
             return Ok(Self {
                 root: PathBuf::from(home),
             });
@@ -120,7 +120,7 @@ pub struct Config {
     /// Cosine-distance ceiling applied when a search omits `max_distance` (SPEC §10).
     /// `null` disables the cap.
     pub default_max_distance: Option<f32>,
-    /// TCP port for the MCP server (SPEC §11); `llmphant mcp` listens here by default.
+    /// TCP port for the MCP server (SPEC §11); `ellmephant mcp` listens here by default.
     pub port: u16,
 }
 

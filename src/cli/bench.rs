@@ -1,4 +1,4 @@
-//! `llmphant bench` — real latency numbers and the golden eval (PLAN §6 P10).
+//! `ellmephant bench` — real latency numbers and the golden eval (PLAN §6 P10).
 //!
 //! `bench` loads the encoder (that *is* the measured cold start), times embed and semantic
 //! search, and — with `--golden` — scores a JSONL query set. `--sweep` additionally walks the

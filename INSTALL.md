@@ -1,7 +1,7 @@
-# Installing llmphant
+# Installing ellmephant
 
-llmphant is a single binary backed by one SQLite file. You can build it from source or run the
-container image. Either way the store is a single directory (`~/.llmphant` by default, `/data`
+ellmephant is a single binary backed by one SQLite file. You can build it from source or run the
+container image. Either way the store is a single directory (`~/.ellmephant` by default, `/data`
 in the container) and the model weights are fetched into it once, then reused offline.
 
 - [Prerequisites](#prerequisites)
@@ -24,9 +24,9 @@ in the container) and the model weights are fetched into it once, then reused of
 ## Build from source
 
 ```sh
-git clone <this-repo> && cd llmphant
+git clone <this-repo> && cd ellmephant
 cargo build --release --locked        # or: make release
-./target/release/llmphant --version
+./target/release/ellmephant --version
 ```
 
 The first build is slow: it compiles the SQLite/`sqlite-vec` C sources, the candle ML stack, and
@@ -35,9 +35,9 @@ roughly four hundred crates. Later builds are incremental.
 ## Install the binary on your `PATH`
 
 ```sh
-cargo install --path .                # -> ~/.cargo/bin/llmphant
+cargo install --path .                # -> ~/.cargo/bin/ellmephant
 # or, without cargo:
-install -m 0755 target/release/llmphant ~/.local/bin/llmphant
+install -m 0755 target/release/ellmephant ~/.local/bin/ellmephant
 ```
 
 ## Store-only build
@@ -53,41 +53,41 @@ cargo build --release --locked --no-default-features
 ## Create the store and fetch weights
 
 ```sh
-llmphant doctor            # creates ~/.llmphant/ and the schema; prints health
-llmphant model fetch       # one-time ~1.2 GB download into ~/.llmphant/models/
-llmphant doctor --verify   # optional: re-hash every weight file
+ellmephant doctor            # creates ~/.ellmephant/ and the schema; prints health
+ellmephant model fetch       # one-time ~1.2 GB download into ~/.ellmephant/models/
+ellmephant doctor --verify   # optional: re-hash every weight file
 ```
 
-Every command honours `LLMPHANT_HOME`; without it the store is `~/.llmphant`. After the fetch,
-runs need no network. `llmphant --offline <cmd>` opens no socket.
+Every command honours `ELLMEPHANT_HOME`; without it the store is `~/.ellmephant`. After the fetch,
+runs need no network. `ellmephant --offline <cmd>` opens no socket.
 
 ## Docker
 
 The image is a multi-stage build: dependencies compile in `rust:1-bookworm`, and the runtime is
 `debian:bookworm-slim` plus the one binary. The store is a volume at `/data`
-(`LLMPHANT_HOME=/data`).
+(`ELLMEPHANT_HOME=/data`).
 
 ```sh
-make docker-build                     # docker build -t llmphant:dev .
+make docker-build                     # docker build -t ellmephant:dev .
 # or:
-docker build -t llmphant:dev .
+docker build -t ellmephant:dev .
 ```
 
 The image's default command is the MCP server (`mcp`, HTTP on port 8888). To bootstrap a volume,
 name a different command:
 
 ```sh
-docker run --rm -v llmphant-data:/data llmphant:dev doctor
-docker run --rm -v llmphant-data:/data llmphant:dev model fetch
+docker run --rm -v ellmephant-data:/data ellmephant:dev doctor
+docker run --rm -v ellmephant-data:/data ellmephant:dev model fetch
 ```
 
 Do not bake the weights into the image. Fetch them into the volume (above), or mount an existing
 cache read-only:
 
 ```sh
-docker run --rm -it -v llmphant-data:/data \
-                    -v ~/.llmphant/models:/data/models:ro \
-                    llmphant:dev search "where do the logs live"
+docker run --rm -it -v ellmephant-data:/data \
+                    -v ~/.ellmephant/models:/data/models:ro \
+                    ellmephant:dev search "where do the logs live"
 ```
 
 See the [README](README.md) for usage, including the MCP server on a host and in Docker.
@@ -95,6 +95,6 @@ See the [README](README.md) for usage, including the MCP server on a host and in
 ## Verify the installation
 
 ```sh
-llmphant --version
-llmphant doctor
+ellmephant --version
+ellmephant doctor
 ```

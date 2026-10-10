@@ -6,9 +6,9 @@
 mod common;
 
 use common::temp_store;
-use llmphant::db;
-use llmphant::embed::HashEmbedder;
-use llmphant::store::{self, Memory, stats};
+use ellmephant::db;
+use ellmephant::embed::HashEmbedder;
+use ellmephant::store::{self, Memory, stats};
 
 const DIM: usize = 8;
 
@@ -121,4 +121,3 @@ fn telemetry_totals_and_top_useful() {
     // Busiest first: b (2) then a (1).
     assert_eq!(s.top_useful.first(), Some(&("b".to_string(), 2)));
 }
-

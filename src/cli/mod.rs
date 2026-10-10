@@ -20,22 +20,22 @@ use crate::store::stats;
 
 use self::session::Session;
 
-/// Top-level arguments. `--home` (or `LLMPHANT_HOME`) relocates the whole store,
+/// Top-level arguments. `--home` (or `ELLMEPHANT_HOME`) relocates the whole store,
 /// which is what keeps tests hermetic.
 #[derive(Debug, Parser)]
 #[command(
-    name = "llmphant",
+    name = "ellmephant",
     version = crate::VERSION,
     about = "Single-binary, SQLite-backed long-term memory for AI agents",
     long_about = None,
 )]
 pub struct Cli {
-    /// Store root (defaults to `~/.llmphant`).
-    #[arg(long, global = true, value_name = "DIR", env = "LLMPHANT_HOME")]
+    /// Store root (defaults to `~/.ellmephant`).
+    #[arg(long, global = true, value_name = "DIR", env = "ELLMEPHANT_HOME")]
     pub home: Option<PathBuf>,
 
     /// Never touch the network; a cold weights cache is an error (SPEC §6.4).
-    #[arg(long, global = true, env = "LLMPHANT_OFFLINE")]
+    #[arg(long, global = true, env = "ELLMEPHANT_OFFLINE")]
     pub offline: bool,
 
     /// Use an existing flat weights directory instead of the cache (implies `--offline`).
@@ -154,12 +154,12 @@ pub enum Command {
         #[arg(
             long,
             value_name = "ADDR",
-            env = "LLMPHANT_MCP_HOST",
+            env = "ELLMEPHANT_MCP_HOST",
             default_value = "127.0.0.1"
         )]
         host: String,
         /// HTTP port (default: config `port`, else 8888).
-        #[arg(long, value_name = "PORT", env = "LLMPHANT_MCP_PORT")]
+        #[arg(long, value_name = "PORT", env = "ELLMEPHANT_MCP_PORT")]
         port: Option<u16>,
     },
     /// Weights cache: status | fetch | rm (SPEC §6.5).
@@ -192,7 +192,7 @@ pub enum Command {
     },
 }
 
-/// `llmphant model …` — the weights cache (SPEC §6.5).
+/// `ellmephant model …` — the weights cache (SPEC §6.5).
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
     /// Show the cache without touching the network.

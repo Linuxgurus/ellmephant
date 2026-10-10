@@ -3,7 +3,7 @@
 *.db-wal
 *.db-shm
 models/
-.llmphant/
+.ellmephant/
 .env
 
 # editor / OS noise

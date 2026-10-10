@@ -6,10 +6,10 @@
 mod common;
 
 use common::temp_store;
-use llmphant::db;
-use llmphant::embed::{Embedder, HashEmbedder, projection};
-use llmphant::index::vec;
-use llmphant::store::{self, Memory, maintain};
+use ellmephant::db;
+use ellmephant::embed::{Embedder, HashEmbedder, projection};
+use ellmephant::index::vec;
+use ellmephant::store::{self, Memory, maintain};
 use rusqlite::{Connection, params};
 
 fn memory(key: &str, body: &str, tags_: &[&str]) -> Memory {

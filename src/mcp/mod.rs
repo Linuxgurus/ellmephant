@@ -51,7 +51,7 @@ pub const TOOLS: &[&str] = &[
 
 /// Server-level instruction: the read/write policy every client should follow (SPEC §9).
 const INSTRUCTIONS: &str = "\
-llmphant = memory-rock. Clever caveman share it. \
+ellmephant = memory-rock. Clever caveman share it. \
 WRITE: big words in, small words out. Drop filler. Drop articles. Drop glue. One fact, one \
 row. Key + tags live inside prose — name sharp. Sharp name, sharp recall. `source` = proof \
 stone: command/path/repo that prove fact. Never live state. Live state change; memory not \
@@ -161,7 +161,7 @@ pub struct MemoryServer {
 }
 
 impl MemoryServer {
-    /// Build a server over an open session — the `llmphant mcp` path.
+    /// Build a server over an open session — the `ellmephant mcp` path.
     pub fn new(session: Session) -> Self {
         Self::from_shared(Arc::new(Mutex::new(session)))
     }
@@ -224,7 +224,7 @@ fn json_ok(value: serde_json::Value) -> String {
 }
 
 /// Log one `memory_search` round trip: the request, every returned hit (key/tags/distance) and
-/// the size of the serialized response. Visible with `RUST_LOG=llmphant=info`; the Docker image
+/// the size of the serialized response. Visible with `RUST_LOG=ellmephant=info`; the Docker image
 /// sets that by default.
 #[allow(clippy::too_many_arguments)] // one structured log line; splitting it would hurt grepping
 fn log_search(
@@ -498,12 +498,12 @@ impl MemoryServer {
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("llmphant", crate::VERSION))
+            .with_server_info(Implementation::new("ellmephant", crate::VERSION))
             .with_instructions(INSTRUCTIONS)
     }
 }
 
-/// How `llmphant mcp` reaches its client.
+/// How `ellmephant mcp` reaches its client.
 pub enum Transport {
     /// Newline-delimited JSON-RPC over stdin/stdout (a client launches the process).
     Stdio,
@@ -512,7 +512,7 @@ pub enum Transport {
     Http { host: String, port: u16 },
 }
 
-/// Serve MCP on the chosen [`Transport`] until it is stopped (the `llmphant mcp` subcommand).
+/// Serve MCP on the chosen [`Transport`] until it is stopped (the `ellmephant mcp` subcommand).
 /// HTTP is the default; stdio stays available for client-launched setups.
 pub fn serve(
     paths: Paths,
@@ -528,10 +528,10 @@ pub fn serve(
         device = %cfg.device,
         precision = %cfg.precision,
         offline = spec.offline,
-        "starting llmphant mcp"
+        "starting ellmephant mcp"
     );
     let server = MemoryServer::new(Session::open(paths, cfg, spec)?);
-    // rmcp is async; the rest of llmphant is not, so own the runtime here.
+    // rmcp is async; the rest of ellmephant is not, so own the runtime here.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         match transport {
@@ -595,7 +595,7 @@ fn is_loopback(host: &str) -> bool {
 async fn serve_http(server: MemoryServer, host: &str, port: u16) -> crate::error::Result<()> {
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     let addr = listener.local_addr()?;
-    tracing::info!(%addr, "llmphant mcp listening on http://{addr}/mcp");
+    tracing::info!(%addr, "ellmephant mcp listening on http://{addr}/mcp");
     let app = http_router(server, host);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

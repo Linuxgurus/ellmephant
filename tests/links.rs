@@ -7,9 +7,9 @@
 mod common;
 
 use common::temp_store;
-use llmphant::db;
-use llmphant::embed::HashEmbedder;
-use llmphant::store::{self, Memory, links};
+use ellmephant::db;
+use ellmephant::embed::HashEmbedder;
+use ellmephant::store::{self, Memory, links};
 use rusqlite::Connection;
 
 const DIM: usize = 8;

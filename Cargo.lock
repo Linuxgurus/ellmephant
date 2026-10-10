@@ -759,6 +759,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
+name = "ellmephant"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "clap",
+ "libc",
+ "regex",
+ "rmcp",
+ "rusqlite",
+ "rustyline",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlite-vec",
+ "tabled",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokenizers",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,37 +1589,6 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
-name = "llmphant"
-version = "0.1.0"
-dependencies = [
- "axum",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "clap",
- "libc",
- "regex",
- "rmcp",
- "rusqlite",
- "rustyline",
- "safetensors 0.8.0",
- "serde",
- "serde_json",
- "sha2",
- "sqlite-vec",
- "tabled",
- "tempfile",
- "thiserror 2.0.21",
- "tokenizers",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
 
 [[package]]
 name = "log"

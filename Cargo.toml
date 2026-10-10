@@ -1,11 +1,11 @@
 [package]
-name = "llmphant"
+name = "ellmephant"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Single-binary, SQLite-backed long-term memory for AI agents"
 license = "MIT"
-repository = "https://example.invalid/llmphant"
+repository = "https://example.invalid/ellmephant"
 readme = "README.md"
 
 # NOTE: this is the P1–P4 dependency set. `sqlite-vec` (in-process vec0) and `sha2`
@@ -16,11 +16,11 @@ readme = "README.md"
 # download, and we load safetensors/tokenizer files ourselves.
 
 [lib]
-name = "llmphant"
+name = "ellmephant"
 path = "src/lib.rs"
 
 [[bin]]
-name = "llmphant"
+name = "ellmephant"
 path = "src/main.rs"
 
 [dependencies]
@@ -65,7 +65,7 @@ tabled = "0.22"
 # hence the crate's rust-version bump). Default features bring the `#[tool]`/`#[tool_router]`
 # macros, the `server` runtime and JSON-Schema generation; `transport-io` adds stdio and
 # `transport-streamable-http-server` adds the networked MCP transport (SPEC §11).
-# `tokio` is the transport runtime — the rest of llmphant stays synchronous.
+# `tokio` is the transport runtime — the rest of ellmephant stays synchronous.
 rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 # Hosts rmcp's `StreamableHttpService` (a tower service) — MCP-over-HTTP is the `mcp` default.

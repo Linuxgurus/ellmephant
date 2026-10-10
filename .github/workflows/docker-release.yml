@@ -55,6 +55,9 @@ jobs:
       - name: Tag the release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rel.outputs.publish == 'true'
         run: |
+          # A fresh runner has no git identity, and an annotated tag needs one.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v${{ steps.rel.outputs.version }}" -m "ellmephant ${{ steps.rel.outputs.version }}"
           git push origin "v${{ steps.rel.outputs.version }}"
 

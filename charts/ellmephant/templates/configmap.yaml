@@ -1,0 +1,15 @@
+{{- if .Values.config.create -}}
+{{/*
+`config.toml` mounted at <home>/config.toml. Flags and env override these (SPEC §12), and the
+file rejects unknown fields, so only real keys belong in `config.toml` below.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ellmephant.configMapName" . }}
+  labels:
+    {{- include "ellmephant.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- .Values.config.toml | nindent 4 }}
+{{- end }}

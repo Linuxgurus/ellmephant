@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ellmephant.fullname" . }}
+  labels:
+    {{- include "ellmephant.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.updateStrategy }}
+  # One writer connection and one RWO store: a second pod during a rollout would fight the first
+  # for `memory.db`. Recreate, always. Do not raise `replicaCount` above 1.
+  strategy:
+    type: Recreate
+  {{- else }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  {{- end }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ellmephant.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "ellmephant.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ellmephant.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if or .Values.initContainers.store.enabled .Values.models.fetch.enabled }}
+      initContainers:
+        {{- if .Values.initContainers.store.enabled }}
+        # Create/migrate the store once, before the server holds it open. Idempotent and cheap.
+        - name: init-store
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["ellmephant"]
+          args: ["doctor"]
+          env:
+            {{- include "ellmephant.env" . | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.initContainers.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "ellmephant.volumeMounts" . | nindent 12 }}
+        {{- end }}
+        {{- if .Values.models.fetch.enabled }}
+        # One-time (or forced) ~1.2 GB fetch into the cache; needs egress to the Hub. Off by
+        # default so a cluster without egress does not wedge on startup.
+        - name: fetch-models
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["ellmephant"]
+          args:
+            - model
+            - fetch
+            {{- with .Values.models.fetch.repo }}
+            - --repo
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.models.fetch.revision }}
+            - --revision
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.models.fetch.force }}
+            - --force
+            {{- end }}
+          env:
+            {{- include "ellmephant.env" . | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.initContainers.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "ellmephant.volumeMounts" . | nindent 12 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml .Values.command | nindent 12 }}
+          args:
+            {{- toYaml .Values.args | nindent 12 }}
+          ports:
+            - name: mcp
+              containerPort: {{ include "ellmephant.mcpPort" . }}
+              protocol: TCP
+          env:
+            {{- include "ellmephant.env" . | nindent 12 }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "ellmephant.volumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "ellmephant.volumes" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}

@@ -7,6 +7,10 @@ models/
 .env
 .tmp/
 
+# chart tooling droppings: a packaged chart, and the .bak a `sed`-in-place leaves behind
+*.tgz
+Chart.yaml.bak
+
 # editor / OS noise
 .DS_Store
 *.swp

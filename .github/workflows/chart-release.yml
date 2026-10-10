@@ -1,0 +1,40 @@
+name: chart-release
+
+# Package the Helm chart, cut a GitHub Release with the .tgz attached, and refresh the gh-pages
+# Helm repo index — the same chart-releaser pattern as the `wordpress` repo. No registry, no OCI.
+# Once Pages is enabled on the `gh-pages` branch, users install with:
+#   helm repo add ellmephant https://jdblack.github.io/ellmephant
+#   helm install ellmephant ellmephant/ellmephant --version <chart version>
+#
+# Publishing is keyed off the Chart.yaml `version`: bump it, or chart-releaser finds the
+# `ellmephant-<version>` release already present and quietly does nothing. (CI guards the bump.)
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/chart-release.yml"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + push the gh-pages branch
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.7.0
+        with:
+          charts_dir: charts
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

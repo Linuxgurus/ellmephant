@@ -81,7 +81,7 @@ async fn tools_round_trip_over_the_transport() {
     // add -> get -> search round-trip.
     let added = call(
         &client,
-        "memory_add",
+        "memory_upsert",
         serde_json::json!({
             "key": "infra-logs",
             "title": "Where logs live",
@@ -107,7 +107,7 @@ async fn tools_round_trip_over_the_transport() {
     // A fetch counted exactly one visit.
     assert!(text(&got).contains("\"visits\":1"), "{}", text(&got));
 
-    // Feedback is independent of a fetch (a bare title can earn it) and bumps `was_useful`.
+    // Feedback is independent of a fetch (a bare title can earn it) and bumps `times_useful`.
     let useful = call(
         &client,
         "memory_useful",
@@ -116,7 +116,7 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     assert!(!useful.is_error.unwrap_or(false), "{}", text(&useful));
     assert!(
-        text(&useful).contains("\"was_useful\":1"),
+        text(&useful).contains("\"times_useful\":1"),
         "{}",
         text(&useful)
     );
@@ -130,7 +130,7 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     let again: serde_json::Value = serde_json::from_str(&text(&again)).expect("memory json");
     assert_eq!(again["visits"], serde_json::json!(2));
-    assert_eq!(again["was_useful"], serde_json::json!(1));
+    assert_eq!(again["times_useful"], serde_json::json!(1));
 
     // An unknown key is a tool error (not a silent zero).
     let bogus = call(
@@ -158,7 +158,7 @@ async fn tools_round_trip_over_the_transport() {
     // A second memory links back; `memory_backlinks` finds it.
     call(
         &client,
-        "memory_add",
+        "memory_upsert",
         serde_json::json!({
             "key": "infra-observability",
             "title": "Observability",
@@ -180,21 +180,14 @@ async fn tools_round_trip_over_the_transport() {
         serde_json::json!("infra-observability")
     );
 
-    // update requires an existing key; a missing one is a tool error.
-    let updated = call(
+    // `memory_upsert` upserts: re-storing an existing key overwrites it, no twin row.
+    let upserted = call(
         &client,
-        "memory_update",
+        "memory_upsert",
         serde_json::json!({ "key": "infra-logs", "title": "Where logs live", "body": "Logs ship to ns1 via vector (updated)." }),
     )
     .await;
-    assert!(!updated.is_error.unwrap_or(false), "{}", text(&updated));
-    let missing = call(
-        &client,
-        "memory_update",
-        serde_json::json!({ "key": "ghost", "title": "x", "body": "y" }),
-    )
-    .await;
-    assert_eq!(missing.is_error, Some(true));
+    assert!(!upserted.is_error.unwrap_or(false), "{}", text(&upserted));
 
     // delete removes it; a second get is a tool error.
     let removed = call(
@@ -341,7 +334,7 @@ async fn tools_round_trip_over_http() {
         Some(&session),
         serde_json::json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": { "name": "memory_add", "arguments": {
+            "params": { "name": "memory_upsert", "arguments": {
                 "key": "http-note",
                 "title": "HTTP note", "body": "reached over http"
             }}
@@ -375,7 +368,7 @@ async fn list_tool_reports_the_index_without_bodies() {
     for key in ["note-one", "note-two"] {
         let added = call(
             &client,
-            "memory_add",
+            "memory_upsert",
             serde_json::json!({
                 "key": key, "title": key, "body": format!("body for {key}"),
                 "tags": ["infra"],

@@ -1,5 +1,6 @@
 //! The write/read path over `memory` and its derived indexes (P4).
 
+pub mod dupes;
 pub mod links;
 pub mod maintain;
 pub mod slug;
@@ -50,9 +51,9 @@ pub struct Memory {
     /// Times the row was read whole (`memory_get`/`show`); runtime counter, never in the embed.
     #[serde(default)]
     pub visits: i64,
-    /// Explicit positive feedback from an agent that found this memory useful; runtime counter.
+    /// Count of explicit "this helped" marks from an agent; runtime counter, never in the embed.
     #[serde(default)]
-    pub was_useful: i64,
+    pub times_useful: i64,
 }
 
 /// One row's index entry: identity and shape, without the body (the `list` surface, SPEC §14).
@@ -268,13 +269,13 @@ pub fn record_visit(conn: &Connection, key: &str) -> Result<i64> {
     bump(conn, key, "visits")
 }
 
-/// Bump the `was_useful` counter for `key` and return the new total (explicit agent
+/// Bump the `times_useful` counter for `key` and return the new total (explicit agent
 /// feedback). Errors with [`Error::NotFound`] when the key is unknown.
 pub fn record_useful(conn: &Connection, key: &str) -> Result<i64> {
-    bump(conn, key, "was_useful")
+    bump(conn, key, "times_useful")
 }
 
-/// Increment `column` (`visits` or `was_useful`) for `key` and read it back. `column` is a
+/// Increment `column` (`visits` or `times_useful`) for `key` and read it back. `column` is a
 /// hard-coded literal, never user input.
 fn bump(conn: &Connection, key: &str, column: &str) -> Result<i64> {
     let updated = conn.execute(
@@ -307,7 +308,7 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
 
 /// The canonical column list shared by `get_by_id` and `all`.
 const MEMORY_COLUMNS: &str =
-    "id, key, title, body, tags, source, doc_hash, created, updated, visits, was_useful";
+    "id, key, title, body, tags, source, doc_hash, created, updated, visits, times_useful";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -323,7 +324,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         created: r.get(7)?,
         updated: r.get(8)?,
         visits: r.get(9)?,
-        was_useful: r.get(10)?,
+        times_useful: r.get(10)?,
     })
 }
 

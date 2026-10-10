@@ -62,9 +62,9 @@ pub struct Stats {
     pub largest_component: i64,
     /// Sum of `visits` across the store.
     pub visits_total: i64,
-    /// Sum of `was_useful` across the store.
+    /// Sum of `times_useful` across the store.
     pub useful_total: i64,
-    /// The most-useful memories (key, `was_useful`), count-desc then key — at most [`TOP_USEFUL`].
+    /// The most-useful memories (key, `times_useful`), count-desc then key — at most [`TOP_USEFUL`].
     pub top_useful: Vec<(String, i64)>,
     /// Oldest `created` timestamp, or `None` for an empty store.
     pub oldest: Option<String>,
@@ -163,14 +163,14 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
 
     // Usage telemetry: the two counters, plus the most-useful memories (the store's own gold).
     let (visits_total, useful_total): (i64, i64) = conn.query_row(
-        "SELECT coalesce(sum(visits), 0), coalesce(sum(was_useful), 0) FROM memory",
+        "SELECT coalesce(sum(visits), 0), coalesce(sum(times_useful), 0) FROM memory",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let top_useful: Vec<(String, i64)> = {
         let mut stmt = conn.prepare(
-            "SELECT key, was_useful FROM memory WHERE was_useful > 0 \
-             ORDER BY was_useful DESC, key LIMIT ?1",
+            "SELECT key, times_useful FROM memory WHERE times_useful > 0 \
+             ORDER BY times_useful DESC, key LIMIT ?1",
         )?;
         let rows = stmt.query_map([TOP_USEFUL as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?

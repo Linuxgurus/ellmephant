@@ -228,16 +228,21 @@ Notes: `memory_vec` is **app-written** (SQLite can't embed). FTS is external-con
 
 The store is **atomics-first**; generalization is derived, not stored.
 
-- **Atomic memory = the storage *and* embedding unit.** One fact/decision/gotcha/signpost,
-  terse, self-contained. Focused text embeds sharply; edits are surgical; no staleness cascade.
+- **Atomic memory = the storage *and* embedding unit.** One **topic** — a fact/decision/gotcha/
+  signpost, or several *close* ones, one per line — terse, self-contained. A coherent topic
+  embeds sharply and edits surgically; a grab-bag smears the vector and rots. Split facts that
+  are genuinely distinct.
 - **General views are computed at query time** (fan-out / one-hop expansion), never written.
   Store the atoms, synthesize the whole.
 - **A sparse pointer tier** (`*-overview` notes) is allowed for routing/navigation only —
   pointers, not content; governed by "one home per fact, cross-link don't duplicate."
-- **Write policy** (guided via tool descriptions + a system instruction):
+- **Write policy** (guided via the tool descriptions; the **smart-caveman** style is defined
+  once in the server instructions, the rest on `memory_upsert`):
   **smart-caveman** — drop filler, articles and glue words, keep high-signal words ·
-  one fact per row · **tags** name aspects of the subject · **provenance** in `source`
-  (store the *derivation command*, not live state) · upsert-by-`key` · trim-on-edit
+  one **topic** per row (close facts, one per line; distinct facts split) · **tags** name
+  aspects of the subject · **provenance** in `source` (store the *derivation command*, not live
+  state) · upsert-by-`key` (whole-body replace, **no auto-merge**) · **merge redundant
+  memories by hand** (fold both bodies, upsert the survivor, delete the twin) · trim-on-edit
   (never grow) · never store cheaply-derivable state.
 - **Read policy:** return **titles, tags and scores**, never dumps (tokens regress otherwise);
   the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
@@ -270,12 +275,20 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 
 ## 11. Interfaces
 
-**MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_add`, `memory_update`,
+**MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
 `memory_delete`, `memory_search`,
-`memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`, `memory_stats`.
+`memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`, `memory_stats`,
+`memory_dupes`.
 
-- The server also advertises the §9 write policy as its **instructions**, and each write tool
-  carries it in its description — that is what the model actually reads.
+- **Each tool states its own law in its own description** — that is what the model actually
+  reads, so nothing is written twice. The §9 write policy rides on `memory_upsert`'s
+  description; the read policy on `memory_search`'s; the feedback nudge on `memory_useful`'s.
+  The server-level **instructions** carry the identity and the shared **smart-caveman** style
+  (defined once there, referenced by the write tool).
+- **A tool's description carries policy; its parameter schemas carry the per-field
+  definitions** — the two never restate each other. So `memory_upsert`'s description holds the
+  write *rules* (one topic, trim, merge); each field's `key`/`title`/`body`/`source`/`tags`
+  meaning lives in that field's schema.
 - `memory_search` takes a semantic `phrase` and the ranking knobs `k`, `max_distance` and
   `expand`; there are **no key/tag filters and no regex leg** — `key`/`tags` are not search
   constraints, and `memory_get` reads a known key.
@@ -283,7 +296,8 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   top-level `cols` header names the fields and the rows are bare arrays, **one row per line**
   (whitespace is insignificant to a parser, so a raw result is scannable, not one blob). The
   `cols` header is self-describing (the model can't mis-map columns) while field names aren't
-  repeated per row; distances are rounded to 4 decimals. `memory_search` →
+  repeated per row; distances are rounded to 4 decimals. The convention is announced **once**,
+  in the server **instructions** — individual tool descriptions don't restate it. `memory_search` →
   `{"cols":["key","title","tags","distance"],"hits":[[…],…]}`; link `neighbors` (with `expand>0`)
   carry their own `cols`/`rows` table. `memory_list` →
   `{"cols":["key","title","tags"],"count":N,"memories":[[…],…]}`. `memory_backlinks` →
@@ -293,6 +307,11 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   counters, most-useful memories, age) as one keyed JSON object — the same `Stats` the `stats` CLI
   command emits (`store::stats::compute`); no bodies.
 - `memory_get` is the **only** read that returns a body, and the way to read a known `key`.
+- `memory_dupes` is the **finder for the §9 merge rule**: a read-only audit returning memory
+  *pairs* whose document embeddings sit within a tight cosine ceiling (default `0.05`), nearest
+  first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
+  A **finder, not a judge**: because `key`+tags are folded into the document, merely-related
+  memories cluster too, so candidates are judged (`memory_get` both) before merging. No bodies.
 
 **CLI** — three faces over one core:
 

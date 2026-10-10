@@ -112,9 +112,15 @@ impl Session {
         Ok(mem)
     }
 
-    /// Bump the `was_useful` counter for `key` (explicit agent feedback); returns the new total.
+    /// Bump the `times_useful` counter for `key` (explicit agent feedback); returns the new total.
     pub fn record_useful(&self, key: &str) -> Result<i64> {
         store::record_useful(&self.conn, key)
+    }
+
+    /// Find near-duplicate candidate pairs (the merge finder, SPEC §9). No encoder needed —
+    /// it reads the stored document vectors.
+    pub fn dupes(&self, max_distance: f32, limit: usize) -> Result<Vec<store::dupes::DupePair>> {
+        store::dupes::find(&self.conn, max_distance, limit)
     }
 
     /// Delete one memory by key; `false` means there was nothing to delete.

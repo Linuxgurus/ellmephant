@@ -19,9 +19,10 @@ Internals, design rationale, and development workflow. For the normative specifi
 
 The decisions the code obeys:
 
-- **Atoms, not essays — in smart-caveman.** One memory = one fact, terse and self-contained:
-  drop filler, articles and glue words. Focused text embeds sharply and edits surgically; broad
-  summaries rot. Derived views are computed at query time, not stored.
+- **Topics, not essays — in smart-caveman.** One memory = one topic: terse and self-contained,
+  close facts one per line; distinct facts split. Drop filler, articles and glue words. A
+  coherent topic embeds sharply and edits surgically; grab-bag summaries smear the vector and
+  rot. Derived views are computed at query time, not stored.
 - **`store ≠ embed`.** The row keeps the full, literal text; one **document** (`key` + tags +
   title + link-stripped body) is embedded. The embedding strategy can change without losing what
   was written.

@@ -20,6 +20,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0002_telemetry.sql"),
         "telemetry: visits, was_useful",
     ),
+    (
+        3,
+        include_str!("../../migrations/0003_times_useful.sql"),
+        "rename was_useful -> times_useful",
+    ),
 ];
 
 /// Current schema version recorded in the file.

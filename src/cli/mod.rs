@@ -109,7 +109,7 @@ pub enum Command {
     },
     /// Delete one memory by key.
     Rm { key: String },
-    /// Bump a memory's `was_useful` counter (it earned its keep).
+    /// Bump a memory's `times_useful` counter (it earned its keep).
     Useful { key: String },
     /// List the memory index (key, tags, title) without bodies.
     List {

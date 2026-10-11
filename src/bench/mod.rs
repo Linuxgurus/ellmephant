@@ -96,6 +96,10 @@ fn case_query(case: &Case, k: usize) -> Query {
         k,
         max_distance: None,
         expand: 0,
+        tags: Vec::new(),
+        min_chars: None,
+        max_chars: None,
+        coherent: None,
     }
 }
 

@@ -260,3 +260,32 @@ fn upsert_preserves_counters() {
     assert_eq!(got.title, "A2");
     assert_eq!((got.visits, got.times_useful), (1, 1));
 }
+
+#[test]
+fn upsert_resets_the_coherence_verdict() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = CountingEmbedder::new();
+    store::add(&conn, &embedder, &memory("a", "A", "body", &[])).expect("add");
+
+    // A fresh row is unjudged.
+    assert_eq!(store::get(&conn, "a").unwrap().unwrap().coherent, None);
+
+    assert!(store::set_coherent(&conn, "a", Some(true)).unwrap());
+    assert_eq!(
+        store::get(&conn, "a").unwrap().unwrap().coherent,
+        Some(true)
+    );
+
+    // Unknown key is a no-op, not an error.
+    assert!(!store::set_coherent(&conn, "ghost", Some(false)).unwrap());
+
+    // An upsert resets the verdict (even a byte-identical rewrite re-opens review).
+    store::add(&conn, &embedder, &memory("a", "A", "body", &[])).expect("re-add");
+    assert_eq!(store::get(&conn, "a").unwrap().unwrap().coherent, None);
+
+    // Setting it again does not re-embed (coherent is not part of the document).
+    let calls = embedder.calls();
+    store::set_coherent(&conn, "a", Some(false)).unwrap();
+    assert_eq!(embedder.calls(), calls, "marking must not embed");
+}

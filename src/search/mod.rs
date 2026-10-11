@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::embed::Embedder;
+use crate::embed::{Embedder, projection};
 use crate::error::{Error, Result};
 use crate::index;
 use crate::store::{self, Memory};
@@ -44,6 +44,46 @@ pub struct Query {
     pub max_distance: Option<f32>,
     /// Link-neighbourhood hops to include (0 = off).
     pub expand: u8,
+    /// Tag filter: **every** listed tag must be present (intersection). Empty = no constraint.
+    pub tags: Vec<String>,
+    /// Minimum embedded-document length in chars. `None` = no floor.
+    pub min_chars: Option<usize>,
+    /// Maximum embedded-document length in chars. `None` = no ceiling.
+    pub max_chars: Option<usize>,
+    /// Coherence-verdict filter over `memory.coherent`. `None` = any.
+    pub coherent: Option<Coherent>,
+}
+
+/// A predicate over `memory.coherent` (a nullable bool). `!X` reads "not X", so the six
+/// values are exactly the six non-empty proper subsets of `{true, false, null}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coherent {
+    /// `coherent = true` — judged one coherent topic.
+    True,
+    /// `coherent = false` — judged a grab-bag worth splitting.
+    False,
+    /// `coherent IS NULL` — never judged.
+    Null,
+    /// `NOT true` — false or null (everything not proven coherent; the review queue).
+    NotTrue,
+    /// `NOT false` — true or null.
+    NotFalse,
+    /// `NOT null` — judged at all (true or false).
+    NotNull,
+}
+
+impl Coherent {
+    /// Whether a row's `coherent` value satisfies this predicate.
+    pub fn matches(self, value: Option<bool>) -> bool {
+        match self {
+            Coherent::True => value == Some(true),
+            Coherent::False => value == Some(false),
+            Coherent::Null => value.is_none(),
+            Coherent::NotTrue => value != Some(true),
+            Coherent::NotFalse => value != Some(false),
+            Coherent::NotNull => value.is_some(),
+        }
+    }
 }
 
 /// One hydrated hit: `key`/`title`/`tags` and (semantic only) `distance`. No body.
@@ -59,6 +99,13 @@ pub struct Hit {
     /// Attached tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Split-review verdict (§9): `Some(true)`/`Some(false)`/`None` (unjudged).
+    #[serde(default)]
+    pub coherent: Option<bool>,
+    /// Length (chars) of the row's embedded document — the size the `min_chars`/`max_chars`
+    /// filters key on. Lets a caller sort the fat tail itself (no server-side sort).
+    #[serde(default)]
+    pub chars: usize,
     /// Vector distance when the semantic leg ranked this hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f32>,
@@ -98,11 +145,13 @@ pub fn to_wire_json(bundle: &Bundle) -> Result<String> {
         .iter()
         .map(|h| {
             let distance = h.distance.map(wire_distance);
-            serde_json::json!([h.key, h.title, h.tags, distance])
+            serde_json::json!([h.key, h.title, h.tags, h.coherent, h.chars, distance])
         })
         .collect();
 
-    let mut out = String::from("{\"cols\":[\"key\",\"title\",\"tags\",\"distance\"],\"hits\":");
+    let mut out = String::from(
+        "{\"cols\":[\"key\",\"title\",\"tags\",\"coherent\",\"chars\",\"distance\"],\"hits\":",
+    );
     out.push_str(&crate::wire::rows_array(&hits));
 
     if !bundle.neighbors.is_empty() {
@@ -145,6 +194,11 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         Some(p) => p,
         None => all_ranked(conn)?,
     };
+    // Structured filters intersect the candidate set BEFORE the k cap, so a filtered result
+    // is exact (the KNN already spans the whole store): filter, then truncate, never the reverse.
+    if let Some(set) = filter_set(conn, q)? {
+        ordered.retain(|(id, _)| set.contains(id));
+    }
     if ranked {
         ordered.truncate(q.k.max(1)); // k caps the distance-ranked case only
     }
@@ -154,11 +208,14 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         let Some(mem) = store::get_by_id(conn, id)? else {
             continue; // the leg returned an id that vanished; skip, don't fail the query
         };
+        let chars = embedded_len(&mem);
         hits.push(Hit {
             id,
             key: mem.key,
             title: mem.title,
             tags: mem.tags,
+            coherent: mem.coherent,
+            chars,
             distance,
         });
     }
@@ -169,6 +226,49 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         Vec::new()
     };
     Ok(Bundle { hits, neighbors })
+}
+
+/// The ids passing every structured predicate (`tags`, size, `coherent`), or `None` when the
+/// query carries none (no filtering). Size is the length of the row's embedded document.
+fn filter_set(conn: &Connection, q: &Query) -> Result<Option<HashSet<i64>>> {
+    if q.tags.is_empty() && q.min_chars.is_none() && q.max_chars.is_none() && q.coherent.is_none() {
+        return Ok(None);
+    }
+    let mut set = HashSet::new();
+    for mem in store::all(conn)? {
+        if passes(&mem, q)
+            && let Some(id) = mem.id
+        {
+            set.insert(id);
+        }
+    }
+    Ok(Some(set))
+}
+
+/// Whether `mem` satisfies every structured predicate in `q` (tags AND, size range, coherence).
+fn passes(mem: &Memory, q: &Query) -> bool {
+    if !q
+        .tags
+        .iter()
+        .all(|want| mem.tags.iter().any(|t| t.eq_ignore_ascii_case(want.trim())))
+    {
+        return false;
+    }
+    let chars = embedded_len(mem);
+    if q.min_chars.is_some_and(|min| chars < min) || q.max_chars.is_some_and(|max| chars > max) {
+        return false;
+    }
+    if q.coherent.is_some_and(|c| !c.matches(mem.coherent)) {
+        return false;
+    }
+    true
+}
+
+/// Length (chars) of the document a row embeds: `key` + tags + `title` + `body`, links stripped.
+fn embedded_len(mem: &Memory) -> usize {
+    projection::embed_document(&mem.key, &mem.tags, &mem.title, &mem.body)
+        .chars()
+        .count()
 }
 
 /// Every id, `key` order — the "no constraints at all" case.
@@ -299,6 +399,10 @@ mod tests {
             k: 10,
             max_distance: None,
             expand: 0,
+            tags: Vec::new(),
+            min_chars: None,
+            max_chars: None,
+            coherent: None,
         };
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         // No phrase ⇒ no candidates, and no embedder required.

@@ -25,6 +25,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0003_times_useful.sql"),
         "rename was_useful -> times_useful",
     ),
+    (
+        4,
+        include_str!("../../migrations/0004_coherent.sql"),
+        "coherent: split-review verdict",
+    ),
 ];
 
 /// Current schema version recorded in the file.

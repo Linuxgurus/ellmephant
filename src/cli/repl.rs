@@ -24,8 +24,8 @@ use super::session::Session;
 
 /// Verbs offered by tab-completion: the REPL's own plus the one-shot tree.
 const COMMANDS: &[&str] = &[
-    "add", "search", "show", "rm", "useful", "list", "tags", "stats", "rename", "reembed", "links",
-    "help", "quit", "exit",
+    "add", "search", "show", "rm", "useful", "coherent", "list", "tags", "stats", "rename",
+    "reembed", "links", "help", "quit", "exit",
 ];
 
 /// A REPL line, parsed with the exact `Command` tree the one-shot CLI uses.
@@ -61,7 +61,7 @@ impl Completer for ReplHelper {
         let verb = head[..start].split_whitespace().next();
         let candidates = match verb {
             None => candidates(COMMANDS.iter().copied(), word),
-            Some("show" | "rm" | "useful" | "rename") => {
+            Some("show" | "rm" | "useful" | "coherent" | "rename") => {
                 let keys = self.keys.borrow();
                 candidates(keys.iter().map(String::as_str), word)
             }
@@ -201,6 +201,7 @@ fn print_help() {
          \x20 show KEY [--json]\n\
          \x20 rm KEY\n\
          \x20 useful KEY\n\
+         \x20 coherent KEY [true|false|null]\n\
          \x20 list [--json]\n\
          \x20 tags [--json]\n\
          \x20 stats [--json]\n\

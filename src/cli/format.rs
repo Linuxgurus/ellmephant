@@ -306,6 +306,8 @@ mod tests {
             id: 1,
             key: "infra-gitops".into(),
             title: "GitOps & registry".into(),
+            coherent: Some(true),
+            chars: 120,
             distance: Some(0.25),
             tags: vec!["k8s".into()],
         }
@@ -342,6 +344,7 @@ mod tests {
             updated: "2026-01-02 00:00:00".into(),
             visits: 3,
             times_useful: 1,
+            coherent: None,
         }
     }
 

@@ -1,7 +1,7 @@
 //! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_upsert`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`, `memory_stats`,
+//! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_useful`, `memory_stats`,
 //! `memory_dupes` — with read-only annotations on the read tools and destructive on `delete`.
 //! The tool descriptions carry the SPEC §9 write policy; that is where memory quality is
 //! actually tuned. `memory_get` counts a `visits` read and `memory_useful` bumps the
@@ -36,7 +36,7 @@ use crate::error::Error;
 use crate::model;
 use crate::search::{Bundle, Query, to_wire_json};
 use crate::store::links::backlinks_to_wire_json;
-use crate::store::{self, Memory, summaries_to_wire_json};
+use crate::store::{self, Memory};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
@@ -45,7 +45,7 @@ pub const TOOLS: &[&str] = &[
     "memory_search",
     "memory_get",
     "memory_backlinks",
-    "memory_list",
+    "memory_coherent",
     "memory_useful",
     "memory_stats",
     "memory_dupes",
@@ -79,6 +79,10 @@ merging. The finder for the merge rule.";
 
 /// Cap on returned dupe pairs for a bare `memory_dupes` call.
 const DUPES_LIMIT: usize = 50;
+
+/// `memory_coherent` description. The split-review law rides here, in its owning tool only.
+const COHERENT_DESCRIPTION: &str = "\
+Record a memory's split-review verdict: `true` = one coherent topic, `false` = a grab-bag worth splitting, omit/`null` = unjudged. Reset to null automatically on the next upsert, so an edit re-opens review. Find the fat tail with `memory_search` (`min_chars`, `coherent`).";
 
 /// Parameters for [`MemoryServer::memory_upsert`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -136,6 +140,61 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Link-neighbour hops drag in (0 = off).")]
     pub expand: Option<u8>,
+    /// Tag filter (AND).
+    #[serde(default)]
+    #[schemars(description = "Tag filter; a memory must carry EVERY listed tag.")]
+    pub tags: Vec<String>,
+    /// Minimum embedded-document size.
+    #[serde(default)]
+    #[schemars(description = "Minimum embedded-document size, in chars.")]
+    pub min_chars: Option<usize>,
+    /// Maximum embedded-document size.
+    #[serde(default)]
+    #[schemars(description = "Maximum embedded-document size, in chars.")]
+    pub max_chars: Option<usize>,
+    /// Coherence-verdict filter.
+    #[serde(default)]
+    #[schemars(description = "Split-review verdict: `true`, `false`, `null`, or negate with `!`.")]
+    pub coherent: Option<CoherentFilter>,
+}
+
+/// The `memory_search` coherence filter — a nullable bool with negation. `!X` reads "not X",
+/// so the six values are the six non-empty proper subsets of `{true, false, null}`.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+pub enum CoherentFilter {
+    /// `coherent = true` — one topic.
+    #[serde(rename = "true")]
+    True,
+    /// `coherent = false` — a grab-bag.
+    #[serde(rename = "false")]
+    False,
+    /// `coherent IS NULL` — unjudged.
+    #[serde(rename = "null")]
+    Null,
+    /// Not proven coherent (false or null).
+    #[serde(rename = "!true")]
+    NotTrue,
+    /// Not proven a grab-bag (true or null).
+    #[serde(rename = "!false")]
+    NotFalse,
+    /// Judged at all (true or false).
+    #[serde(rename = "!null")]
+    NotNull,
+}
+
+impl CoherentFilter {
+    /// Map the wire enum onto the search-layer predicate.
+    fn to_coherent(self) -> crate::search::Coherent {
+        use crate::search::Coherent;
+        match self {
+            CoherentFilter::True => Coherent::True,
+            CoherentFilter::False => Coherent::False,
+            CoherentFilter::Null => Coherent::Null,
+            CoherentFilter::NotTrue => Coherent::NotTrue,
+            CoherentFilter::NotFalse => Coherent::NotFalse,
+            CoherentFilter::NotNull => Coherent::NotNull,
+        }
+    }
 }
 
 /// A single-key request.
@@ -146,7 +205,7 @@ pub struct KeyParams {
     pub key: String,
 }
 
-/// Parameters for [`MemoryServer::memory_list`].
+/// Parameters for a no-argument tool (`memory_stats`).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {}
 
@@ -161,6 +220,20 @@ pub struct DupesParams {
     #[serde(default)]
     #[schemars(description = "Most pairs to return, nearest first.")]
     pub limit: Option<usize>,
+}
+
+/// Parameters for [`MemoryServer::memory_coherent`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CoherentParams {
+    /// The memory's key.
+    #[schemars(description = "Memory key. Slug.")]
+    pub key: String,
+    /// The verdict.
+    #[serde(default)]
+    #[schemars(
+        description = "true = one topic; false = a grab-bag to split; omit/null = unjudged."
+    )]
+    pub coherent: Option<bool>,
 }
 
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
@@ -328,7 +401,7 @@ impl MemoryServer {
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
-        description = "Hunt memory by meaning. Whole document (key, tags, title, body) sits in the embedding, so a phrase touching any part raises the memory. Hits give key, title, tags, distance — never the body; `memory_get` only the hit you use. Start small `k`; none fit? Widen — raise `k`, loosen `max_distance`. Know the `key`? `memory_get` instead.",
+        description = "Hunt memory by meaning, or filter it. `query` = semantic phrase; whole document (key, tags, title, body) sits in the embedding, so a phrase touching any part raises the memory. Filters intersect — a hit must satisfy every one given: `tags` (each listed tag present), `min_chars`/`max_chars` (embedded-document size), `coherent` (`true`/`false`/`null`, or negate with `!`). No `query`? Then it is a pure filter over the store (key order, uncapped). Hits give key, title, tags, coherent, chars, distance — never the body; `memory_get` only the hit you use. Start small `k`; none fit? Widen — raise `k`, loosen `max_distance`. Know the `key`? `memory_get` instead.",
         annotations(
             title = "Search memory",
             read_only_hint = true,
@@ -345,6 +418,10 @@ impl MemoryServer {
         let k = p.k;
         let max_distance = p.max_distance;
         let expand = p.expand.unwrap_or(0);
+        let tags = p.tags;
+        let min_chars = p.min_chars;
+        let max_chars = p.max_chars;
+        let coherent = p.coherent.map(CoherentFilter::to_coherent);
         // Keep a copy for the log line: the original moves into the store closure.
         let log_query = query.clone();
         let started = std::time::Instant::now();
@@ -356,6 +433,10 @@ impl MemoryServer {
                     // Fall back to the configured ceiling so a bare semantic search is capped.
                     max_distance: max_distance.or_else(|| s.default_max_distance()),
                     expand,
+                    tags,
+                    min_chars,
+                    max_chars,
+                    coherent,
                 };
                 s.search(&q)
             })
@@ -448,27 +529,33 @@ impl MemoryServer {
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
     }
 
-    /// List the store's index (no bodies).
+    /// Record a memory's split-review verdict (coherent / grab-bag / unjudged).
     #[tool(
-        name = "memory_list",
-        description = "List the store index — `key`, `tags`, `title` per memory. Browse; pick key(s) before get/search.",
+        name = "memory_coherent",
+        description = COHERENT_DESCRIPTION,
         annotations(
-            title = "List memories",
-            read_only_hint = true,
+            title = "Mark coherent",
+            read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
-    async fn memory_list(
+    async fn memory_coherent(
         &self,
-        Parameters(_): Parameters<ListParams>,
+        Parameters(p): Parameters<CoherentParams>,
     ) -> std::result::Result<String, String> {
-        let memories = self
-            .with_store("memory_list", move |s| s.summaries())
+        let key = p.key;
+        let coherent = p.coherent;
+        let mark = key.clone();
+        self.with_store("memory_coherent", move |s| s.mark_coherent(&mark, coherent))
             .await?;
-        tracing::info!(tool = "memory_list", count = memories.len(), "listed");
-        summaries_to_wire_json(&memories).map_err(|e| e.to_string())
+        tracing::info!(tool = "memory_coherent", key = %key, coherent = ?coherent, "marked");
+        Ok(json_ok(serde_json::json!({
+            "status": "marked",
+            "key": key,
+            "coherent": coherent,
+        })))
     }
 
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
@@ -663,7 +750,6 @@ mod tests {
             "memory_search",
             "memory_get",
             "memory_backlinks",
-            "memory_list",
             "memory_stats",
             "memory_dupes",
         ] {
@@ -680,6 +766,9 @@ mod tests {
         assert_eq!(ann("memory_useful").read_only_hint, Some(false));
         assert_eq!(ann("memory_useful").destructive_hint, Some(false));
         assert_eq!(ann("memory_upsert").idempotent_hint, Some(true));
+        // The split-review mark writes, non-destructively.
+        assert_eq!(ann("memory_coherent").read_only_hint, Some(false));
+        assert_eq!(ann("memory_coherent").destructive_hint, Some(false));
 
         // The write *policy* rides on the upsert description (SPEC §9)...
         let upsert = find("memory_upsert")
@@ -689,7 +778,10 @@ mod tests {
         assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
         // The pre-write split nudge: evaluate, then action = one call per atom.
-        assert!(upsert.to_lowercase().contains("separate memories"), "{upsert}");
+        assert!(
+            upsert.to_lowercase().contains("separate memories"),
+            "{upsert}"
+        );
         // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
             .input_schema
@@ -711,31 +803,35 @@ mod tests {
             "field defs belong on the fields: {upsert}"
         );
 
-        // Search filters by phrase only — no key/tag constraints anywhere in the schema.
+        // Search carries the semantic phrase plus the structured filters — but no `key` leg
+        // (a known key is `memory_get`) and no literal/regex `match` mode.
         let props = find("memory_search")
             .input_schema
             .get("properties")
             .and_then(|v| v.as_object())
             .cloned()
             .expect("search schema has properties");
-        for gone in ["key", "tags", "tag_match", "field", "match"] {
+        for gone in ["key", "tag_match", "field", "match"] {
             assert!(
                 !props.contains_key(gone),
                 "memory_search must not expose {gone}: {props:?}"
             );
         }
-        // Only the phrase and its ranking knobs remain.
         let mut searchable: Vec<&str> = props.keys().map(String::as_str).collect();
         searchable.sort();
-        assert_eq!(searchable, ["expand", "k", "max_distance", "query"]);
-        // `memory_list` is unfiltered now (no `tag`).
-        let list_props = find("memory_list")
-            .input_schema
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        assert!(!list_props.contains_key("tag"), "{list_props:?}");
+        assert_eq!(
+            searchable,
+            [
+                "coherent",
+                "expand",
+                "k",
+                "max_chars",
+                "max_distance",
+                "min_chars",
+                "query",
+                "tags"
+            ]
+        );
 
         // The read law rides on the search description, not the server instructions.
         let search = find("memory_search")

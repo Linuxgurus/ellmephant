@@ -36,6 +36,10 @@ fn query(text: Option<&str>) -> Query {
         k: 10,
         max_distance: None,
         expand: 0,
+        tags: Vec::new(),
+        min_chars: None,
+        max_chars: None,
+        coherent: None,
     }
 }
 
@@ -204,6 +208,8 @@ fn wire_json_is_positional_with_a_cols_header() {
             key: "k".into(),
             title: "T".into(),
             tags: vec!["a".into(), "b".into()],
+            coherent: Some(true),
+            chars: 3,
             distance: Some(0.42),
         }],
         neighbors: vec![],
@@ -212,11 +218,11 @@ fn wire_json_is_positional_with_a_cols_header() {
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "title", "tags", "distance"])
+        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
     );
     assert_eq!(
         v["hits"][0],
-        serde_json::json!(["k", "T", ["a", "b"], 0.42])
+        serde_json::json!(["k", "T", ["a", "b"], true, 3, 0.42])
     );
     assert!(
         v.get("neighbors").is_none(),
@@ -255,4 +261,53 @@ fn wire_json_emits_a_neighbors_table_when_expanded() {
         v["neighbors"]["rows"][0],
         serde_json::json!([1, "seed", "linked", "Linked", ["t"], "a snippet"])
     );
+}
+
+#[test]
+fn tag_and_size_filters_intersect() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let big = format!("word {}", "x ".repeat(200));
+    seed(&conn, &embedder, "long-k8s", &big, &["k8s"]);
+    seed(&conn, &embedder, "short-k8s", "tiny", &["k8s"]);
+    seed(&conn, &embedder, "long-web", &big, &["web"]);
+
+    // No phrase: a pure filter. The tag keeps the k8s rows, the size floor keeps the long one.
+    let mut q = query(None);
+    q.tags = vec!["k8s".into()];
+    q.min_chars = Some(100);
+    let hits = search::run(&conn, None, &q).expect("search").hits;
+    assert_eq!(
+        hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        ["long-k8s"]
+    );
+    assert!(hits[0].chars >= 100, "{}", hits[0].chars);
+}
+
+#[test]
+fn coherent_filter_selects_by_verdict() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "a", "one", &[]);
+    seed(&conn, &embedder, "b", "two", &[]);
+    store::set_coherent(&conn, "a", Some(true)).expect("mark");
+
+    let keys = |c: search::Coherent| {
+        let mut q = query(None);
+        q.coherent = Some(c);
+        search::run(&conn, None, &q)
+            .expect("search")
+            .hits
+            .into_iter()
+            .map(|h| h.key)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(keys(search::Coherent::True), ["a"]);
+    assert_eq!(keys(search::Coherent::Null), ["b"]);
+    assert_eq!(keys(search::Coherent::NotNull), ["a"]);
+    assert_eq!(keys(search::Coherent::NotTrue), ["b"]);
+    assert_eq!(keys(search::Coherent::False), Vec::<String>::new());
 }

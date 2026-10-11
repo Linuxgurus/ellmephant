@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Paths};
 use crate::error::{Error, Result};
-use crate::search::Query;
+use crate::search::{Coherent, Query};
 use crate::store::Memory;
 use crate::store::stats;
 
@@ -83,9 +83,9 @@ pub enum Command {
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
-    /// Semantic phrase search over the embedded document.
+    /// Semantic phrase search, with optional tag/size/coherence filters (all intersect).
     Search {
-        /// The phrase.
+        /// The phrase; omit for a pure filter over the store.
         query: Option<String>,
         /// Result count.
         #[arg(long)]
@@ -99,6 +99,18 @@ pub enum Command {
         /// Link-neighbourhood hops to include.
         #[arg(long, default_value_t = 0)]
         expand: u8,
+        /// Repeatable tag; a memory must carry every tag given.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Minimum embedded-document size (chars).
+        #[arg(long)]
+        min_chars: Option<usize>,
+        /// Maximum embedded-document size (chars).
+        #[arg(long)]
+        max_chars: Option<usize>,
+        /// Coherence filter: true|false|null|!true|!false|!null.
+        #[arg(long)]
+        coherent: Option<String>,
     },
     /// Print one memory by key.
     Show {
@@ -111,6 +123,13 @@ pub enum Command {
     Rm { key: String },
     /// Bump a memory's `times_useful` counter (it earned its keep).
     Useful { key: String },
+    /// Set a memory's split-review verdict (coherent / grab-bag / unjudged).
+    Coherent {
+        key: String,
+        /// `true` (one topic), `false` (a grab-bag), or `null`/`clear` (unjudged).
+        #[arg(default_value = "null")]
+        value: String,
+    },
     /// List the memory index (key, tags, title) without bodies.
     List {
         /// Emit JSON.
@@ -330,18 +349,27 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
             max_distance,
             json,
             expand,
+            tags,
+            min_chars,
+            max_chars,
+            coherent,
         } => {
             let q = Query {
                 text: query,
                 k: k.unwrap_or_else(|| session.default_k()),
                 max_distance: max_distance.or(session.default_max_distance()),
                 expand,
+                tags,
+                min_chars,
+                max_chars,
+                coherent: coherent.as_deref().map(parse_coherent).transpose()?,
             };
             cmd_search(session, q, json)
         }
         Command::Show { key, json } => cmd_show(session, &key, json),
         Command::Rm { key } => cmd_rm(session, &key),
         Command::Useful { key } => cmd_useful(session, &key),
+        Command::Coherent { key, value } => cmd_coherent(session, &key, &value),
         Command::List { json } => cmd_list(session, json),
         Command::Tags { json } => cmd_tags(session, json),
         Command::Stats { json } => cmd_stats(session, json),
@@ -368,6 +396,49 @@ fn cmd_search(session: &mut Session, q: Query, json: bool) -> Result<()> {
     let bundle = session.search(&q)?;
     emit(format::render_bundle(&bundle, json)?);
     Ok(())
+}
+
+fn cmd_coherent(session: &Session, key: &str, value: &str) -> Result<()> {
+    let verdict = parse_verdict(value)?;
+    session.mark_coherent(key, verdict)?;
+    let shown = match verdict {
+        Some(true) => "coherent",
+        Some(false) => "grab-bag",
+        None => "unjudged",
+    };
+    println!("{key} -> {shown}");
+    Ok(())
+}
+
+/// Parse a `--coherent` filter value (a nullable bool with `!` negation).
+fn parse_coherent(value: &str) -> Result<Coherent> {
+    Ok(match value.trim() {
+        "true" => Coherent::True,
+        "false" => Coherent::False,
+        "null" => Coherent::Null,
+        "!true" => Coherent::NotTrue,
+        "!false" => Coherent::NotFalse,
+        "!null" => Coherent::NotNull,
+        other => {
+            return Err(Error::Config(format!(
+                "bad coherent filter: {other} (want true|false|null|!true|!false|!null)"
+            )));
+        }
+    })
+}
+
+/// Parse a `coherent` verdict value into a nullable bool (`null`/`clear` = unjudged).
+fn parse_verdict(value: &str) -> Result<Option<bool>> {
+    Ok(match value.trim() {
+        "true" | "coherent" => Some(true),
+        "false" | "incoherent" | "grab-bag" => Some(false),
+        "null" | "clear" | "unknown" => None,
+        other => {
+            return Err(Error::Config(format!(
+                "bad verdict: {other} (want true|false|null)"
+            )));
+        }
+    })
 }
 
 fn cmd_show(session: &Session, key: &str, json: bool) -> Result<()> {

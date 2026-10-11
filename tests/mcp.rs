@@ -151,7 +151,7 @@ async fn tools_round_trip_over_the_transport() {
     // Positional wire: a `cols` header names the fields, rows are bare arrays.
     assert_eq!(
         found["cols"],
-        serde_json::json!(["key", "title", "tags", "distance"])
+        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
     );
     assert_eq!(found["hits"][0][0], serde_json::json!("infra-logs"));
 
@@ -349,8 +349,9 @@ async fn tools_round_trip_over_http() {
 }
 
 #[tokio::test]
-async fn list_tool_reports_the_index_without_bodies() {
-    // `memory_list` is the read-out surface: the whole store index, no bodies.
+async fn search_filters_and_coherence_mark_round_trip() {
+    // `memory_search` filters on tags/size/coherence; `memory_coherent` records the verdict,
+    // which an upsert resets, and a `coherent` filter then selects.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path()));
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -365,32 +366,92 @@ async fn list_tool_reports_the_index_without_bodies() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    for key in ["note-one", "note-two"] {
+    async fn hits(client: &Peer<RoleClient>, args: serde_json::Value) -> usize {
+        let r = call(client, "memory_search", args).await;
+        assert!(!r.is_error.unwrap_or(false), "search failed: {}", text(&r));
+        let v: serde_json::Value = serde_json::from_str(&text(&r)).expect("search json");
+        v["hits"].as_array().unwrap().len()
+    }
+
+    for (key, body) in [
+        ("note-long", "alpha ".repeat(50)),
+        ("note-short", "beta".to_string()),
+    ] {
         let added = call(
             &client,
             "memory_upsert",
-            serde_json::json!({
-                "key": key, "title": key, "body": format!("body for {key}"),
-                "tags": ["infra"],
-            }),
+            serde_json::json!({ "key": key, "title": key, "body": body, "tags": ["infra"] }),
         )
         .await;
         assert!(!added.is_error.unwrap_or(false), "{}", text(&added));
     }
 
-    let listed = call(&client, "memory_list", serde_json::json!({})).await;
-    assert!(!listed.is_error.unwrap_or(false), "{}", text(&listed));
-    let raw = text(&listed);
-    let listed: serde_json::Value = serde_json::from_str(&raw).expect("list json");
-    // Positional wire: a `cols` header names the fields, rows are bare arrays.
-    assert_eq!(listed["cols"], serde_json::json!(["key", "title", "tags"]));
-    assert_eq!(listed["count"], serde_json::json!(2));
-    assert_eq!(listed["memories"][0][0], serde_json::json!("note-one"));
-    assert_eq!(listed["memories"][0][2], serde_json::json!(["infra"]));
-    assert!(
-        !raw.contains("\"body\""),
-        "list must not carry bodies: {raw}"
+    // Filters intersect: the tag keeps both, the size floor keeps the long one.
+    let filtered = call(
+        &client,
+        "memory_search",
+        serde_json::json!({ "tags": ["infra"], "min_chars": 100 }),
+    )
+    .await;
+    let filtered: serde_json::Value = serde_json::from_str(&text(&filtered)).expect("search json");
+    assert_eq!(
+        filtered["cols"],
+        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
     );
+    assert_eq!(filtered["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["hits"][0][0], serde_json::json!("note-long"));
+
+    // Both start unjudged (null).
+    assert_eq!(
+        hits(&client, serde_json::json!({ "coherent": "null" })).await,
+        2
+    );
+
+    // Mark the long note a grab-bag: `false` finds it, `null` finds the other, `!true` both.
+    let marked = call(
+        &client,
+        "memory_coherent",
+        serde_json::json!({ "key": "note-long", "coherent": false }),
+    )
+    .await;
+    assert!(!marked.is_error.unwrap_or(false), "{}", text(&marked));
+    assert_eq!(
+        hits(&client, serde_json::json!({ "coherent": "false" })).await,
+        1
+    );
+    assert_eq!(
+        hits(&client, serde_json::json!({ "coherent": "null" })).await,
+        1
+    );
+    assert_eq!(
+        hits(&client, serde_json::json!({ "coherent": "!true" })).await,
+        2
+    );
+
+    // An upsert resets the verdict to unjudged (the row changed, so re-judge it).
+    call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "note-long", "title": "note-long", "body": "changed", "tags": ["infra"] }),
+    )
+    .await;
+    assert_eq!(
+        hits(&client, serde_json::json!({ "coherent": "null" })).await,
+        2
+    );
+    assert_eq!(
+        hits(&client, serde_json::json!({ "coherent": "false" })).await,
+        0
+    );
+
+    // An unknown key is a tool error.
+    let bogus = call(
+        &client,
+        "memory_coherent",
+        serde_json::json!({ "key": "ghost", "coherent": true }),
+    )
+    .await;
+    assert_eq!(bogus.is_error, Some(true));
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");

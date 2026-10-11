@@ -62,8 +62,10 @@ small words out; drop filler, articles, glue. List-shaped reads return a positio
 /// model reads before a write.
 const UPSERT_DESCRIPTION: &str = "\
 Upsert one memory. WRITE in smart-caveman. One topic per memory — cluster close facts; split \
-distinct. Trim, never grow. Merge redundant memories by hand: fold less useful into more useful and \
-`memory_delete` the less useful. Skip memory/facts when cheap to derive, live state, or one-off.";
+distinct. Before saving, check: does the body hold ≥2 distinct retrieval intents? Then upsert them \
+as separate memories, one call each — never a misc/gotchas bucket; each atom must stand alone \
+(≥2-3 facts). Trim, never grow. Merge redundant memories by hand: fold less useful into more useful \
+and `memory_delete` the less useful. Skip memory/facts when cheap to derive, live state, or one-off.";
 
 /// `memory_useful` description. The feedback nudge, carried here only.
 const USEFUL_DESCRIPTION: &str =
@@ -686,6 +688,8 @@ mod tests {
             .expect("description");
         assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
+        // The pre-write split nudge: evaluate, then action = one call per atom.
+        assert!(upsert.to_lowercase().contains("separate memories"), "{upsert}");
         // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
             .input_schema

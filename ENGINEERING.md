@@ -108,20 +108,25 @@ ellmephant embed "where do the logs live" --query   # dim + load/embed latency +
 
 ## Search
 
-A search matches a single **semantic phrase**: the query is embedded (with the instruction
-prefix) and the KNN of the whole store is taken, capped by `--max-distance` and truncated to
-`-k`. `--expand N` appends the N-hop link neighbourhood. There are no key/tag filters and no
-regex leg — `key`/`tags` are identity and lookup, and are part of the embedded document.
+A search is a **semantic phrase plus optional structured filters**, which **intersect** (a hit
+must satisfy every one given). The phrase is embedded (with the query-side instruction prefix)
+and the KNN of the whole store is taken, capped by `--max-distance` and truncated to `-k`;
+**with no phrase it is a pure filter** over the store (every matching row, key order, uncapped).
+Filters apply *before* the `k` cap, so a result shorter than `-k` means the distance ceiling cut
+it, not `-k`. There is no regex/key leg — `key`/`tags` are part of the embedded document.
 
 ```sh
-ellmephant search "where do the logs live"             # semantic, k=5
-ellmephant search "portainer-notes-gw"                 # key/tag tokens are in the embedding
-ellmephant search "backups" --expand 1                 # + linked neighbours
+ellmephant search "where do the logs live"                 # semantic, k=5
+ellmephant search "portainer-notes-gw"                     # key/tag tokens are in the embedding
+ellmephant search "backups" --expand 1                     # + linked neighbours
+ellmephant search --tag k8s --tag gotchas                  # phrase-less: AND filter, all rows
+ellmephant search --min-chars 1000 --coherent '!true'      # the §9 split-review queue
 ```
 
-Results are ordered by ascending distance. Each hit carries `key`, `title`, `tags` and
-`distance` — never the body. The read policy is titles and tags, never full dumps; a body is a
-`show`/`memory_get` away.
+Results are ordered by ascending distance. A hit carries no body: the terminal shows
+`key`/`title`/`tags`/`distance`; the MCP wire returns **`key` alone by default** unless the
+caller names extra `fields` (§10 of `SPEC.md`). The read policy is titles and tags, never full
+dumps; a body is a `show`/`memory_get` away.
 
 ## Wiki links
 

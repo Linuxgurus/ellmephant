@@ -73,7 +73,7 @@ pub fn render_memory(mem: &Memory, json: bool) -> Result<String> {
     out.push_str(&format!("  times   {} -> {}\n", mem.created, mem.updated));
     out.push_str(&format!(
         "  use     {} visit(s), {} useful\n",
-        mem.visits, mem.was_useful
+        mem.visits, mem.times_useful
     ));
     out.push_str("  body\n");
     for line in mem.body.lines() {
@@ -306,6 +306,8 @@ mod tests {
             id: 1,
             key: "infra-gitops".into(),
             title: "GitOps & registry".into(),
+            coherent: Some(true),
+            chars: 120,
             distance: Some(0.25),
             tags: vec!["k8s".into()],
         }
@@ -341,7 +343,8 @@ mod tests {
             created: "2026-01-01 00:00:00".into(),
             updated: "2026-01-02 00:00:00".into(),
             visits: 3,
-            was_useful: 1,
+            times_useful: 1,
+            coherent: None,
         }
     }
 

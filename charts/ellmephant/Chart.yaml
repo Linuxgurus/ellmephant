@@ -2,8 +2,8 @@ apiVersion: v2
 name: ellmephant
 description: Single-binary, SQLite-backed long-term memory for AI agents (MCP over HTTP)
 type: application
-version: 0.1.0
-appVersion: "1.0.1"
+version: 0.2.0
+appVersion: "1.1.0"
 home: https://github.com/jdblack/ellmephant
 sources:
   - https://github.com/jdblack/ellmephant
@@ -29,7 +29,9 @@ annotations:
       url: https://github.com/jdblack/ellmephant/blob/main/README.md
   artifacthub.io/images: |
     - name: ellmephant
-      image: ghcr.io/jdblack/ellmephant:1.0.1
+      image: ghcr.io/jdblack/ellmephant:1.1.0
   artifacthub.io/changes: |
+    - kind: removed
+      description: "the optional TypingMind MCP connector (use the standalone compose stack in TYPINGMIND.md)"
     - kind: added
-      description: "Initial chart: MCP server over HTTP, Gateway API exposure, optional TypingMind connector"
+      description: "Gateway API exposure (ListenerSet + ReferenceGrant + HTTPRoute) and a configurable weights-cache PVC"

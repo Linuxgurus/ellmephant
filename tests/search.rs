@@ -9,7 +9,7 @@ mod common;
 use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
-use ellmephant::search::{self, Hit, Neighbor, Query};
+use ellmephant::search::{self, Field, Fields, Hit, Neighbor, Query};
 use ellmephant::store::{self, Memory};
 use rusqlite::Connection;
 
@@ -36,6 +36,10 @@ fn query(text: Option<&str>) -> Query {
         k: 10,
         max_distance: None,
         expand: 0,
+        tags: Vec::new(),
+        min_chars: None,
+        max_chars: None,
+        coherent: None,
     }
 }
 
@@ -204,19 +208,23 @@ fn wire_json_is_positional_with_a_cols_header() {
             key: "k".into(),
             title: "T".into(),
             tags: vec!["a".into(), "b".into()],
+            coherent: Some(true),
+            chars: 3,
             distance: Some(0.42),
         }],
         neighbors: vec![],
     };
-    let wire = search::to_wire_json(&bundle).expect("wire");
+    // Every field requested: the full six-column shape, in canonical order.
+    let all = Fields::selection(Field::ALL);
+    let wire = search::to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "title", "tags", "distance"])
+        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
     );
     assert_eq!(
         v["hits"][0],
-        serde_json::json!(["k", "T", ["a", "b"], 0.42])
+        serde_json::json!(["k", "T", ["a", "b"], true, 3, 0.42])
     );
     assert!(
         v.get("neighbors").is_none(),
@@ -227,6 +235,48 @@ fn wire_json_is_positional_with_a_cols_header() {
     assert!(!wire.contains("\"body\""), "hits carry no body: {wire}");
     // One row per line, so a raw result is scannable rather than a wall of blob.
     assert_eq!(wire.lines().count(), 3, "open+row+close: {wire}");
+}
+
+#[test]
+fn wire_json_defaults_to_key_only() {
+    let bundle = search::Bundle {
+        hits: vec![Hit {
+            id: 1,
+            key: "k".into(),
+            title: "T".into(),
+            tags: vec!["a".into()],
+            coherent: Some(true),
+            chars: 3,
+            distance: Some(0.42),
+        }],
+        neighbors: vec![],
+    };
+    // Nothing asked for: a hit is just its key — the lean default (SPEC §10).
+    let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    assert_eq!(v["cols"], serde_json::json!(["key"]));
+    assert_eq!(v["hits"][0], serde_json::json!(["k"]));
+}
+
+#[test]
+fn fields_always_include_key_and_keep_canonical_order() {
+    // `key` leads even when unrequested, and the rest come in canonical order regardless of the
+    // order they were named in.
+    let fields = Fields::selection([Field::Distance, Field::Title]);
+    assert_eq!(
+        fields.names().collect::<Vec<_>>(),
+        ["key", "title", "distance"]
+    );
+
+    // An empty selection still yields `key`.
+    let empty = Fields::selection(Vec::new());
+    assert_eq!(empty.names().collect::<Vec<_>>(), ["key"]);
+
+    // Wire names round-trip through `parse`.
+    for f in Field::ALL {
+        assert_eq!(Field::parse(f.name()), Some(f));
+    }
+    assert_eq!(Field::parse("nope"), None);
 }
 
 #[test]
@@ -245,7 +295,7 @@ fn wire_json_emits_a_neighbors_table_when_expanded() {
             },
         }],
     };
-    let wire = search::to_wire_json(&bundle).expect("wire");
+    let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["neighbors"]["cols"],
@@ -255,4 +305,53 @@ fn wire_json_emits_a_neighbors_table_when_expanded() {
         v["neighbors"]["rows"][0],
         serde_json::json!([1, "seed", "linked", "Linked", ["t"], "a snippet"])
     );
+}
+
+#[test]
+fn tag_and_size_filters_intersect() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let big = format!("word {}", "x ".repeat(200));
+    seed(&conn, &embedder, "long-k8s", &big, &["k8s"]);
+    seed(&conn, &embedder, "short-k8s", "tiny", &["k8s"]);
+    seed(&conn, &embedder, "long-web", &big, &["web"]);
+
+    // No phrase: a pure filter. The tag keeps the k8s rows, the size floor keeps the long one.
+    let mut q = query(None);
+    q.tags = vec!["k8s".into()];
+    q.min_chars = Some(100);
+    let hits = search::run(&conn, None, &q).expect("search").hits;
+    assert_eq!(
+        hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        ["long-k8s"]
+    );
+    assert!(hits[0].chars >= 100, "{}", hits[0].chars);
+}
+
+#[test]
+fn coherent_filter_selects_by_verdict() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "a", "one", &[]);
+    seed(&conn, &embedder, "b", "two", &[]);
+    store::set_coherent(&conn, "a", Some(true)).expect("mark");
+
+    let keys = |c: search::Coherent| {
+        let mut q = query(None);
+        q.coherent = Some(c);
+        search::run(&conn, None, &q)
+            .expect("search")
+            .hits
+            .into_iter()
+            .map(|h| h.key)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(keys(search::Coherent::True), ["a"]);
+    assert_eq!(keys(search::Coherent::Null), ["b"]);
+    assert_eq!(keys(search::Coherent::NotNull), ["a"]);
+    assert_eq!(keys(search::Coherent::NotTrue), ["b"]);
+    assert_eq!(keys(search::Coherent::False), Vec::<String>::new());
 }

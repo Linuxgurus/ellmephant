@@ -30,7 +30,7 @@ release-grade - and, if the version was bumped, publishes an image.
 
 - **`.github/workflows/ci.yml`** - runs on every push to `main` and every pull request. Format,
   clippy, tests (both feature sets), a no-push Docker build, and the chart gate (lint, render
-  every value shape, the token guard, and the two version guards). Gate, not publisher.
+  every value shape, and the two version guards). Gate, not publisher.
 - **`.github/workflows/docker-release.yml`** - the image publisher. Fires on a push to `main`, a
   push to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the
   image to `ghcr.io/<owner>/ellmephant`.
@@ -144,7 +144,7 @@ asset directly:
 
 ```sh
 helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.1/ellmephant-0.1.1.tgz
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.1/ellmephant-0.2.1.tgz
 ```
 
 Local sanity before you push (also what CI runs):
@@ -161,7 +161,7 @@ to it: this step is local by necessity. `dev` is wired to publish itself.
 
 On a commit to `dev`, `.githooks/post-commit` backgrounds `scripts/harbor-publish.sh`, which:
 
-1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library`;
+1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library/charts`;
 2. mirrors the image - it waits for CI to publish `sha-<short>` to GHCR, then pulls the
    `linux/amd64` variant and pushes it to Harbor as `edge` + `sha-<short>`.
 
@@ -183,7 +183,7 @@ Watch it, skip it, or run it by hand:
 tail -f .tmp/harbor-publish.log
 SKIP_HARBOR=1 git commit -m '...'               # one commit, no publish
 make harbor-publish                             # run it now
-SOURCE_TAG=1.0.1 make harbor-publish            # mirror a released main image
+SOURCE_TAG=1.1.0 make harbor-publish            # mirror a released main image
 ```
 
 Point the cluster at the mirror with:
@@ -192,16 +192,20 @@ Point the cluster at the mirror with:
 --set image.repository=harbor.vn.linuxguru.net/library/ellmephant
 ```
 
-The chart installs from the same project over OCI - the closest thing to a `helm repo add` here,
-and the path the cluster would actually use:
+The chart installs from its own nested repo over OCI - the closest thing to a `helm repo add`
+here, and the path the cluster would actually use:
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/ellmephant --version 0.1.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
 ```
 
-Harbor holds an OCI chart and a container image under the same repository name happily (unlike
-GHCR, where a chart tag colliding with an image tag is a rejected push), so the house convention
-of `oci://<project>` with the chart named after the app is safe here.
+The chart and the image live under *separate* Harbor repos - `library/charts/ellmephant` versus
+`library/ellmephant`. Harbor would happily co-locate an OCI chart and a container image under one
+repository name, but sharing a repo means sharing a tag namespace, and the chart's own SemVer
+(`0.2.0` today, `1.0.0` eventually) would collide with an image tag. Separate paths rule that out.
+Because `helm push` derives the final path segment from the chart's `name`, the split is a
+different *parent* path, not a renamed chart: the chart stays `ellmephant`, so its labels, selectors
+and resource names are unchanged.
 
 ## Pre-releases
 
@@ -231,11 +235,11 @@ gh release create v1.1.0-rc.1 --prerelease --generate-notes
 A stable release is broken. Base the fix on the tag, not on `dev`.
 
 ```sh
-git switch -c hotfix-1.0.1 v1.0.0
-# ...fix, bump Cargo.toml (and Cargo.lock) to 1.0.1, commit...
-git switch main && git merge --no-ff hotfix-1.0.1
-git push origin main                       # -> tag v1.0.1 + image 1.0.1 published
-git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from regressing
+git switch -c hotfix-1.1.1 v1.1.0
+# ...fix, bump Cargo.toml (and Cargo.lock) to 1.1.1, commit...
+git switch main && git merge --no-ff hotfix-1.1.1
+git push origin main                       # -> tag v1.1.1 + image 1.1.1 published
+git switch dev && git merge --no-ff hotfix-1.1.1 && git push   # keep dev from regressing
 ```
 
 ## Gotchas
@@ -255,8 +259,10 @@ git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from r
   skips pre-releases. A hand-rolled `latest` rule would move it onto an `-rc`.
 - **ghcr packages start private.** After the first publish, set visibility under Package settings
   if anonymous pulls are wanted.
-- **Platforms.** Images are published for `linux/amd64` and `linux/arm64` (QEMU on the runner),
-  so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
+- **Platforms.** Versioned releases are published for `linux/amd64` and `linux/arm64` (QEMU on the
+  runner), so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
+  `dev`/`edge` builds are **amd64 only** - the cluster is amd64, and the arm64 half roughly
+  triples the build time, which the local Harbor hook would then sit waiting on.
 - **A chart change without a version bump publishes nothing.** `chart-release.yml` skips a
   `<chart>-<version>` release that already exists, silently. CI fails the PR instead - but only on
   a PR, so a direct push to `main` gets the silent no-op.

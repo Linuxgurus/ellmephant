@@ -2,6 +2,8 @@ CARGO ?= cargo
 IMAGE ?= ellmephant:dev
 CHART ?= charts/ellmephant
 HARBOR ?= harbor.vn.linuxguru.net/library
+# The chart lives in its own nested repo so its tags never collide with the image tags.
+HARBOR_CHARTS ?= $(HARBOR)/charts
 # Pinned so lint/render do not inherit Helm 3's v1.20.0 default, which the chart's kubeVersion rejects.
 KUBE_VERSION ?= 1.34.0
 
@@ -44,7 +46,7 @@ chart-package:   ## package the chart -> ellmephant-<version>.tgz
 	helm package $(CHART)
 
 chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: helm registry login)
-	helm push ellmephant-*.tgz "oci://$(HARBOR)"
+	helm push ellmephant-*.tgz "oci://$(HARBOR_CHARTS)"
 	@rm -f ellmephant-*.tgz
 
 harbor-publish:  ## push this commit to Harbor: chart + image (mirrors the CI-built image)

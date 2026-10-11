@@ -229,16 +229,16 @@ fn visit_and_useful_counters_bump_by_key() {
 
     // A fresh row starts at zero.
     let got = store::get(&conn, "a").unwrap().unwrap();
-    assert_eq!((got.visits, got.was_useful), (0, 0));
+    assert_eq!((got.visits, got.times_useful), (0, 0));
 
     // Reads count; each call returns the new total.
     assert_eq!(store::record_visit(&conn, "a").unwrap(), 1);
     assert_eq!(store::record_visit(&conn, "a").unwrap(), 2);
-    // `was_useful` is independent of a fetch.
+    // `times_useful` is independent of a fetch.
     assert_eq!(store::record_useful(&conn, "a").unwrap(), 1);
 
     let got = store::get(&conn, "a").unwrap().unwrap();
-    assert_eq!((got.visits, got.was_useful), (2, 1));
+    assert_eq!((got.visits, got.times_useful), (2, 1));
 
     // An unknown key is an error, not a silent zero.
     assert!(store::record_visit(&conn, "ghost").is_err());
@@ -258,5 +258,34 @@ fn upsert_preserves_counters() {
     store::add(&conn, &embedder, &memory("a", "A2", "body a2", &["k8s"])).unwrap();
     let got = store::get(&conn, "a").unwrap().unwrap();
     assert_eq!(got.title, "A2");
-    assert_eq!((got.visits, got.was_useful), (1, 1));
+    assert_eq!((got.visits, got.times_useful), (1, 1));
+}
+
+#[test]
+fn upsert_resets_the_coherence_verdict() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = CountingEmbedder::new();
+    store::add(&conn, &embedder, &memory("a", "A", "body", &[])).expect("add");
+
+    // A fresh row is unjudged.
+    assert_eq!(store::get(&conn, "a").unwrap().unwrap().coherent, None);
+
+    assert!(store::set_coherent(&conn, "a", Some(true)).unwrap());
+    assert_eq!(
+        store::get(&conn, "a").unwrap().unwrap().coherent,
+        Some(true)
+    );
+
+    // Unknown key is a no-op, not an error.
+    assert!(!store::set_coherent(&conn, "ghost", Some(false)).unwrap());
+
+    // An upsert resets the verdict (even a byte-identical rewrite re-opens review).
+    store::add(&conn, &embedder, &memory("a", "A", "body", &[])).expect("re-add");
+    assert_eq!(store::get(&conn, "a").unwrap().unwrap().coherent, None);
+
+    // Setting it again does not re-embed (coherent is not part of the document).
+    let calls = embedder.calls();
+    store::set_coherent(&conn, "a", Some(false)).unwrap();
+    assert_eq!(embedder.calls(), calls, "marking must not embed");
 }

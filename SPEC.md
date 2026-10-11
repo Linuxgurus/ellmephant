@@ -11,7 +11,7 @@
 
 ellmephant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
 embedder engine is compiled into the binary, one SQLite file is the sole source of truth,
-and a *rebuildable* vector + full-text + link index sits on top of it. It speaks MCP (so
+and a *rebuildable* vector + link index sits on top of it. It speaks MCP (so
 any client — Cline, TypingMind — shares the same memory) and ships an interactive REPL for
 the human. The name is LLM + elephant; the animal is the aspiration, the software is the
 attempt.
@@ -30,8 +30,8 @@ attempt.
 - Hermetic Rust binary: no Python/Node runtime, no external service, no cloud.
 - SQLite is the single source of truth (one file, `~/.ellmephant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
-- Retrieval as a single **phrase** matched semantically (KNN) or by regex over `title`/`body` —
-  `key`/`tags` are identity and lookup, not search.
+- Retrieval as a single **phrase** matched semantically (KNN), with optional structured filters
+  (tags, size, coherence) — no regex/key search leg; `key`/`tags` are identity and lookup.
 - Wiki-style links with backlinks and one-hop graph expansion.
 - Multi-client via MCP; interactive REPL for humans.
 
@@ -207,8 +207,13 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- model, dim, instruction, schema_version
 ```
 
-Notes: `memory_vec` is **app-written** (SQLite can't embed). FTS is external-content
-(no text copy). Tags normalised for join-based filtering and rename.
+Notes: `memory_vec` is **app-written** (SQLite can't embed). `tags` is a normalised, comma-joined
+column on `memory` (filtered in Rust, rewritten on rename); there is no FTS index or tag table.
+
+Later migrations add runtime columns to `memory`: `visits` / `times_useful` (0002–0003, usage
+counters) and `coherent` (0004) — the §9 split-review verdict, a **nullable bool** (`NULL` =
+unjudged, `TRUE` = one topic, `FALSE` = a grab-bag worth splitting). `coherent` is not part of
+the embedded document, and an upsert resets it to `NULL` (the row changed, so re-judge it).
 
 ## 8. Cross-links (wiki semantics)
 
@@ -228,17 +233,26 @@ Notes: `memory_vec` is **app-written** (SQLite can't embed). FTS is external-con
 
 The store is **atomics-first**; generalization is derived, not stored.
 
-- **Atomic memory = the storage *and* embedding unit.** One fact/decision/gotcha/signpost,
-  terse, self-contained. Focused text embeds sharply; edits are surgical; no staleness cascade.
+- **Atomic memory = the storage *and* embedding unit.** One **topic** — a fact/decision/gotcha/
+  signpost, or several *close* ones, one per line — terse, self-contained. A coherent topic
+  embeds sharply and edits surgically; a grab-bag smears the vector and rots. Split facts that
+  are genuinely distinct.
 - **General views are computed at query time** (fan-out / one-hop expansion), never written.
   Store the atoms, synthesize the whole.
 - **A sparse pointer tier** (`*-overview` notes) is allowed for routing/navigation only —
   pointers, not content; governed by "one home per fact, cross-link don't duplicate."
-- **Write policy** (guided via tool descriptions + a system instruction):
+- **Write policy** (guided via the tool descriptions; the **smart-caveman** style is defined
+  once in the server instructions, the rest on `memory_upsert`):
   **smart-caveman** — drop filler, articles and glue words, keep high-signal words ·
-  one fact per row · **tags** name aspects of the subject · **provenance** in `source`
-  (store the *derivation command*, not live state) · upsert-by-`key` · trim-on-edit
+  one **topic** per row (close facts, one per line; distinct facts split) · **tags** name
+  aspects of the subject · **provenance** in `source` (store the *derivation command*, not live
+  state) · upsert-by-`key` (whole-body replace, **no auto-merge**) · **merge redundant
+  memories by hand** (fold both bodies, upsert the survivor, delete the twin) · trim-on-edit
   (never grow) · never store cheaply-derivable state.
+- **Split review (`coherent`).** No size or geometry heuristic detects a grab-bag — the judgement
+  is a **read**. Review a fat row with `memory_search` (`min_chars`, `coherent: "!true"` — the rows
+  not proven coherent), split it by hand, then stamp the verdict (`memory_coherent`). An upsert
+  resets the verdict to unjudged, so an edit re-opens review.
 - **Read policy:** return **titles, tags and scores**, never dumps (tokens regress otherwise);
   the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
   at a small `k`, judged from titles/tags/distances, `memory_get` only the hit(s) you'll use,
@@ -246,20 +260,32 @@ The store is **atomics-first**; generalization is derived, not stored.
 
 ## 10. Search
 
-A search is a single **semantic phrase**. There are no key/tag constraints and no literal
-(regex) leg — `key` and `tags` are identity and lookup, and both are folded into the embedded
-document, so a phrase reaches them semantically.
+A search is a semantic **phrase** plus optional structured **filters**. **Filters intersect** —
+a hit must satisfy every one given. With no phrase it is a pure filter over the store (every
+row, `key` order, uncapped). There is no literal/regex leg — `key` and `tags` are folded into
+the embedded document, so a phrase reaches them semantically.
 
 - The phrase is embedded (query-side instruction) and the KNN of the whole store is taken,
-  within a cosine-distance ceiling. One vector per row (§6).
-- **Params:** default `k=5`; `max_distance` optional, falling back to the configured
-  `default_max_distance` (`0.6`; `null` disables the cap). With no phrase, results are ordered
-  by `key` and uncapped. The KNN is taken over the whole store and `k` truncates the ranked
+  within a cosine-distance ceiling. One vector per row (§6). Filters are applied to the ranked
+  candidate set **before** the `k` cap, so a filtered result is exact (the KNN already spans the
+  whole store): filter, then truncate.
+- **Params:** `query` (the phrase; omit for a pure filter), `k` (default `5`; caps the ranked
+  case only), `max_distance` (optional, falling back to `default_max_distance`, `0.6`; `null`
+  disables), `expand`, `fields` (the extra hit columns to return; default = `key` only), and the
+  filters:
+  - `tags` — every listed tag must be present (AND).
+  - `min_chars` / `max_chars` — bounds on the **embedded-document** length (chars).
+  - `coherent` — the §9 split-review verdict: `true`, `false`, `null`, or negate with `!`
+    (`!true` = false-or-null = the review queue; also `!false`, `!null`); omit = any.
+  The KNN is taken over the whole store and `k` truncates the ranked
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
-- **Returns:** `{key, title, tags, distance}` — **never the body** (fetch it with
-  `memory_get`/`show`). Over MCP this is emitted as **positional JSON**: a top-level `cols`
-  header names the fields and each row is a bare array (§11); `--json`/core keep the keyed form.
+- **Returns:** `key` **alone by default** — **never the body** (fetch it with `memory_get`/`show`).
+  The caller names any extra `fields` it wants (`title`, `tags`, `coherent`, `chars`, `distance`);
+  they are added in that **canonical order**, `key` always leading. So a hit says *which* memory,
+  and nothing more unless asked — the lean default keeps a search from bloating context. Over MCP
+  this is emitted as **positional JSON**: a top-level `cols` header names the returned fields and
+  each row is a bare array (§11); `--json`/core keep the keyed form.
 - **`--expand N`:** pull N-hop link neighbourhoods into the result bundle (derived profiles);
   neighbours keep their (snipped) bodies.
 
@@ -270,33 +296,53 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 
 ## 11. Interfaces
 
-**MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_add`, `memory_update`,
+**MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
 `memory_delete`, `memory_search`,
-`memory_get`, `memory_backlinks`, `memory_list`, `memory_useful`.
+`memory_get`, `memory_backlinks`, `memory_coherent`, `memory_useful`, `memory_stats`,
+`memory_dupes`.
 
-- The server also advertises the §9 write policy as its **instructions**, and each write tool
-  carries it in its description — that is what the model actually reads.
-- `memory_search` takes a semantic `phrase` and the ranking knobs `k`, `max_distance` and
-  `expand`; there are **no key/tag filters and no regex leg** — `key`/`tags` are not search
-  constraints, and `memory_get` reads a known key.
+- **Each tool states its own law in its own description** — that is what the model actually
+  reads, so nothing is written twice. The §9 write policy rides on `memory_upsert`'s
+  description; the read policy on `memory_search`'s; the feedback nudge on `memory_useful`'s.
+  The server-level **instructions** carry the identity and the shared **smart-caveman** style
+  (defined once there, referenced by the write tool).
+- **A tool's description carries policy; its parameter schemas carry the per-field
+  definitions** — the two never restate each other. So `memory_upsert`'s description holds the
+  write *rules* (one topic, trim, merge); each field's `key`/`title`/`body`/`source`/`tags`
+  meaning lives in that field's schema.
+- `memory_search` takes a semantic `phrase`, the ranking knobs `k`/`max_distance`/`expand`, the
+  `fields` projection (default `key` only), and the structured filters `tags` (AND),
+  `min_chars`/`max_chars` and `coherent` (§10); there is **no regex leg** and no `key` leg —
+  `memory_get` reads a known key.
 - The list-shaped reads return **positional JSON** to keep the LLM-facing payload small: a
   top-level `cols` header names the fields and the rows are bare arrays, **one row per line**
   (whitespace is insignificant to a parser, so a raw result is scannable, not one blob). The
   `cols` header is self-describing (the model can't mis-map columns) while field names aren't
-  repeated per row; distances are rounded to 4 decimals. `memory_search` →
-  `{"cols":["key","title","tags","distance"],"hits":[[…],…]}`; link `neighbors` (with `expand>0`)
-  carry their own `cols`/`rows` table. `memory_list` →
-  `{"cols":["key","title","tags"],"count":N,"memories":[[…],…]}`. `memory_backlinks` →
+  repeated per row; distances are rounded to 4 decimals. The convention is announced **once**,
+  in the server **instructions** — individual tool descriptions don't restate it. `memory_search` →
+  `{"cols":["key",…],"hits":[[…],…]}` (`key` default; `fields` adds columns per §10); link `neighbors`
+  (with `expand>0`) carry their own `cols`/`rows` table. `memory_backlinks` →
   `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
-- `memory_list` returns the store index (`key`, `tags`, `title`, no bodies) — cheap browsing (§9).
+- `memory_coherent` records the §9 split-review verdict for a key (`true` = one topic, `false` =
+  a grab-bag, omit/`null` = unjudged); an upsert resets it to unjudged.
+- `memory_stats` returns the read-only store digest (counts, size, tag/link shape, top tags, usage
+  counters, most-useful memories, age) as one keyed JSON object — the same `Stats` the `stats` CLI
+  command emits (`store::stats::compute`); no bodies.
 - `memory_get` is the **only** read that returns a body, and the way to read a known `key`.
+- `memory_dupes` is the **finder for the §9 merge rule**: a read-only audit returning memory
+  *pairs* whose document embeddings sit within a tight cosine ceiling (default `0.05`), nearest
+  first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
+  A **finder, not a judge**: because `key`+tags are folded into the document, merely-related
+  memories cluster too, so candidates are judged (`memory_get` both) before merging. No bodies.
 
 **CLI** — three faces over one core:
 
 - `ellmephant` → **REPL** (rustyline: history at `~/.ellmephant/history`, completion;
-  bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `list`, `tags`,
-  `stats`, `rename`, `reembed`, `links`, `model`, `help`, `quit`.
+  bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `useful`, `coherent`,
+  `list`, `tags`, `stats`, `rename`, `reembed`, `links`, `model`, `help`, `quit`.
 - One-shot flags for scripting: `ellmephant search "..." --json`.
+- `ellmephant search` takes the same §10 filters (`--tag`, `--min-chars`, `--max-chars`,
+  `--coherent`); `ellmephant coherent KEY [true|false|null]` sets the split-review verdict.
 - `ellmephant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
 - `ellmephant stats [--json]` (alias `summary`) → a read-only digest: counts, on-disk size and
   body/title spread, tag shape (distinct, placements, singletons, top-N, per-memory / per-tag
@@ -365,7 +411,7 @@ any model is touched; flags are re-checked the same way after they override the 
 
 1. **Golden eval set + `bench`** — shipped (P10): `tests/golden/` (corpus + ≥20 questions),
    `bench` / `--golden` / `--sweep`; default `k=10`; recall@3 gate 0.8. Grown from real usage.
-2. **MCP tool schema + annotations** — shipped (P7): 8 tools with JSON-Schema params and
+2. **MCP tool schema + annotations** — shipped (P7): 9 tools with JSON-Schema params and
    read-only / destructive / idempotent hints (`src/mcp`).
 3. **Rename implementation + collision policy** — shipped (P9): one transaction rewrites
    `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).

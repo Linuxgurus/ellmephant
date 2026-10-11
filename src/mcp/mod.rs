@@ -34,7 +34,7 @@ use crate::config::{Config, Paths};
 // uses the unqualified `Result` from `rmcp`, and our single-parameter alias would shadow it.
 use crate::error::Error;
 use crate::model;
-use crate::search::{Bundle, Query, to_wire_json};
+use crate::search::{Bundle, Field, Fields, Query, to_wire_json};
 use crate::store::links::backlinks_to_wire_json;
 use crate::store::{self, Memory};
 
@@ -156,6 +156,45 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Split-review verdict: `true`, `false`, `null`, or negate with `!`.")]
     pub coherent: Option<CoherentFilter>,
+    /// Hit fields to return beyond `key`.
+    #[serde(default)]
+    #[schemars(
+        description = "Extra hit fields to return, alongside the always-present `key`. Omit for `key` only (lean). E.g. `[\"title\",\"tags\",\"distance\"]`."
+    )]
+    pub fields: Vec<FieldParam>,
+}
+
+/// A hit field a caller can request on `memory_search` (the `fields` selection). `key` is always
+/// returned, so naming it here is a harmless no-op.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldParam {
+    /// Slug.
+    Key,
+    /// Salient line.
+    Title,
+    /// Attached tags.
+    Tags,
+    /// Split-review verdict.
+    Coherent,
+    /// Embedded-document length (chars).
+    Chars,
+    /// Cosine distance (semantic ranking only).
+    Distance,
+}
+
+impl FieldParam {
+    /// Map the wire enum onto the search-layer [`Field`].
+    fn to_field(self) -> Field {
+        match self {
+            FieldParam::Key => Field::Key,
+            FieldParam::Title => Field::Title,
+            FieldParam::Tags => Field::Tags,
+            FieldParam::Coherent => Field::Coherent,
+            FieldParam::Chars => Field::Chars,
+            FieldParam::Distance => Field::Distance,
+        }
+    }
 }
 
 /// The `memory_search` coherence filter — a nullable bool with negation. `!X` reads "not X",
@@ -401,7 +440,7 @@ impl MemoryServer {
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
-        description = "Hunt memory by meaning, or filter it. `query` = semantic phrase; whole document (key, tags, title, body) sits in the embedding, so a phrase touching any part raises the memory. Filters intersect — a hit must satisfy every one given: `tags` (each listed tag present), `min_chars`/`max_chars` (embedded-document size), `coherent` (`true`/`false`/`null`, or negate with `!`). No `query`? Then it is a pure filter over the store (key order, uncapped). Hits give key, title, tags, coherent, chars, distance — never the body; `memory_get` only the hit you use. Start small `k`; none fit? Widen — raise `k`, loosen `max_distance`. Know the `key`? `memory_get` instead.",
+        description = "Hunt memory by meaning, or filter it. `query` = semantic phrase; whole document (key, tags, title, body) sits in the embedding, so a phrase touching any part raises the memory. Filters intersect — a hit must satisfy every one given: `tags` (each listed tag present), `min_chars`/`max_chars` (embedded-document size), `coherent` (`true`/`false`/`null`, or negate with `!`). No `query`? Then it is a pure filter over the store (key order, uncapped). Hits carry `key` alone — never the body, so `memory_get` only the hit you use — unless you name more in `fields` (`title`, `tags`, `coherent`, `chars`, `distance`), which add in that order. Start small `k`; none fit? Widen — raise `k`, loosen `max_distance`. Know the `key`? `memory_get` instead.",
         annotations(
             title = "Search memory",
             read_only_hint = true,
@@ -422,6 +461,8 @@ impl MemoryServer {
         let min_chars = p.min_chars;
         let max_chars = p.max_chars;
         let coherent = p.coherent.map(CoherentFilter::to_coherent);
+        // Default: `key` only (lean). Named fields are added, in canonical order.
+        let fields = Fields::selection(p.fields.into_iter().map(FieldParam::to_field));
         // Keep a copy for the log line: the original moves into the store closure.
         let log_query = query.clone();
         let started = std::time::Instant::now();
@@ -441,7 +482,7 @@ impl MemoryServer {
                 s.search(&q)
             })
             .await?;
-        let json = to_wire_json(&bundle).map_err(|e| e.to_string())?;
+        let json = to_wire_json(&bundle, &fields).map_err(|e| e.to_string())?;
         log_search(
             log_query.as_deref(),
             expand,
@@ -824,6 +865,7 @@ mod tests {
             [
                 "coherent",
                 "expand",
+                "fields",
                 "k",
                 "max_chars",
                 "max_distance",
@@ -832,6 +874,8 @@ mod tests {
                 "tags"
             ]
         );
+        // The projection selection rides on `fields` (a hit returns `key` alone by default).
+        assert!(props.contains_key("fields"), "search must expose `fields`");
 
         // The read law rides on the search description, not the server instructions.
         let search = find("memory_search")

@@ -148,12 +148,23 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     let found: serde_json::Value = serde_json::from_str(&text(&found)).expect("search json");
-    // Positional wire: a `cols` header names the fields, rows are bare arrays.
-    assert_eq!(
-        found["cols"],
-        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
-    );
+    // Positional wire, lean default: no `fields` named, so a hit is just its key (SPEC §10).
+    assert_eq!(found["cols"], serde_json::json!(["key"]));
     assert_eq!(found["hits"][0][0], serde_json::json!("infra-logs"));
+
+    // Naming `fields` adds those columns (canonical order), `key` always leading.
+    let named = call(
+        &client,
+        "memory_search",
+        serde_json::json!({ "query": "where do logs go", "fields": ["title", "distance"] }),
+    )
+    .await;
+    let named: serde_json::Value = serde_json::from_str(&text(&named)).expect("search json");
+    assert_eq!(
+        named["cols"],
+        serde_json::json!(["key", "title", "distance"])
+    );
+    assert_eq!(named["hits"][0][0], serde_json::json!("infra-logs"));
 
     // A second memory links back; `memory_backlinks` finds it.
     call(
@@ -394,10 +405,8 @@ async fn search_filters_and_coherence_mark_round_trip() {
     )
     .await;
     let filtered: serde_json::Value = serde_json::from_str(&text(&filtered)).expect("search json");
-    assert_eq!(
-        filtered["cols"],
-        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
-    );
+    // A filter with no `fields` named is still key-only.
+    assert_eq!(filtered["cols"], serde_json::json!(["key"]));
     assert_eq!(filtered["hits"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["hits"][0][0], serde_json::json!("note-long"));
 

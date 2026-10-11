@@ -4,8 +4,9 @@
 //! cosine distance. There are no key/tag constraints and no literal (regex) leg — the key and
 //! tags are part of the embedded document, so a query reaches them semantically.
 //!
-//! Results are distance-ranked, capped by `k` and a `max_distance` ceiling. A hit carries
-//! `key`/`title`/`tags` and its `distance` — never a body; fetch it with `memory_get`/`show`.
+//! Results are distance-ranked, capped by `k` and a `max_distance` ceiling. A hit returns its
+//! `key` by default and nothing else; the caller names the extra [`Field`]s it wants (via
+//! [`Fields`]) — never a body; fetch that with `memory_get`/`show`.
 
 /// Characters of a neighbour's body returned by `--expand` (SPEC §9/§14: snippets, not dumps).
 pub const SNIPPET_CHARS: usize = 280;
@@ -132,26 +133,117 @@ pub struct Bundle {
     pub neighbors: Vec<Neighbor>,
 }
 
+/// One selectable hit field on the MCP wire. `key` is always returned (it is the handle you
+/// `memory_get` with); the rest are opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    /// Slug.
+    Key,
+    /// Salient line.
+    Title,
+    /// Attached tags.
+    Tags,
+    /// Split-review verdict (§9).
+    Coherent,
+    /// Embedded-document length (chars).
+    Chars,
+    /// Cosine distance (semantic ranking only).
+    Distance,
+}
+
+impl Field {
+    /// Every field, in canonical wire order.
+    pub const ALL: [Field; 6] = [
+        Field::Key,
+        Field::Title,
+        Field::Tags,
+        Field::Coherent,
+        Field::Chars,
+        Field::Distance,
+    ];
+
+    /// The wire name (a `cols` header entry).
+    pub fn name(self) -> &'static str {
+        match self {
+            Field::Key => "key",
+            Field::Title => "title",
+            Field::Tags => "tags",
+            Field::Coherent => "coherent",
+            Field::Chars => "chars",
+            Field::Distance => "distance",
+        }
+    }
+
+    /// Parse a wire name; `None` when it is not a field.
+    pub fn parse(s: &str) -> Option<Field> {
+        Field::ALL.into_iter().find(|f| f.name() == s)
+    }
+}
+
+/// The hit projection for the wire: which fields each row carries. `key` is always included — it
+/// is the handle — so a selection really names the *extra* fields on top of it, emitted in
+/// canonical order. The default ([`key_only`](Self::key_only)) keeps a targeted search to one
+/// column (SPEC §10): a hit says *which* memory, and `memory_get` reads it.
+#[derive(Debug, Clone)]
+pub struct Fields(Vec<Field>);
+
+impl Fields {
+    /// Just `key` — the lean default.
+    pub fn key_only() -> Self {
+        Self(vec![Field::Key])
+    }
+
+    /// Canonical order; `key` is always present, `wanted` adds the rest (duplicates ignored).
+    pub fn selection(wanted: impl IntoIterator<Item = Field>) -> Self {
+        let wanted: Vec<Field> = wanted.into_iter().collect();
+        Self(
+            Field::ALL
+                .into_iter()
+                .filter(|f| *f == Field::Key || wanted.contains(f))
+                .collect(),
+        )
+    }
+
+    /// Column names, in canonical order.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.iter().map(|f| f.name())
+    }
+
+    /// One hit as a positional row matching [`names`](Self::names).
+    pub fn row(&self, h: &Hit) -> serde_json::Value {
+        serde_json::Value::Array(self.0.iter().map(|f| self.value(h, *f)).collect())
+    }
+
+    /// The JSON value of one field on one hit.
+    fn value(&self, h: &Hit, f: Field) -> serde_json::Value {
+        match f {
+            Field::Key => serde_json::json!(h.key),
+            Field::Title => serde_json::json!(h.title),
+            Field::Tags => serde_json::json!(h.tags),
+            Field::Coherent => serde_json::json!(h.coherent),
+            Field::Chars => serde_json::json!(h.chars),
+            Field::Distance => serde_json::json!(h.distance.map(wire_distance)),
+        }
+    }
+}
+
 /// Serialize a [`Bundle`] for the MCP wire: a top-level `cols` header names the hit fields and
 /// `hits` are positional rows, so the payload stays self-describing without repeating field
-/// names on every row. Link `neighbors`, when present, carry their own `cols`/`rows` table.
+/// names on every row. `fields` decides which columns ride along (see [`Fields`]; `key` is always
+/// present). Link `neighbors`, when present, carry their own `cols`/`rows` table.
 ///
 /// This is the compact LLM-facing shape (fewer tokens than keyed JSON); the keyed serde form
 /// remains the stable machine face used by `--json` and `structuredContent`. Each row sits on
 /// its own line (see [`crate::wire::rows_array`]) so a raw result is scannable, not one blob.
-pub fn to_wire_json(bundle: &Bundle) -> Result<String> {
-    let hits: Vec<serde_json::Value> = bundle
-        .hits
-        .iter()
-        .map(|h| {
-            let distance = h.distance.map(wire_distance);
-            serde_json::json!([h.key, h.title, h.tags, h.coherent, h.chars, distance])
-        })
-        .collect();
+pub fn to_wire_json(bundle: &Bundle, fields: &Fields) -> Result<String> {
+    let hits: Vec<serde_json::Value> = bundle.hits.iter().map(|h| fields.row(h)).collect();
+    let header: String = fields
+        .names()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(",");
 
-    let mut out = String::from(
-        "{\"cols\":[\"key\",\"title\",\"tags\",\"coherent\",\"chars\",\"distance\"],\"hits\":",
-    );
+    let mut out = format!("{{\"cols\":[{header}],\"hits\":");
     out.push_str(&crate::wire::rows_array(&hits));
 
     if !bundle.neighbors.is_empty() {

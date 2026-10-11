@@ -9,7 +9,7 @@ mod common;
 use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
-use ellmephant::search::{self, Hit, Neighbor, Query};
+use ellmephant::search::{self, Field, Fields, Hit, Neighbor, Query};
 use ellmephant::store::{self, Memory};
 use rusqlite::Connection;
 
@@ -214,7 +214,9 @@ fn wire_json_is_positional_with_a_cols_header() {
         }],
         neighbors: vec![],
     };
-    let wire = search::to_wire_json(&bundle).expect("wire");
+    // Every field requested: the full six-column shape, in canonical order.
+    let all = Fields::selection(Field::ALL);
+    let wire = search::to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
@@ -236,6 +238,48 @@ fn wire_json_is_positional_with_a_cols_header() {
 }
 
 #[test]
+fn wire_json_defaults_to_key_only() {
+    let bundle = search::Bundle {
+        hits: vec![Hit {
+            id: 1,
+            key: "k".into(),
+            title: "T".into(),
+            tags: vec!["a".into()],
+            coherent: Some(true),
+            chars: 3,
+            distance: Some(0.42),
+        }],
+        neighbors: vec![],
+    };
+    // Nothing asked for: a hit is just its key — the lean default (SPEC §10).
+    let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    assert_eq!(v["cols"], serde_json::json!(["key"]));
+    assert_eq!(v["hits"][0], serde_json::json!(["k"]));
+}
+
+#[test]
+fn fields_always_include_key_and_keep_canonical_order() {
+    // `key` leads even when unrequested, and the rest come in canonical order regardless of the
+    // order they were named in.
+    let fields = Fields::selection([Field::Distance, Field::Title]);
+    assert_eq!(
+        fields.names().collect::<Vec<_>>(),
+        ["key", "title", "distance"]
+    );
+
+    // An empty selection still yields `key`.
+    let empty = Fields::selection(Vec::new());
+    assert_eq!(empty.names().collect::<Vec<_>>(), ["key"]);
+
+    // Wire names round-trip through `parse`.
+    for f in Field::ALL {
+        assert_eq!(Field::parse(f.name()), Some(f));
+    }
+    assert_eq!(Field::parse("nope"), None);
+}
+
+#[test]
 fn wire_json_emits_a_neighbors_table_when_expanded() {
     let bundle = search::Bundle {
         hits: vec![],
@@ -251,7 +295,7 @@ fn wire_json_emits_a_neighbors_table_when_expanded() {
             },
         }],
     };
-    let wire = search::to_wire_json(&bundle).expect("wire");
+    let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["neighbors"]["cols"],

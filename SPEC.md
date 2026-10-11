@@ -271,7 +271,8 @@ the embedded document, so a phrase reaches them semantically.
   whole store): filter, then truncate.
 - **Params:** `query` (the phrase; omit for a pure filter), `k` (default `5`; caps the ranked
   case only), `max_distance` (optional, falling back to `default_max_distance`, `0.6`; `null`
-  disables), `expand`, and the filters:
+  disables), `expand`, `fields` (the extra hit columns to return; default = `key` only), and the
+  filters:
   - `tags` — every listed tag must be present (AND).
   - `min_chars` / `max_chars` — bounds on the **embedded-document** length (chars).
   - `coherent` — the §9 split-review verdict: `true`, `false`, `null`, or negate with `!`
@@ -279,9 +280,12 @@ the embedded document, so a phrase reaches them semantically.
   The KNN is taken over the whole store and `k` truncates the ranked
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
-- **Returns:** `{key, title, tags, coherent, chars, distance}` — **never the body** (fetch it with
-  `memory_get`/`show`). Over MCP this is emitted as **positional JSON**: a top-level `cols`
-  header names the fields and each row is a bare array (§11); `--json`/core keep the keyed form.
+- **Returns:** `key` **alone by default** — **never the body** (fetch it with `memory_get`/`show`).
+  The caller names any extra `fields` it wants (`title`, `tags`, `coherent`, `chars`, `distance`);
+  they are added in that **canonical order**, `key` always leading. So a hit says *which* memory,
+  and nothing more unless asked — the lean default keeps a search from bloating context. Over MCP
+  this is emitted as **positional JSON**: a top-level `cols` header names the returned fields and
+  each row is a bare array (§11); `--json`/core keep the keyed form.
 - **`--expand N`:** pull N-hop link neighbourhoods into the result bundle (derived profiles);
   neighbours keep their (snipped) bodies.
 
@@ -306,16 +310,17 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   definitions** — the two never restate each other. So `memory_upsert`'s description holds the
   write *rules* (one topic, trim, merge); each field's `key`/`title`/`body`/`source`/`tags`
   meaning lives in that field's schema.
-- `memory_search` takes a semantic `phrase`, the ranking knobs `k`/`max_distance`/`expand`, and
-  the structured filters `tags` (AND), `min_chars`/`max_chars` and `coherent` (§10); there is
-  **no regex leg** and no `key` leg — `memory_get` reads a known key.
+- `memory_search` takes a semantic `phrase`, the ranking knobs `k`/`max_distance`/`expand`, the
+  `fields` projection (default `key` only), and the structured filters `tags` (AND),
+  `min_chars`/`max_chars` and `coherent` (§10); there is **no regex leg** and no `key` leg —
+  `memory_get` reads a known key.
 - The list-shaped reads return **positional JSON** to keep the LLM-facing payload small: a
   top-level `cols` header names the fields and the rows are bare arrays, **one row per line**
   (whitespace is insignificant to a parser, so a raw result is scannable, not one blob). The
   `cols` header is self-describing (the model can't mis-map columns) while field names aren't
   repeated per row; distances are rounded to 4 decimals. The convention is announced **once**,
   in the server **instructions** — individual tool descriptions don't restate it. `memory_search` →
-  `{"cols":["key","title","tags","coherent","chars","distance"],"hits":[[…],…]}`; link `neighbors`
+  `{"cols":["key",…],"hits":[[…],…]}` (`key` default; `fields` adds columns per §10); link `neighbors`
   (with `expand>0`) carry their own `cols`/`rows` table. `memory_backlinks` →
   `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
 - `memory_coherent` records the §9 split-review verdict for a key (`true` = one topic, `false` =

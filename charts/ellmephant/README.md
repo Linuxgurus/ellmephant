@@ -125,8 +125,13 @@ direction.
 ## Compatibility notes
 
 - **Gateway API / NGINX Gateway Fabric** — first-class via `gateway`; the handler gets a
-  `ListenerSet`, not an Ingress. Add a `ProxySettingsPolicy` read timeout externally if a client
-  holds a long-lived stream (the house `modules/network/gateway` provides it).
+  `ListenerSet`, not an Ingress. Two timeouts matter when a client is left idle between calls and
+  must be set on the shared Gateway (the house `modules/network/gateway` provides both):
+  a `ProxySettingsPolicy` read timeout for long-lived streams, and a `ClientSettingsPolicy`
+  `keepAlive.timeout.server` — nginx's 75s client-keepalive default closes an idle pooled
+  connection, so a client that pauses longer reuses a dead socket and errors on its next call.
+  (A client that holds the MCP SSE stream, as the official SDK does, stays warm on the server's
+  15s keep-alive pings and does not need this; POST-only clients do.)
 - **cert-manager** — the ListenerSet carries `cert-manager.io/cluster-issuer: <certIssuer>`;
   cert-manager issues cert-`<hostname>` itself, no chart-side cert objects.
 - **external-dns** — HTTPRoutes carry the hostname annotation, so records land in BIND with no

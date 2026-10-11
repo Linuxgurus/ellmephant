@@ -144,7 +144,7 @@ asset directly:
 
 ```sh
 helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.1/ellmephant-0.1.1.tgz
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.1/ellmephant-0.2.1.tgz
 ```
 
 Local sanity before you push (also what CI runs):
@@ -183,7 +183,7 @@ Watch it, skip it, or run it by hand:
 tail -f .tmp/harbor-publish.log
 SKIP_HARBOR=1 git commit -m '...'               # one commit, no publish
 make harbor-publish                             # run it now
-SOURCE_TAG=1.0.1 make harbor-publish            # mirror a released main image
+SOURCE_TAG=1.1.0 make harbor-publish            # mirror a released main image
 ```
 
 Point the cluster at the mirror with:
@@ -196,13 +196,13 @@ The chart installs from its own nested repo over OCI - the closest thing to a `h
 here, and the path the cluster would actually use:
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.1.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
 ```
 
 The chart and the image live under *separate* Harbor repos - `library/charts/ellmephant` versus
 `library/ellmephant`. Harbor would happily co-locate an OCI chart and a container image under one
 repository name, but sharing a repo means sharing a tag namespace, and the chart's own SemVer
-(`0.1.0` today, `1.0.0` eventually) would collide with an image tag. Separate paths rule that out.
+(`0.2.0` today, `1.0.0` eventually) would collide with an image tag. Separate paths rule that out.
 Because `helm push` derives the final path segment from the chart's `name`, the split is a
 different *parent* path, not a renamed chart: the chart stays `ellmephant`, so its labels, selectors
 and resource names are unchanged.
@@ -235,11 +235,11 @@ gh release create v1.1.0-rc.1 --prerelease --generate-notes
 A stable release is broken. Base the fix on the tag, not on `dev`.
 
 ```sh
-git switch -c hotfix-1.0.1 v1.0.0
-# ...fix, bump Cargo.toml (and Cargo.lock) to 1.0.1, commit...
-git switch main && git merge --no-ff hotfix-1.0.1
-git push origin main                       # -> tag v1.0.1 + image 1.0.1 published
-git switch dev && git merge --no-ff hotfix-1.0.1 && git push   # keep dev from regressing
+git switch -c hotfix-1.1.1 v1.1.0
+# ...fix, bump Cargo.toml (and Cargo.lock) to 1.1.1, commit...
+git switch main && git merge --no-ff hotfix-1.1.1
+git push origin main                       # -> tag v1.1.1 + image 1.1.1 published
+git switch dev && git merge --no-ff hotfix-1.1.1 && git push   # keep dev from regressing
 ```
 
 ## Gotchas

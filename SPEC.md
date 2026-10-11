@@ -11,7 +11,7 @@
 
 ellmephant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
 embedder engine is compiled into the binary, one SQLite file is the sole source of truth,
-and a *rebuildable* vector + full-text + link index sits on top of it. It speaks MCP (so
+and a *rebuildable* vector + link index sits on top of it. It speaks MCP (so
 any client — Cline, TypingMind — shares the same memory) and ships an interactive REPL for
 the human. The name is LLM + elephant; the animal is the aspiration, the software is the
 attempt.
@@ -30,8 +30,8 @@ attempt.
 - Hermetic Rust binary: no Python/Node runtime, no external service, no cloud.
 - SQLite is the single source of truth (one file, `~/.ellmephant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
-- Retrieval as a single **phrase** matched semantically (KNN) or by regex over `title`/`body` —
-  `key`/`tags` are identity and lookup, not search.
+- Retrieval as a single **phrase** matched semantically (KNN), with optional structured filters
+  (tags, size, coherence) — no regex/key search leg; `key`/`tags` are identity and lookup.
 - Wiki-style links with backlinks and one-hop graph expansion.
 - Multi-client via MCP; interactive REPL for humans.
 
@@ -207,8 +207,8 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- model, dim, instruction, schema_version
 ```
 
-Notes: `memory_vec` is **app-written** (SQLite can't embed). FTS is external-content
-(no text copy). Tags normalised for join-based filtering and rename.
+Notes: `memory_vec` is **app-written** (SQLite can't embed). `tags` is a normalised, comma-joined
+column on `memory` (filtered in Rust, rewritten on rename); there is no FTS index or tag table.
 
 Later migrations add runtime columns to `memory`: `visits` / `times_useful` (0002–0003, usage
 counters) and `coherent` (0004) — the §9 split-review verdict, a **nullable bool** (`NULL` =

@@ -43,9 +43,9 @@ install -m 0755 target/release/ellmephant ~/.local/bin/ellmephant
 
 ## Store-only build
 
-A build without the embedding stack, for machines that only read a store. `--match regex` search
-and every key/tag query work; a semantic phrase needs the encoder and reports an error without
-it.
+A build without the embedding stack, for machines that only read a store. `show`, `list`, `tags`,
+`stats`, `backlinks` and **phrase-less filter searches** work; a *semantic phrase* needs the
+encoder and reports an error without it.
 
 ```sh
 cargo build --release --locked --no-default-features
@@ -109,7 +109,7 @@ and no Helm repo index — so install straight from the asset URL:
 
 ```sh
 helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.1.0/ellmephant-0.1.0.tgz
+  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.0/ellmephant-0.2.0.tgz
 ```
 
 Point the MCP client at `http://ellmephant.ellmephant.svc:8888/mcp`. The store lives on the

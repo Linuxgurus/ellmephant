@@ -247,8 +247,10 @@ The store is **atomics-first**; generalization is derived, not stored.
   one **topic** per row (close facts, one per line; distinct facts split) · **tags** name
   aspects of the subject · **provenance** in `source` (store the *derivation command*, not live
   state) · upsert-by-`key` (whole-body replace, **no auto-merge**) · **merge redundant
-  memories by hand** (fold both bodies, upsert the survivor, delete the twin) · trim-on-edit
-  (never grow) · never store cheaply-derivable state.
+  memories by hand** (fold both bodies, upsert the survivor, delete the twin) · trim junk on edit
+  — deepen the topic, never add a second (**coherence, not size** — a topic accrues facts over
+  time; # of chars is not the signal, the `coherent` verdict is) · never store cheaply-derivable
+  state.
 - **Split review (`coherent`).** No size or geometry heuristic detects a grab-bag — the judgement
   is a **read**. Review a fat row with `memory_search` (`min_chars`, `coherent: "!true"` — the rows
   not proven coherent), split it by hand, then stamp the verdict (`memory_coherent`). An upsert
@@ -298,12 +300,13 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
 `memory_delete`, `memory_search`,
-`memory_get`, `memory_backlinks`, `memory_coherent`, `memory_useful`, `memory_stats`,
+`memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
 `memory_dupes`.
 
 - **Each tool states its own law in its own description** — that is what the model actually
   reads, so nothing is written twice. The §9 write policy rides on `memory_upsert`'s
-  description; the read policy on `memory_search`'s; the feedback nudge on `memory_useful`'s.
+  description; the read policy on `memory_search`'s; the feedback *trigger* on `memory_upvote`'s,
+  with its firing cue on `memory_get`'s (the read that hands back a body the model consumes).
   The server-level **instructions** carry the identity and the shared **smart-caveman** style
   (defined once there, referenced by the write tool).
 - **A tool's description carries policy; its parameter schemas carry the per-field

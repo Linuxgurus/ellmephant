@@ -1,11 +1,11 @@
 //! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_upsert`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_useful`, `memory_stats`,
+//! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
 //! `memory_dupes` — with read-only annotations on the read tools and destructive on `delete`.
 //! The tool descriptions carry the SPEC §9 write policy; that is where memory quality is
-//! actually tuned. `memory_get` counts a `visits` read and `memory_useful` bumps the
-//! `times_useful` feedback counter.
+//! actually tuned. `memory_get` counts a `visits` read and carries the upvote cue; `memory_upvote`
+//! bumps the `times_useful` feedback counter.
 //!
 //! The store is one SQLite file behind a single connection (SPEC §15 #10), so the
 //! server holds the [`Session`] behind a mutex and serves requests serially. SQLite and
@@ -46,7 +46,7 @@ pub const TOOLS: &[&str] = &[
     "memory_get",
     "memory_backlinks",
     "memory_coherent",
-    "memory_useful",
+    "memory_upvote",
     "memory_stats",
     "memory_dupes",
 ];
@@ -61,16 +61,15 @@ small words out; drop filler, articles, glue. List-shaped reads return a positio
 /// `memory_upsert` description. The write policy lives here and *only* here — the one thing the
 /// model reads before a write.
 const UPSERT_DESCRIPTION: &str = "\
-Upsert one memory. WRITE in smart-caveman. One topic per memory — cluster close facts; split \
-distinct. Before saving, check: does the body hold ≥2 distinct retrieval intents? Then upsert them \
-as separate memories, one call each — never a misc/gotchas bucket; each atom must stand alone \
-(≥2-3 facts). Trim, never grow. Merge redundant memories by hand: fold less useful into more useful \
-and `memory_delete` the less useful. Skip memory/facts when cheap to derive, live state, or one-off.";
+Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clustered facts, one \
+per line; never a misc/gotchas bucket. Before saving, check: body hold ≥2 distinct topics? Split — \
+one call each, each atom stands alone (≥2-3 facts). Trim junk on edit — deepen the topic, never add \
+a second. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete` \
+Skip facts cheap to derive, live state, or one-off.";
 
-/// `memory_useful` description. The feedback nudge, carried here only.
-const USEFUL_DESCRIPTION: &str = "Bump `times_useful` on a memory that actually shaped this task — \
-it changed a decision, dodged a bug, or you followed its law. A bare fetch is `visits`, not this. \
-Sharp truth, no flattery.";
+/// `memory_upvote` description. The feedback nudge, carried here only.
+const UPVOTE_DESCRIPTION: &str = "Upvote a memory that shaped this task — it changed a decision, \
+dodged a bug, or you followed its law. A bare fetch is a visit, not this. Sharp truth, no flattery.";
 
 /// `memory_dupes` description. A finder for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
@@ -84,6 +83,14 @@ const DUPES_LIMIT: usize = 50;
 /// `memory_coherent` description. The split-review law rides here, in its owning tool only.
 const COHERENT_DESCRIPTION: &str = "\
 Record a memory's split-review verdict: `true` = one coherent topic, `false` = a grab-bag worth splitting, omit/`null` = unjudged. Reset to null automatically on the next upsert, so an edit re-opens review. Find the fat tail with `memory_search` (`min_chars`, `coherent`).";
+
+/// `memory_search` description. The read law lives here — the semantic phrase, the structured
+/// filters, the lean `key`-only default, and the narrow-to-wide widen trigger.
+const SEARCH_DESCRIPTION: &str = "\
+Hunt memory by meaning. `query` = semantic phrase against the whole document; omit it to filter the \
+store. Filters intersect (all must hold). Hits are `key`-only by default; `fields` adds more, body \
+never. `memory_get` the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — \
+raise `k`, loosen `max_distance`.";
 
 /// Parameters for [`MemoryServer::memory_upsert`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -441,7 +448,7 @@ impl MemoryServer {
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
-        description = "Hunt memory by meaning, or filter it. `query` = semantic phrase; whole document (key, tags, title, body) sits in the embedding, so a phrase touching any part raises the memory. Filters intersect — a hit must satisfy every one given: `tags` (each listed tag present), `min_chars`/`max_chars` (embedded-document size), `coherent` (`true`/`false`/`null`, or negate with `!`). No `query`? Then it is a pure filter over the store (key order, uncapped). Hits carry `key` alone — never the body, so `memory_get` only the hit you use — unless you name more in `fields` (`title`, `tags`, `coherent`, `chars`, `distance`), which add in that order. Start small `k`; none fit? Widen — raise `k`, loosen `max_distance`. Know the `key`? `memory_get` instead.",
+        description = SEARCH_DESCRIPTION,
         annotations(
             title = "Search memory",
             read_only_hint = true,
@@ -497,7 +504,7 @@ impl MemoryServer {
     /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
-        description = "Pull one memory whole by `key` — the only read that returns a body.",
+        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it.",
         annotations(
             title = "Get memory",
             read_only_hint = true,
@@ -521,26 +528,26 @@ impl MemoryServer {
 
     /// Bump the `times_useful` counter on a memory that helped the task.
     #[tool(
-        name = "memory_useful",
-        description = USEFUL_DESCRIPTION,
+        name = "memory_upvote",
+        description = UPVOTE_DESCRIPTION,
         annotations(
-            title = "Mark memory useful",
+            title = "Upvote memory",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = false
         )
     )]
-    async fn memory_useful(
+    async fn memory_upvote(
         &self,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
         let key = p.key;
         let bump = key.clone();
         let total = self
-            .with_store("memory_useful", move |s| s.record_useful(&bump))
+            .with_store("memory_upvote", move |s| s.record_useful(&bump))
             .await?;
-        tracing::info!(tool = "memory_useful", key = %key, times_useful = total, "marked useful");
+        tracing::info!(tool = "memory_upvote", key = %key, times_useful = total, "marked useful");
         Ok(json_ok(
             serde_json::json!({ "status": "useful", "key": key, "times_useful": total }),
         ))
@@ -805,8 +812,8 @@ mod tests {
         assert_eq!(ann("memory_delete").destructive_hint, Some(true));
         assert_eq!(ann("memory_delete").read_only_hint, Some(false));
         // Feedback writes but is neither read-only nor destructive.
-        assert_eq!(ann("memory_useful").read_only_hint, Some(false));
-        assert_eq!(ann("memory_useful").destructive_hint, Some(false));
+        assert_eq!(ann("memory_upvote").read_only_hint, Some(false));
+        assert_eq!(ann("memory_upvote").destructive_hint, Some(false));
         assert_eq!(ann("memory_upsert").idempotent_hint, Some(true));
         // The split-review mark writes, non-destructively.
         assert_eq!(ann("memory_coherent").read_only_hint, Some(false));
@@ -819,21 +826,29 @@ mod tests {
             .expect("description");
         assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
-        // The pre-write split nudge: evaluate, then action = one call per atom.
+        // The pre-write split nudge: *evaluate* ("before saving"), then *action* (split, one call each).
+        assert!(upsert.to_lowercase().contains("before saving"), "{upsert}");
+        assert!(upsert.to_lowercase().contains("split"), "{upsert}");
+        // Growth law is *coherence, not size*: deepen a topic, never add a second; no "never grow".
         assert!(
-            upsert.to_lowercase().contains("separate memories"),
+            upsert.to_lowercase().contains("deepen the topic"),
             "{upsert}"
         );
+        assert!(!upsert.to_lowercase().contains("never grow"), "{upsert}");
         // The feedback nudge must carry a *trigger*, not just a quality bar.
-        let useful = find("memory_useful")
+        let upvote = find("memory_upvote")
             .description
             .clone()
             .expect("description");
         assert!(
-            useful.to_lowercase().contains("actually shaped"),
-            "{useful}"
+            upvote.to_lowercase().contains("shaped this task"),
+            "{upvote}"
         );
-        assert!(useful.to_lowercase().contains("visits"), "{useful}");
+        assert!(upvote.to_lowercase().contains("visit"), "{upvote}");
+        // ...and the firing cue must ride the *consuming* read, not the write tool —
+        // the model reads `memory_get`, uses the body, and there learns to upvote.
+        let get = find("memory_get").description.clone().expect("description");
+        assert!(get.contains("memory_upvote"), "{get}");
         // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
             .input_schema
@@ -887,6 +902,26 @@ mod tests {
         );
         // The projection selection rides on `fields` (a hit returns `key` alone by default).
         assert!(props.contains_key("fields"), "search must expose `fields`");
+        // The `fields` *values* live in the schema (a `FieldParam` enum), never in the description —
+        // that is how the model learns them; the prose stays policy-only.
+        let field_oneof = find("memory_search")
+            .input_schema
+            .get("$defs")
+            .and_then(|d| d.get("FieldParam"))
+            .and_then(|f| f.get("oneOf"))
+            .and_then(|v| v.as_array())
+            .expect("FieldParam enum in the schema");
+        let field_vals: Vec<&str> = field_oneof
+            .iter()
+            .filter_map(|v| v.get("const"))
+            .filter_map(|v| v.as_str())
+            .collect();
+        for want in ["key", "title", "tags", "coherent", "chars", "distance"] {
+            assert!(
+                field_vals.contains(&want),
+                "missing field {want}: {field_vals:?}"
+            );
+        }
 
         // The read law rides on the search description, not the server instructions.
         let search = find("memory_search")
@@ -894,6 +929,11 @@ mod tests {
             .clone()
             .expect("description");
         assert!(search.to_lowercase().contains("widen"), "{search}");
+        // The filter/projection *definitions* are the schema's job — the desc must not restate them.
+        assert!(
+            !search.contains("min_chars") && !search.contains("max_chars"),
+            "search desc must not restate field defs: {search}"
+        );
 
         // The server instruction carries the identity + the smart-caveman style (defined
         // once); it must not restate the tool law (that rides on the tools).

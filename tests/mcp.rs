@@ -108,17 +108,17 @@ async fn tools_round_trip_over_the_transport() {
     assert!(text(&got).contains("\"visits\":1"), "{}", text(&got));
 
     // Feedback is independent of a fetch (a bare title can earn it) and bumps `times_useful`.
-    let useful = call(
+    let upvote = call(
         &client,
-        "memory_useful",
+        "memory_upvote",
         serde_json::json!({ "key": "infra-logs" }),
     )
     .await;
-    assert!(!useful.is_error.unwrap_or(false), "{}", text(&useful));
+    assert!(!upvote.is_error.unwrap_or(false), "{}", text(&upvote));
     assert!(
-        text(&useful).contains("\"times_useful\":1"),
+        text(&upvote).contains("\"times_useful\":1"),
         "{}",
-        text(&useful)
+        text(&upvote)
     );
 
     // A second fetch shows both counters riding on the row.
@@ -135,7 +135,7 @@ async fn tools_round_trip_over_the_transport() {
     // An unknown key is a tool error (not a silent zero).
     let bogus = call(
         &client,
-        "memory_useful",
+        "memory_upvote",
         serde_json::json!({ "key": "ghost" }),
     )
     .await;

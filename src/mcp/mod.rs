@@ -68,8 +68,9 @@ as separate memories, one call each — never a misc/gotchas bucket; each atom m
 and `memory_delete` the less useful. Skip memory/facts when cheap to derive, live state, or one-off.";
 
 /// `memory_useful` description. The feedback nudge, carried here only.
-const USEFUL_DESCRIPTION: &str =
-    "Indicates a memory was very helpful current task. Sharp truth, no flattery.";
+const USEFUL_DESCRIPTION: &str = "Bump `times_useful` on a memory that actually shaped this task — \
+it changed a decision, dodged a bug, or you followed its law. A bare fetch is `visits`, not this. \
+Sharp truth, no flattery.";
 
 /// `memory_dupes` description. A finder for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
@@ -823,6 +824,16 @@ mod tests {
             upsert.to_lowercase().contains("separate memories"),
             "{upsert}"
         );
+        // The feedback nudge must carry a *trigger*, not just a quality bar.
+        let useful = find("memory_useful")
+            .description
+            .clone()
+            .expect("description");
+        assert!(
+            useful.to_lowercase().contains("actually shaped"),
+            "{useful}"
+        );
+        assert!(useful.to_lowercase().contains("visits"), "{useful}");
         // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
             .input_schema

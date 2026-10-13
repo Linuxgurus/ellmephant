@@ -4,11 +4,15 @@ CHART ?= charts/ellmephant
 HARBOR ?= harbor.vn.linuxguru.net/library
 # The chart lives in its own nested repo so its tags never collide with the image tags.
 HARBOR_CHARTS ?= $(HARBOR)/charts
+# The prebuilt dependency layer (Dockerfile.builder) that the main Dockerfile builds FROM. CI
+# republishes it when Cargo.lock changes; this target is for when you want it sooner.
+BUILDER_IMAGE ?= $(HARBOR)/ellmephant-builder:rust
 # Pinned so lint/render do not inherit Helm 3's v1.20.0 default, which the chart's kubeVersion rejects.
 KUBE_VERSION ?= 1.34.0
 
 .PHONY: build release test fmt clippy lint doc docker-build docker-run clean \
-        chart-lint chart-template chart-package chart-push harbor-publish harbor-hooks
+        chart-lint chart-template chart-package chart-push harbor-publish harbor-hooks \
+        builder-image
 
 build:        ## debug build
 	$(CARGO) build
@@ -51,6 +55,10 @@ chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: h
 
 harbor-publish:  ## push this commit to Harbor: chart + image (builds the image locally)
 	scripts/harbor-publish.sh
+
+builder-image:   ## build + push the dependency image (rare, slow; CI does it when Cargo.lock moves)
+	docker build -f Dockerfile.builder -t $(BUILDER_IMAGE) .
+	docker push $(BUILDER_IMAGE)
 
 harbor-hooks:    ## install the repo's git hooks into this clone (core.hooksPath)
 	git config core.hooksPath .githooks

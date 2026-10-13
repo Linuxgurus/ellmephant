@@ -1,0 +1,42 @@
+name: build-builder
+
+# Rebuild the dependency image (Dockerfile.builder) when the dependency set changes. Everything
+# else rides on it: after this, a cold `publish-dev` build skips compiling ~250 crates.
+#
+# Lagging is safe. If this has not run yet, or ran against an older lockfile, the main build just
+# compiles whatever moved -- cargo decides, not us. Wrong is not a state this can reach; only
+# slower-than-necessary.
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile.builder
+      - .forgejo/workflows/build-builder.yml
+  workflow_dispatch: # after a manual lockfile surgery
+
+env:
+  REGISTRY: harbor.vn.linuxguru.net
+  IMAGE: harbor.vn.linuxguru.net/library/ellmephant-builder
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          set -eu
+          echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+
+      - name: Build and push the dependency image
+        run: |
+          set -eu
+          docker build -f Dockerfile.builder -t "$IMAGE:rust" .
+          docker push "$IMAGE:rust"
+          echo "pushed $IMAGE:rust"

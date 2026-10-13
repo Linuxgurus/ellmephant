@@ -4,10 +4,19 @@ CHART ?= charts/ellmephant
 HARBOR ?= harbor.vn.linuxguru.net/library
 # The chart lives in its own nested repo so its tags never collide with the image tags.
 HARBOR_CHARTS ?= $(HARBOR)/charts
-# The prebuilt dependency layer (Dockerfile.builder) that the main Dockerfile builds FROM. The tag
-# names the build profile, so it MUST be bumped whenever that profile changes -- and kept in step
-# with .forgejo/workflows/publish-dev.yml. CI republishes it; this target is for doing it sooner.
-BUILDER_IMAGE ?= $(HARBOR)/ellmephant-builder:rust-lean
+# The prebuilt dependency layer (Dockerfile.builder) that the main Dockerfile builds FROM.
+#
+# The tag is a FINGERPRINT, not a name: the first 8 hex digits of sha256 over exactly these three
+# files, in this order -- `Cargo.toml`, `Cargo.lock`, `Dockerfile.builder` -- which are the image's
+# only inputs (the dependency set, and the build profile in the Dockerfile). Change any of them and
+# the tag moves by itself, so a stale image can never be silently reused and there is nothing to
+# remember to bump. `.forgejo/workflows/publish-dev.yml` computes the same hash, from the same
+# files in the same order -- keep the two in step.
+#
+# `make builder-image` publishes it; `make docker-build` consumes it.
+BUILDER_PROFILE ?= rust-lean
+BUILDER_HASH    := $(shell cat Cargo.toml Cargo.lock Dockerfile.builder | shasum -a 256 | cut -c1-8)
+BUILDER_IMAGE   ?= $(HARBOR)/ellmephant-builder:$(BUILDER_PROFILE)-$(BUILDER_HASH)
 # Pinned so lint/render do not inherit Helm 3's v1.20.0 default, which the chart's kubeVersion rejects.
 KUBE_VERSION ?= 1.34.0
 
@@ -35,8 +44,8 @@ lint: fmt clippy
 doc:          ## rustdoc
 	$(CARGO) doc --no-deps
 
-docker-build: ## build the runtime image
-	docker build -t $(IMAGE) .
+docker-build: ## build the runtime image (needs the dependency image -- `make builder-image` first)
+	docker build --build-arg BUILDER=$(BUILDER_IMAGE) -t $(IMAGE) .
 
 docker-run:   ## run doctor against a named volume
 	docker run --rm -it -v ellmephant-data:/data $(IMAGE) doctor

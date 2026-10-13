@@ -2,9 +2,11 @@
 
 # ---------- build ----------
 # The dependency layer is prebuilt and published to Harbor (see Dockerfile.builder), so a cold
-# build skips compiling ~250 crates -- 190 of the ~310 seconds it used to take. Override for a
-# self-contained build off the LAN:  --build-arg BUILDER=rust:1-bookworm
-ARG BUILDER=harbor.vn.linuxguru.net/library/ellmephant-builder:rust-lean
+# build skips compiling ~250 crates. CI passes the exact tag (a fingerprint of the dependency set
+# plus the build profile) via --build-arg. The default here is deliberately the plain image: a
+# build with no arguments is then self-contained and correct, merely slower. For the fast path
+# locally, run `make builder-image` once and then `make docker-build`.
+ARG BUILDER=rust:1-bookworm
 FROM ${BUILDER} AS builder
 
 # These MUST match Dockerfile.builder: the profile is part of cargo's dependency fingerprint, so a

@@ -52,8 +52,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 # Match candle-core 0.11's `^0.22` so only one `tokenizers` links (PLAN §1).
-tokenizers = { version = "0.22", optional = true }
-safetensors = { version = "0.8", optional = true }
+#
+# `default-features = false` drops `progressbar` (cosmetics — it drags in `indicatif`) and
+# `esaxx_fast` (a C++ pretokenizer used only to *train* a tokenizer, which we never do). It does
+# NOT drop `onig`, and cannot: candle-core depends on tokenizers with it non-optionally. That is
+# the regex engine the pretokenizer actually needs, so tokenization is identical either way and
+# every stored vector stays valid.
+tokenizers = { version = "0.22", default-features = false, optional = true }
+# `safetensors` is deliberately absent: weights are loaded through
+# `candle_core::safetensors::MmapedSafetensors`, so candle already owns that version and a direct
+# dependency here would only duplicate it.
 
 # --- P7: the MCP server (PLAN §4). `rmcp` is the official Rust MCP SDK (needs rustc 1.88,
 # hence the crate's rust-version bump). Default features bring the `#[tool]`/`#[tool_router]`
@@ -82,7 +90,6 @@ encoder = [
     "dep:candle-nn",
     "dep:candle-transformers",
     "dep:tokenizers",
-    "dep:safetensors",
 ]
 
 [dev-dependencies]

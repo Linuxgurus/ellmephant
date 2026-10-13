@@ -49,7 +49,7 @@ chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: h
 	helm push ellmephant-*.tgz "oci://$(HARBOR_CHARTS)"
 	@rm -f ellmephant-*.tgz
 
-harbor-publish:  ## push this commit to Harbor: chart + image (mirrors the CI-built image)
+harbor-publish:  ## push this commit to Harbor: chart + image (builds the image locally)
 	scripts/harbor-publish.sh
 
 harbor-hooks:    ## install the repo's git hooks into this clone (core.hooksPath)

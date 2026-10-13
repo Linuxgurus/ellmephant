@@ -6,14 +6,14 @@
 #   1. the chart, as an OCI artifact at `.../library/charts/ellmephant` (pushed immediately);
 #   2. the image at `.../library/ellmephant`, tagged `edge` and `sha-<short>`.
 #
-# The image is MIRRORED from GHCR by default rather than built here. CI already built the exact
-# linux/amd64 artifact for this commit (`sha-<short>`), so pulling it takes seconds, whereas
-# building it on Apple Silicon is an emulated Rosetta rebuild that takes half an hour.
-# HARBOR_IMAGE_MODE=build builds locally instead (no CI, no GHCR - but slow).
+# The image is BUILT HERE by default (podman, linux/amd64) - the normal process. We do NOT wait
+# on GitHub CI to build the edge image: the publish owns its own build, so a green Actions run is
+# never on the critical path. HARBOR_IMAGE_MODE=mirror pulls the CI-built GHCR image instead
+# (fast, but couples the publish to CI); =skip pushes no image at all.
 #
 # Run in the background by .githooks/post-commit on `dev`; also by hand:
 #   make harbor-publish
-#   SOURCE_TAG=1.0.1 make harbor-publish      # mirror a released main image
+#   SKIP_CHART=1 make harbor-publish          # image only (chart content unchanged)
 #
 # Needs a one-time `helm registry login harbor.vn.linuxguru.net` (podman already holds its own).
 set -euo pipefail
@@ -28,7 +28,7 @@ HARBOR_CHART=${HARBOR_CHART:-$HARBOR/charts}
 GHCR_IMAGE=${GHCR_IMAGE:-ghcr.io/jdblack/ellmephant}
 CHART=${CHART:-charts/ellmephant}
 PLATFORM=${PLATFORM:-linux/amd64}
-IMAGE_MODE=${HARBOR_IMAGE_MODE:-mirror}   # mirror | build | skip
+IMAGE_MODE=${HARBOR_IMAGE_MODE:-build}   # build | mirror | skip
 WAIT_SECONDS=${WAIT_SECONDS:-1800}
 SHORT=$(git rev-parse HEAD | cut -c1-7)
 SOURCE_TAG=${SOURCE_TAG:-sha-$SHORT}

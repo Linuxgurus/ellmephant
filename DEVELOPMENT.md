@@ -162,13 +162,13 @@ to it: this step is local by necessity. `dev` is wired to publish itself.
 On a commit to `dev`, `.githooks/post-commit` backgrounds `scripts/harbor-publish.sh`, which:
 
 1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library/charts`;
-2. mirrors the image - it waits for CI to publish `sha-<short>` to GHCR, then pulls the
-   `linux/amd64` variant and pushes it to Harbor as `edge` + `sha-<short>`.
+2. builds the `linux/amd64` image with `podman` and pushes it to Harbor as `edge` + `sha-<short>`.
 
-Mirroring instead of building is deliberate: CI has already built the exact amd64 image for that
-commit, so copying it takes seconds, while `podman build` on Apple Silicon is an emulated Rosetta
-rebuild that takes half an hour. `HARBOR_IMAGE_MODE=build` builds locally instead (no CI, no GHCR);
-`HARBOR_IMAGE_MODE=skip` skips the image.
+Building locally is the normal process: the publish owns its own build, so a green CI run is never
+on the critical path and there is nothing to wait for. (`podman build` on Apple Silicon is an
+emulated amd64 rebuild, so it is slow - but self-contained.) `HARBOR_IMAGE_MODE=mirror` pulls the
+CI-built GHCR image instead (fast, but couples the publish to CI); `HARBOR_IMAGE_MODE=skip` skips
+the image.
 
 One-time, per clone:
 
@@ -183,7 +183,7 @@ Watch it, skip it, or run it by hand:
 tail -f .tmp/harbor-publish.log
 SKIP_HARBOR=1 git commit -m '...'               # one commit, no publish
 make harbor-publish                             # run it now
-SOURCE_TAG=1.1.0 make harbor-publish            # mirror a released main image
+SOURCE_TAG=1.1.0 HARBOR_IMAGE_MODE=mirror make harbor-publish   # mirror a released main image
 ```
 
 Point the cluster at the mirror with:
@@ -261,8 +261,8 @@ git switch dev && git merge --no-ff hotfix-1.1.1 && git push   # keep dev from r
   if anonymous pulls are wanted.
 - **Platforms.** Versioned releases are published for `linux/amd64` and `linux/arm64` (QEMU on the
   runner), so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
-  `dev`/`edge` builds are **amd64 only** - the cluster is amd64, and the arm64 half roughly
-  triples the build time, which the local Harbor hook would then sit waiting on.
+  `dev`/`edge` builds are **amd64 only** - the cluster is amd64, and building the arm64 half too
+  would double a local, emulated build for no user.
 - **A chart change without a version bump publishes nothing.** `chart-release.yml` skips a
   `<chart>-<version>` release that already exists, silently. CI fails the PR instead - but only on
   a PR, so a direct push to `main` gets the silent no-op.
@@ -275,8 +275,10 @@ git switch dev && git merge --no-ff hotfix-1.1.1 && git push   # keep dev from r
   the repository's "Latest release" badge away from the app's `v*` releases.
 - **The Harbor hook is per clone.** `core.hooksPath` is local config, not committed - run
   `make harbor-hooks` in a fresh clone or the hook silently does not exist.
-- **The Harbor hook waits for CI.** It mirrors `sha-<short>` from GHCR, which CI only publishes
-  after the push - so a commit you never push times out after 30 minutes. `SKIP_HARBOR=1` skips it.
+- **The Harbor hook builds locally, so it never waits on CI.** The image is built and pushed from
+  the working tree, so it does not depend on a green Actions run (nor does it require the commit to
+  be pushed first) - just expect a slow, emulated amd64 build on Apple Silicon. `SKIP_HARBOR=1`
+  skips the hook.
 - **Harbor needs its own login for helm.** podman and helm keep separate credential stores; the
   hook's chart push fails until `helm registry login harbor.vn.linuxguru.net` has been run once.
 - **`artifacthub.io/images` is guarded too.** CI asserts the tag it names equals `Cargo.toml`'s

@@ -269,6 +269,10 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The outcome of a feedback sweep (see [`record_useful_many`]): `(key, new_total)` for every key
+/// that existed, and the keys that did not — both in input order.
+pub type UsefulSweep = (Vec<(String, i64)>, Vec<String>);
+
 /// Bump the `visits` counter for `key` and return the new total (telemetry on read).
 /// Errors with [`Error::NotFound`] when the key is unknown.
 pub fn record_visit(conn: &Connection, key: &str) -> Result<i64> {
@@ -279,6 +283,23 @@ pub fn record_visit(conn: &Connection, key: &str) -> Result<i64> {
 /// feedback). Errors with [`Error::NotFound`] when the key is unknown.
 pub fn record_useful(conn: &Connection, key: &str) -> Result<i64> {
     bump(conn, key, "times_useful")
+}
+
+/// Bump `times_useful` for many keys at once (a feedback sweep: one call, many keys). Returns
+/// `(key, new_total)` for every key that existed, and the keys that did not, both in input
+/// order. A missing key is not an error here — the caller reports the split. Duplicate keys each
+/// count once, in place.
+pub fn record_useful_many(conn: &Connection, keys: &[String]) -> Result<UsefulSweep> {
+    let mut upvoted = Vec::new();
+    let mut missing = Vec::new();
+    for key in keys {
+        match bump(conn, key, "times_useful") {
+            Ok(total) => upvoted.push((key.clone(), total)),
+            Err(Error::NotFound(_)) => missing.push(key.clone()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((upvoted, missing))
 }
 
 /// Set the split-review verdict (`Some(true)` coherent, `Some(false)` a grab-bag, `None`

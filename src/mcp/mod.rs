@@ -4,8 +4,9 @@
 //! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
 //! `memory_dupes` — with read-only annotations on the read tools and destructive on `delete`.
 //! The tool descriptions carry the SPEC §9 write policy; that is where memory quality is
-//! actually tuned. `memory_get` counts a `visits` read and carries the upvote cue; `memory_upvote`
-//! bumps the `times_useful` feedback counter.
+//! actually tuned. `memory_get` counts a `visits` read and carries the upvote cue — both in its
+//! description *and* in the returned payload (`_nudge`), where the model's attention sits after
+//! consuming a body; `memory_upvote` bumps the `times_useful` feedback counter.
 //!
 //! The store is one SQLite file behind a single connection (SPEC §15 #10), so the
 //! server holds the [`Session`] behind a mutex and serves requests serially. SQLite and
@@ -51,12 +52,14 @@ pub const TOOLS: &[&str] = &[
     "memory_dupes",
 ];
 
-/// Server-level instruction: the identity plus the smart-caveman style, defined once here.
-/// Every other law lives in the tool descriptions — each states its own, so nothing is
-/// written twice (SPEC §9).
+/// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
+/// every tool (curation), defined once here. Every other law lives in the tool descriptions — each
+/// states its own, so nothing is written twice (SPEC §9).
 const INSTRUCTIONS: &str = "ellmephant = Memory storage in smart-caveman style — big words in, \
 small words out; drop filler, articles, glue. List-shaped reads return a positional table: a \
-`cols` header names the fields, rows are bare arrays. Tool descriptions are the spec.";
+`cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
+when a memory shapes your task, `memory_upvote` it — the store's own rankings ride on your votes. \
+Tool descriptions are the spec.";
 
 /// `memory_upsert` description. The write policy lives here and *only* here — the one thing the
 /// model reads before a write.
@@ -68,8 +71,14 @@ a second. Merge redundant memories by hand: weaker is folded into stronger and `
 Skip facts cheap to derive, live state, or one-off.";
 
 /// `memory_upvote` description. The feedback nudge, carried here only.
-const UPVOTE_DESCRIPTION: &str = "Upvote a memory that shaped this task — it changed a decision, \
-dodged a bug, or you followed its law. A bare fetch is a visit, not this. Sharp truth, no flattery.";
+const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \
+decision, dodged a bug, or you followed its law. A bare fetch is a visit, not this. Pass every key \
+that earned its keep in one call; under-voting starves the store's own rankings.";
+
+/// The firing cue that rides the `memory_get` *result* payload, not just its static description.
+/// The model's attention is on the body it just consumed — a trigger fires where attention sits at
+/// the moment of use (cf. the telemetry lesson).
+const GET_NUDGE: &str = "Shaped your task? memory_upvote this key.";
 
 /// `memory_dupes` description. A finder for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
@@ -250,6 +259,14 @@ pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
     pub key: String,
+}
+
+/// A many-key request (feedback sweep).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KeysParams {
+    /// The memories' keys.
+    #[schemars(description = "Memory keys (one or more). Slugs.")]
+    pub keys: Vec<String>,
 }
 
 /// Parameters for a no-argument tool (`memory_stats`).
@@ -523,7 +540,13 @@ impl MemoryServer {
             .with_store("memory_get", move |s| s.fetch(&lookup))
             .await?;
         tracing::debug!(tool = "memory_get", key = %key, "memory fetched");
-        serde_json::to_string(&mem).map_err(|e| e.to_string())
+        // Carry the firing cue in the payload, not only the static description: the model reads
+        // the returned body here, so this is where the upvote ask must live.
+        let mut v = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+        }
+        serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
     /// Bump the `times_useful` counter on a memory that helped the task.
@@ -540,17 +563,35 @@ impl MemoryServer {
     )]
     async fn memory_upvote(
         &self,
-        Parameters(p): Parameters<KeyParams>,
+        Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        let key = p.key;
-        let bump = key.clone();
-        let total = self
-            .with_store("memory_upvote", move |s| s.record_useful(&bump))
+        let keys = p.keys;
+        if keys.is_empty() {
+            return Err("memory_upvote needs at least one key".to_string());
+        }
+        let sweep = keys.clone();
+        let (upvoted, missing) = self
+            .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
             .await?;
-        tracing::info!(tool = "memory_upvote", key = %key, times_useful = total, "marked useful");
-        Ok(json_ok(
-            serde_json::json!({ "status": "useful", "key": key, "times_useful": total }),
-        ))
+        // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
+        if upvoted.is_empty() {
+            return Err(Error::NotFound(keys.join(", ")).to_string());
+        }
+        tracing::info!(
+            tool = "memory_upvote",
+            upvoted = upvoted.len(),
+            missing = missing.len(),
+            "marked useful"
+        );
+        let upvoted: Vec<serde_json::Value> = upvoted
+            .into_iter()
+            .map(|(key, times_useful)| serde_json::json!({ "key": key, "times_useful": times_useful }))
+            .collect();
+        let mut result = serde_json::json!({ "status": "useful", "upvoted": upvoted });
+        if !missing.is_empty() {
+            result["missing"] = serde_json::json!(missing);
+        }
+        Ok(json_ok(result))
     }
 
     /// List the memories whose bodies link to `key`.
@@ -845,10 +886,34 @@ mod tests {
             "{upvote}"
         );
         assert!(upvote.to_lowercase().contains("visit"), "{upvote}");
+        // The old "no flattery" clause was a *brake* that starved the counter; it must stay gone,
+        // replaced by a default-on push to vote.
+        assert!(
+            !upvote.to_lowercase().contains("no flattery"),
+            "the withholding brake is back: {upvote}"
+        );
+        assert!(upvote.to_lowercase().contains("under-voting"), "{upvote}");
+        // The sweep takes *many* keys: the schema exposes `keys`, never a single `key`.
+        let upvote_props = find("memory_upvote")
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .expect("upvote schema has properties");
+        assert!(upvote_props.contains_key("keys"), "{upvote_props:?}");
+        assert!(!upvote_props.contains_key("key"), "{upvote_props:?}");
         // ...and the firing cue must ride the *consuming* read, not the write tool —
         // the model reads `memory_get`, uses the body, and there learns to upvote.
         let get = find("memory_get").description.clone().expect("description");
         assert!(get.contains("memory_upvote"), "{get}");
+        // ...and the cue must also ride `memory_get`'s *result* payload, where the model's
+        // attention actually sits after consuming the body (pinned end-to-end in tests/mcp.rs).
+        assert!(GET_NUDGE.contains("memory_upvote"), "{GET_NUDGE}");
+        // Curation is a cross-tool duty, so it is announced once in the server instructions too.
+        assert!(
+            INSTRUCTIONS.contains("memory_upvote") && INSTRUCTIONS.contains("Curation"),
+            "{INSTRUCTIONS}"
+        );
         // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
             .input_schema

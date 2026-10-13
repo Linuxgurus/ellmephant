@@ -307,8 +307,11 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   reads, so nothing is written twice. The §9 write policy rides on `memory_upsert`'s
   description; the read policy on `memory_search`'s; the feedback *trigger* on `memory_upvote`'s,
   with its firing cue on `memory_get`'s (the read that hands back a body the model consumes).
-  The server-level **instructions** carry the identity and the shared **smart-caveman** style
-  (defined once there, referenced by the write tool).
+  The cue rides **both** `memory_get`'s description **and** its returned payload (a `_nudge`
+  field): the model's attention sits on the body it just read, so the ask must live there — a
+  trigger fires only where attention sits at the moment of use. Curation is announced once as a
+  cross-tool duty in the server-level **instructions**, alongside the identity and the shared
+  **smart-caveman** style (defined once there, referenced by the write tool).
 - **A tool's description carries policy; its parameter schemas carry the per-field
   definitions** — the two never restate each other. So `memory_upsert`'s description holds the
   write *rules* (one topic, trim, merge); each field's `key`/`title`/`body`/`source`/`tags`
@@ -328,10 +331,17 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
 - `memory_coherent` records the §9 split-review verdict for a key (`true` = one topic, `false` =
   a grab-bag, omit/`null` = unjudged); an upsert resets it to unjudged.
+- `memory_upvote` takes one or more `keys` (`{keys:[…]}`) and bumps `times_useful` for each that
+  exists — a feedback sweep in one call. It returns `{status, upvoted:[{key,times_useful}], missing?}`;
+  a key that does not exist is reported in `missing` (not fatal), but a sweep that hits **nothing**
+  (or an empty list) is a tool error, so a typo is surfaced rather than silently zero.
 - `memory_stats` returns the read-only store digest (counts, size, tag/link shape, top tags, usage
-  counters, most-useful memories, age) as one keyed JSON object — the same `Stats` the `stats` CLI
-  command emits (`store::stats::compute`); no bodies.
-- `memory_get` is the **only** read that returns a body, and the way to read a known `key`.
+  counters, most-useful memories, **hot-but-unvoted** candidates, age) as one keyed JSON object —
+  the same `Stats` the `stats` CLI command emits (`store::stats::compute`); no bodies. `unvoted_hot`
+  lists `(key, visits)` for memories read at least twice but never marked useful — the store's own
+  blind spot, surfaced so it can be judged.
+- `memory_get` is the **only** read that returns a body, and the way to read a known `key`. Its
+  result carries a `_nudge` field prompting `memory_upvote` when the memory shaped the task.
 - `memory_dupes` is the **finder for the §9 merge rule**: a read-only audit returning memory
   *pairs* whose document embeddings sit within a tight cosine ceiling (default `0.05`), nearest
   first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
@@ -349,7 +359,8 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 - `ellmephant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
 - `ellmephant stats [--json]` (alias `summary`) → a read-only digest: counts, on-disk size and
   body/title spread, tag shape (distinct, placements, singletons, top-N, per-memory / per-tag
-  averages, coverage), link shape (edges, linked, orphans, dangling) and recent activity (§14).
+  averages, coverage), link shape (edges, linked, orphans, dangling), usage telemetry (visits,
+  useful, most-useful, hot-but-unvoted) and recent activity (§14).
 - `ellmephant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
 - `ellmephant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
 

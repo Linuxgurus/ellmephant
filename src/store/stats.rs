@@ -19,6 +19,12 @@ pub const TOP_TAGS: usize = 10;
 /// How many of the most-useful memories the digest carries.
 pub const TOP_USEFUL: usize = 5;
 
+/// How many read-but-never-upvoted memories the digest carries.
+pub const TOP_UNVOTED: usize = 5;
+
+/// Minimum `visits` for a memory to count as "hot but unvoted" (a single read is a glance, not a hit).
+pub const UNVOTED_MIN_VISITS: i64 = 2;
+
 /// A read-only digest of the store (`ellmephant stats`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
@@ -66,6 +72,11 @@ pub struct Stats {
     pub useful_total: i64,
     /// The most-useful memories (key, `times_useful`), count-desc then key — at most [`TOP_USEFUL`].
     pub top_useful: Vec<(String, i64)>,
+    /// Candidates the store's own ranking may be starving: memories read at least
+    /// [`UNVOTED_MIN_VISITS`] times but never marked useful (key, `visits`), visit-desc then key —
+    /// at most [`TOP_UNVOTED`]. Surfaced so a hot-but-ignored memory can be judged, not silently
+    /// forgotten.
+    pub unvoted_hot: Vec<(String, i64)>,
     /// Oldest `created` timestamp, or `None` for an empty store.
     pub oldest: Option<String>,
     /// Newest `created` timestamp, or `None` for an empty store.
@@ -175,6 +186,17 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         let rows = stmt.query_map([TOP_USEFUL as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // Hot but unvoted: read repeatedly, never marked useful — the store's own blind spot.
+    let unvoted_hot: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT key, visits FROM memory WHERE times_useful = 0 AND visits >= ?2 \
+             ORDER BY visits DESC, key LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([TOP_UNVOTED as i64, UNVOTED_MIN_VISITS], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
     // Dense clusters: connected components of the (undirected) link graph.
     let (link_components, largest_component) = component_sizes(conn)?;
@@ -202,6 +224,7 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         visits_total,
         useful_total,
         top_useful,
+        unvoted_hot,
         oldest,
         newest,
         added_7d,
@@ -306,6 +329,7 @@ mod tests {
             visits_total: 0,
             useful_total: 0,
             top_useful: Vec::new(),
+            unvoted_hot: Vec::new(),
             oldest: None,
             newest: None,
             added_7d: 0,

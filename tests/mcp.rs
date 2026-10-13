@@ -108,10 +108,11 @@ async fn tools_round_trip_over_the_transport() {
     assert!(text(&got).contains("\"visits\":1"), "{}", text(&got));
 
     // Feedback is independent of a fetch (a bare title can earn it) and bumps `times_useful`.
+    // A sweep takes one or more keys.
     let upvote = call(
         &client,
         "memory_upvote",
-        serde_json::json!({ "key": "infra-logs" }),
+        serde_json::json!({ "keys": ["infra-logs"] }),
     )
     .await;
     assert!(!upvote.is_error.unwrap_or(false), "{}", text(&upvote));
@@ -131,15 +132,37 @@ async fn tools_round_trip_over_the_transport() {
     let again: serde_json::Value = serde_json::from_str(&text(&again)).expect("memory json");
     assert_eq!(again["visits"], serde_json::json!(2));
     assert_eq!(again["times_useful"], serde_json::json!(1));
+    // The upvote cue rides the fetched *payload* itself, not just the tool's static description:
+    // the ask must sit where the model's attention lands after consuming the body.
+    assert!(
+        again["_nudge"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("memory_upvote"),
+        "get result missing the upvote nudge: {again}"
+    );
 
-    // An unknown key is a tool error (not a silent zero).
+    // An unknown key is a tool error (not a silent zero): a sweep that hits nothing fails.
     let bogus = call(
         &client,
         "memory_upvote",
-        serde_json::json!({ "key": "ghost" }),
+        serde_json::json!({ "keys": ["ghost"] }),
     )
     .await;
     assert_eq!(bogus.is_error, Some(true));
+
+    // A mixed sweep upvotes the keys that exist and reports the rest in `missing` (not fatal).
+    let mixed = call(
+        &client,
+        "memory_upvote",
+        serde_json::json!({ "keys": ["infra-logs", "ghost"] }),
+    )
+    .await;
+    assert!(!mixed.is_error.unwrap_or(false), "{}", text(&mixed));
+    let mixed: serde_json::Value = serde_json::from_str(&text(&mixed)).expect("upvote json");
+    assert_eq!(mixed["upvoted"][0]["key"], serde_json::json!("infra-logs"));
+    assert_eq!(mixed["upvoted"][0]["times_useful"], serde_json::json!(2));
+    assert_eq!(mixed["missing"], serde_json::json!(["ghost"]));
 
     let found = call(
         &client,

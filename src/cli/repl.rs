@@ -200,7 +200,7 @@ fn print_help() {
          \x20 search [\"PHRASE\"] [--k N] [--max-distance D] [--expand N] [--json]\n\
          \x20 show KEY [--json]\n\
          \x20 rm KEY\n\
-         \x20 useful KEY\n\
+         \x20 useful KEY...\n\
          \x20 coherent KEY [true|false|null]\n\
          \x20 list [--json]\n\
          \x20 tags [--json]\n\

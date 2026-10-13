@@ -117,6 +117,12 @@ impl Session {
         store::record_useful(&self.conn, key)
     }
 
+    /// Bump `times_useful` for many keys at once. Returns `(key, new_total)` for the keys that
+    /// existed and the keys that did not, both in input order — a missing key is not an error.
+    pub fn record_useful_many(&self, keys: &[String]) -> Result<store::UsefulSweep> {
+        store::record_useful_many(&self.conn, keys)
+    }
+
     /// Set the split-review verdict for `key` (`Some(true)` coherent, `Some(false)` a
     /// grab-bag, `None` unjudged). Errors with [`Error::NotFound`] when the key is unknown.
     pub fn mark_coherent(&self, key: &str, coherent: Option<bool>) -> Result<()> {

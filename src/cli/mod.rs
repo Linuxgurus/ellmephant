@@ -121,8 +121,8 @@ pub enum Command {
     },
     /// Delete one memory by key.
     Rm { key: String },
-    /// Bump a memory's `times_useful` counter (it earned its keep).
-    Useful { key: String },
+    /// Bump a memory's `times_useful` counter (it earned its keep). One or more keys.
+    Useful { keys: Vec<String> },
     /// Set a memory's split-review verdict (coherent / grab-bag / unjudged).
     Coherent {
         key: String,
@@ -368,7 +368,7 @@ pub fn execute(session: &mut Session, command: Command) -> Result<()> {
         }
         Command::Show { key, json } => cmd_show(session, &key, json),
         Command::Rm { key } => cmd_rm(session, &key),
-        Command::Useful { key } => cmd_useful(session, &key),
+        Command::Useful { keys } => cmd_useful(session, &keys),
         Command::Coherent { key, value } => cmd_coherent(session, &key, &value),
         Command::List { json } => cmd_list(session, json),
         Command::Tags { json } => cmd_tags(session, json),
@@ -448,9 +448,17 @@ fn cmd_show(session: &Session, key: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_useful(session: &Session, key: &str) -> Result<()> {
-    let total = session.record_useful(key)?;
-    println!("useful {key} ({total})");
+fn cmd_useful(session: &Session, keys: &[String]) -> Result<()> {
+    let (upvoted, missing) = session.record_useful_many(keys)?;
+    if upvoted.is_empty() {
+        return Err(Error::NotFound(keys.join(", ")));
+    }
+    for (key, total) in &upvoted {
+        println!("useful {key} ({total})");
+    }
+    for key in &missing {
+        eprintln!("no such memory: {key}");
+    }
     Ok(())
 }
 

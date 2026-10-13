@@ -244,6 +244,17 @@ pub fn render_stats(s: &Stats, json: bool) -> Result<String> {
             .join(", ");
         out.push_str(&format!("  top useful     {top}\n"));
     }
+    if s.unvoted_hot.is_empty() {
+        out.push_str("  unvoted hot    (none)\n");
+    } else {
+        let hot = s
+            .unvoted_hot
+            .iter()
+            .map(|(key, n)| format!("{key} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("  unvoted hot    {hot}\n"));
+    }
 
     Ok(out)
 }

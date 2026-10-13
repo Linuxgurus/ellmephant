@@ -169,7 +169,8 @@ impl Session {
     }
 
     /// Recompute every vector and rebuild the derived vector index, handling a model or
-    /// dimension change (P9). Loads the encoder, so it is a deliberately heavy command.
+    /// dimension change (P9). Loads the encoder, so it is the heaviest call the server makes —
+    /// it backs the `memory_reembed` tool.
     pub fn reembed(&mut self) -> Result<maintain::Report> {
         self.ensure_embedder()?;
         let embedder = self.embedder()?;

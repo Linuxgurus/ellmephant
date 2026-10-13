@@ -50,6 +50,7 @@ pub const TOOLS: &[&str] = &[
     "memory_upvote",
     "memory_stats",
     "memory_dupes",
+    "memory_reembed",
 ];
 
 /// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
@@ -63,6 +64,15 @@ Tool descriptions are the spec.";
 
 /// `memory_upsert` description. The write policy lives here and *only* here — the one thing the
 /// model reads before a write.
+const REEMBED_DESCRIPTION: &str = "\
+Recompute every stored vector and rebuild the derived vector index. Needed when the encoder \
+changes — a different model, projection or dimension — because the vector table's width is fixed \
+when it is created, and the store refuses to reinterpret stored vectors rather than hand back \
+wrong neighbours. `memory` (keys, tags, titles, bodies) is the only source of truth; everything \
+this touches is derived, so nothing written can be lost and re-running it is harmless. Heavy: it \
+loads the encoder and re-embeds the whole store in one call, so call it once and wait, rather \
+than retrying it.";
+
 const UPSERT_DESCRIPTION: &str = "\
 Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clustered facts, one \
 per line; never a misc/gotchas bucket. Before saving, check: body hold ≥2 distinct topics? Split — \
@@ -698,6 +708,44 @@ impl MemoryServer {
         );
         store::dupes::to_wire_json(&pairs).map_err(|e| e.to_string())
     }
+
+    /// Recompute every vector and rebuild the derived index — the only path out of a model or
+    /// dimension change, which [`crate::index::vec::ensure`] deliberately refuses to absorb.
+    #[tool(
+        name = "memory_reembed",
+        description = REEMBED_DESCRIPTION,
+        annotations(
+            title = "Re-embed store",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_reembed(
+        &self,
+        Parameters(_): Parameters<ListParams>,
+    ) -> std::result::Result<String, String> {
+        let report = self
+            .with_store("memory_reembed", move |s| s.reembed())
+            .await?;
+        tracing::info!(
+            tool = "memory_reembed",
+            rows = report.rows,
+            dim = report.dim,
+            rebuilt = report.rebuilt,
+            model = %report.model,
+            "re-embedded the store"
+        );
+        // `Report` is not Serialize; spell the fields out so the response stays explicit.
+        Ok(json_ok(serde_json::json!({
+            "status": "re-embedded",
+            "rows": report.rows,
+            "dim": report.dim,
+            "rebuilt": report.rebuilt,
+            "model": report.model,
+        })))
+    }
 }
 
 #[tool_handler]
@@ -859,6 +907,10 @@ mod tests {
         // The split-review mark writes, non-destructively.
         assert_eq!(ann("memory_coherent").read_only_hint, Some(false));
         assert_eq!(ann("memory_coherent").destructive_hint, Some(false));
+        // Re-embed writes, but only to the derived index -- nothing it touches is source data.
+        assert_eq!(ann("memory_reembed").read_only_hint, Some(false));
+        assert_eq!(ann("memory_reembed").destructive_hint, Some(false));
+        assert_eq!(ann("memory_reembed").idempotent_hint, Some(true));
 
         // The write *policy* rides on the upsert description (SPEC §9)...
         let upsert = find("memory_upsert")

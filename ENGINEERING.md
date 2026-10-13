@@ -27,7 +27,7 @@ The decisions the code obeys:
   title + link-stripped body) is embedded. The embedding strategy can change without losing what
   was written.
 - **Everything but `memory` is derived.** The vector index and the link graph are rebuildable
-  from the rows (`ellmephant reembed`). The relational store must never lie; there is no FTS index
+  from the rows (the `memory_reembed` tool). The relational store must never lie; there is no FTS index
   and no tag table to keep in sync.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
@@ -103,24 +103,27 @@ Two implementation notes:
 invalidates a stored vector.
 
 ```sh
-ellmephant embed "where do the logs live" --query   # dim + load/embed latency + norm
+# There is no "embed one string" entry point: the encoder is reachable only through `memory_search`
+# and `memory_reembed`, which reports the dimension and model id it has just written with.
 ```
 
 ## Search
 
 A search is a **semantic phrase plus optional structured filters**, which **intersect** (a hit
 must satisfy every one given). The phrase is embedded (with the query-side instruction prefix)
-and the KNN of the whole store is taken, capped by `--max-distance` and truncated to `-k`;
+and the KNN of the whole store is taken, capped by `max_distance` and truncated to `k`;
 **with no phrase it is a pure filter** over the store (every matching row, key order, uncapped).
-Filters apply *before* the `k` cap, so a result shorter than `-k` means the distance ceiling cut
-it, not `-k`. There is no regex/key leg — `key`/`tags` are part of the embedded document.
+Filters apply *before* the `k` cap, so a result shorter than `k` means the distance ceiling cut
+it, not `k`. There is no regex/key leg — `key`/`tags` are part of the embedded document.
 
-```sh
-ellmephant search "where do the logs live"                 # semantic, k=5
-ellmephant search "portainer-notes-gw"                     # key/tag tokens are in the embedding
-ellmephant search "backups" --expand 1                     # + linked neighbours
-ellmephant search --tag k8s --tag gotchas                  # phrase-less: AND filter, all rows
-ellmephant search --min-chars 1000 --coherent '!true'      # the §9 split-review queue
+```jsonc
+// `memory_search` parameters. Every one is optional but the query — or omit the query entirely
+// and the filters stand alone, returning every matching row in key order.
+{ "query": "where do the logs live" }                   // semantic, k=5 by default
+{ "query": "portainer-notes-gw" }                       // key/tag tokens are in the embedding
+{ "query": "backups", "expand": 1 }                     // + linked neighbours
+{ "tags": ["k8s", "gotchas"] }                          // phrase-less: AND filter, all rows
+{ "min_chars": 1000, "coherent": "!true" }              // the §9 split-review queue
 ```
 
 Results are ordered by ascending distance. A hit carries no body: the terminal shows
@@ -156,13 +159,11 @@ file is detected via the manifest rather than silently fed into the vectors.
 
 ## Bench & tuning
 
-`bench` measures load/embed/search latency and gates retrieval quality.
+The `bench` integration test measures load/embed/search latency and gates retrieval quality.
 
 ```sh
-ellmephant bench                            # load / embed / search latency at the current row count
-ellmephant bench --golden                   # + recall@k & MRR over <home>/golden/queries.jsonl
-ellmephant bench --golden --golden-file Q   # score a specific golden set
-ellmephant bench --sweep                    # walk k
+cargo test --test bench                    # latency + recall@k & MRR over tests/golden/
+cargo test --test bench -- --nocapture     # print the detail rather than just the verdict
 ```
 
 The golden file is JSONL, one object per line: `{"query": "…", "expect": ["key", …], "k": 3}`

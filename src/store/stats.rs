@@ -1,4 +1,4 @@
-//! Store statistics for `ellmephant stats` (aliases `summary`/`stat`): size, spread, tag and link
+//! Store statistics for the `memory_stats` tool: size, spread, tag and link
 //! shape, and recent activity — read-only aggregates over `memory` and its derived indexes.
 //!
 //! Everything here is cheap: counts and `length()` aggregates run in SQLite, and the tag shape
@@ -25,7 +25,7 @@ pub const TOP_UNVOTED: usize = 5;
 /// Minimum `visits` for a memory to count as "hot but unvoted" (a single read is a glance, not a hit).
 pub const UNVOTED_MIN_VISITS: i64 = 2;
 
-/// A read-only digest of the store (`ellmephant stats`).
+/// A read-only digest of the store (the `memory_stats` tool).
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     /// Rows in `memory`.

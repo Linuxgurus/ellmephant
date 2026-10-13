@@ -14,6 +14,7 @@ don't have to remember the exact words you used.
   chatbots like TypingMind work too, as long as whatever MCP connector they rely on can reach
   Ellmephant.
 
+
 ## Contents
 
 - [Getting started](#getting-started) — follow these in order

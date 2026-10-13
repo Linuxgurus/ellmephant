@@ -22,6 +22,10 @@ env:
   REGISTRY: harbor.vn.linuxguru.net
   IMAGE: harbor.vn.linuxguru.net/library/ellmephant
   BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
+  # The tag NAMES the build profile. Bump it whenever the profile in Dockerfile.builder changes:
+  # the ensure-step below only checks for the tag's existence, so a stale image would be reused and
+  # the profile mismatch would make cargo rebuild every dependency instead of skipping them.
+  BUILDER_TAG: rust-lean
 
 jobs:
   publish:
@@ -46,12 +50,13 @@ jobs:
       - name: Ensure the dependency image exists
         run: |
           set -eu
-          if docker manifest inspect "$BUILDER:rust" > /dev/null 2>&1; then
-            echo "$BUILDER:rust is present"
+          ref="$BUILDER:$BUILDER_TAG"
+          if docker manifest inspect "$ref" > /dev/null 2>&1; then
+            echo "$ref is present"
           else
-            echo "$BUILDER:rust is missing -- building it (slow, but once)"
-            docker build -f Dockerfile.builder -t "$BUILDER:rust" .
-            docker push "$BUILDER:rust"
+            echo "$ref is missing -- building it (slow, but once)"
+            docker build -f Dockerfile.builder -t "$ref" .
+            docker push "$ref"
           fi
 
       - name: Build and push

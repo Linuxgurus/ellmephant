@@ -4,8 +4,15 @@
 # The dependency layer is prebuilt and published to Harbor (see Dockerfile.builder), so a cold
 # build skips compiling ~250 crates -- 190 of the ~310 seconds it used to take. Override for a
 # self-contained build off the LAN:  --build-arg BUILDER=rust:1-bookworm
-ARG BUILDER=harbor.vn.linuxguru.net/library/ellmephant-builder:rust
+ARG BUILDER=harbor.vn.linuxguru.net/library/ellmephant-builder:rust-lean
 FROM ${BUILDER} AS builder
+
+# These MUST match Dockerfile.builder: the profile is part of cargo's dependency fingerprint, so a
+# mismatch here makes cargo rebuild every dependency the image was built to provide.
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=false
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=gold"
+
 WORKDIR /src
 
 # Warm the dependency cache against a stub crate so editing src/ does not rebuild

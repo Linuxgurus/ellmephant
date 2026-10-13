@@ -15,6 +15,22 @@
 
 FROM rust:1-bookworm
 
+# The lean release profile -- and this MUST match the main Dockerfile exactly. Profile settings are
+# part of cargo's dependency fingerprint, so if this image's dependencies were built with a
+# different profile than the build that consumes them, cargo treats every dependency as changed
+# and recompiles all of them -- which is the whole cost this image exists to avoid.
+#
+# `codegen-units = 16` and `lto = false` are cargo's own release defaults. They remove the
+# cross-crate LLVM work from the build and hand back a slower runtime binary. Deliberate for an
+# `edge` image: to get the optimised build back, drop both ENVs here and in the Dockerfile, and
+# bump the builder tag (see .forgejo/workflows/publish-dev.yml).
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=false
+
+# `gold` ships with binutils and beats the default `ld` (bfd). `lld` is not installed in this
+# image; note gold is itself deprecated upstream, so lld is the eventual answer.
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=gold"
+
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./

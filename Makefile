@@ -4,9 +4,10 @@ CHART ?= charts/ellmephant
 HARBOR ?= harbor.vn.linuxguru.net/library
 # The chart lives in its own nested repo so its tags never collide with the image tags.
 HARBOR_CHARTS ?= $(HARBOR)/charts
-# The prebuilt dependency layer (Dockerfile.builder) that the main Dockerfile builds FROM. CI
-# republishes it when Cargo.lock changes; this target is for when you want it sooner.
-BUILDER_IMAGE ?= $(HARBOR)/ellmephant-builder:rust
+# The prebuilt dependency layer (Dockerfile.builder) that the main Dockerfile builds FROM. The tag
+# names the build profile, so it MUST be bumped whenever that profile changes -- and kept in step
+# with .forgejo/workflows/publish-dev.yml. CI republishes it; this target is for doing it sooner.
+BUILDER_IMAGE ?= $(HARBOR)/ellmephant-builder:rust-lean
 # Pinned so lint/render do not inherit Helm 3's v1.20.0 default, which the chart's kubeVersion rejects.
 KUBE_VERSION ?= 1.34.0
 

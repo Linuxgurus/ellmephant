@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 
 # ---------- build ----------
-FROM rust:1-bookworm AS builder
+# The dependency layer is prebuilt and published to Harbor (see Dockerfile.builder), so a cold
+# build skips compiling ~250 crates -- 190 of the ~310 seconds it used to take. Override for a
+# self-contained build off the LAN:  --build-arg BUILDER=rust:1-bookworm
+ARG BUILDER=harbor.vn.linuxguru.net/library/ellmephant-builder:rust
+FROM ${BUILDER} AS builder
 WORKDIR /src
 
 # Warm the dependency cache against a stub crate so editing src/ does not rebuild

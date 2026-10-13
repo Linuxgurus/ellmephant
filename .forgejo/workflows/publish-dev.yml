@@ -5,7 +5,7 @@ name: publish-dev
 # This replaces the old `.githooks/post-commit` hook, which did the same job by building with
 # podman on the developer's machine: emulated amd64 on Apple Silicon (its own comment admitted it
 # was slow), and only if that machine happened to be awake. Here the build runs on the cluster,
-# natively amd64, and the DinD layer cache survives between jobs.
+# natively amd64.
 #
 # Tags match what the hook used -- `edge` plus `sha-<short>` -- so nothing downstream has to move.
 #
@@ -21,6 +21,7 @@ on:
 env:
   REGISTRY: harbor.vn.linuxguru.net
   IMAGE: harbor.vn.linuxguru.net/library/ellmephant
+  BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
 
 jobs:
   publish:
@@ -36,6 +37,22 @@ jobs:
           set -eu
           # The robot name contains a `$` (robot$library+forgejo); quoted, so the shell leaves it be.
           echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+
+      # The dependency layer, prebuilt (Dockerfile.builder). Building it here, lazily, rather than
+      # in a separate path-filtered workflow, keeps this correct without depending on whether
+      # Forgejo's `on.push.paths` matches and without racing a second job on this one-at-a-time
+      # runner. A miss costs one slow build; it can never be *wrong*, because cargo recompiles
+      # whatever the image is missing.
+      - name: Ensure the dependency image exists
+        run: |
+          set -eu
+          if docker manifest inspect "$BUILDER:rust" > /dev/null 2>&1; then
+            echo "$BUILDER:rust is present"
+          else
+            echo "$BUILDER:rust is missing -- building it (slow, but once)"
+            docker build -f Dockerfile.builder -t "$BUILDER:rust" .
+            docker push "$BUILDER:rust"
+          fi
 
       - name: Build and push
         run: |

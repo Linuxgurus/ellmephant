@@ -1,11 +1,12 @@
-//! The CLI: one clap tree, three faces (REPL, one-shot, MCP) over one core.
+//! The binary's command surface: the MCP server, plus two operational commands.
+//!
+//! The interactive REPL and the one-shot store commands (add/search/show/stats/…) are gone:
+//! MCP is the read/write path, and anything that is not MCP is better served by the API.
 
-pub mod bench;
 pub mod doctor;
 pub mod embed;
 pub mod format;
 pub mod model;
-pub mod repl;
 pub mod session;
 
 use std::path::PathBuf;
@@ -13,12 +14,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Paths};
-use crate::error::{Error, Result};
-use crate::search::{Coherent, Query};
-use crate::store::Memory;
-use crate::store::stats;
-
-use self::session::Session;
+use crate::error::Result;
 
 /// Top-level arguments. `--home` (or `ELLMEPHANT_HOME`) relocates the whole store,
 /// which is what keeps tests hermetic.
@@ -54,116 +50,9 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// One-shot subcommands; the REPL mirrors these.
+/// What the binary can be asked to do. With no subcommand it serves MCP.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Interactive REPL (default when no subcommand is given).
-    Repl,
-    /// Print paths, schema version and derived-index health.
-    Doctor {
-        /// Re-hash every cached weight file (slow; SPEC §6.3).
-        #[arg(long)]
-        verify: bool,
-    },
-    /// Store a memory (upsert by key).
-    Add {
-        /// Slug; auto-generated from the title when omitted.
-        #[arg(long)]
-        key: Option<String>,
-        /// One-liner.
-        #[arg(long)]
-        title: String,
-        /// Fact; `-` reads stdin.
-        #[arg(long)]
-        body: String,
-        /// Provenance (command/path/repo/quote).
-        #[arg(long)]
-        source: Option<String>,
-        /// Repeatable tag (an aspect of the subject).
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-    },
-    /// Semantic phrase search, with optional tag/size/coherence filters (all intersect).
-    Search {
-        /// The phrase; omit for a pure filter over the store.
-        query: Option<String>,
-        /// Result count.
-        #[arg(long)]
-        k: Option<usize>,
-        /// Cosine-distance ceiling.
-        #[arg(long)]
-        max_distance: Option<f32>,
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-        /// Link-neighbourhood hops to include.
-        #[arg(long, default_value_t = 0)]
-        expand: u8,
-        /// Repeatable tag; a memory must carry every tag given.
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// Minimum embedded-document size (chars).
-        #[arg(long)]
-        min_chars: Option<usize>,
-        /// Maximum embedded-document size (chars).
-        #[arg(long)]
-        max_chars: Option<usize>,
-        /// Coherence filter: true|false|null|!true|!false|!null.
-        #[arg(long)]
-        coherent: Option<String>,
-    },
-    /// Print one memory by key.
-    Show {
-        key: String,
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete one memory by key.
-    Rm { key: String },
-    /// Bump a memory's `times_useful` counter (it earned its keep). One or more keys.
-    Useful { keys: Vec<String> },
-    /// Set a memory's split-review verdict (coherent / grab-bag / unjudged).
-    Coherent {
-        key: String,
-        /// `true` (one topic), `false` (a grab-bag), or `null`/`clear` (unjudged).
-        #[arg(default_value = "null")]
-        value: String,
-    },
-    /// List the memory index (key, tags, title) without bodies.
-    List {
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List tags with counts.
-    Tags {
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Digest of the store: size, spread, tags, links and activity.
-    #[command(visible_alias = "summary", alias = "stat")]
-    Stats {
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Recompute every vector and rebuild the vector index (handles a model/dim change).
-    Reembed,
-    /// Rename a key: rewrite `[[old]]` in bodies and repoint link edges.
-    Rename {
-        /// Existing key.
-        old: String,
-        /// New key.
-        new: String,
-    },
-    /// Audit the link graph for dangling `[[key]]` targets.
-    Links {
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-    },
     /// Serve MCP over Streamable HTTP (default) or stdio.
     Mcp {
         /// Serve over stdio instead of HTTP.
@@ -181,33 +70,16 @@ pub enum Command {
         #[arg(long, value_name = "PORT", env = "ELLMEPHANT_MCP_PORT")]
         port: Option<u16>,
     },
+    /// Print paths, schema version and derived-index health.
+    Doctor {
+        /// Re-hash every cached weight file (slow; SPEC §6.3).
+        #[arg(long)]
+        verify: bool,
+    },
     /// Weights cache: status | fetch | rm (SPEC §6.5).
     Model {
         #[command(subcommand)]
         command: ModelCommand,
-    },
-    /// Measure load/embed/search latency; `--golden` scores retrieval quality.
-    Bench {
-        /// Run the golden eval set too.
-        #[arg(long)]
-        golden: bool,
-        /// Golden JSONL (default: `<home>/golden/queries.jsonl`).
-        #[arg(long, value_name = "FILE")]
-        golden_file: Option<PathBuf>,
-        /// Sweep the result count and the embed projection.
-        #[arg(long)]
-        sweep: bool,
-        /// Result count for the timing search and the single-shot golden run.
-        #[arg(long, default_value_t = 10)]
-        k: usize,
-    },
-    /// Embed a string and print dim + latency (debug; PLAN P3).
-    Embed {
-        /// Text to embed.
-        text: String,
-        /// Embed as a query (applies the instruction prefix).
-        #[arg(long)]
-        query: bool,
     },
 }
 
@@ -252,7 +124,7 @@ pub enum ModelCommand {
     },
 }
 
-/// Resolve paths, then dispatch.
+/// Resolve paths, then dispatch. No subcommand means "serve MCP" — the container's mode.
 pub fn run(cli: Cli) -> Result<()> {
     let paths = match cli.home {
         Some(dir) => Paths::from_root(dir),
@@ -278,14 +150,15 @@ pub fn run(cli: Cli) -> Result<()> {
         spec.offline = true;
     }
 
-    match cli.command.unwrap_or(Command::Repl) {
-        Command::Repl => {
-            let session = Session::open(paths, cfg, spec)?;
-            repl::run(session)
-        }
+    let command = cli.command.unwrap_or_else(|| Command::Mcp {
+        stdio: false,
+        host: std::env::var("ELLMEPHANT_MCP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: None,
+    });
+
+    match command {
         Command::Doctor { verify } => doctor::run(&paths, &cfg, &spec, verify),
         Command::Model { command } => model::cmd(&spec, command),
-        Command::Embed { text, query } => embed::run(&spec, &cfg, &text, query),
         // MCP holds the store open and serves until the client disconnects (P7).
         Command::Mcp { stdio, host, port } => {
             let transport = if stdio {
@@ -298,245 +171,5 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             crate::mcp::serve(paths, cfg, spec, transport)
         }
-        Command::Bench {
-            golden,
-            golden_file,
-            sweep,
-            k,
-        } => bench::run(
-            &paths,
-            &cfg,
-            &spec,
-            &bench::Options {
-                golden,
-                golden_file,
-                sweep,
-                k,
-            },
-        ),
-        command => {
-            let mut session = Session::open(paths, cfg, spec)?;
-            execute(&mut session, command)
-        }
     }
-}
-
-/// Run one already-parsed store command against a live [`Session`] — the shared core of
-/// the one-shot CLI and the REPL, so the two can never drift apart (PLAN §6 P6).
-/// The dispatcher only builds the request; each `cmd_*` does the work and the printing.
-pub fn execute(session: &mut Session, command: Command) -> Result<()> {
-    match command {
-        Command::Add {
-            key,
-            title,
-            body,
-            source,
-            tags,
-        } => {
-            let mem = Memory {
-                key: key.unwrap_or_default(),
-                title,
-                body: read_body(&body)?,
-                source,
-                tags,
-                ..Default::default()
-            };
-            cmd_add(session, &mem)
-        }
-        Command::Search {
-            query,
-            k,
-            max_distance,
-            json,
-            expand,
-            tags,
-            min_chars,
-            max_chars,
-            coherent,
-        } => {
-            let q = Query {
-                text: query,
-                k: k.unwrap_or_else(|| session.default_k()),
-                max_distance: max_distance.or(session.default_max_distance()),
-                expand,
-                tags,
-                min_chars,
-                max_chars,
-                coherent: coherent.as_deref().map(parse_coherent).transpose()?,
-            };
-            cmd_search(session, q, json)
-        }
-        Command::Show { key, json } => cmd_show(session, &key, json),
-        Command::Rm { key } => cmd_rm(session, &key),
-        Command::Useful { keys } => cmd_useful(session, &keys),
-        Command::Coherent { key, value } => cmd_coherent(session, &key, &value),
-        Command::List { json } => cmd_list(session, json),
-        Command::Tags { json } => cmd_tags(session, json),
-        Command::Stats { json } => cmd_stats(session, json),
-        Command::Rename { old, new } => cmd_rename(session, &old, &new),
-        Command::Reembed => cmd_reembed(session),
-        Command::Links { json } => cmd_links(session, json),
-        // Not store commands: the dispatcher above owns these, and the REPL rejects them.
-        Command::Repl
-        | Command::Doctor { .. }
-        | Command::Model { .. }
-        | Command::Embed { .. }
-        | Command::Bench { .. }
-        | Command::Mcp { .. } => Err(Error::Config("command is not available here".into())),
-    }
-}
-
-fn cmd_add(session: &mut Session, mem: &Memory) -> Result<()> {
-    let key = session.add(mem)?;
-    println!("added {key}");
-    Ok(())
-}
-
-fn cmd_search(session: &mut Session, q: Query, json: bool) -> Result<()> {
-    let bundle = session.search(&q)?;
-    emit(format::render_bundle(&bundle, json)?);
-    Ok(())
-}
-
-fn cmd_coherent(session: &Session, key: &str, value: &str) -> Result<()> {
-    let verdict = parse_verdict(value)?;
-    session.mark_coherent(key, verdict)?;
-    let shown = match verdict {
-        Some(true) => "coherent",
-        Some(false) => "grab-bag",
-        None => "unjudged",
-    };
-    println!("{key} -> {shown}");
-    Ok(())
-}
-
-/// Parse a `--coherent` filter value (a nullable bool with `!` negation).
-fn parse_coherent(value: &str) -> Result<Coherent> {
-    Ok(match value.trim() {
-        "true" => Coherent::True,
-        "false" => Coherent::False,
-        "null" => Coherent::Null,
-        "!true" => Coherent::NotTrue,
-        "!false" => Coherent::NotFalse,
-        "!null" => Coherent::NotNull,
-        other => {
-            return Err(Error::Config(format!(
-                "bad coherent filter: {other} (want true|false|null|!true|!false|!null)"
-            )));
-        }
-    })
-}
-
-/// Parse a `coherent` verdict value into a nullable bool (`null`/`clear` = unjudged).
-fn parse_verdict(value: &str) -> Result<Option<bool>> {
-    Ok(match value.trim() {
-        "true" | "coherent" => Some(true),
-        "false" | "incoherent" | "grab-bag" => Some(false),
-        "null" | "clear" | "unknown" => None,
-        other => {
-            return Err(Error::Config(format!(
-                "bad verdict: {other} (want true|false|null)"
-            )));
-        }
-    })
-}
-
-fn cmd_show(session: &Session, key: &str, json: bool) -> Result<()> {
-    // The read path counts a visit (telemetry); the write path's existence check does not.
-    let mem = session.fetch(key)?;
-    emit(format::render_memory(&mem, json)?);
-    Ok(())
-}
-
-fn cmd_useful(session: &Session, keys: &[String]) -> Result<()> {
-    let (upvoted, missing) = session.record_useful_many(keys)?;
-    if upvoted.is_empty() {
-        return Err(Error::NotFound(keys.join(", ")));
-    }
-    for (key, total) in &upvoted {
-        println!("useful {key} ({total})");
-    }
-    for key in &missing {
-        eprintln!("no such memory: {key}");
-    }
-    Ok(())
-}
-
-fn cmd_rm(session: &Session, key: &str) -> Result<()> {
-    if session.rm(key)? {
-        println!("removed {key}");
-        Ok(())
-    } else {
-        Err(Error::NotFound(key.to_string()))
-    }
-}
-
-fn cmd_list(session: &Session, json: bool) -> Result<()> {
-    let rows = session.summaries()?;
-    emit(format::render_summaries(&rows, json)?);
-    Ok(())
-}
-
-fn cmd_tags(session: &Session, json: bool) -> Result<()> {
-    let tags = session.tags()?;
-    emit(format::render_tags(&tags, json)?);
-    Ok(())
-}
-
-fn cmd_stats(session: &Session, json: bool) -> Result<()> {
-    // The store layer is DB-only; the on-disk size is a filesystem fact the CLI supplies.
-    let mut stats = session.stats()?;
-    stats.db_bytes = stats::disk_bytes(&session.paths().db());
-    emit(format::render_stats(&stats, json)?);
-    Ok(())
-}
-
-fn cmd_rename(session: &Session, old: &str, new: &str) -> Result<()> {
-    let outcome = session.rename(old, new)?;
-    println!(
-        "renamed {} -> {} ({} body/bodies rewritten, {} edge(s) repointed)",
-        old, outcome.key, outcome.bodies, outcome.edges
-    );
-    Ok(())
-}
-
-fn cmd_reembed(session: &mut Session) -> Result<()> {
-    let report = session.reembed()?;
-    println!(
-        "re-embedded {} row(s) at dim {}{} ({})",
-        report.rows,
-        report.dim,
-        if report.rebuilt {
-            "; vector index recreated"
-        } else {
-            ""
-        },
-        report.model
-    );
-    Ok(())
-}
-
-fn cmd_links(session: &Session, json: bool) -> Result<()> {
-    let dangling = session.dangling()?;
-    emit(format::render_dangling(&dangling, json)?);
-    Ok(())
-}
-
-/// Print rendered output, guaranteeing a trailing newline so the next prompt starts clean.
-fn emit(text: String) {
-    print!("{text}");
-    if !text.ends_with('\n') {
-        println!();
-    }
-}
-
-/// `--body -` reads the body from stdin (long, piped memories); anything else is literal.
-fn read_body(arg: &str) -> Result<String> {
-    if arg != "-" {
-        return Ok(arg.to_string());
-    }
-    use std::io::Read;
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf)?;
-    Ok(buf)
 }

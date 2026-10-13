@@ -55,12 +55,6 @@ candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.22", optional = true }
 safetensors = { version = "0.8", optional = true }
 
-# --- P6: the CLI (PLAN §1). `rustyline` is the REPL line editor (history + completion);
-# `tabled` renders the tag table. Both are pure-Rust, so the "one binary, no dylibs"
-# promise (PLAN §8) still holds.
-rustyline = "18"
-tabled = "0.22"
-
 # --- P7: the MCP server (PLAN §4). `rmcp` is the official Rust MCP SDK (needs rustc 1.88,
 # hence the crate's rust-version bump). Default features bring the `#[tool]`/`#[tool_router]`
 # macros, the `server` runtime and JSON-Schema generation; `transport-io` adds stdio and

@@ -5,8 +5,9 @@ name: smoke
 # going green: does the runner pick the job up, does `actions/checkout` resolve, and can a job
 # actually reach the DinD daemon?
 #
-# Why the git step: the `ubuntu-latest` label maps to `docker:29-cli`, whose CLI matches the DinD
-# daemon (docker:29.5.2-dind) but which ships NO git -- and `actions/checkout` shells out to git.
+# The `ubuntu-latest` label maps to `catthehacker/ubuntu:act-22.04`, the act ecosystem's image:
+# node + git + the docker CLI + bash. node is the non-obvious requirement -- the runner execs it
+# INSIDE the job container for every JavaScript action, so `actions/checkout` fails without it.
 #
 # Diagnostic on purpose: the docker probes use `|| echo` so a failure shows up in the log instead of
 # aborting the run. Read the output, don't trust the tick.
@@ -25,12 +26,11 @@ jobs:
           command -v git    || echo "NO-GIT"
           command -v docker || echo "NO-DOCKER"
           command -v bash   || echo "NO-BASH"
+          command -v node   || echo "NO-NODE"
+          node --version    || echo "NO-NODE-VERSION"
           cat /etc/os-release | head -2
           env | grep -i '^DOCKER' || echo "NO-DOCKER-ENV"
           ls -la /certs/client 2>&1 | head -5 || echo "NO-CERTS"
-
-      - name: Install git (docker:29-cli has the docker CLI but no git)
-        run: apk add --no-cache git
 
       - uses: actions/checkout@v4
 

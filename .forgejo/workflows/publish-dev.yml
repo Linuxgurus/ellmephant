@@ -1,0 +1,50 @@
+name: publish-dev
+
+# Build the image and push it to Harbor on every commit to `dev`.
+#
+# This replaces the old `.githooks/post-commit` hook, which did the same job by building with
+# podman on the developer's machine: emulated amd64 on Apple Silicon (its own comment admitted it
+# was slow), and only if that machine happened to be awake. Here the build runs on the cluster,
+# natively amd64, and the DinD layer cache survives between jobs.
+#
+# Tags match what the hook used -- `edge` plus `sha-<short>` -- so nothing downstream has to move.
+#
+# Credentials are repo-level Actions secrets (HARBOR_USER / HARBOR_TOKEN) written by
+# `module.forgejo_setup` in stacks/mantle. They are the Harbor robot `robot$library+forgejo`,
+# scoped to repository pull+push and tag create+list on the public `library` project -- notably
+# it cannot delete. Anonymous pulls still work, so nothing needs an imagePullSecret.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch: # manual republish, e.g. after rotating the robot
+
+env:
+  REGISTRY: harbor.vn.linuxguru.net
+  IMAGE: harbor.vn.linuxguru.net/library/ellmephant
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          set -eu
+          # The robot name contains a `$` (robot$library+forgejo); quoted, so the shell leaves it be.
+          echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+
+      - name: Build and push
+        run: |
+          set -eu
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "building $IMAGE:sha-$short"
+          docker build --platform linux/amd64 \
+            -t "$IMAGE:edge" -t "$IMAGE:sha-$short" .
+          # sha-<short> first: it is the immutable handle, so it exists before the moving tag.
+          docker push "$IMAGE:sha-$short"
+          docker push "$IMAGE:edge"
+          echo "pushed $IMAGE:sha-$short and $IMAGE:edge"

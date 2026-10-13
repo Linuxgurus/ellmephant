@@ -12,8 +12,6 @@ name: smoke
 # Diagnostic on purpose: the docker probes use `|| echo` so a failure shows up in the log instead of
 # aborting the run. Read the output, don't trust the tick.
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 jobs:

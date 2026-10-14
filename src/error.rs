@@ -21,6 +21,11 @@ pub enum Error {
     #[error("no such memory: {0}")]
     NotFound(String),
 
+    /// A malformed search pattern (a regex that will not compile); the message carries the
+    /// compiler's complaint.
+    #[error("invalid pattern: {0}")]
+    Pattern(String),
+
     /// Weights cache problem (missing/partial/corrupt; SPEC §6).
     #[error("model error: {0}")]
     Model(String),

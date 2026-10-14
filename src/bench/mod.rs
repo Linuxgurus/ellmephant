@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
-use crate::search::{self, Query};
+use crate::search::{self, MatchMode, Query};
 
 /// The cutoff the golden set is scored at unless it names its own (PLAN §6 P10).
 pub const DEFAULT_EVAL_K: usize = 3;
@@ -93,6 +93,8 @@ impl Eval {
 fn case_query(case: &Case, k: usize) -> Query {
     Query {
         text: Some(case.query.clone()),
+        pattern: None,
+        mode: MatchMode::Literal,
         k,
         max_distance: None,
         expand: 0,

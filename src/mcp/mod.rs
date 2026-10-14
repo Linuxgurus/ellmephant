@@ -35,7 +35,7 @@ use crate::config::{Config, Paths};
 // uses the unqualified `Result` from `rmcp`, and our single-parameter alias would shadow it.
 use crate::error::Error;
 use crate::model;
-use crate::search::{Bundle, Field, Fields, Query, to_wire_json};
+use crate::search::{Bundle, Field, Fields, MatchMode, Query, to_wire_json};
 use crate::store::links::backlinks_to_wire_json;
 use crate::store::{self, Memory};
 
@@ -103,13 +103,15 @@ const DUPES_LIMIT: usize = 50;
 const COHERENT_DESCRIPTION: &str = "\
 Record a memory's split-review verdict: `true` = one coherent topic, `false` = a grab-bag worth splitting, omit/`null` = unjudged. Reset to null automatically on the next upsert, so an edit re-opens review. Find the fat tail with `memory_search` (`min_chars`, `coherent`).";
 
-/// `memory_search` description. The read law lives here — the semantic phrase, the structured
-/// filters, the lean `key`-only default, and the narrow-to-wide widen trigger.
+/// `memory_search` description. The read law lives here — the semantic phrase, the literal/regex
+/// leg, the structured filters, the lean `key`-only default, and the narrow-to-wide widen trigger.
 const SEARCH_DESCRIPTION: &str = "\
-Hunt memory by meaning. `query` = semantic phrase against the whole document; omit it to filter the \
-store. Filters intersect (all must hold). Hits are `key`-only by default; `fields` adds more, body \
-never. `memory_get` the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — \
-raise `k`, loosen `max_distance`.";
+Hunt memory by meaning (`query`) or by literal (`pattern`) — semantics reach sense; `pattern` reaches \
+a half-remembered string (a key, a filename, an error). `mode` reads `pattern` as `literal` (a \
+substring, the default) or `regex`. Both legs and the filters intersect (all must hold); omit all to \
+filter the whole store. Hits are `key`-only by default; `fields` adds more, body never. `memory_get` \
+the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
+`max_distance`.";
 
 /// Parameters for [`MemoryServer::memory_upsert`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -155,6 +157,16 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Phrase to hunt with. Matched against embedded document.")]
     pub query: Option<String>,
+    /// The literal/regex pattern.
+    #[serde(default)]
+    #[schemars(
+        description = "Literal/regex pattern over `key`/`title`/`body` — for a half-remembered literal (a key, a filename, an error string). Intersects with `query` and the filters. Blank = no lexical leg."
+    )]
+    pub pattern: Option<String>,
+    /// How `pattern` is read.
+    #[serde(default)]
+    #[schemars(description = "How `pattern` is read: `literal` (substring, default) or `regex`.")]
+    pub mode: Option<MatchModeParam>,
     /// Result count.
     #[serde(default)]
     #[schemars(description = "Most hits bring back (default = configured k).")]
@@ -220,6 +232,26 @@ impl FieldParam {
             FieldParam::Coherent => Field::Coherent,
             FieldParam::Chars => Field::Chars,
             FieldParam::Distance => Field::Distance,
+        }
+    }
+}
+
+/// How a `pattern` is read on `memory_search` (the lexical leg).
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchModeParam {
+    /// A plain substring, case-insensitive; regex metacharacters are literal text.
+    Literal,
+    /// A regex, case-insensitive by default (opt out with a leading `(?-i)`).
+    Regex,
+}
+
+impl MatchModeParam {
+    /// Map the wire enum onto the search-layer mode.
+    fn to_mode(self) -> MatchMode {
+        match self {
+            MatchModeParam::Literal => MatchMode::Literal,
+            MatchModeParam::Regex => MatchMode::Regex,
         }
     }
 }
@@ -489,6 +521,8 @@ impl MemoryServer {
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
         let query = p.query;
+        let pattern = p.pattern;
+        let mode = p.mode.map(MatchModeParam::to_mode).unwrap_or_default();
         let k = p.k;
         let max_distance = p.max_distance;
         let expand = p.expand.unwrap_or(0);
@@ -505,6 +539,8 @@ impl MemoryServer {
             .with_store("memory_search", move |s| {
                 let q = Query {
                     text: query,
+                    pattern,
+                    mode,
                     k: k.unwrap_or_else(|| s.default_k()),
                     // Fall back to the configured ceiling so a bare semantic search is capped.
                     max_distance: max_distance.or_else(|| s.default_max_distance()),
@@ -987,8 +1023,8 @@ mod tests {
             "field defs belong on the fields: {upsert}"
         );
 
-        // Search carries the semantic phrase plus the structured filters — but no `key` leg
-        // (a known key is `memory_get`) and no literal/regex `match` mode.
+        // Search carries the semantic phrase (`query`), the lexical leg (`pattern` + `mode`) and the
+        // structured filters — but no `key` leg (a known key is `memory_get`).
         let props = find("memory_search")
             .input_schema
             .get("properties")
@@ -1013,10 +1049,31 @@ mod tests {
                 "max_chars",
                 "max_distance",
                 "min_chars",
+                "mode",
+                "pattern",
                 "query",
                 "tags"
             ]
         );
+        // The `mode` values live in the schema (a `MatchModeParam` enum), never in the description.
+        let mode_oneof = find("memory_search")
+            .input_schema
+            .get("$defs")
+            .and_then(|d| d.get("MatchModeParam"))
+            .and_then(|f| f.get("oneOf"))
+            .and_then(|v| v.as_array())
+            .expect("MatchModeParam enum in the schema");
+        let mode_vals: Vec<&str> = mode_oneof
+            .iter()
+            .filter_map(|v| v.get("const"))
+            .filter_map(|v| v.as_str())
+            .collect();
+        for want in ["literal", "regex"] {
+            assert!(
+                mode_vals.contains(&want),
+                "missing mode {want}: {mode_vals:?}"
+            );
+        }
         // The projection selection rides on `fields` (a hit returns `key` alone by default).
         assert!(props.contains_key("fields"), "search must expose `fields`");
         // The `fields` *values* live in the schema (a `FieldParam` enum), never in the description —

@@ -9,7 +9,7 @@ mod common;
 use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
-use ellmephant::search::{self, Field, Fields, Hit, Neighbor, Query};
+use ellmephant::search::{self, Field, Fields, Hit, MatchMode, Neighbor, Query};
 use ellmephant::store::{self, Memory};
 use rusqlite::Connection;
 
@@ -33,6 +33,8 @@ fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str, tags:
 fn query(text: Option<&str>) -> Query {
     Query {
         text: text.map(str::to_string),
+        pattern: None,
+        mode: MatchMode::Literal,
         k: 10,
         max_distance: None,
         expand: 0,
@@ -354,4 +356,129 @@ fn coherent_filter_selects_by_verdict() {
     assert_eq!(keys(search::Coherent::NotNull), ["a"]);
     assert_eq!(keys(search::Coherent::NotTrue), ["b"]);
     assert_eq!(keys(search::Coherent::False), Vec::<String>::new());
+}
+
+/// The keys of a query's hits, in order.
+fn hit_keys(conn: &Connection, q: &Query) -> Vec<String> {
+    search::run(conn, None, q)
+        .expect("search")
+        .hits
+        .into_iter()
+        .map(|h| h.key)
+        .collect()
+}
+
+#[test]
+fn literal_pattern_finds_a_half_remembered_string() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(
+        &conn,
+        &embedder,
+        "mcp-port",
+        "server listens on localhost:8888",
+        &[],
+    );
+    seed(&conn, &embedder, "other", "nothing to see here", &[]);
+
+    let mut q = query(None);
+    // A literal the semantic leg cannot reach, and case-insensitive.
+    q.pattern = Some("LOCALHOST:8888".into());
+    let hits = search::run(&conn, None, &q).expect("search").hits;
+    assert_eq!(
+        hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        ["mcp-port"]
+    );
+    assert!(
+        hits[0].distance.is_none(),
+        "a lexical hit carries no cosine distance"
+    );
+}
+
+#[test]
+fn regex_mode_matches_over_key_title_and_body() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "err-404", "gone", &[]);
+    seed(&conn, &embedder, "err-500", "boom", &[]);
+    seed(&conn, &embedder, "ok-note", "fine", &[]);
+
+    let mut q = query(None);
+    q.pattern = Some(r"err-(4|5)\d\d".into()); // matches the *key*
+    q.mode = MatchMode::Regex;
+    assert_eq!(hit_keys(&conn, &q), ["err-404", "err-500"]);
+}
+
+#[test]
+fn a_bad_regex_is_a_pattern_error() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let mut q = query(None);
+    q.pattern = Some("(unclosed".into());
+    q.mode = MatchMode::Regex;
+    let err = search::run(&conn, None, &q).unwrap_err();
+    assert!(format!("{err}").contains("invalid pattern"), "{err}");
+}
+
+#[test]
+fn a_blank_pattern_is_no_lexical_constraint() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "a", "x", &[]);
+    seed(&conn, &embedder, "b", "y", &[]);
+
+    let mut q = query(None);
+    q.pattern = Some("   ".into());
+    assert_eq!(hit_keys(&conn, &q), ["a", "b"]); // every row, key order
+}
+
+#[test]
+fn the_lexical_leg_intersects_the_semantic_phrase() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    // Both are semantically near "alpha beta gamma"; only one holds the literal.
+    seed(
+        &conn,
+        &embedder,
+        "ports-a",
+        "alpha beta gamma on port 8888",
+        &[],
+    );
+    seed(
+        &conn,
+        &embedder,
+        "ports-b",
+        "alpha beta gamma on port 9999",
+        &[],
+    );
+
+    let mut q = query(Some("alpha beta gamma"));
+    q.pattern = Some("8888".into());
+    let hits = search::run(&conn, Some(&embedder), &q)
+        .expect("search")
+        .hits;
+    assert_eq!(
+        hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        ["ports-a"]
+    );
+    // The survivor kept its semantic distance (it is still a ranked hit).
+    assert!(hits[0].distance.is_some());
+}
+
+#[test]
+fn the_lexical_leg_intersects_the_tag_filter() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "k8s-note", "uses kubectl", &["k8s"]);
+    seed(&conn, &embedder, "web-note", "uses kubectl", &["web"]);
+
+    let mut q = query(None);
+    q.pattern = Some("kubectl".into());
+    q.tags = vec!["k8s".into()];
+    assert_eq!(hit_keys(&conn, &q), ["k8s-note"]);
 }

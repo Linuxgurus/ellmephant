@@ -30,8 +30,8 @@ attempt.
 - Hermetic Rust binary: no Python/Node runtime, no external service, no cloud.
 - SQLite is the single source of truth (one file, `~/.ellmephant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
-- Retrieval as a single **phrase** matched semantically (KNN), with optional structured filters
-  (tags, size, coherence) — no regex/key search leg; `key`/`tags` are identity and lookup.
+- Retrieval by **meaning** (a semantic phrase, KNN) or by **literal** (a substring/regex `pattern`),
+  with optional structured filters (tags, size, coherence); `key`/`tags` remain identity and lookup.
 - Wiki-style links with backlinks and one-hop graph expansion.
 - Multi-client via MCP; interactive REPL for humans.
 
@@ -262,23 +262,28 @@ The store is **atomics-first**; generalization is derived, not stored.
 
 ## 10. Search
 
-A search is a semantic **phrase** plus optional structured **filters**. **Filters intersect** —
-a hit must satisfy every one given. With no phrase it is a pure filter over the store (every
-row, `key` order, uncapped). There is no literal/regex leg — `key` and `tags` are folded into
-the embedded document, so a phrase reaches them semantically.
+A search has two independent **legs** — a semantic **phrase** (`query`) and a literal/regex
+**pattern** — plus optional structured **filters**. **Everything intersects** — a hit must satisfy
+every leg and filter given. With none, it is a pure filter over the store (every row, `key` order,
+uncapped). The two legs don't fuse: a lexical-only query is unranked (`key` order), while a phrase
+plus a pattern keeps the semantic ranking and merely drops the rows the pattern rejects.
 
 - The phrase is embedded (query-side instruction) and the KNN of the whole store is taken,
   within a cosine-distance ceiling. One vector per row (§6). Filters are applied to the ranked
   candidate set **before** the `k` cap, so a filtered result is exact (the KNN already spans the
   whole store): filter, then truncate.
-- **Params:** `query` (the phrase; omit for a pure filter), `k` (default `5`; caps the ranked
-  case only), `max_distance` (optional, falling back to `default_max_distance`, `0.6`; `null`
-  disables), `expand`, `fields` (the extra hit columns to return; default = `key` only), and the
-  filters:
+- **Params:** `query` (the semantic phrase), `pattern` (a literal/regex over the raw `key`/`title`/
+  `body` — for a half-remembered string), `mode` (`literal`, the substring default, or `regex`;
+  both case-insensitive), `k` (default `5`; caps the ranked case only), `max_distance` (optional,
+  falling back to `default_max_distance`, `0.6`; `null` disables), `expand`, `fields` (the extra hit
+  columns to return; default = `key` only), and the filters:
   - `tags` — every listed tag must be present (AND).
   - `min_chars` / `max_chars` — bounds on the **embedded-document** length (chars).
   - `coherent` — the §9 split-review verdict: `true`, `false`, `null`, or negate with `!`
     (`!true` = false-or-null = the review queue; also `!false`, `!null`); omit = any.
+  - the **lexical leg** is a plain scan of the store's raw text — **no FTS index, no `LIKE`** — so
+    nothing needs keeping in sync (`memory` is the only truth, §5/§7) and a malformed regex is a
+    clean error. `key`/`tags` stay identity/lookup; a tag match is the `tags` filter, not a pattern.
   The KNN is taken over the whole store and `k` truncates the ranked
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
@@ -294,6 +299,8 @@ the embedded document, so a phrase reaches them semantically.
 ```sql
 -- Semantic phrase: KNN over the document vectors
 SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance;
+-- Lexical leg: a plain scan (no FTS index — `memory` is the only truth), matched in Rust:
+--   SELECT id, key, title, body FROM memory;  -- literal substring or regex over key/title/body
 ```
 
 ## 11. Interfaces
@@ -316,9 +323,9 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   definitions** — the two never restate each other. So `memory_upsert`'s description holds the
   write *rules* (one topic, trim, merge); each field's `key`/`title`/`body`/`source`/`tags`
   meaning lives in that field's schema.
-- `memory_search` takes a semantic `phrase`, the ranking knobs `k`/`max_distance`/`expand`, the
-  `fields` projection (default `key` only), and the structured filters `tags` (AND),
-  `min_chars`/`max_chars` and `coherent` (§10); there is **no regex leg** and no `key` leg —
+- `memory_search` takes a semantic `query`, a lexical `pattern` (+ `mode`), the ranking knobs
+  `k`/`max_distance`/`expand`, the `fields` projection (default `key` only), and the structured
+  filters `tags` (AND), `min_chars`/`max_chars` and `coherent` (§10); there is still no `key` leg —
   `memory_get` reads a known key.
 - The list-shaped reads return **positional JSON** to keep the LLM-facing payload small: a
   top-level `cols` header names the fields and the rows are bare arrays, **one row per line**

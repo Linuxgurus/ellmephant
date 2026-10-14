@@ -7,10 +7,10 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/jdblack/ellmephant
-  # `edge` is the published build: every push to `main` publishes the image under it (plus an
-  # immutable `sha-<commit>`). There are no version tags, so leaving this empty would resolve to
-  # `appVersion` and miss. Pin `sha-<commit>` if you need a build that cannot move.
-  tag: edge
+  # Defaults to the chart's appVersion when empty -- which is right: `appVersion` tracks a released
+  # version, and releases are what GHCR carries. (`edge` is the *dev* tag and lives only in private
+  # Harbor; do not point the chart's default at it.)
+  tag: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

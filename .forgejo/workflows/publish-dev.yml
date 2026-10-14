@@ -1,0 +1,71 @@
+name: publish-dev
+
+# Publish `dev`: build the runtime image and push it to Harbor as `edge` + `sha-<commit>`.
+#
+# Harbor is the PRIVATE registry (LAN-only) and `edge` is the *dev* tag: the newest build of `dev`,
+# which the cluster may track. Releases are a separate workflow (`publish.yml`, on `main`) and go to
+# BOTH registries. `edge` is deliberately NOT mirrored to GHCR: a public tag that stops moving is a
+# trap, and it would freeze the moment this branch stopped being the source.
+#
+# amd64 only, on purpose: the cluster is amd64, and an arm64 half would double the build for no user
+# (public users pull releases; see publish.yml for where arm64 stands).
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch: # manual republish, e.g. after rotating the robot
+
+env:
+  REGISTRY: harbor.vn.linuxguru.net
+  IMAGE: harbor.vn.linuxguru.net/library/ellmephant
+  BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
+  BUILDER_PROFILE: rust-lean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          set -eu
+          echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+
+      # The dependency layer, prebuilt (Dockerfile.builder): ~250 crates compiled once and reused as
+      # the builder stage, so a fresh runner pod does not recompile them. Built lazily here rather
+      # than in a path-filtered workflow, because Forgejo's `on.push.paths` is not worth depending on
+      # and a second job would race this one-at-a-time runner. A miss costs one slow build; it can
+      # never be wrong, since cargo recompiles whatever the image is missing.
+      #
+      # The tag is a fingerprint of the dependency set and the build profile, so a change to any of
+      # the three files moves it by itself and a stale image cannot be reused silently.
+      # Order matters and must match the Makefile: Cargo.toml, Cargo.lock, Dockerfile.builder.
+      - name: Ensure the dependency image exists
+        run: |
+          set -eu
+          hash=$(cat Cargo.toml Cargo.lock Dockerfile.builder | sha256sum | cut -c1-8)
+          ref="$BUILDER:$BUILDER_PROFILE-$hash"
+          echo "dependency image: $ref"
+          if docker manifest inspect "$ref" > /dev/null 2>&1; then
+            echo "present"
+          else
+            echo "missing -- building it (slow, but only once per input change)"
+            docker build -f Dockerfile.builder -t "$ref" .
+            docker push "$ref"
+          fi
+          echo "$ref" > .builder-ref
+
+      - name: Build and push edge
+        run: |
+          set -eu
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          docker build --platform linux/amd64 \
+            --build-arg BUILDER="$(cat .builder-ref)" \
+            -t "$IMAGE:edge" -t "$IMAGE:sha-$short" .
+          # sha-<short> first: the immutable handle exists before the moving tag points at it.
+          docker push "$IMAGE:sha-$short"
+          docker push "$IMAGE:edge"
+          echo "pushed $IMAGE:sha-$short and $IMAGE:edge"

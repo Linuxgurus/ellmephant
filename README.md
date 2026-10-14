@@ -65,7 +65,7 @@ You can run it either way: use the [Podman Compose setup](#optional-podman-compo
 below, or just run this command:
 
 ```sh
-podman run -d --rm -p 8888:8888 -v ellmephant-data:/data ghcr.io/jdblack/ellmephant:edge
+podman run -d --rm -p 8888:8888 -v ellmephant-data:/data ghcr.io/jdblack/ellmephant:latest
 # Or docker, if you're not on podman yet
 ```
 
@@ -111,7 +111,7 @@ long-running container needed:
     "ellmephant": {
       "command": "podman",
       "args": ["run", "--rm", "-i", "-v", "ellmephant-data:/data",
-               "ghcr.io/jdblack/ellmephant:edge", "mcp", "--stdio"]
+               "ghcr.io/jdblack/ellmephant:latest", "mcp", "--stdio"]
     }
   }
 }
@@ -243,7 +243,7 @@ git clone https://github.com/jdblack/ellmephant.git && cd ellmephant
 podman build -t ellmephant:dev .
 ```
 
-Then use `ellmephant:dev` wherever this guide says `ghcr.io/jdblack/ellmephant:edge`. Fair
+Then use `ellmephant:dev` wherever this guide says `ghcr.io/jdblack/ellmephant:latest`. Fair
 warning: that first build compiles the whole ML stack (the SQLite/`sqlite-vec` C sources, the
 candle stack, ~400 crates) and can take 5–20 minutes. [`DEVELOPMENT.md`](DEVELOPMENT.md) has the
 full workflow.

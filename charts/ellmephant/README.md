@@ -12,8 +12,8 @@ PVC. No sidecars, no operators.
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-**The chart is published to both registries by the Forgejo `publish.yml` on every push to `main`** —
-private Harbor for the cluster, public GHCR for everyone else. Public install:
+**The chart is published to both registries by the Forgejo `publish.yml` on a release** — a push to
+`main`, or a `v*` tag. Private Harbor for the cluster, public GHCR for everyone else. Public install:
 
 ```sh
 helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.0

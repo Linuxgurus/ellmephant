@@ -97,9 +97,10 @@ See the [README](README.md) for usage, including the MCP server on a host and in
 
 A chart ships in [`charts/ellmephant/`](charts/ellmephant/): one Deployment, a store PVC, and an
 optional separate weights-cache PVC, serving MCP over HTTP on port 8888. It defaults to the public
-image `ghcr.io/jdblack/ellmephant` — the public mirror of what the maintainer's cluster runs. Every
-push to `main` publishes it as `edge` plus an immutable `sha-<commit>`; there is **no `latest` and no
-version tag**, so pin `:edge` (or a specific `:sha-abcdef1`) rather than a version.
+image `ghcr.io/jdblack/ellmephant` — the public mirror of what the maintainer's cluster runs. It
+carries **releases**: a push to `main` publishes the version from `Cargo.toml` plus `latest`, so pull
+`:latest` (or pin a version, e.g. `:1.1.0`). The `edge` tag is the *dev* build and lives only in
+private Harbor.
 
 ```sh
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace

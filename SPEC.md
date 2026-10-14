@@ -229,7 +229,7 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 
 A project is **an activity completed over time** — work with a beginning, a current state, and a
 place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
-prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`dead`), an
+prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`aborted`), an
 `owner` (a set of names), `tags`, and a `preload` — the **ordered** list of memories to load as
 context to work in here, which is the boot set generalized to every project. It is **listed** by
 field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by `project_get`,
@@ -249,13 +249,13 @@ CREATE TABLE project (             -- the key IS the identity: no rowid-derived 
   title   TEXT NOT NULL,
   goal    TEXT NOT NULL DEFAULT '',        -- what this is for
   state   TEXT NOT NULL DEFAULT '',        -- mutable current-state prose
-  status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|dead
+  status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|aborted
   owner   TEXT NOT NULL DEFAULT '',      -- comma-joined names, e.g. 'Cline,James'
   tags    TEXT NOT NULL DEFAULT '',
   preload TEXT NOT NULL DEFAULT '',        -- comma-joined keys, ORDERED: attention
   created TEXT NOT NULL DEFAULT (datetime('now')),
   updated TEXT NOT NULL DEFAULT (datetime('now')),
-  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead'))));
+  CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))));
 
 CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   memory_key  TEXT PRIMARY KEY,
@@ -295,7 +295,7 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   entry need not: a project may be created before its memories.
 - **A link to a project is not membership.** `[[prj-x]]` is a `see` edge (navigation, attention);
   `contains` means born here. So `links::dangling` resolves a target against **both** tables.
-- **No delete.** A project ends with `status = dead`; the `preload` list and the `contains` edges
+- **No delete.** A project ends with `status = done` or `aborted`; the `preload` list and the `contains` edges
   cannot outlive one.
 
 ## 8. Cross-links (wiki semantics)

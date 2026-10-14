@@ -34,8 +34,8 @@ use crate::store::{links, slug, tags};
 /// Every project key starts with this.
 pub const KEY_PREFIX: &str = "prj-";
 
-/// The legal `status` values. `dead` is how a project ends — there is no delete.
-pub const STATUSES: &[&str] = &["todo", "active", "paused", "done", "dead"];
+/// The legal `status` values. `done` and `aborted` both end a project — there is no delete.
+pub const STATUSES: &[&str] = &["todo", "active", "paused", "done", "aborted"];
 
 /// One project: identity, prose and shape.
 ///
@@ -53,7 +53,7 @@ pub struct Project {
     /// Mutable current-state prose: where it stands, what's next.
     #[serde(default)]
     pub state: String,
-    /// `todo` | `active` | `paused` | `done` | `dead` (default `todo`).
+    /// `todo` | `active` | `paused` | `done` | `aborted` (default `todo`).
     #[serde(default)]
     pub status: String,
     /// Who owns it, by name — a **set**, stored comma-joined, sorted. Free text: there is no
@@ -502,7 +502,7 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
 /// Project-side rot: `preload`/`contains` keys that resolve to no memory.
 ///
 /// Membership cannot outlive a project — [`apply_home`] requires the project to exist and a
-/// project is never deleted (`status = dead` instead) — so the only rot here is a dangling memory
+/// project is never deleted (`status = aborted` instead) — so the only rot here is a dangling memory
 /// key: a forward reference the audit surfaces, exactly as SPEC §8 does for `[[…]]`.
 ///
 /// `contains` is a table, so SQL finds its rot directly; `preload` is a column, so its list is

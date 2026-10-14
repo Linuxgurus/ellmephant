@@ -31,13 +31,13 @@ CREATE TABLE project (
   title   TEXT NOT NULL,                        -- smart-caveman one-liner
   goal    TEXT NOT NULL DEFAULT '',             -- what this is for
   state   TEXT NOT NULL DEFAULT '',             -- mutable current-state prose
-  status  TEXT NOT NULL DEFAULT 'todo',         -- todo|active|paused|done|dead
+  status  TEXT NOT NULL DEFAULT 'todo',         -- todo|active|paused|done|aborted
   owner   TEXT NOT NULL DEFAULT '',             -- comma-joined names, e.g. 'Cline,James'
   tags    TEXT NOT NULL DEFAULT '',             -- comma-joined, sorted (the memory codec)
   preload TEXT NOT NULL DEFAULT '',             -- comma-joined keys, ORDERED by priority
   created TEXT NOT NULL DEFAULT (datetime('now')),
   updated TEXT NOT NULL DEFAULT (datetime('now')),
-  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead'))
+  CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))
 );
 
 -- `preload` — project -> memory, ORDERED (the `preload` column above). About ATTENTION: "to work

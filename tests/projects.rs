@@ -81,6 +81,20 @@ fn upsert_and_get_round_trip_with_defaults() {
 }
 
 #[test]
+fn an_aborted_project_is_ended_not_gone() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "aborted".into();
+    let key = project::upsert(&conn, &p, None).expect("aborted is a legal status");
+
+    let got = project::get(&conn, &key).unwrap().expect("still there");
+    assert_eq!(got.status, "aborted", "ended, not deleted");
+}
+
+#[test]
 fn an_unknown_status_is_rejected() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");

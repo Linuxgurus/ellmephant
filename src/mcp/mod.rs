@@ -124,7 +124,7 @@ Create or replace a project — an activity completed over time: identity, statu
 ordered `preload`. A project is the structure half of the store and a container you can stand \
 inside; facts go in memories, where the store matches them by meaning. `key` is `prj-…` (a bare \
 name is prefixed). \
-`status` is todo|active|paused|done|dead — `dead` is how a project ends, there is no delete; \
+`status` is todo|active|paused|done|aborted — `done` and `aborted` both end a project, and there is no delete; \
 `owner` is a set of names, e.g. [\"Cline\",\"James\"] — free text, since the store keeps no list of \
 who exists (and `me` would mean whatever reader asks). `preload` is the ORDERED list of memory keys to load as \
 context to work \
@@ -419,7 +419,7 @@ pub struct ProjectUpsertParams {
     pub state: Option<String>,
     /// Lifecycle.
     #[serde(default)]
-    #[schemars(description = "todo | active | paused | done | dead (default todo).")]
+    #[schemars(description = "todo | active | paused | done | aborted (default todo).")]
     pub status: Option<String>,
     /// Whose it is.
     #[serde(default)]

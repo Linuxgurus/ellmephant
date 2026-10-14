@@ -1,12 +1,20 @@
-//! Search: a single semantic phrase over the store (SPEC §10).
+//! Search: a semantic phrase plus an optional literal/regex leg, over the store (SPEC §10).
 //!
-//! A query is one `phrase`, embedded and compared against the stored document embeddings by
-//! cosine distance. There are no key/tag constraints and no literal (regex) leg — the key and
-//! tags are part of the embedded document, so a query reaches them semantically.
+//! Two legs feed one candidate set. The **semantic** leg embeds `text` as a query-side phrase and
+//! takes the KNN over the stored document vectors (cosine distance). The **lexical** leg
+//! ([`lexical`]) matches `pattern` as a literal substring or a regex against the *raw* `key`,
+//! `title` and `body`. Both compose with the structured filters by **intersection** — every leg
+//! and filter given must hold (the ledger's "filters intersect" law); there is no cross-leg fusion
+//! ranking, so a lexical-only query is unranked (`key` order).
 //!
-//! Results are distance-ranked, capped by `k` and a `max_distance` ceiling. A hit returns its
-//! `key` by default and nothing else; the caller names the extra [`Field`]s it wants (via
-//! [`Fields`]) — never a body; fetch that with `memory_get`/`show`.
+//! Results are distance-ranked only when the phrase was semantic, then capped by `k` and a
+//! `max_distance` ceiling. A hit returns its `key` by default and nothing else; the caller names
+//! the extra [`Field`]s it wants (via [`Fields`]) — never a body; fetch that with
+//! `memory_get`/`show`.
+
+pub mod lexical;
+
+pub use lexical::MatchMode;
 
 /// Characters of a neighbour's body returned by `--expand` (SPEC §9/§14: snippets, not dumps).
 pub const SNIPPET_CHARS: usize = 280;
@@ -39,6 +47,10 @@ type Candidate = (i64, Option<f32>);
 pub struct Query {
     /// The phrase; `None`/blank means "no phrase" (every row, key order).
     pub text: Option<String>,
+    /// Literal/regex pattern over `key`/`title`/`body`; `None`/blank means "no lexical leg".
+    pub pattern: Option<String>,
+    /// How `pattern` is read — a plain substring or a regex ([`MatchMode`]).
+    pub mode: MatchMode,
     /// Result cap (semantic ranking only).
     pub k: usize,
     /// Optional cosine-distance ceiling.
@@ -291,6 +303,11 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     if let Some(set) = filter_set(conn, q)? {
         ordered.retain(|(id, _)| set.contains(id));
     }
+    // The lexical leg intersects the same way; a lexical-only query is unranked, so `k` does not
+    // cap it (like the structured filters).
+    if let Some(set) = lexical_set(conn, q)? {
+        ordered.retain(|(id, _)| set.contains(id));
+    }
     if ranked {
         ordered.truncate(q.k.max(1)); // k caps the distance-ranked case only
     }
@@ -330,6 +347,30 @@ fn filter_set(conn: &Connection, q: &Query) -> Result<Option<HashSet<i64>>> {
     for mem in store::all(conn)? {
         if passes(&mem, q)
             && let Some(id) = mem.id
+        {
+            set.insert(id);
+        }
+    }
+    Ok(Some(set))
+}
+
+/// The ids matching the lexical leg, or `None` when the query carries no pattern. A blank pattern
+/// is no pattern (mirrors the blank-phrase rule).
+fn lexical_set(conn: &Connection, q: &Query) -> Result<Option<HashSet<i64>>> {
+    let Some(pattern) = q
+        .pattern
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    // Compile once, then scan — a malformed regex fails here, before touching a row.
+    let matcher = lexical::Matcher::new(pattern, q.mode)?;
+    let mut set = HashSet::new();
+    for mem in store::all(conn)? {
+        if let Some(id) = mem.id
+            && matcher.hits(&mem)
         {
             set.insert(id);
         }
@@ -456,13 +497,17 @@ fn expand_frontier(
 
 /// Neighbours of `(id, key)` in both directions: outgoing `[[…]]` edges and incoming
 /// backlinks, as `(id, key)` pairs.
+///
+/// Memory kind only, both ways: a `[[prj:x]]` edge points at a project, which is not a memory
+/// neighbour — and because keys are bare, a project's edge would otherwise look like an edge to the
+/// memory that happens to share its name.
 fn adjacent(conn: &Connection, id: i64, key: &str) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.key FROM memory_link l JOIN memory m ON m.key = l.to_key
-          WHERE l.from_id = ?1
+          WHERE l.from_id = ?1 AND l.to_type = 'memory'
          UNION
          SELECT m.id, m.key FROM memory_link l JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key = ?2",
+          WHERE l.to_key = ?2 AND l.to_type = 'memory'",
     )?;
     let rows = stmt.query_map(rusqlite::params![id, key], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let mut out = Vec::new();
@@ -488,6 +533,8 @@ mod tests {
     fn a_blank_phrase_is_no_constraint() {
         let q = Query {
             text: Some("   ".to_string()),
+            pattern: None,
+            mode: MatchMode::Literal,
             k: 10,
             max_distance: None,
             expand: 0,

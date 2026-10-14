@@ -1,7 +1,20 @@
 # syntax=docker/dockerfile:1
 
 # ---------- build ----------
-FROM rust:1-bookworm AS builder
+# The dependency layer is prebuilt and published to Harbor (see Dockerfile.builder), so a cold
+# build skips compiling ~250 crates. CI passes the exact tag (a fingerprint of the dependency set
+# plus the build profile) via --build-arg. The default here is deliberately the plain image: a
+# build with no arguments is then self-contained and correct, merely slower. For the fast path
+# locally, run `make builder-image` once and then `make docker-build`.
+ARG BUILDER=rust:1-bookworm
+FROM ${BUILDER} AS builder
+
+# These MUST match Dockerfile.builder: the profile is part of cargo's dependency fingerprint, so a
+# mismatch here makes cargo rebuild every dependency the image was built to provide.
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=false
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=gold"
+
 WORKDIR /src
 
 # Warm the dependency cache against a stub crate so editing src/ does not rebuild

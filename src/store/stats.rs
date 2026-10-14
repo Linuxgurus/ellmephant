@@ -1,4 +1,4 @@
-//! Store statistics for `ellmephant stats` (aliases `summary`/`stat`): size, spread, tag and link
+//! Store statistics for the `memory_stats` tool: size, spread, tag and link
 //! shape, and recent activity — read-only aggregates over `memory` and its derived indexes.
 //!
 //! Everything here is cheap: counts and `length()` aggregates run in SQLite, and the tag shape
@@ -19,7 +19,13 @@ pub const TOP_TAGS: usize = 10;
 /// How many of the most-useful memories the digest carries.
 pub const TOP_USEFUL: usize = 5;
 
-/// A read-only digest of the store (`ellmephant stats`).
+/// How many read-but-never-upvoted memories the digest carries.
+pub const TOP_UNVOTED: usize = 5;
+
+/// Minimum `visits` for a memory to count as "hot but unvoted" (a single read is a glance, not a hit).
+pub const UNVOTED_MIN_VISITS: i64 = 2;
+
+/// A read-only digest of the store (the `memory_stats` tool).
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     /// Rows in `memory`.
@@ -66,6 +72,11 @@ pub struct Stats {
     pub useful_total: i64,
     /// The most-useful memories (key, `times_useful`), count-desc then key — at most [`TOP_USEFUL`].
     pub top_useful: Vec<(String, i64)>,
+    /// Candidates the store's own ranking may be starving: memories read at least
+    /// [`UNVOTED_MIN_VISITS`] times but never marked useful (key, `visits`), visit-desc then key —
+    /// at most [`TOP_UNVOTED`]. Surfaced so a hot-but-ignored memory can be judged, not silently
+    /// forgotten.
+    pub unvoted_hot: Vec<(String, i64)>,
     /// Oldest `created` timestamp, or `None` for an empty store.
     pub oldest: Option<String>,
     /// Newest `created` timestamp, or `None` for an empty store.
@@ -135,13 +146,20 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     counts.truncate(TOP_TAGS);
 
-    let edges: i64 = conn.query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))?;
+    // Edge counts are MEMORY edges: a `[[prj:x]]` link names the other table, so it is not part of
+    // the memory graph's degree, orphans or components — with bare keys, a project edge would
+    // otherwise look like an edge to a memory that happens to share its name.
+    let edges: i64 = conn.query_row(
+        "SELECT count(*) FROM memory_link WHERE to_type = 'memory'",
+        [],
+        |r| r.get(0),
+    )?;
     let dangling = links::dangling(conn)?.len() as i64;
     // A memory is linked if it appears as an edge source or resolves as an edge target.
     let orphans: i64 = conn.query_row(
         "SELECT count(*) FROM memory m \
           WHERE m.id NOT IN (SELECT from_id FROM memory_link) \
-            AND m.key NOT IN (SELECT to_key FROM memory_link)",
+            AND m.key NOT IN (SELECT to_key FROM memory_link WHERE to_type = 'memory')",
         [],
         |r| r.get(0),
     )?;
@@ -175,6 +193,17 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         let rows = stmt.query_map([TOP_USEFUL as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // Hot but unvoted: read repeatedly, never marked useful — the store's own blind spot.
+    let unvoted_hot: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT key, visits FROM memory WHERE times_useful = 0 AND visits >= ?2 \
+             ORDER BY visits DESC, key LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([TOP_UNVOTED as i64, UNVOTED_MIN_VISITS], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
     // Dense clusters: connected components of the (undirected) link graph.
     let (link_components, largest_component) = component_sizes(conn)?;
@@ -202,6 +231,7 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         visits_total,
         useful_total,
         top_useful,
+        unvoted_hot,
         oldest,
         newest,
         added_7d,
@@ -225,7 +255,8 @@ fn component_sizes(conn: &Connection) -> Result<(i64, i64)> {
     let pos: HashMap<i64, usize> = nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
     let mut parent: Vec<usize> = (0..nodes.len()).collect();
-    let mut stmt = conn.prepare("SELECT from_id, to_key FROM memory_link")?;
+    let mut stmt =
+        conn.prepare("SELECT from_id, to_key FROM memory_link WHERE to_type = 'memory'")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (from_id, to_key) = row?;
@@ -306,6 +337,7 @@ mod tests {
             visits_total: 0,
             useful_total: 0,
             top_useful: Vec::new(),
+            unvoted_hot: Vec::new(),
             oldest: None,
             newest: None,
             added_7d: 0,

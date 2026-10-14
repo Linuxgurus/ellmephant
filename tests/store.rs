@@ -246,6 +246,28 @@ fn visit_and_useful_counters_bump_by_key() {
 }
 
 #[test]
+fn record_useful_many_sweeps_known_keys_and_reports_the_rest() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = CountingEmbedder::new();
+    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    store::add(&conn, &embedder, &memory("b", "B", "body b", &["k8s"])).unwrap();
+
+    let keys = vec!["a".to_string(), "ghost".to_string(), "b".to_string()];
+    let (upvoted, missing) = store::record_useful_many(&conn, &keys).unwrap();
+
+    // Known keys in input order with their new totals; the unknown one is reported, not fatal.
+    assert_eq!(upvoted, vec![("a".to_string(), 1), ("b".to_string(), 1)]);
+    assert_eq!(missing, vec!["ghost".to_string()]);
+
+    // A second sweep stacks on the first.
+    let again = vec!["a".to_string()];
+    let (upvoted, missing) = store::record_useful_many(&conn, &again).unwrap();
+    assert_eq!(upvoted, vec![("a".to_string(), 2)]);
+    assert!(missing.is_empty());
+}
+
+#[test]
 fn upsert_preserves_counters() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");

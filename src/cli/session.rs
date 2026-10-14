@@ -12,7 +12,7 @@ use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, links, maintain, tags};
+use crate::store::{self, Memory, links, maintain, project, tags};
 
 /// A store handle plus its (lazily loaded) encoder.
 pub struct Session {
@@ -104,6 +104,15 @@ impl Session {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
+    /// Upsert a memory *and* set (or clear) its project home (SPEC §7.1) — one transaction, so a
+    /// memory is never stored without the provenance the caller asked for.
+    pub fn add_with_home(&mut self, mem: &Memory, home: project::Home) -> Result<String> {
+        self.ensure_embedder()?;
+        let embedder = self.embedder()?;
+        let (_id, key) = store::add_with_home(&self.conn, embedder, mem, home)?;
+        Ok(key)
+    }
+
     /// Fetch one memory and count the read (the `visits` telemetry). The read path uses this;
     /// the write path's existence check uses [`show`](Self::show), which must not count.
     pub fn fetch(&self, key: &str) -> Result<Memory> {
@@ -115,6 +124,12 @@ impl Session {
     /// Bump the `times_useful` counter for `key` (explicit agent feedback); returns the new total.
     pub fn record_useful(&self, key: &str) -> Result<i64> {
         store::record_useful(&self.conn, key)
+    }
+
+    /// Bump `times_useful` for many keys at once. Returns `(key, new_total)` for the keys that
+    /// existed and the keys that did not, both in input order — a missing key is not an error.
+    pub fn record_useful_many(&self, keys: &[String]) -> Result<store::UsefulSweep> {
+        store::record_useful_many(&self.conn, keys)
     }
 
     /// Set the split-review verdict for `key` (`Some(true)` coherent, `Some(false)` a
@@ -163,7 +178,8 @@ impl Session {
     }
 
     /// Recompute every vector and rebuild the derived vector index, handling a model or
-    /// dimension change (P9). Loads the encoder, so it is a deliberately heavy command.
+    /// dimension change (P9). Loads the encoder, so it is the heaviest call the server makes —
+    /// it backs the `memory_reembed` tool.
     pub fn reembed(&mut self) -> Result<maintain::Report> {
         self.ensure_embedder()?;
         let embedder = self.embedder()?;
@@ -188,6 +204,31 @@ impl Session {
     /// Every tag with its reference count, alphabetical.
     pub fn tags(&self) -> Result<Vec<(String, i64)>> {
         tags::list(&self.conn)
+    }
+
+    /// Upsert a project; `preload` (`Some`) replaces its ordered preload wholesale. No encoder —
+    /// a project is structure, not a document.
+    pub fn project_upsert(
+        &self,
+        project: &project::Project,
+        preload: Option<&[String]>,
+    ) -> Result<String> {
+        project::upsert(&self.conn, project, preload)
+    }
+
+    /// One project with both relations resolved — the "stand inside it" read.
+    pub fn project_view(&self, key: &str) -> Result<project::View> {
+        project::view(&self.conn, key)?.ok_or_else(|| Error::NoProject(project::normalize_key(key)))
+    }
+
+    /// Projects matching `filter`, key order.
+    pub fn project_list(&self, filter: &project::Filter) -> Result<Vec<project::Project>> {
+        project::list(&self.conn, filter)
+    }
+
+    /// Project-side rot: `preload`/`contains` keys that resolve to no memory (`doctor`).
+    pub fn project_dangling(&self) -> Result<Vec<links::Dangling>> {
+        project::dangling(&self.conn)
     }
 
     /// Every key in the store, alphabetical — the REPL's tab-completion vocabulary.

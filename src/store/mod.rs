@@ -3,6 +3,7 @@
 pub mod dupes;
 pub mod links;
 pub mod maintain;
+pub mod project;
 pub mod slug;
 pub mod stats;
 pub mod tags;
@@ -109,13 +110,14 @@ fn resolve_key(conn: &Connection, mem: &Memory) -> Result<String> {
 /// Replace the outgoing `[[key]]` edges for `id` with those parsed from `body`.
 fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> {
     conn.execute("DELETE FROM memory_link WHERE from_id = ?1", params![id])?;
-    for target in links::extract_links(body) {
-        if target == key {
+    for (kind, target) in links::extract_links(body) {
+        if kind == links::Kind::Memory && target == key {
             continue; // a self-link carries no navigation value
         }
         conn.execute(
-            "INSERT OR IGNORE INTO memory_link (from_id, to_key, rel) VALUES (?1, ?2, 'see')",
-            params![id, target],
+            "INSERT OR IGNORE INTO memory_link (from_id, to_key, to_type, rel)
+             VALUES (?1, ?2, ?3, 'see')",
+            params![id, target, kind.as_str()],
         )?;
     }
     Ok(())
@@ -129,7 +131,23 @@ fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> 
 ///
 /// A non-empty `mem.created`/`mem.updated` is honoured; empty strings fall back to
 /// `datetime('now')`, which is what the CLI/MCP write path passes.
+///
+/// No opinion about provenance — a project home is [`add_with_home`].
 pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(i64, String)> {
+    add_with_home(conn, embedder, mem, project::Home::Keep)
+}
+
+/// [`add`], plus a verdict on which project the memory belongs to ([`project::Home`]).
+///
+/// The membership lands in the **same transaction** as the row, so a home is never half-written;
+/// `Home::Keep` (what [`add`] passes) leaves an existing home untouched, which is what keeps a
+/// re-upsert from silently orphaning a memory.
+pub fn add_with_home(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    mem: &Memory,
+    home: project::Home,
+) -> Result<(i64, String)> {
     let prepared = prepare(conn, embedder, mem)?;
     // Create the vec table before the tx so its DDL is not inside it.
     index::vec::ensure(conn, embedder.dim())?;
@@ -141,6 +159,9 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(
     };
     let tx = conn.unchecked_transaction()?;
     let id = apply(&tx, mem, &prepared, vector.as_deref())?;
+    // A bad home (unknown project, or a second home) rolls the whole write back: the tx is
+    // dropped without commit.
+    project::apply_home(&tx, &prepared.key, &home)?;
     tx.commit()?;
     Ok((id, prepared.key))
 }
@@ -269,6 +290,10 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The outcome of a feedback sweep (see [`record_useful_many`]): `(key, new_total)` for every key
+/// that existed, and the keys that did not — both in input order.
+pub type UsefulSweep = (Vec<(String, i64)>, Vec<String>);
+
 /// Bump the `visits` counter for `key` and return the new total (telemetry on read).
 /// Errors with [`Error::NotFound`] when the key is unknown.
 pub fn record_visit(conn: &Connection, key: &str) -> Result<i64> {
@@ -279,6 +304,23 @@ pub fn record_visit(conn: &Connection, key: &str) -> Result<i64> {
 /// feedback). Errors with [`Error::NotFound`] when the key is unknown.
 pub fn record_useful(conn: &Connection, key: &str) -> Result<i64> {
     bump(conn, key, "times_useful")
+}
+
+/// Bump `times_useful` for many keys at once (a feedback sweep: one call, many keys). Returns
+/// `(key, new_total)` for every key that existed, and the keys that did not, both in input
+/// order. A missing key is not an error here — the caller reports the split. Duplicate keys each
+/// count once, in place.
+pub fn record_useful_many(conn: &Connection, keys: &[String]) -> Result<UsefulSweep> {
+    let mut upvoted = Vec::new();
+    let mut missing = Vec::new();
+    for key in keys {
+        match bump(conn, key, "times_useful") {
+            Ok(total) => upvoted.push((key.clone(), total)),
+            Err(Error::NotFound(_)) => missing.push(key.clone()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((upvoted, missing))
 }
 
 /// Set the split-review verdict (`Some(true)` coherent, `Some(false)` a grab-bag, `None`

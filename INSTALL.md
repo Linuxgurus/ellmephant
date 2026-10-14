@@ -97,19 +97,20 @@ See the [README](README.md) for usage, including the MCP server on a host and in
 
 A chart ships in [`charts/ellmephant/`](charts/ellmephant/): one Deployment, a store PVC, and an
 optional separate weights-cache PVC, serving MCP over HTTP on port 8888. It defaults to the public
-image `ghcr.io/jdblack/ellmephant`.
+image `ghcr.io/jdblack/ellmephant` — the public mirror of what the maintainer's cluster runs. It
+carries **releases**: a push to `main` publishes the version from `Cargo.toml` plus `latest`, so pull
+`:latest` (or pin a version, e.g. `:1.2.0`). The `edge` tag is the *dev* build and lives only in
+private Harbor.
 
 ```sh
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-Releases are cut by [`chart-release.yml`](.github/workflows/chart-release.yml): the packaged chart
-is attached to a GitHub Release tagged `ellmephant-<version>`. Release assets only — no registry
-and no Helm repo index — so install straight from the asset URL:
+The chart is published to **both** registries by the Forgejo `publish.yml` on every push to `main`:
+public GHCR for anyone, private Harbor for the cluster. Install straight from OCI:
 
 ```sh
-helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.0/ellmephant-0.2.0.tgz
+helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.1
 ```
 
 Point the MCP client at `http://ellmephant.ellmephant.svc:8888/mcp`. The store lives on the

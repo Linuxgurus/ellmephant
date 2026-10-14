@@ -8,7 +8,7 @@ use super::model::verify_weights;
 use crate::config::{Config, Paths};
 use crate::error::Result;
 use crate::model;
-use crate::store::{links, tags};
+use crate::store::{links, project, tags};
 use crate::{db, index};
 
 /// Report paths, schema version and derived-index health; `verify` re-hashes the weights.
@@ -95,6 +95,14 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     println!("  links          {edges} edge(s), {dangling} dangling");
     let tag_count = tags::list(conn)?.len();
     println!("  tags           {tag_count} tag(s)");
+    // Projects are a second table, not a second graph: report them on their own line, with the
+    // project-side rot (`preload`/`contains` keys that resolve to no memory) alongside it.
+    let projects = project::count(conn)?;
+    let homed = project::homed(conn)?;
+    let project_rot = project::dangling(conn)?.len();
+    println!(
+        "  projects       {projects} project(s), {homed} memory home(s), {project_rot} dangling"
+    );
     println!(
         "  vectors        {} row(s) without a vector",
         (memories - vectors).max(0)

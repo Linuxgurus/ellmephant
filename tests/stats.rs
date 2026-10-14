@@ -121,3 +121,30 @@ fn telemetry_totals_and_top_useful() {
     // Busiest first: b (2) then a (1).
     assert_eq!(s.top_useful.first(), Some(&("b".to_string(), 2)));
 }
+
+#[test]
+fn unvoted_hot_surfaces_read_but_never_marked_useful() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    store::add(&conn, &embedder, &memory("hot", "hot body", &["k8s"])).expect("add hot");
+    store::add(&conn, &embedder, &memory("cold", "cold body", &["k8s"])).expect("add cold");
+    store::add(&conn, &embedder, &memory("voted", "voted body", &["k8s"])).expect("add voted");
+
+    // `hot`: read three times, never upvoted -- the store's blind spot.
+    for _ in 0..3 {
+        store::record_visit(&conn, "hot").unwrap();
+    }
+    // `cold`: a single read is a glance, below the floor.
+    store::record_visit(&conn, "cold").unwrap();
+    // `voted`: read twice and also marked useful -- excluded (it is not unvoted).
+    store::record_visit(&conn, "voted").unwrap();
+    store::record_visit(&conn, "voted").unwrap();
+    store::record_useful(&conn, "voted").unwrap();
+
+    let s = stats::compute(&conn).expect("stats");
+    assert_eq!(s.unvoted_hot, vec![("hot".to_string(), 3)]);
+    // It is a candidate list, not a vote total: the useful row still counts.
+    assert_eq!(s.useful_total, 1);
+}

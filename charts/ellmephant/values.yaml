@@ -7,7 +7,9 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/jdblack/ellmephant
-  # Defaults to the chart's appVersion when empty.
+  # Defaults to the chart's appVersion when empty -- which is right: `appVersion` tracks a released
+  # version, and releases are what GHCR carries. (`edge` is the *dev* tag and lives only in private
+  # Harbor; do not point the chart's default at it.)
   tag: ""
   pullPolicy: IfNotPresent
 

@@ -1,6 +1,6 @@
 //! ellmephant — single-binary, SQLite-backed long-term memory for AI agents.
 //!
-//! One SQLite file is the source of truth; vector, full-text and link indexes are
+//! One SQLite file is the source of truth; the vector index and the link graph are
 //! derived and rebuildable. See `SPEC.md` for the decision record and `PLAN.md` for
 //! the phased build.
 

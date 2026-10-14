@@ -11,17 +11,68 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::store::slug;
 
-/// Capture `[[key]]` targets, key charset `[a-z0-9-]+`.
+/// Capture a `[[key]]` or `[[prj:key]]` target. Key charset `[a-z0-9-]+`; the `prj:` marker is the
+/// only thing allowed before it.
 static LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[\[([a-z0-9-]+)\]\]").expect("link regex is valid"));
+    LazyLock::new(|| Regex::new(r"\[\[((?:prj:)?[a-z0-9-]+)\]\]").expect("link regex is valid"));
+
+/// Which table a key names.
+///
+/// A key is a plain name — two tables may each hold a `sessions` — so the type travels with the
+/// *reference* and never with the name. The table is a row's type; this says which table an edge
+/// points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// A `memory` row.
+    Memory,
+    /// A `project` row.
+    Project,
+}
+
+impl Kind {
+    /// The stored spelling (`memory_link.to_type`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Memory => "memory",
+            Kind::Project => "project",
+        }
+    }
+
+    /// Read the stored spelling back. The column's `CHECK` constrains it to the two values, so
+    /// anything that is not `project` is a memory.
+    pub fn from_stored(raw: &str) -> Self {
+        if raw == Kind::Project.as_str() {
+            Kind::Project
+        } else {
+            Kind::Memory
+        }
+    }
+}
+
+/// The marker that names a **project** in a link token: `[[prj:chronos]]`.
+///
+/// Links live in memory bodies, so a bare `[[key]]` means a memory and only the other kind needs
+/// saying. `:` cannot occur in a slug (`[a-z0-9-]`, see [`slug::slugify`]), so unlike the old
+/// `prj-` prefix no name can ever squat on it.
+pub const PROJECT_MARKER: &str = "prj:";
+
+/// Parse a link token's target into its kind and bare key. The token has already matched the
+/// [`LINK_RE`] charset, so what comes back is always a valid key.
+pub fn parse_target(token: &str) -> (Kind, String) {
+    match token.strip_prefix(PROJECT_MARKER) {
+        Some(key) => (Kind::Project, key.to_string()),
+        None => (Kind::Memory, token.to_string()),
+    }
+}
 
 /// Extract link targets in first-seen order, de-duplicated.
-pub fn extract_links(body: &str) -> Vec<String> {
+pub fn extract_links(body: &str) -> Vec<(Kind, String)> {
     let mut seen = Vec::new();
     for cap in LINK_RE.captures_iter(body) {
-        let key = cap[1].to_string();
-        if !seen.contains(&key) {
-            seen.push(key);
+        let target = parse_target(&cap[1]);
+        if !seen.contains(&target) {
+            seen.push(target);
         }
     }
     seen
@@ -38,33 +89,56 @@ pub fn strip_links(s: &str) -> String {
 pub struct Dangling {
     /// The missing target key.
     pub to_key: String,
+    /// Which table it was expected in — a missing memory and a missing project are different rot.
+    pub to_type: Kind,
     /// Keys of the rows whose bodies point at it, sorted.
     pub from_keys: Vec<String>,
 }
 
-/// Every `[[key]]` target with no matching `memory.key`, grouped by target (SPEC §8 SQL),
-/// ordered by target key.
-pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
-    let mut stmt = conn.prepare(
-        "SELECT l.to_key, m.key FROM memory_link l
-           JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key NOT IN (SELECT key FROM memory)
-          ORDER BY l.to_key, m.key",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-
+/// Group ordered `(to_key, to_type, from_key)` rows into [`Dangling`]s. Shared by the `[[…]]` audit
+/// and the project audit, which both count rot the same way: one entry per unresolved target. The
+/// GROUP is the pair — the same bare key can be missing as both a memory and a project.
+pub fn group_dangling(rows: Vec<(String, Kind, String)>) -> Result<Vec<Dangling>> {
     let mut out: Vec<Dangling> = Vec::new();
-    for row in rows {
-        let (to_key, from_key) = row?;
+    for (to_key, to_type, from_key) in rows {
         match out.last_mut() {
-            Some(group) if group.to_key == to_key => group.from_keys.push(from_key),
+            Some(group) if group.to_key == to_key && group.to_type == to_type => {
+                group.from_keys.push(from_key);
+            }
             _ => out.push(Dangling {
                 to_key,
+                to_type,
                 from_keys: vec![from_key],
             }),
         }
     }
     Ok(out)
+}
+
+/// Every `[[key]]` target that resolves to nothing, grouped by target (SPEC §8 SQL), ordered by
+/// target key.
+///
+/// **A target resolves against the table its kind names** — a memory may point at a project with
+/// `[[prj:chronos]]`, so a project key is not rot, and `to_type` is what keeps that honest. The
+/// same name in the other table does *not* satisfy the edge: a `prj:sessions` link is not fixed by
+/// a memory called `sessions`. A link to a project is still a `see` edge and not membership:
+/// `contains` means "born here", a link only points.
+pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.to_key, l.to_type, m.key FROM memory_link l
+           JOIN memory m ON m.id = l.from_id
+          WHERE (l.to_type = 'memory'  AND l.to_key NOT IN (SELECT key FROM memory))
+             OR (l.to_type = 'project' AND l.to_key NOT IN (SELECT key FROM project))
+          ORDER BY l.to_key, m.key",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Kind::from_stored(&r.get::<_, String>(1)?),
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    group_dangling(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// What a [`rename`] changed.
@@ -128,9 +202,12 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
             format!("%[[{old}]]%")
         ],
     )?;
-    // OR REPLACE clears a would-be PK collision when a source already links to `new`.
+    // OR REPLACE clears a would-be PK collision when a source already links to `new`. Scoped to
+    // `memory`: a bare key can also name a *project*, and renaming a memory must not repoint edges
+    // that were aimed at it.
     let edges = tx.execute(
-        "UPDATE OR REPLACE memory_link SET to_key = ?2 WHERE to_key = ?1",
+        "UPDATE OR REPLACE memory_link SET to_key = ?2
+          WHERE to_key = ?1 AND to_type = 'memory'",
         params![old, new],
     )?;
     tx.commit()?;
@@ -152,10 +229,13 @@ pub struct Backlink {
 }
 
 /// Incoming `[[…]]` edges for `key`, ordered by source key (the MCP `memory_backlinks`).
+///
+/// Memory-kind edges only: a `[[prj:sessions]]` link is aimed at the project, so it is not a
+/// backlink of a memory called `sessions`.
 pub fn backlinks(conn: &Connection, key: &str) -> Result<Vec<Backlink>> {
     let mut stmt = conn.prepare(
         "SELECT m.key, m.title FROM memory_link l JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key = ?1 ORDER BY m.key",
+          WHERE l.to_key = ?1 AND l.to_type = 'memory' ORDER BY m.key",
     )?;
     let rows = stmt.query_map(params![key], |r| {
         Ok(Backlink {
@@ -188,16 +268,47 @@ mod tests {
     #[test]
     fn finds_and_dedupes_in_order() {
         let body = "see [[b]] then [[a]] and [[b]] again";
-        assert_eq!(extract_links(body), vec!["b", "a"]);
+        assert_eq!(
+            extract_links(body),
+            vec![
+                (Kind::Memory, "b".to_string()),
+                (Kind::Memory, "a".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_project_marker_is_what_types_a_target() {
+        // A bare token is a memory; `prj:` is what crosses to the other table — so one name can be
+        // both, and both edges survive.
+        assert_eq!(
+            extract_links("[[sessions]] and [[prj:sessions]]"),
+            vec![
+                (Kind::Memory, "sessions".to_string()),
+                (Kind::Project, "sessions".to_string())
+            ]
+        );
+        // The legacy spelling is NOT a marker in prose: a body saying `[[prj-foo]]` meant a memory
+        // called `prj-foo`. (`prj-` is only stripped from tool *arguments*, where the type is
+        // already given by the argument's job.)
+        assert_eq!(
+            extract_links("[[prj-foo]]"),
+            vec![(Kind::Memory, "prj-foo".to_string())]
+        );
     }
 
     #[test]
     fn ignores_bad_keys() {
         assert!(
             extract_links("[[Upper Case]] [[has_underscore]] [[ok-2]]")
-                .contains(&"ok-2".to_string())
+                .contains(&(Kind::Memory, "ok-2".to_string()))
         );
-        assert_eq!(extract_links("[[has_underscore]]"), Vec::<String>::new());
+        assert_eq!(extract_links("[[has_underscore]]"), Vec::new());
+        assert_eq!(
+            extract_links("[[mem:x]]"),
+            Vec::new(),
+            "only `prj:` is a marker; `mem:` is not a token at all"
+        );
     }
 
     #[test]

@@ -108,17 +108,18 @@ async fn tools_round_trip_over_the_transport() {
     assert!(text(&got).contains("\"visits\":1"), "{}", text(&got));
 
     // Feedback is independent of a fetch (a bare title can earn it) and bumps `times_useful`.
-    let useful = call(
+    // A sweep takes one or more keys.
+    let upvote = call(
         &client,
-        "memory_useful",
-        serde_json::json!({ "key": "infra-logs" }),
+        "memory_upvote",
+        serde_json::json!({ "keys": ["infra-logs"] }),
     )
     .await;
-    assert!(!useful.is_error.unwrap_or(false), "{}", text(&useful));
+    assert!(!upvote.is_error.unwrap_or(false), "{}", text(&upvote));
     assert!(
-        text(&useful).contains("\"times_useful\":1"),
+        text(&upvote).contains("\"times_useful\":1"),
         "{}",
-        text(&useful)
+        text(&upvote)
     );
 
     // A second fetch shows both counters riding on the row.
@@ -131,15 +132,37 @@ async fn tools_round_trip_over_the_transport() {
     let again: serde_json::Value = serde_json::from_str(&text(&again)).expect("memory json");
     assert_eq!(again["visits"], serde_json::json!(2));
     assert_eq!(again["times_useful"], serde_json::json!(1));
+    // The upvote cue rides the fetched *payload* itself, not just the tool's static description:
+    // the ask must sit where the model's attention lands after consuming the body.
+    assert!(
+        again["_nudge"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("memory_upvote"),
+        "get result missing the upvote nudge: {again}"
+    );
 
-    // An unknown key is a tool error (not a silent zero).
+    // An unknown key is a tool error (not a silent zero): a sweep that hits nothing fails.
     let bogus = call(
         &client,
-        "memory_useful",
-        serde_json::json!({ "key": "ghost" }),
+        "memory_upvote",
+        serde_json::json!({ "keys": ["ghost"] }),
     )
     .await;
     assert_eq!(bogus.is_error, Some(true));
+
+    // A mixed sweep upvotes the keys that exist and reports the rest in `missing` (not fatal).
+    let mixed = call(
+        &client,
+        "memory_upvote",
+        serde_json::json!({ "keys": ["infra-logs", "ghost"] }),
+    )
+    .await;
+    assert!(!mixed.is_error.unwrap_or(false), "{}", text(&mixed));
+    let mixed: serde_json::Value = serde_json::from_str(&text(&mixed)).expect("upvote json");
+    assert_eq!(mixed["upvoted"][0]["key"], serde_json::json!("infra-logs"));
+    assert_eq!(mixed["upvoted"][0]["times_useful"], serde_json::json!(2));
+    assert_eq!(mixed["missing"], serde_json::json!(["ghost"]));
 
     let found = call(
         &client,
@@ -461,6 +484,167 @@ async fn search_filters_and_coherence_mark_round_trip() {
     )
     .await;
     assert_eq!(bogus.is_error, Some(true));
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}
+
+#[tokio::test]
+async fn projects_round_trip_over_the_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    // The project tools are advertised alongside the memory ones.
+    let listed = client.list_tools(Default::default()).await.expect("list");
+    for name in ["project_upsert", "project_get", "project_list"] {
+        assert!(
+            listed.tools.iter().any(|t| t.name == name),
+            "{name} not advertised"
+        );
+    }
+
+    // A memory to preload, then the project itself.
+    call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "boot-note", "title": "Read me first", "body": "boot" }),
+    )
+    .await;
+    let stored = call(
+        &client,
+        "project_upsert",
+        serde_json::json!({
+            "key": "chronos",
+            "title": "Chronos — the timing subsystem",
+            "goal": "Place my own intent into a future I won't occupy",
+            "state": "Design only",
+            "status": "active",
+            "owner": ["Cline", "James"],
+            "start_date": "2026-09-01",
+            "tags": ["continuity"],
+            "preload": ["boot-note"]
+        }),
+    )
+    .await;
+    assert!(!stored.is_error.unwrap_or(false), "{}", text(&stored));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text(&stored)).unwrap()["key"],
+        serde_json::json!("chronos"),
+        "the key comes back as a plain name"
+    );
+
+    // `project_get` returns the project with its ordered preload.
+    let got = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "chronos" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
+    assert_eq!(v["project"]["status"], serde_json::json!("active"));
+    assert_eq!(
+        v["project"]["start_date"],
+        serde_json::json!("2026-09-01"),
+        "a backfilled start survives the wire"
+    );
+    assert_eq!(
+        v["project"]["end_date"],
+        serde_json::json!(""),
+        "a running project has no end"
+    );
+    assert_eq!(
+        v["project"]["owner"],
+        serde_json::json!(["Cline", "James"]),
+        "the owner set crosses the wire as an array, sorted"
+    );
+    assert_eq!(v["preload"]["rows"][0][0], serde_json::json!("boot-note"));
+    assert_eq!(
+        v["preload"]["rows"][0][1],
+        serde_json::json!("Read me first")
+    );
+    assert_eq!(v["contains"]["rows"], serde_json::json!([]));
+
+    // A memory JOINs the project by home — set in the memory write, not the project write.
+    let homed = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({
+            "key": "chronos-design",
+            "title": "Chronos design v0",
+            "body": "bells + periods",
+            "project": "chronos"
+        }),
+    )
+    .await;
+    assert!(!homed.is_error.unwrap_or(false), "{}", text(&homed));
+
+    let after = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "chronos" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&after)).expect("json");
+    assert_eq!(
+        v["contains"]["rows"][0][0],
+        serde_json::json!("chronos-design")
+    );
+
+    // One home per memory: a second project is a tool error, not a silent move.
+    call(
+        &client,
+        "project_upsert",
+        serde_json::json!({ "key": "sessions", "title": "Sessions" }),
+    )
+    .await;
+    let moved = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({
+            "key": "chronos-design",
+            "title": "Chronos design v0",
+            "body": "bells + periods",
+            "project": "sessions"
+        }),
+    )
+    .await;
+    assert_eq!(moved.is_error, Some(true), "a second home must be refused");
+    assert!(text(&moved).contains("already belongs"), "{}", text(&moved));
+
+    // `project_list` is the cheap index, and its filters intersect.
+    let all = call(&client, "project_list", serde_json::json!({})).await;
+    let v: serde_json::Value = serde_json::from_str(&text(&all)).expect("json");
+    assert_eq!(v["projects"].as_array().unwrap().len(), 2);
+    let active = call(
+        &client,
+        "project_list",
+        serde_json::json!({ "status": "active", "pattern": "timing" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&active)).expect("json");
+    assert_eq!(v["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(v["projects"][0][0], serde_json::json!("chronos"));
+
+    // An unknown project is a clean tool error.
+    let missing = call(&client, "project_get", serde_json::json!({ "key": "nope" })).await;
+    assert_eq!(missing.is_error, Some(true));
+    assert!(
+        text(&missing).contains("no such project"),
+        "{}",
+        text(&missing)
+    );
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");

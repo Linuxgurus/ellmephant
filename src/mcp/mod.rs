@@ -1,11 +1,12 @@
 //! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_upsert`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_useful`, `memory_stats`,
+//! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
 //! `memory_dupes` — with read-only annotations on the read tools and destructive on `delete`.
 //! The tool descriptions carry the SPEC §9 write policy; that is where memory quality is
-//! actually tuned. `memory_get` counts a `visits` read and `memory_useful` bumps the
-//! `times_useful` feedback counter.
+//! actually tuned. `memory_get` counts a `visits` read and carries the upvote cue — both in its
+//! description *and* in the returned payload (`_nudge`), where the model's attention sits after
+//! consuming a body; `memory_upvote` bumps the `times_useful` feedback counter.
 //!
 //! The store is one SQLite file behind a single connection (SPEC §15 #10), so the
 //! server holds the [`Session`] behind a mutex and serves requests serially. SQLite and
@@ -34,9 +35,9 @@ use crate::config::{Config, Paths};
 // uses the unqualified `Result` from `rmcp`, and our single-parameter alias would shadow it.
 use crate::error::Error;
 use crate::model;
-use crate::search::{Bundle, Field, Fields, Query, to_wire_json};
+use crate::search::{Bundle, Field, Fields, MatchMode, Query, to_wire_json};
 use crate::store::links::backlinks_to_wire_json;
-use crate::store::{self, Memory};
+use crate::store::{self, Memory, project};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
@@ -46,30 +47,56 @@ pub const TOOLS: &[&str] = &[
     "memory_get",
     "memory_backlinks",
     "memory_coherent",
-    "memory_useful",
+    "memory_upvote",
     "memory_stats",
     "memory_dupes",
+    "memory_reembed",
+    "project_upsert",
+    "project_get",
+    "project_list",
 ];
 
-/// Server-level instruction: the identity plus the smart-caveman style, defined once here.
-/// Every other law lives in the tool descriptions — each states its own, so nothing is
-/// written twice (SPEC §9).
+/// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
+/// every tool (curation), defined once here. Every other law lives in the tool descriptions — each
+/// states its own, so nothing is written twice (SPEC §9).
 const INSTRUCTIONS: &str = "ellmephant = Memory storage in smart-caveman style — big words in, \
 small words out; drop filler, articles, glue. List-shaped reads return a positional table: a \
-`cols` header names the fields, rows are bare arrays. Tool descriptions are the spec.";
+`cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
+when a memory shapes your task, `memory_upvote` it — the store's own rankings ride on your votes. \
+A project is an activity over time — a container you can stand inside: \
+`project_upsert` writes one, `project_get` reads one with its `preload`/`contains`, `project_list` \
+shows them all; a memory JOINS a project by home (`memory_upsert`'s `project`) and POINTS at one \
+from its body with `[[prj:key]]` (a bare `[[key]]` is a memory; keys are plain names, and the two \
+tables may share one). \
+Tool descriptions are the spec.";
 
-/// `memory_upsert` description. The write policy lives here and *only* here — the one thing the
-/// model reads before a write.
+/// `memory_reembed` description: the only path out of a model or dimension change.
+const REEMBED_DESCRIPTION: &str = "\
+Recompute every stored vector and rebuild the derived vector index. Needed when the encoder \
+changes — a different model, projection or dimension — because the vector table's width is fixed \
+when it is created, and the store refuses to reinterpret stored vectors rather than hand back \
+wrong neighbours. The rows (`memory` — keys, tags, titles, bodies; `project` — a project's own \
+fields) are the source of truth; everything \
+this touches is derived, so nothing written can be lost and re-running it is harmless. Heavy: it \
+loads the encoder and re-embeds the whole store in one call, so call it once and wait, rather \
+than retrying it.";
+
 const UPSERT_DESCRIPTION: &str = "\
-Upsert one memory. WRITE in smart-caveman. One topic per memory — cluster close facts; split \
-distinct. Before saving, check: does the body hold ≥2 distinct retrieval intents? Then upsert them \
-as separate memories, one call each — never a misc/gotchas bucket; each atom must stand alone \
-(≥2-3 facts). Trim, never grow. Merge redundant memories by hand: fold less useful into more useful \
-and `memory_delete` the less useful. Skip memory/facts when cheap to derive, live state, or one-off.";
+Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clustered facts, one \
+per line; never a misc/gotchas bucket. Before saving, check: body hold ≥2 distinct topics? Split — \
+one call each, each atom stands alone (≥2-3 facts). Trim junk on edit — deepen the topic, never add \
+a second. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete` \
+Skip facts cheap to derive, live state, or one-off.";
 
-/// `memory_useful` description. The feedback nudge, carried here only.
-const USEFUL_DESCRIPTION: &str =
-    "Indicates a memory was very helpful current task. Sharp truth, no flattery.";
+/// `memory_upvote` description. The feedback nudge, carried here only.
+const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \
+decision, dodged a bug, or you followed its law. A bare fetch is a visit, not this. Pass every key \
+that earned its keep in one call; under-voting starves the store's own rankings.";
+
+/// The firing cue that rides the `memory_get` *result* payload, not just its static description.
+/// The model's attention is on the body it just consumed — a trigger fires where attention sits at
+/// the moment of use (cf. the telemetry lesson).
+const GET_NUDGE: &str = "Shaped your task? memory_upvote this key.";
 
 /// `memory_dupes` description. A finder for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
@@ -83,6 +110,47 @@ const DUPES_LIMIT: usize = 50;
 /// `memory_coherent` description. The split-review law rides here, in its owning tool only.
 const COHERENT_DESCRIPTION: &str = "\
 Record a memory's split-review verdict: `true` = one coherent topic, `false` = a grab-bag worth splitting, omit/`null` = unjudged. Reset to null automatically on the next upsert, so an edit re-opens review. Find the fat tail with `memory_search` (`min_chars`, `coherent`).";
+
+/// `memory_search` description. The read law lives here — the semantic phrase, the literal/regex
+/// leg, the structured filters, the lean `key`-only default, and the narrow-to-wide widen trigger.
+const SEARCH_DESCRIPTION: &str = "\
+Hunt memory by meaning (`query`) or by literal (`pattern`) — semantics reach sense; `pattern` reaches \
+a half-remembered string (a key, a filename, an error). `mode` reads `pattern` as `literal` (a \
+substring, the default) or `regex`. Both legs and the filters intersect (all must hold); omit all to \
+filter the whole store. Hits are `key`-only by default; `fields` adds more, body never. `memory_get` \
+the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
+`max_distance`.";
+
+/// `project_upsert` description. The project write law lives here and *only* here.
+const PROJECT_UPSERT_DESCRIPTION: &str = "\
+Create or replace a project — an activity completed over time: identity, status, prose, and an \
+ordered `preload`. A project is the structure half of the store and a container you can stand \
+inside; facts go in memories, where the store matches them by meaning. `key` is a plain slug — the \
+name is the identity, `prj:`/`prj-` are accepted and stripped, and a memory may share it. \
+`status` is todo|active|paused|done|aborted — `done` and `aborted` both end a project, and there is no delete; \
+`owner` is a set of names, e.g. [\"Cline\",\"James\"] — free text, since the store keeps no list of \
+who exists (and `me` would mean whatever reader asks). `preload` is the ORDERED list of memory keys to load as \
+context to work \
+in here; it replaces the previous list, and it may name memories this project did not author \
+(conventions, boot notes). `start_date`/`end_date` are ISO dates (`YYYY-MM-DD`): `start_date` is \
+stamped on the first write and correctable after, and `end_date` is stamped when `status` becomes \
+done|aborted — `status` says HOW it ended, the date only says WHEN, and reopening clears it. A write \
+is whole-row, so `project_get` first if you mean to edit one \
+field. A memory joins a project by HOME, which is `memory_upsert`'s `project`.";
+
+/// `project_get` description.
+const PROJECT_GET_DESCRIPTION: &str = "\
+Read one project whole, with both relations resolved — `preload` (the ordered context to load, \
+project -> memory) and `contains` (the memories born here, memory -> project; one home each). \
+A referenced key whose title is null resolves to nothing: a forward reference or rot. The read \
+reports it rather than hiding it.";
+
+/// `project_list` description.
+const PROJECT_LIST_DESCRIPTION: &str = "\
+List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `title`, `goal`, \
+`start_date`, `end_date`; never `state`, which is a `project_get` away). Filters intersect: `status`, `tags` (every listed \
+tag must be present) and a literal/regex `pattern` over `key`/`title`/`goal`/`state`. Omit them \
+all to list every project.";
 
 /// Parameters for [`MemoryServer::memory_upsert`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -105,6 +173,12 @@ pub struct UpsertParams {
     #[serde(default)]
     #[schemars(description = "Aspects of the subject, e.g. storage, gotchas.")]
     pub tags: Vec<String>,
+    /// Project home.
+    #[serde(default)]
+    #[schemars(
+        description = "Project this was born in (a plain name; `prj:`/`prj-` accepted and stripped). Omit = keep the current home; \"\" = detach. One home per memory."
+    )]
+    pub project: Option<String>,
 }
 
 impl UpsertParams {
@@ -119,6 +193,16 @@ impl UpsertParams {
             ..Default::default()
         }
     }
+
+    /// The provenance this write expresses: absent = keep the current home, `""` = detach, else
+    /// belong to that project. [`project::Home::Keep`] is what makes a re-upsert safe.
+    fn home(&self) -> project::Home {
+        match self.project.as_deref() {
+            None => project::Home::Keep,
+            Some(raw) if raw.trim().is_empty() => project::Home::Clear,
+            Some(raw) => project::Home::Set(raw.to_string()),
+        }
+    }
 }
 
 /// Parameters for [`MemoryServer::memory_search`].
@@ -128,6 +212,16 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Phrase to hunt with. Matched against embedded document.")]
     pub query: Option<String>,
+    /// The literal/regex pattern.
+    #[serde(default)]
+    #[schemars(
+        description = "Literal/regex pattern over `key`/`title`/`body` — for a half-remembered literal (a key, a filename, an error string). Intersects with `query` and the filters. Blank = no lexical leg."
+    )]
+    pub pattern: Option<String>,
+    /// How `pattern` is read.
+    #[serde(default)]
+    #[schemars(description = "How `pattern` is read: `literal` (substring, default) or `regex`.")]
+    pub mode: Option<MatchModeParam>,
     /// Result count.
     #[serde(default)]
     #[schemars(description = "Most hits bring back (default = configured k).")]
@@ -197,6 +291,26 @@ impl FieldParam {
     }
 }
 
+/// How a `pattern` is read on `memory_search` (the lexical leg).
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchModeParam {
+    /// A plain substring, case-insensitive; regex metacharacters are literal text.
+    Literal,
+    /// A regex, case-insensitive by default (opt out with a leading `(?-i)`).
+    Regex,
+}
+
+impl MatchModeParam {
+    /// Map the wire enum onto the search-layer mode.
+    fn to_mode(self) -> MatchMode {
+        match self {
+            MatchModeParam::Literal => MatchMode::Literal,
+            MatchModeParam::Regex => MatchMode::Regex,
+        }
+    }
+}
+
 /// The `memory_search` coherence filter — a nullable bool with negation. `!X` reads "not X",
 /// so the six values are the six non-empty proper subsets of `{true, false, null}`.
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -244,6 +358,14 @@ pub struct KeyParams {
     pub key: String,
 }
 
+/// A many-key request (feedback sweep).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KeysParams {
+    /// The memories' keys.
+    #[schemars(description = "Memory keys (one or more). Slugs.")]
+    pub keys: Vec<String>,
+}
+
 /// Parameters for a no-argument tool (`memory_stats`).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {}
@@ -273,6 +395,108 @@ pub struct CoherentParams {
         description = "true = one topic; false = a grab-bag to split; omit/null = unjudged."
     )]
     pub coherent: Option<bool>,
+}
+
+/// Parameters for [`MemoryServer::project_get`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectKeyParams {
+    /// The project's key.
+    #[schemars(description = "Project key — a plain slug (`prj:`/`prj-` accepted and stripped).")]
+    pub key: String,
+}
+
+/// Parameters for [`MemoryServer::project_upsert`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectUpsertParams {
+    /// Stable slug.
+    #[serde(default)]
+    #[schemars(description = "Stable slug — a plain name; reuse replaces that project.")]
+    pub key: Option<String>,
+    /// Salient one-liner.
+    #[schemars(description = "One sharp line.")]
+    pub title: String,
+    /// What this is for.
+    #[serde(default)]
+    #[schemars(description = "What this is for. One line.")]
+    pub goal: Option<String>,
+    /// Where it stands.
+    #[serde(default)]
+    #[schemars(description = "Mutable current-state prose: where it stands, what's next.")]
+    pub state: Option<String>,
+    /// Lifecycle.
+    #[serde(default)]
+    #[schemars(description = "todo | active | paused | done | aborted (default todo).")]
+    pub status: Option<String>,
+    /// Whose it is.
+    #[serde(default)]
+    #[schemars(
+        description = "Whose it is: a set of names, e.g. [\"Cline\",\"James\"]. Free text; empty = unassigned."
+    )]
+    pub owner: Option<Vec<String>>,
+    /// Aspect tags.
+    #[serde(default)]
+    #[schemars(description = "Aspects of the subject, e.g. continuity, storage.")]
+    pub tags: Vec<String>,
+    /// The ordered context to load.
+    #[serde(default)]
+    #[schemars(
+        description = "ORDERED memory keys to load to work in here; replaces the previous list. May name memories this project did not author."
+    )]
+    pub preload: Option<Vec<String>>,
+    /// When the work started.
+    #[serde(default)]
+    #[schemars(
+        description = "When the work started, ISO `YYYY-MM-DD`. Stamped on first write if omitted; correct it to backfill a late entry."
+    )]
+    pub start_date: Option<String>,
+    /// When it ended.
+    #[serde(default)]
+    #[schemars(
+        description = "When it ended, ISO `YYYY-MM-DD` — only with status done|aborted (both END a project; `status` says how, this says when). Stamped when omitted, cleared if reopened."
+    )]
+    pub end_date: Option<String>,
+}
+
+impl ProjectUpsertParams {
+    /// Split the request into the project and its optional (whole-list) preload.
+    fn into_parts(self) -> (project::Project, Option<Vec<String>>) {
+        let project = project::Project {
+            key: self.key.unwrap_or_default(),
+            title: self.title,
+            goal: self.goal.unwrap_or_default(),
+            state: self.state.unwrap_or_default(),
+            status: self.status.unwrap_or_default(),
+            owner: self.owner.unwrap_or_default(),
+            tags: self.tags,
+            start_date: self.start_date.unwrap_or_default(),
+            end_date: self.end_date.unwrap_or_default(),
+            ..Default::default()
+        };
+        (project, self.preload)
+    }
+}
+
+/// Parameters for [`MemoryServer::project_list`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectListParams {
+    /// Lifecycle filter.
+    #[serde(default)]
+    #[schemars(description = "Only this status.")]
+    pub status: Option<String>,
+    /// Tag filter (AND).
+    #[serde(default)]
+    #[schemars(description = "Tag filter; a project must carry EVERY listed tag.")]
+    pub tags: Vec<String>,
+    /// The literal/regex pattern.
+    #[serde(default)]
+    #[schemars(
+        description = "Literal/regex pattern over `key`/`title`/`goal`/`state`. Blank = no lexical leg."
+    )]
+    pub pattern: Option<String>,
+    /// How `pattern` is read.
+    #[serde(default)]
+    #[schemars(description = "How `pattern` is read: `literal` (substring, default) or `regex`.")]
+    pub mode: Option<MatchModeParam>,
 }
 
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
@@ -393,11 +617,16 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
+        let home = p.home();
         let mem = p.into_memory();
         let tags = mem.tags.clone();
         let body_bytes = mem.body.len();
+        // `Home::Keep` is the common path (a write with no opinion about provenance).
         let key = self
-            .with_store("memory_upsert", move |s| s.add(&mem))
+            .with_store("memory_upsert", move |s| match home {
+                project::Home::Keep => s.add(&mem),
+                home => s.add_with_home(&mem, home),
+            })
             .await?;
         tracing::info!(tool = "memory_upsert", key = %key, tags = ?tags, body_bytes, "memory stored");
         Ok(json_ok(
@@ -440,7 +669,7 @@ impl MemoryServer {
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
-        description = "Hunt memory by meaning, or filter it. `query` = semantic phrase; whole document (key, tags, title, body) sits in the embedding, so a phrase touching any part raises the memory. Filters intersect — a hit must satisfy every one given: `tags` (each listed tag present), `min_chars`/`max_chars` (embedded-document size), `coherent` (`true`/`false`/`null`, or negate with `!`). No `query`? Then it is a pure filter over the store (key order, uncapped). Hits carry `key` alone — never the body, so `memory_get` only the hit you use — unless you name more in `fields` (`title`, `tags`, `coherent`, `chars`, `distance`), which add in that order. Start small `k`; none fit? Widen — raise `k`, loosen `max_distance`. Know the `key`? `memory_get` instead.",
+        description = SEARCH_DESCRIPTION,
         annotations(
             title = "Search memory",
             read_only_hint = true,
@@ -454,6 +683,8 @@ impl MemoryServer {
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
         let query = p.query;
+        let pattern = p.pattern;
+        let mode = p.mode.map(MatchModeParam::to_mode).unwrap_or_default();
         let k = p.k;
         let max_distance = p.max_distance;
         let expand = p.expand.unwrap_or(0);
@@ -470,6 +701,8 @@ impl MemoryServer {
             .with_store("memory_search", move |s| {
                 let q = Query {
                     text: query,
+                    pattern,
+                    mode,
                     k: k.unwrap_or_else(|| s.default_k()),
                     // Fall back to the configured ceiling so a bare semantic search is capped.
                     max_distance: max_distance.or_else(|| s.default_max_distance()),
@@ -496,7 +729,7 @@ impl MemoryServer {
     /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
-        description = "Pull one memory whole by `key` — the only read that returns a body.",
+        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it.",
         annotations(
             title = "Get memory",
             read_only_hint = true,
@@ -515,34 +748,58 @@ impl MemoryServer {
             .with_store("memory_get", move |s| s.fetch(&lookup))
             .await?;
         tracing::debug!(tool = "memory_get", key = %key, "memory fetched");
-        serde_json::to_string(&mem).map_err(|e| e.to_string())
+        // Carry the firing cue in the payload, not only the static description: the model reads
+        // the returned body here, so this is where the upvote ask must live.
+        let mut v = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+        }
+        serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
     /// Bump the `times_useful` counter on a memory that helped the task.
     #[tool(
-        name = "memory_useful",
-        description = USEFUL_DESCRIPTION,
+        name = "memory_upvote",
+        description = UPVOTE_DESCRIPTION,
         annotations(
-            title = "Mark memory useful",
+            title = "Upvote memory",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = false
         )
     )]
-    async fn memory_useful(
+    async fn memory_upvote(
         &self,
-        Parameters(p): Parameters<KeyParams>,
+        Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        let key = p.key;
-        let bump = key.clone();
-        let total = self
-            .with_store("memory_useful", move |s| s.record_useful(&bump))
+        let keys = p.keys;
+        if keys.is_empty() {
+            return Err("memory_upvote needs at least one key".to_string());
+        }
+        let sweep = keys.clone();
+        let (upvoted, missing) = self
+            .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
             .await?;
-        tracing::info!(tool = "memory_useful", key = %key, times_useful = total, "marked useful");
-        Ok(json_ok(
-            serde_json::json!({ "status": "useful", "key": key, "times_useful": total }),
-        ))
+        // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
+        if upvoted.is_empty() {
+            return Err(Error::NotFound(keys.join(", ")).to_string());
+        }
+        tracing::info!(
+            tool = "memory_upvote",
+            upvoted = upvoted.len(),
+            missing = missing.len(),
+            "marked useful"
+        );
+        let upvoted: Vec<serde_json::Value> = upvoted
+            .into_iter()
+            .map(|(key, times_useful)| serde_json::json!({ "key": key, "times_useful": times_useful }))
+            .collect();
+        let mut result = serde_json::json!({ "status": "useful", "upvoted": upvoted });
+        if !missing.is_empty() {
+            result["missing"] = serde_json::json!(missing);
+        }
+        Ok(json_ok(result))
     }
 
     /// List the memories whose bodies link to `key`.
@@ -648,6 +905,133 @@ impl MemoryServer {
             "dupes"
         );
         store::dupes::to_wire_json(&pairs).map_err(|e| e.to_string())
+    }
+
+    /// Recompute every vector and rebuild the derived index — the only path out of a model or
+    /// dimension change, which [`crate::index::vec::ensure`] deliberately refuses to absorb.
+    #[tool(
+        name = "memory_reembed",
+        description = REEMBED_DESCRIPTION,
+        annotations(
+            title = "Re-embed store",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_reembed(
+        &self,
+        Parameters(_): Parameters<ListParams>,
+    ) -> std::result::Result<String, String> {
+        let report = self
+            .with_store("memory_reembed", move |s| s.reembed())
+            .await?;
+        tracing::info!(
+            tool = "memory_reembed",
+            rows = report.rows,
+            dim = report.dim,
+            rebuilt = report.rebuilt,
+            model = %report.model,
+            "re-embedded the store"
+        );
+        // `Report` is not Serialize; spell the fields out so the response stays explicit.
+        Ok(json_ok(serde_json::json!({
+            "status": "re-embedded",
+            "rows": report.rows,
+            "dim": report.dim,
+            "rebuilt": report.rebuilt,
+            "model": report.model,
+        })))
+    }
+
+    /// Create or replace a project — the structures half of the store.
+    #[tool(
+        name = "project_upsert",
+        description = PROJECT_UPSERT_DESCRIPTION,
+        annotations(
+            title = "Upsert project",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_upsert(
+        &self,
+        Parameters(p): Parameters<ProjectUpsertParams>,
+    ) -> std::result::Result<String, String> {
+        let (project, preload) = p.into_parts();
+        let preload_len = preload.as_ref().map(Vec::len);
+        let key = self
+            .with_store("project_upsert", move |s| {
+                s.project_upsert(&project, preload.as_deref())
+            })
+            .await?;
+        tracing::info!(tool = "project_upsert", key = %key, preload = ?preload_len, "project stored");
+        Ok(json_ok(
+            serde_json::json!({ "status": "stored", "key": key }),
+        ))
+    }
+
+    /// Read one project whole: its fields, its ordered preload, and the memories it owns.
+    #[tool(
+        name = "project_get",
+        description = PROJECT_GET_DESCRIPTION,
+        annotations(
+            title = "Get project",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_get(
+        &self,
+        Parameters(p): Parameters<ProjectKeyParams>,
+    ) -> std::result::Result<String, String> {
+        let key = p.key;
+        let lookup = key.clone();
+        let view = self
+            .with_store("project_get", move |s| s.project_view(&lookup))
+            .await?;
+        tracing::debug!(
+            tool = "project_get",
+            key = %key,
+            preload = view.preload.len(),
+            contains = view.contains.len(),
+            "project read"
+        );
+        project::view_to_wire_json(&view).map_err(|e| e.to_string())
+    }
+
+    /// List the projects: the cheap index (no `state`), with intersecting filters.
+    #[tool(
+        name = "project_list",
+        description = PROJECT_LIST_DESCRIPTION,
+        annotations(
+            title = "List projects",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_list(
+        &self,
+        Parameters(p): Parameters<ProjectListParams>,
+    ) -> std::result::Result<String, String> {
+        let filter = project::Filter {
+            status: p.status,
+            tags: p.tags,
+            pattern: p.pattern,
+            mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
+        };
+        let rows = self
+            .with_store("project_list", move |s| s.project_list(&filter))
+            .await?;
+        tracing::info!(tool = "project_list", projects = rows.len(), "projects");
+        project::list_to_wire_json(&rows).map_err(|e| e.to_string())
     }
 }
 
@@ -804,12 +1188,16 @@ mod tests {
         assert_eq!(ann("memory_delete").destructive_hint, Some(true));
         assert_eq!(ann("memory_delete").read_only_hint, Some(false));
         // Feedback writes but is neither read-only nor destructive.
-        assert_eq!(ann("memory_useful").read_only_hint, Some(false));
-        assert_eq!(ann("memory_useful").destructive_hint, Some(false));
+        assert_eq!(ann("memory_upvote").read_only_hint, Some(false));
+        assert_eq!(ann("memory_upvote").destructive_hint, Some(false));
         assert_eq!(ann("memory_upsert").idempotent_hint, Some(true));
         // The split-review mark writes, non-destructively.
         assert_eq!(ann("memory_coherent").read_only_hint, Some(false));
         assert_eq!(ann("memory_coherent").destructive_hint, Some(false));
+        // Re-embed writes, but only to the derived index -- nothing it touches is source data.
+        assert_eq!(ann("memory_reembed").read_only_hint, Some(false));
+        assert_eq!(ann("memory_reembed").destructive_hint, Some(false));
+        assert_eq!(ann("memory_reembed").idempotent_hint, Some(true));
 
         // The write *policy* rides on the upsert description (SPEC §9)...
         let upsert = find("memory_upsert")
@@ -818,10 +1206,52 @@ mod tests {
             .expect("description");
         assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
-        // The pre-write split nudge: evaluate, then action = one call per atom.
+        // The pre-write split nudge: *evaluate* ("before saving"), then *action* (split, one call each).
+        assert!(upsert.to_lowercase().contains("before saving"), "{upsert}");
+        assert!(upsert.to_lowercase().contains("split"), "{upsert}");
+        // Growth law is *coherence, not size*: deepen a topic, never add a second; no "never grow".
         assert!(
-            upsert.to_lowercase().contains("separate memories"),
+            upsert.to_lowercase().contains("deepen the topic"),
             "{upsert}"
+        );
+        assert!(!upsert.to_lowercase().contains("never grow"), "{upsert}");
+        // The feedback nudge must carry a *trigger*, not just a quality bar.
+        let upvote = find("memory_upvote")
+            .description
+            .clone()
+            .expect("description");
+        assert!(
+            upvote.to_lowercase().contains("shaped this task"),
+            "{upvote}"
+        );
+        assert!(upvote.to_lowercase().contains("visit"), "{upvote}");
+        // The old "no flattery" clause was a *brake* that starved the counter; it must stay gone,
+        // replaced by a default-on push to vote.
+        assert!(
+            !upvote.to_lowercase().contains("no flattery"),
+            "the withholding brake is back: {upvote}"
+        );
+        assert!(upvote.to_lowercase().contains("under-voting"), "{upvote}");
+        // The sweep takes *many* keys: the schema exposes `keys`, never a single `key`.
+        let upvote_props = find("memory_upvote")
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .expect("upvote schema has properties");
+        assert!(upvote_props.contains_key("keys"), "{upvote_props:?}");
+        assert!(!upvote_props.contains_key("key"), "{upvote_props:?}");
+        // ...and the firing cue must ride the *consuming* read, not the write tool —
+        // the model reads `memory_get`, uses the body, and there learns to upvote.
+        let get = find("memory_get").description.clone().expect("description");
+        assert!(get.contains("memory_upvote"), "{get}");
+        // ...and the cue must also ride `memory_get`'s *result* payload, where the model's
+        // attention actually sits after consuming the body (pinned end-to-end in tests/mcp.rs).
+        assert!(GET_NUDGE.contains("memory_upvote"), "{GET_NUDGE}");
+        // Curation is a cross-tool duty, so it is announced once in the server instructions too.
+        assert!(
+            INSTRUCTIONS.contains("memory_upvote") && INSTRUCTIONS.contains("Curation"),
+            "{INSTRUCTIONS}"
         );
         // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
@@ -844,8 +1274,8 @@ mod tests {
             "field defs belong on the fields: {upsert}"
         );
 
-        // Search carries the semantic phrase plus the structured filters — but no `key` leg
-        // (a known key is `memory_get`) and no literal/regex `match` mode.
+        // Search carries the semantic phrase (`query`), the lexical leg (`pattern` + `mode`) and the
+        // structured filters — but no `key` leg (a known key is `memory_get`).
         let props = find("memory_search")
             .input_schema
             .get("properties")
@@ -870,12 +1300,53 @@ mod tests {
                 "max_chars",
                 "max_distance",
                 "min_chars",
+                "mode",
+                "pattern",
                 "query",
                 "tags"
             ]
         );
+        // The `mode` values live in the schema (a `MatchModeParam` enum), never in the description.
+        let mode_oneof = find("memory_search")
+            .input_schema
+            .get("$defs")
+            .and_then(|d| d.get("MatchModeParam"))
+            .and_then(|f| f.get("oneOf"))
+            .and_then(|v| v.as_array())
+            .expect("MatchModeParam enum in the schema");
+        let mode_vals: Vec<&str> = mode_oneof
+            .iter()
+            .filter_map(|v| v.get("const"))
+            .filter_map(|v| v.as_str())
+            .collect();
+        for want in ["literal", "regex"] {
+            assert!(
+                mode_vals.contains(&want),
+                "missing mode {want}: {mode_vals:?}"
+            );
+        }
         // The projection selection rides on `fields` (a hit returns `key` alone by default).
         assert!(props.contains_key("fields"), "search must expose `fields`");
+        // The `fields` *values* live in the schema (a `FieldParam` enum), never in the description —
+        // that is how the model learns them; the prose stays policy-only.
+        let field_oneof = find("memory_search")
+            .input_schema
+            .get("$defs")
+            .and_then(|d| d.get("FieldParam"))
+            .and_then(|f| f.get("oneOf"))
+            .and_then(|v| v.as_array())
+            .expect("FieldParam enum in the schema");
+        let field_vals: Vec<&str> = field_oneof
+            .iter()
+            .filter_map(|v| v.get("const"))
+            .filter_map(|v| v.as_str())
+            .collect();
+        for want in ["key", "title", "tags", "coherent", "chars", "distance"] {
+            assert!(
+                field_vals.contains(&want),
+                "missing field {want}: {field_vals:?}"
+            );
+        }
 
         // The read law rides on the search description, not the server instructions.
         let search = find("memory_search")
@@ -883,6 +1354,11 @@ mod tests {
             .clone()
             .expect("description");
         assert!(search.to_lowercase().contains("widen"), "{search}");
+        // The filter/projection *definitions* are the schema's job — the desc must not restate them.
+        assert!(
+            !search.contains("min_chars") && !search.contains("max_chars"),
+            "search desc must not restate field defs: {search}"
+        );
 
         // The server instruction carries the identity + the smart-caveman style (defined
         // once); it must not restate the tool law (that rides on the tools).

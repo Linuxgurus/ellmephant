@@ -1,0 +1,182 @@
+name: publish
+
+# Publish a RELEASE: build the image and the chart once, tag them with the version from `Cargo.toml`,
+# and push BOTH to BOTH registries.
+#
+#   Harbor  harbor.vn.linuxguru.net/library/...   PRIVATE -- LAN-only, what the cluster pulls
+#   GHCR    ghcr.io/jdblack/...                   PUBLIC  -- the same bytes, mirrored
+#
+# The two paths are deliberately different:
+#   dev   -> publish-dev.yml, `edge` + `sha-<commit>`, Harbor only (the cluster's dev tag)
+#   main  -> here: versioned release + chart, both registries
+# Neither publishes the other's tags.
+#
+# ARCHITECTURE: amd64 only, for now. The dependency image (Dockerfile.builder, ~250 crates) is
+# amd64-only, so a multi-platform release needs an arm64 dependency image FIRST -- and building that
+# means compiling every crate under QEMU once, which is a project rather than a flag. The path when
+# it matters: build `ellmephant-builder` for linux/arm64 once, then switch the build step to buildx
+# with `--platform linux/amd64,linux/arm64` and let the same `--push` carry both registries (the
+# digests stay identical exactly as they do today). Until then arm64 hosts pull amd64 and emulate.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: harbor.vn.linuxguru.net
+  IMAGE: harbor.vn.linuxguru.net/library/ellmephant
+  CHART_REPO: harbor.vn.linuxguru.net/library/charts
+  BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
+  GHCR_REGISTRY: ghcr.io
+  GHCR_IMAGE: ghcr.io/jdblack/ellmephant
+  GHCR_CHART_REPO: ghcr.io/jdblack/charts
+  CHART: charts/ellmephant
+  # Pinned so the job does not depend on what the runner image happens to ship: the act ubuntu image
+  # has node + git + docker and no helm.
+  HELM_VERSION: v3.16.3
+  BUILDER_PROFILE: rust-lean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release's whole identity comes from the one source of truth. `1.1.0` also implies `1.1`,
+      # `1` and `latest` -- unless it is a pre-release, which publishes only its own tag so a broken
+      # candidate can never take the moving ones (`latest` above all).
+      - name: Read the release version
+        id: ver
+        run: |
+          set -eu
+          ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [ -z "$ver" ]; then
+            echo "no version found in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "releasing $ver"
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          set -eu
+          # The robot name contains a `$` (robot$library+forgejo); quoted, so the shell leaves it be.
+          echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+
+      # The public mirror needs its own credentials, and they are NOT written by
+      # `module.forgejo_setup` the way the Harbor robot is. Missing them FAILS the job rather than
+      # skipping the mirror: a public release that silently stops is worse than one that complains.
+      - name: Log in to GHCR (public mirror)
+        env:
+          GHCR_USER: ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${GHCR_TOKEN:-}" ] || [ -z "${GHCR_USER:-}" ]; then
+            echo "GHCR_USER / GHCR_TOKEN are not set (repo secrets): the public mirror did NOT run."
+            echo "Set them (token needs write:packages) -- see DEVELOPMENT.md (Publishing)."
+            exit 1
+          fi
+          echo "$GHCR_TOKEN" | docker login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
+
+      # Same dependency layer as the dev workflow: ~250 crates compiled once, reused as the builder
+      # stage. The tag fingerprints Cargo.toml + Cargo.lock + Dockerfile.builder, so it moves by
+      # itself when the dependency set or profile changes.
+      # Order matters and must match the Makefile: Cargo.toml, Cargo.lock, Dockerfile.builder.
+      - name: Ensure the dependency image exists
+        run: |
+          set -eu
+          hash=$(cat Cargo.toml Cargo.lock Dockerfile.builder | sha256sum | cut -c1-8)
+          ref="$BUILDER:$BUILDER_PROFILE-$hash"
+          echo "dependency image: $ref"
+          if docker manifest inspect "$ref" > /dev/null 2>&1; then
+            echo "present"
+          else
+            echo "missing -- building it (slow, but only once per input change)"
+            docker build -f Dockerfile.builder -t "$ref" .
+            docker push "$ref"
+          fi
+          echo "$ref" > .builder-ref
+
+      # One build, tagged per registry: `docker tag`/multiple `-t` never rebuild, so the image the
+      # cluster runs and the image anyone can pull are provably the same bytes.
+      #
+      # Pre-releases publish ONLY their own tag (`1.1.0-rc.1`): never `latest`, `1` or `1.1`, so a
+      # candidate cannot leak into ordinary pulls. Promote by bumping Cargo.toml to the final version.
+      - name: Build and push the release image (both registries)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          maj=${VERSION%%.*}
+          rest=${VERSION#*.}
+          min=${rest%%.*}
+
+          # Tag list, in the order they are pushed: immutable handle first, then the version, then
+          # the moving aliases.
+          set -- "$IMAGE:sha-$short" "$IMAGE:$VERSION" "$GHCR_IMAGE:sha-$short" "$GHCR_IMAGE:$VERSION"
+          case "$VERSION" in
+            *-*)
+              echo "pre-release $VERSION: publishing only its own tag"
+              ;;
+            *)
+              set -- "$@" \
+                "$IMAGE:$maj.$min" "$IMAGE:$maj" "$IMAGE:latest" \
+                "$GHCR_IMAGE:$maj.$min" "$GHCR_IMAGE:$maj" "$GHCR_IMAGE:latest"
+              ;;
+          esac
+
+          # Every -t is a local tag on the same build; the push loop below sends them all.
+          tags=""
+          for t in "$@"; do
+            tags="$tags -t $t"
+          done
+          echo "building $VERSION as:$tags"
+          # shellcheck disable=SC2086
+          docker build --platform linux/amd64 \
+            --build-arg BUILDER="$(cat .builder-ref)" $tags .
+
+          # The base name of every tag, so the push loop needs no re-derivation.
+          for t in "$@"; do
+            docker push "$t"
+          done
+          echo "published $VERSION to $REGISTRY ($IMAGE) and $GHCR_REGISTRY ($GHCR_IMAGE)"
+
+      # After the image, so a chart whose defaults name a tag is never ahead of that tag existing.
+      # The chart's own `version` is its OCI tag; `appVersion` is what the chart defaults to.
+      - name: Package and push the chart (both registries)
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+          GHCR_USER: ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -eu
+          # The runner image has docker but not helm; pin our own rather than trust the image. (If a
+          # fatter image arrives later this costs one download, not a break.)
+          if ! command -v helm > /dev/null 2>&1; then
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar xz
+            install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          fi
+          helm version --short
+
+          # helm keeps its OWN credential store (separate from docker's), so both registries need a
+          # login here even though docker is already authenticated to both.
+          echo "$HARBOR_TOKEN" | helm registry login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+          echo "$GHCR_TOKEN" | helm registry login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
+
+          helm package "$CHART" --destination .tmp/chart > /dev/null
+          pkg=$(ls .tmp/chart/*.tgz)
+          echo "pushing $(basename "$pkg")"
+          # Harbor first (private, what the cluster installs from), then the SAME .tgz to GHCR.
+          # `helm push` derives the final path segment from the chart's `name`, so the two repos
+          # differ only by their parent path -- the chart stays `ellmephant`, and its labels,
+          # selectors and resource names are unchanged.
+          helm push "$pkg" "oci://$CHART_REPO"
+          helm push "$pkg" "oci://$GHCR_CHART_REPO"
+          echo "published the chart to $CHART_REPO and $GHCR_CHART_REPO"

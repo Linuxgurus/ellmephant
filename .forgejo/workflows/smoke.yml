@@ -1,0 +1,53 @@
+name: smoke
+
+# First Actions run on this Forgejo instance -- nothing here has ever executed a job, so this
+# deliberately double-checks the assumptions the real publish workflow rests on rather than just
+# going green: does the runner pick the job up, does `actions/checkout` resolve, and can a job
+# actually reach the DinD daemon?
+#
+# The `ubuntu-latest` label maps to `catthehacker/ubuntu:act-22.04`, the act ecosystem's image:
+# node + git + the docker CLI + bash. node is the non-obvious requirement -- the runner execs it
+# INSIDE the job container for every JavaScript action, so `actions/checkout` fails without it.
+#
+# Diagnostic on purpose: the docker probes use `|| echo` so a failure shows up in the log instead of
+# aborting the run. Read the output, don't trust the tick.
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: What is in this image, before we change anything?
+        run: |
+          set -x
+          command -v git    || echo "NO-GIT"
+          command -v docker || echo "NO-DOCKER"
+          command -v bash   || echo "NO-BASH"
+          command -v node   || echo "NO-NODE"
+          node --version    || echo "NO-NODE-VERSION"
+          cat /etc/os-release | head -2
+          env | grep -i '^DOCKER' || echo "NO-DOCKER-ENV"
+          ls -la /certs/client 2>&1 | head -5 || echo "NO-CERTS"
+
+      - uses: actions/checkout@v4
+
+      - name: Prove the checkout landed
+        run: |
+          set -x
+          git log --oneline -1
+          ls -la | head -10
+
+      - name: Can we reach the DinD daemon?
+        run: |
+          set -x
+          docker version 2>&1 || echo "PLAIN-2376-FAILED"
+          DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH=/certs/client docker version 2>&1 || echo "TLS-2376-FAILED"
+
+      - name: Can the daemon actually build?
+        run: |
+          set -x
+          docker build --platform linux/amd64 -t smoke-test:local - <<'EOF' 2>&1 || echo "BUILD-FAILED"
+          FROM alpine:3.21
+          RUN echo "hello from the runner" > /hello.txt
+          EOF

@@ -531,7 +531,7 @@ async fn projects_round_trip_over_the_transport() {
             "goal": "Place my own intent into a future I won't occupy",
             "state": "Design only",
             "status": "active",
-            "owner": "us",
+            "owner": ["us"],
             "tags": ["continuity"],
             "preload": ["boot-note"]
         }),

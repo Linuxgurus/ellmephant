@@ -19,19 +19,23 @@
 -- `[a-z0-9-]` (slug.rs), so a comma can never occur inside one -- the delimiter is safe by
 -- construction, not by convention.
 
+-- `owner` is a SET: comma-joined names from a small vocabulary (`me`, `James`, `us`), sorted and
+-- deduped by the codec. It is validated in Rust rather than by a CHECK, because a CHECK cannot
+-- validate the *elements* of a comma list -- the same reason `tags` has no CHECK either. A key is
+-- `[a-z0-9-]`, so the comma stays unambiguous.
+
 CREATE TABLE project (
   key     TEXT PRIMARY KEY,                     -- 'prj-…'; identity and link target
   title   TEXT NOT NULL,                        -- smart-caveman one-liner
   goal    TEXT NOT NULL DEFAULT '',             -- what this is for
   state   TEXT NOT NULL DEFAULT '',             -- mutable current-state prose
   status  TEXT NOT NULL DEFAULT 'todo',         -- todo|active|paused|done|dead
-  owner   TEXT NOT NULL DEFAULT 'us',           -- me|James|us
+  owner   TEXT NOT NULL DEFAULT 'us',           -- comma-joined set: me|James|us
   tags    TEXT NOT NULL DEFAULT '',             -- comma-joined, sorted (the memory codec)
   preload TEXT NOT NULL DEFAULT '',             -- comma-joined keys, ORDERED by priority
   created TEXT NOT NULL DEFAULT (datetime('now')),
   updated TEXT NOT NULL DEFAULT (datetime('now')),
-  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead')),
-  CHECK (owner IN ('me', 'James', 'us'))
+  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead'))
 );
 
 -- `preload` — project -> memory, ORDERED (the `preload` column above). About ATTENTION: "to work

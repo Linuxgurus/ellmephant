@@ -230,7 +230,7 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 A project is **an activity completed over time** — work with a beginning, a current state, and a
 place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
 prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`dead`), an
-`owner` (`me`|`James`|`us`), `tags`, and a `preload` — the **ordered** list of memories to load as
+`owner` (a set of `me`|`James`|`us`), `tags`, and a `preload` — the **ordered** list of memories to load as
 context to work in here, which is the boot set generalized to every project. It is **listed** by
 field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by `project_get`,
 which resolves both of its relations to memories. Projects are never embedded: a shape is not
@@ -250,18 +250,21 @@ CREATE TABLE project (             -- the key IS the identity: no rowid-derived 
   goal    TEXT NOT NULL DEFAULT '',        -- what this is for
   state   TEXT NOT NULL DEFAULT '',        -- mutable current-state prose
   status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|dead
-  owner   TEXT NOT NULL DEFAULT 'us',      -- me|James|us
+  owner   TEXT NOT NULL DEFAULT 'us',      -- comma-joined set: me|James|us
   tags    TEXT NOT NULL DEFAULT '',
   preload TEXT NOT NULL DEFAULT '',        -- comma-joined keys, ORDERED: attention
   created TEXT NOT NULL DEFAULT (datetime('now')),
   updated TEXT NOT NULL DEFAULT (datetime('now')),
-  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead')),
-  CHECK (owner IN ('me', 'James', 'us')));
+  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead'))));
 
 CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   memory_key  TEXT PRIMARY KEY,
   project_key TEXT NOT NULL);
 ```
+
+- **`owner` is a set,** stored comma-joined and validated in Rust (`james` → `James` — one person,
+  one name — then sorted and deduped). A `CHECK` cannot validate the *elements* of a comma list,
+  which is the same reason `tags` has none.
 
 - **One tie table, not two: a relation earns a table only when its invariant is cross-row.**
   `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a
@@ -548,7 +551,7 @@ any model is touched; flags are re-checked the same way after they override the 
   target), a `title` (the gist), a `body` (the facts), `tags` and a `source`. Found by meaning or
   by a literal/regex pattern, read whole by `memory_get`, cross-linked with `[[key]]`.
 - **Project** — an activity completed over time: a `prj-…` key, a `title`, a `goal`, mutable
-  `state` prose, a `status`, an `owner`, `tags`, and an ordered `preload`. Listed by field
+  `state` prose, a `status`, an `owner` set, `tags`, and an ordered `preload`. Listed by field
   (`project_list`), read whole by `project_get`. Never embedded (§7.1).
 - **Preload** — a project's ordered list of memory keys to load as context for working in it
   ("to work in here, load these"): the boot set, generalized. The order is the payload.

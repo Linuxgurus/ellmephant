@@ -37,13 +37,17 @@ pub const KEY_PREFIX: &str = "prj-";
 /// The legal `status` values. `dead` is how a project ends — there is no delete.
 pub const STATUSES: &[&str] = &["todo", "active", "paused", "done", "dead"];
 
-/// The legal `owner` values.
+/// The legal `owner` names. A project's `owner` is a **set** of these, stored comma-joined.
 pub const OWNERS: &[&str] = &["me", "James", "us"];
+
+/// The `owner` set an empty one falls back to.
+pub const DEFAULT_OWNER: &str = "us";
 
 /// One project: identity, prose and shape.
 ///
-/// `status`/`owner` are strings rather than enums because they are stored, checked and reported
-/// as-is ([`STATUSES`] / [`OWNERS`] are the vocabulary); an empty value takes the default.
+/// `status` is a string rather than an enum because it is stored, checked and reported as-is
+/// ([`STATUSES`] is the vocabulary); `owner` is a *set* of [`OWNERS`] names, stored comma-joined. An
+/// empty value takes the default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Project {
     /// Global-unique slug, always `prj-…`; identity and link target.
@@ -59,9 +63,9 @@ pub struct Project {
     /// `todo` | `active` | `paused` | `done` | `dead` (default `todo`).
     #[serde(default)]
     pub status: String,
-    /// `me` | `James` | `us` (default `us`).
+    /// `me` | `James` | `us` — a set, stored comma-joined, sorted (default `us`).
     #[serde(default)]
-    pub owner: String,
+    pub owner: Vec<String>,
     /// Aspect tags (the same comma-joined codec as `memory.tags`).
     #[serde(default)]
     pub tags: Vec<String>,
@@ -165,8 +169,8 @@ fn taken_keys(conn: &Connection, base: &str) -> Result<HashSet<String>> {
     Ok(set)
 }
 
-/// Validate a `status`/`owner` value against its vocabulary, substituting `default` for an empty
-/// one. `field` names the offender in the error.
+/// Validate a single vocabulary value (a `status`) against its `allowed` set, substituting
+/// `default` for an empty one. `field` names the offender in the error.
 fn choice(value: &str, allowed: &[&str], default: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -190,7 +194,7 @@ fn choice(value: &str, allowed: &[&str], default: &str, field: &str) -> Result<S
 pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Result<String> {
     let key = resolve_key(conn, p)?;
     let status = choice(&p.status, STATUSES, "todo", "status")?;
-    let owner = choice(&p.owner, OWNERS, "us", "owner")?;
+    let owner = encode_owners(&p.owner)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO project (key, title, goal, state, status, owner, tags, created, updated)
@@ -250,6 +254,45 @@ fn encode_preload(keys: &[String]) -> String {
 fn decode_preload(raw: &str) -> Vec<String> {
     raw.split(',')
         .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Validate and encode an owner set as the `project.owner` column: every name checked against
+/// [`OWNERS`] **case-insensitively** and stored in the vocabulary's own spelling (`james` →
+/// `James`, so one person is never two), blanks dropped, duplicates collapsed, then **sorted** —
+/// owners are a set with no order, so the stored form must not depend on the order they were typed
+/// in. Contrast [`encode_preload`], where the order *is* the payload. An empty set takes the
+/// default.
+fn encode_owners(owners: &[String]) -> Result<String> {
+    let mut out: Vec<String> = Vec::new();
+    for owner in owners {
+        let wanted = owner.trim();
+        if wanted.is_empty() {
+            continue;
+        }
+        let Some(known) = OWNERS.iter().find(|name| name.eq_ignore_ascii_case(wanted)) else {
+            return Err(Error::Project(format!(
+                "unknown owner `{wanted}` (one of: {})",
+                OWNERS.join(", ")
+            )));
+        };
+        let known = known.to_string();
+        if !out.contains(&known) {
+            out.push(known);
+        }
+    }
+    if out.is_empty() {
+        return Ok(DEFAULT_OWNER.to_string());
+    }
+    out.sort_by_key(|name| name.to_lowercase());
+    Ok(out.join(","))
+}
+
+/// Decode `project.owner` back into its set of names (canonical spelling, in stored order).
+fn decode_owners(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
 }
@@ -326,13 +369,14 @@ const PROJECT_COLUMNS: &str = "key, title, goal, state, status, owner, tags, cre
 /// Map one `project` row (the canonical column list) to a [`Project`].
 fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let tags: String = r.get(6)?;
+    let owner: String = r.get(5)?;
     Ok(Project {
         key: r.get(0)?,
         title: r.get(1)?,
         goal: r.get(2)?,
         state: r.get(3)?,
         status: r.get(4)?,
-        owner: r.get(5)?,
+        owner: decode_owners(&owner),
         tags: tags::decode(&tags),
         created: r.get(7)?,
         updated: r.get(8)?,
@@ -575,7 +619,6 @@ mod tests {
             choice(" active ", STATUSES, "todo", "status").unwrap(),
             "active"
         );
-        assert_eq!(choice("", OWNERS, "us", "owner").unwrap(), "us");
         let err = choice("nope", STATUSES, "todo", "status").unwrap_err();
         assert!(format!("{err}").contains("unknown status"), "{err}");
     }
@@ -596,6 +639,39 @@ mod tests {
         assert_eq!(
             decode_preload("a,b"),
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn owner_codec_validates_canonicalises_and_sorts() {
+        // Case-insensitive, stored in the vocabulary's spelling: one person, never two names.
+        assert_eq!(
+            encode_owners(&["james".to_string()]).unwrap(),
+            "James",
+            "the spelling comes from OWNERS, not from the input"
+        );
+        // A set: sorted and deduped, so the stored form never depends on the order typed.
+        assert_eq!(
+            encode_owners(&[
+                "us".to_string(),
+                "me".to_string(),
+                "James".to_string(),
+                "me".to_string(),
+            ])
+            .unwrap(),
+            "James,me,us"
+        );
+        assert_eq!(
+            encode_owners(&[]).unwrap(),
+            DEFAULT_OWNER,
+            "an empty set takes the default"
+        );
+        assert_eq!(encode_owners(&["  ".to_string()]).unwrap(), DEFAULT_OWNER);
+        let err = encode_owners(&["nobody".to_string()]).unwrap_err();
+        assert!(format!("{err}").contains("unknown owner"), "{err}");
+        assert_eq!(
+            decode_owners("James,me"),
+            vec!["James".to_string(), "me".to_string()]
         );
     }
 }

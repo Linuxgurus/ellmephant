@@ -39,10 +39,15 @@ pub const KEY_PREFIX: &str = "prj-";
 /// The legal `status` values. `done` and `aborted` both end a project — there is no delete.
 pub const STATUSES: &[&str] = &["todo", "active", "paused", "done", "aborted"];
 
+/// The statuses that END a project: the work stopped, one way or the other. `end_date` rides on
+/// these — *how* it ended is `status`'s job, the date only says *when*.
+pub const ENDED_STATUSES: &[&str] = &["done", "aborted"];
+
 /// One project: identity, prose and shape.
 ///
 /// `status` is a string rather than an enum because it is stored, checked and reported as-is
-/// ([`STATUSES`] is the vocabulary); `owner` is a *set* of names, stored comma-joined.
+/// ([`STATUSES`] is the vocabulary); `owner` is a *set* of names, stored comma-joined; the dates are
+/// ISO strings, so they sort as they read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Project {
     /// Global-unique slug, always `prj-…`; identity and link target.
@@ -65,12 +70,22 @@ pub struct Project {
     /// Aspect tags (the same comma-joined codec as `memory.tags`).
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Creation timestamp.
+    /// Creation timestamp — when the *row* appeared.
     #[serde(default)]
     pub created: String,
-    /// Last-update timestamp.
+    /// Last-update timestamp — last *write*, which is not the same as last *work*.
     #[serde(default)]
     pub updated: String,
+    /// When the work started, ISO date. Stamped once on first write and correctable afterwards:
+    /// [`created`] is when the row appeared, which is not the same thing — a project written down
+    /// three weeks late started three weeks ago.
+    #[serde(default)]
+    pub start_date: String,
+    /// When it ended, ISO date — empty while the project runs. Stamped when `status` becomes one of
+    /// [`ENDED_STATUSES`], cleared when it is reopened, and never moved once set (an unrelated later
+    /// write does not touch it). *How* it ended is `status`; this only says *when*.
+    #[serde(default)]
+    pub end_date: String,
 }
 
 /// A key this project points at, with its title when the target still resolves.
@@ -182,21 +197,71 @@ fn choice(value: &str, allowed: &[&str], default: &str, field: &str) -> Result<S
     }
 }
 
+/// True for `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` — the two shapes `datetime('now')` writes, and
+/// the shapes that sort as they read, which is the whole reason to insist on them. Shape only: a
+/// shaped-but-wrong date (`2026-13-45`) is the writer's lie, not the store's, and the alternative —
+/// free text — breaks every "what ended in September" query silently.
+fn is_iso_date(value: &str) -> bool {
+    let b = value.as_bytes();
+    let digits = |ix: &[usize]| ix.iter().all(|&i| b[i].is_ascii_digit());
+    match b.len() {
+        10 => b[4] == b'-' && b[7] == b'-' && digits(&[0, 1, 2, 3, 5, 6, 8, 9]),
+        19 => {
+            b[4] == b'-'
+                && b[7] == b'-'
+                && b[10] == b' '
+                && b[13] == b':'
+                && b[16] == b':'
+                && digits(&[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18])
+        }
+        _ => false,
+    }
+}
+
+/// Validate a `start_date`/`end_date` value: empty, or an ISO date ([`is_iso_date`]). `field` names
+/// the offender in the error.
+fn date_field(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || is_iso_date(value) {
+        Ok(value.to_string())
+    } else {
+        Err(Error::Project(format!(
+            "`{field}` must be an ISO date (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`), not `{value}`"
+        )))
+    }
+}
+
 /// Upsert a project by key in one transaction. `preload` (`Some`) replaces the ordered preload
 /// wholesale; `None` leaves it alone.
 ///
 /// Returns the resolved key. `goal`/`state`/`tags`/`status`/`owner` are written as given, so a
-/// re-upsert is whole-row — read the project first if you mean to edit one field.
+/// re-upsert is whole-row — read the project first if you mean to edit one field. The dates are the
+/// exception, and deliberately so: `start_date` is stamped once and left alone afterwards, and
+/// `end_date` follows `status` rather than the caller's silence. `created`/`updated` are the row's
+/// own timestamps and never move backwards.
 pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Result<String> {
     let key = resolve_key(conn, p)?;
     let status = choice(&p.status, STATUSES, "todo", "status")?;
     let owner = encode_owners(&p.owner);
+    let start_date = date_field(&p.start_date, "start_date")?;
+    let end_date = date_field(&p.end_date, "end_date")?;
+    let ended = ENDED_STATUSES.contains(&status.as_str());
+    if !end_date.is_empty() && !ended {
+        return Err(Error::Project(format!(
+            "`end_date` on a project that has not ended (`status` is `{status}`): set `status` to {} \
+             to end it, or leave the date out",
+            ENDED_STATUSES.join(" or ")
+        )));
+    }
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO project (key, title, goal, state, status, owner, tags, created, updated)
+        "INSERT INTO project (key, title, goal, state, status, owner, tags, created, updated,
+                              start_date, end_date)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                  COALESCE(NULLIF(?8, ''), datetime('now')),
-                 COALESCE(NULLIF(?9, ''), datetime('now')))
+                 COALESCE(NULLIF(?9, ''), datetime('now')),
+                 COALESCE(NULLIF(?10, ''), datetime('now')),
+                 CASE WHEN ?12 THEN COALESCE(NULLIF(?11, ''), datetime('now')) ELSE '' END)
          ON CONFLICT(key) DO UPDATE SET
              title = excluded.title,
              goal = excluded.goal,
@@ -204,7 +269,12 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
              status = excluded.status,
              owner = excluded.owner,
              tags = excluded.tags,
-             updated = excluded.updated",
+             updated = excluded.updated,
+             start_date = CASE WHEN ?10 <> '' THEN ?10 ELSE project.start_date END,
+             end_date = CASE WHEN ?12
+                             THEN COALESCE(NULLIF(?11, ''), NULLIF(project.end_date, ''),
+                                           datetime('now'))
+                             ELSE '' END",
         params![
             key,
             p.title,
@@ -215,6 +285,9 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
             tags::encode(&p.tags),
             p.created,
             p.updated,
+            start_date,
+            end_date,
+            ended,
         ],
     )?;
     if let Some(keys) = preload {
@@ -353,7 +426,8 @@ fn exists(conn: &Connection, key: &str) -> Result<bool> {
 
 /// The canonical column list shared by every project read. The `mem_preload` column is deliberately
 /// absent: [`preload`] is a *relation*, read by that function and never mapped onto [`Project`].
-const PROJECT_COLUMNS: &str = "key, title, goal, state, status, owner, tags, created, updated";
+const PROJECT_COLUMNS: &str =
+    "key, title, goal, state, status, owner, tags, created, updated, start_date, end_date";
 
 /// Map one `project` row (the canonical column list) to a [`Project`].
 fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -369,6 +443,8 @@ fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         tags: tags::decode(&tags),
         created: r.get(7)?,
         updated: r.get(8)?,
+        start_date: r.get(9)?,
+        end_date: r.get(10)?,
     })
 }
 
@@ -551,13 +627,26 @@ pub fn homed(conn: &Connection) -> Result<i64> {
 
 /// `project_list` for the MCP wire: a `cols` header plus positional rows, one per line (the
 /// convention for list-shaped reads; `state` is deliberately absent — fetch it with `project_get`).
+/// The dates *are* here: "what did I finish last month" is a list question.
 pub fn list_to_wire_json(rows: &[Project]) -> Result<String> {
     let rows: Vec<serde_json::Value> = rows
         .iter()
-        .map(|p| serde_json::json!([p.key, p.status, p.owner, p.tags, p.title, p.goal]))
+        .map(|p| {
+            serde_json::json!([
+                p.key,
+                p.status,
+                p.owner,
+                p.tags,
+                p.title,
+                p.goal,
+                p.start_date,
+                p.end_date
+            ])
+        })
         .collect();
     Ok(format!(
-        "{{\"cols\":[\"key\",\"status\",\"owner\",\"tags\",\"title\",\"goal\"],\"projects\":{}}}",
+        "{{\"cols\":[\"key\",\"status\",\"owner\",\"tags\",\"title\",\"goal\",\"start_date\",\
+          \"end_date\"],\"projects\":{}}}",
         crate::wire::rows_array(&rows)
     ))
 }
@@ -661,5 +750,34 @@ mod tests {
             vec!["Cline".to_string(), "James".to_string()]
         );
         assert!(decode_owners("").is_empty());
+    }
+
+    #[test]
+    fn iso_dates_are_shape_checked() {
+        assert!(is_iso_date("2026-10-15"));
+        assert!(
+            is_iso_date("2026-10-15 09:30:00"),
+            "the shape datetime('now') writes"
+        );
+        assert!(!is_iso_date("2026-1-5"), "no zero padding, no lexical sort");
+        assert!(!is_iso_date("15/10/2026"));
+        assert!(
+            !is_iso_date("2026-10-15T09:30:00"),
+            "the stored form is the SQL one"
+        );
+        assert!(!is_iso_date("yesterday"));
+        assert!(!is_iso_date(""));
+        assert_eq!(
+            date_field(" 2026-10-15 ", "start_date").unwrap(),
+            "2026-10-15",
+            "trimmed"
+        );
+        assert_eq!(
+            date_field("", "start_date").unwrap(),
+            "",
+            "empty is 'not said'"
+        );
+        let err = date_field("Sept 3", "start_date").unwrap_err();
+        assert!(format!("{err}").contains("ISO date"), "{err}");
     }
 }

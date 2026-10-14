@@ -99,7 +99,8 @@ target). Dimensions are frozen at `CREATE`; changing the embedder's width is a d
 `reembed`, not an implicit migration.
 
 **Two more tables are NOT derived: the project tables** (v5). `project` — carrying its ordered
-`mem_preload` list as a column — and `project_memory` (memory → project, `memory_key` as `PRIMARY KEY`
+`mem_preload` list as a column, plus its own `start_date`/`end_date` (`created`/`updated` are the
+row's timestamps and answer a different question) — and `project_memory` (memory → project, `memory_key` as `PRIMARY KEY`
 so a memory has exactly one home) are source-of-truth alongside `memory`. They hold the *structure*
 half of the store: a project's own fields, plus its two relations to memories, with no embedding,
 telemetry or coherence verdict — those belong to facts, which are the thing matched by meaning. A

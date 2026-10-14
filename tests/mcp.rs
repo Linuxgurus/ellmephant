@@ -532,6 +532,7 @@ async fn projects_round_trip_over_the_transport() {
             "state": "Design only",
             "status": "active",
             "owner": ["Cline", "James"],
+            "start_date": "2026-09-01",
             "tags": ["continuity"],
             "preload": ["boot-note"]
         }),
@@ -553,6 +554,16 @@ async fn projects_round_trip_over_the_transport() {
     .await;
     let v: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
     assert_eq!(v["project"]["status"], serde_json::json!("active"));
+    assert_eq!(
+        v["project"]["start_date"],
+        serde_json::json!("2026-09-01"),
+        "a backfilled start survives the wire"
+    );
+    assert_eq!(
+        v["project"]["end_date"],
+        serde_json::json!(""),
+        "a running project has no end"
+    );
     assert_eq!(
         v["project"]["owner"],
         serde_json::json!(["Cline", "James"]),

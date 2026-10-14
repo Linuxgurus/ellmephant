@@ -92,6 +92,129 @@ fn an_aborted_project_is_ended_not_gone() {
 
     let got = project::get(&conn, &key).unwrap().expect("still there");
     assert_eq!(got.status, "aborted", "ended, not deleted");
+    assert!(
+        !got.end_date.is_empty(),
+        "aborted ends it just as done does: `status` says HOW, the date says WHEN"
+    );
+}
+
+#[test]
+fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    project::upsert(&conn, &p, None).expect("upsert");
+    let fresh = project::get(&conn, "prj-x").unwrap().expect("exists");
+    assert!(
+        !fresh.start_date.is_empty(),
+        "start is stamped, not asked for"
+    );
+    assert!(fresh.end_date.is_empty(), "a running project has no end");
+
+    // A later write does not move the start -- unlike `updated`, which is *supposed* to move.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.state = "now with more prose".into();
+    project::upsert(&conn, &p, None).expect("touch");
+    let touched = project::get(&conn, "prj-x").unwrap().expect("exists");
+    assert_eq!(touched.start_date, fresh.start_date, "the start stays put");
+    assert!(
+        touched.updated >= fresh.updated,
+        "the touch timestamp moves"
+    );
+
+    // Ending it stamps the end.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "done".into();
+    project::upsert(&conn, &p, None).expect("end it");
+    let ended = project::get(&conn, "prj-x").unwrap().expect("exists");
+    assert!(!ended.end_date.is_empty(), "done stamps the end");
+    assert!(
+        ended.end_date >= ended.start_date,
+        "and it sorts after the start"
+    );
+
+    // An unrelated write leaves the end where it was: this is the bug the column exists to fix.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "done".into();
+    p.goal = "a footnote, months later".into();
+    project::upsert(&conn, &p, None).expect("touch");
+    assert_eq!(
+        project::get(&conn, "prj-x").unwrap().unwrap().end_date,
+        ended.end_date,
+        "`updated` moves on a touch; the end does not"
+    );
+
+    // Reopening clears it: it is not the end any more.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "active".into();
+    project::upsert(&conn, &p, None).expect("reopen");
+    assert!(
+        project::get(&conn, "prj-x")
+            .unwrap()
+            .unwrap()
+            .end_date
+            .is_empty(),
+        "reopened = running again"
+    );
+
+    // ...and ending it again stamps a fresh one.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "aborted".into();
+    project::upsert(&conn, &p, None).expect("end it again");
+    assert!(
+        !project::get(&conn, "prj-x")
+            .unwrap()
+            .unwrap()
+            .end_date
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_date_can_be_backfilled_but_not_invented() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    // Backfill: the work started in September and was written down in October.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "done".into();
+    p.start_date = "2026-09-01".into();
+    p.end_date = "2026-09-30".into();
+    let key = project::upsert(&conn, &p, None).expect("backfill");
+    let got = project::get(&conn, &key).unwrap().expect("exists");
+    assert_eq!(got.start_date, "2026-09-01", "an explicit start wins");
+    assert_eq!(
+        got.end_date, "2026-09-30",
+        "an explicit end is kept as given"
+    );
+
+    // You cannot date the end of something that has not ended: that is a contradiction, not a filter.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "active".into();
+    p.end_date = "2026-10-15".into();
+    let err = project::upsert(&conn, &p, None).unwrap_err();
+    assert!(format!("{err}").contains("end_date"), "{err}");
+    assert_eq!(
+        project::get(&conn, "prj-x").unwrap().unwrap().end_date,
+        "2026-09-30",
+        "the rejected write changed nothing"
+    );
+
+    // Nor a date that is not a date: it would sort wrongly forever.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.start_date = "Sept 3".into();
+    let err = project::upsert(&conn, &p, None).unwrap_err();
+    assert!(format!("{err}").contains("ISO date"), "{err}");
 }
 
 #[test]
@@ -473,7 +596,16 @@ fn the_wire_shapes_are_positional_and_self_describing() {
     let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "status", "owner", "tags", "title", "goal"])
+        serde_json::json!([
+            "key",
+            "status",
+            "owner",
+            "tags",
+            "title",
+            "goal",
+            "start_date",
+            "end_date"
+        ])
     );
     assert_eq!(v["projects"][0][0], serde_json::json!("prj-chronos"));
     assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");

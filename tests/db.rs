@@ -56,10 +56,12 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     }
     // The preload list is a COLUMN on `project`, not a tie table (0005's header says why):
     // guard against a `project_preload` table creeping back.
-    assert!(
-        column_exists(&conn, "project", "mem_preload"),
-        "project.mem_preload is missing"
-    );
+    for column in ["mem_preload", "start_date", "end_date"] {
+        assert!(
+            column_exists(&conn, "project", column),
+            "project.{column} is missing"
+        );
+    }
     assert!(
         !object_exists(&conn, "table", "project_preload"),
         "preload is a column, not a table"

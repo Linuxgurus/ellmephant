@@ -129,7 +129,10 @@ name is prefixed). \
 who exists (and `me` would mean whatever reader asks). `preload` is the ORDERED list of memory keys to load as \
 context to work \
 in here; it replaces the previous list, and it may name memories this project did not author \
-(conventions, boot notes). A write is whole-row, so `project_get` first if you mean to edit one \
+(conventions, boot notes). `start_date`/`end_date` are ISO dates (`YYYY-MM-DD`): `start_date` is \
+stamped on the first write and correctable after, and `end_date` is stamped when `status` becomes \
+done|aborted — `status` says HOW it ended, the date only says WHEN, and reopening clears it. A write \
+is whole-row, so `project_get` first if you mean to edit one \
 field. A memory joins a project by HOME, which is `memory_upsert`'s `project`.";
 
 /// `project_get` description.
@@ -141,8 +144,8 @@ reports it rather than hiding it.";
 
 /// `project_list` description.
 const PROJECT_LIST_DESCRIPTION: &str = "\
-List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `title`, `goal`; \
-never `state`, which is a `project_get` away). Filters intersect: `status`, `tags` (every listed \
+List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `title`, `goal`, \
+`start_date`, `end_date`; never `state`, which is a `project_get` away). Filters intersect: `status`, `tags` (every listed \
 tag must be present) and a literal/regex `pattern` over `key`/`title`/`goal`/`state`. Omit them \
 all to list every project.";
 
@@ -437,6 +440,18 @@ pub struct ProjectUpsertParams {
         description = "ORDERED memory keys to load to work in here; replaces the previous list. May name memories this project did not author."
     )]
     pub preload: Option<Vec<String>>,
+    /// When the work started.
+    #[serde(default)]
+    #[schemars(
+        description = "When the work started, ISO `YYYY-MM-DD`. Stamped on first write if omitted; correct it to backfill a late entry."
+    )]
+    pub start_date: Option<String>,
+    /// When it ended.
+    #[serde(default)]
+    #[schemars(
+        description = "When it ended, ISO `YYYY-MM-DD` — only with status done|aborted (both END a project; `status` says how, this says when). Stamped when omitted, cleared if reopened."
+    )]
+    pub end_date: Option<String>,
 }
 
 impl ProjectUpsertParams {
@@ -450,6 +465,8 @@ impl ProjectUpsertParams {
             status: self.status.unwrap_or_default(),
             owner: self.owner.unwrap_or_default(),
             tags: self.tags,
+            start_date: self.start_date.unwrap_or_default(),
+            end_date: self.end_date.unwrap_or_default(),
             ..Default::default()
         };
         (project, self.preload)

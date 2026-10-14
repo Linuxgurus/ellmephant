@@ -19,6 +19,13 @@
 -- order. A key is `[a-z0-9-]` (slug.rs), so a comma can never occur inside one -- the delimiter
 -- is safe by construction, not by convention.
 
+-- `start_date`/`end_date` are the PROJECT's own dates (ISO, `YYYY-MM-DD`), distinct from the row's
+-- `created`/`updated`: a project written down three weeks late started three weeks ago, and
+-- `updated` moves on any write, so it cannot answer "when did this finish". `end_date` is neutral
+-- about the ending -- `status` says HOW (done or aborted), the date only says WHEN -- which is why
+-- it is not called `finished`/`completed`: an aborted project was never completed. Both are stamped
+-- when not given and cleared/corrected by rule, in Rust (see store::project::upsert).
+--
 -- `owner` is a SET of names, comma-joined: 'Cline,James'. FREE TEXT -- no vocabulary, no `me`/`us`.
 -- The store does not know who exists and must not pretend to: `me` resolves differently for every
 -- reader, and a shared store cannot carry an indexical. `status` is validated in Rust, and `owner`
@@ -37,6 +44,8 @@ CREATE TABLE project (
   mem_preload TEXT NOT NULL DEFAULT '',         -- comma-joined memory keys, ORDERED by priority
   created     TEXT NOT NULL DEFAULT (datetime('now')),
   updated     TEXT NOT NULL DEFAULT (datetime('now')),
+  start_date  TEXT NOT NULL DEFAULT '',         -- when the WORK started (created = when the row did)
+  end_date    TEXT NOT NULL DEFAULT '',         -- when it ENDED: done or aborted alike
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))
 );
 

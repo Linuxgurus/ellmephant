@@ -230,11 +230,12 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 A project is **an activity completed over time** — work with a beginning, a current state, and a
 place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
 prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`aborted`), an
-`owner` (a set of names), `tags`, and a `preload` — the `mem_preload` column, the **ordered** list of memories to load as
-context to work in here, which is the boot set generalized to every project. It is **listed** by
-field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by `project_get`,
-which resolves both of its relations to memories. Projects are never embedded: a shape is not
-something you match by meaning.
+`owner` (a set of names), `tags`, a `preload` (the `mem_preload` column — the **ordered** list of
+memories to load as context to work in here, the boot set generalized to every project), and two
+dates: `start_date` (when the work started) and `end_date` (when it ended, if it has). It is
+**listed** by field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by
+`project_get`, which resolves both of its relations to memories. Projects are never embedded: a
+shape is not something you match by meaning.
 
 Memories and projects are the two halves of one store, and the line between them is drawn where the
 machinery changes. A memory is a **fact** — voted, ranked, judged for coherence, matched by meaning.
@@ -255,6 +256,8 @@ CREATE TABLE project (             -- the key IS the identity: no rowid-derived 
   mem_preload TEXT NOT NULL DEFAULT '',         -- comma-joined memory keys, ORDERED by priority
   created     TEXT NOT NULL DEFAULT (datetime('now')),
   updated     TEXT NOT NULL DEFAULT (datetime('now')),
+  start_date  TEXT NOT NULL DEFAULT '',         -- when the WORK started
+  end_date    TEXT NOT NULL DEFAULT '',         -- when it ENDED: done or aborted alike
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))));
 
 CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
@@ -269,6 +272,17 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   whoever happens to be reading. A name nobody recognises is a typo, not a schema violation — and a
   blank `owner` is unassigned, which is a fact rather than a missing field. A `CHECK` could not
   validate the *elements* of a comma list anyway, the same reason `tags` has none.
+
+- **Two dates, and they are the project's, not the row's.** `start_date` is stamped on the first
+  write and can be corrected afterwards; `end_date` is stamped when `status` becomes `done` or
+  `aborted`, never moves while the project stays ended (an unrelated later write does not touch it),
+  and is cleared when the project is reopened. Neither is `created`/`updated`: a project written down
+  three weeks late *started* three weeks ago, and `updated` moves on any write, so it cannot answer
+  "when did this finish". The column is `end_date` rather than `finished`/`completed` because
+  `status` says **how** it ended and an aborted project was never *completed* — a date that tried to
+  say how would have to be wrong about one of them. Dates are ISO (`YYYY-MM-DD`) and shape-checked,
+  because a date that does not sort as it reads breaks every "what ended in September" query
+  silently.
 
 - **One tie table, not two: a relation earns a table only when its invariant is cross-row.**
   `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a
@@ -555,7 +569,8 @@ any model is touched; flags are re-checked the same way after they override the 
   target), a `title` (the gist), a `body` (the facts), `tags` and a `source`. Found by meaning or
   by a literal/regex pattern, read whole by `memory_get`, cross-linked with `[[key]]`.
 - **Project** — an activity completed over time: a `prj-…` key, a `title`, a `goal`, mutable
-  `state` prose, a `status`, an `owner` set, `tags`, and an ordered `preload`. Listed by field
+  `state` prose, a `status`, an `owner` set, `tags`, an ordered `preload`, and `start_date`/`end_date`
+  (the project's own dates; `status` says how it ended, `end_date` only says when). Listed by field
   (`project_list`), read whole by `project_get`. Never embedded (§7.1).
 - **Preload** — a project's ordered list of memory keys to load as context for working in it
   ("to work in here, load these"): the boot set, generalized. The order is the payload. The

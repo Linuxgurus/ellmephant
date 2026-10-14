@@ -457,6 +457,19 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
 - `memory_coherent` records the §9 split-review verdict for a key (`true` = one topic, `false` =
   a grab-bag, omit/`null` = unjudged); an upsert resets it to unjudged.
+- `memory_upsert` / `project_upsert` are **partial** writes: every field is optional, and an omitted
+  field keeps the value already stored under `key`. That is what lets one field change without
+  resending the row. Empty is an instruction only where empty is a **fact** — `source: ""`,
+  `tags: []`, `owner: []` clear — and is **refused** where empty is nonsense (`title`, `body`,
+  `status`), so an empty `status` cannot quietly read as `todo`. A create (a key with no row) still
+  needs its minimum: a `title` and a `body` for a memory, a `title` for a project.
+- The write law is **per-field invalidation**, and it separates two questions. *Re-embed?* follows
+  the document (`key` + tags + title + body): `title`/`body`/`tags` re-embed, `source` does not, and
+  a project never does. *Re-judge?* follows **meaning**: `coherent` clears only when the title or the
+  body actually changed, because a tag or a source is *filing*, not *meaning*. So a patch that
+  changes nothing re-embeds nothing and un-judges nothing — and, unlike a whole-row write, a tags or
+  source edit no longer re-opens the §9 split review. Membership in a project is a `tags` write
+  (`prj:<key>`); `project_upsert`'s `status` still follows the §7.1 date rules.
 - `memory_upvote` takes one or more `keys` (`{keys:[…]}`) and bumps `times_useful` for each that
   exists — a feedback sweep in one call. It returns `{status, upvoted:[{key,times_useful}], missing?}`;
   a key that does not exist is reported in `missing` (not fatal), but a sweep that hits **nothing**

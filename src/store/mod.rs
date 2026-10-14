@@ -108,7 +108,7 @@ fn resolve_key(conn: &Connection, mem: &Memory) -> Result<String> {
 }
 
 /// Replace the outgoing `[[key]]` edges for `id` with those parsed from `body`.
-fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> {
+pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> {
     conn.execute("DELETE FROM memory_link WHERE from_id = ?1", params![id])?;
     for (kind, target) in links::extract_links(body) {
         if kind == links::Kind::Memory && target == key {
@@ -135,19 +135,148 @@ fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(i64, String)> {
+    let (id, key, _) = add_impl(conn, embedder, mem, true)?;
+    Ok((id, key))
+}
+
+/// [`add`] with the split-review verdict's fate made explicit. `reset_coherent` is `true` for a
+/// whole-row write — the row's shape may have changed, so re-judge it — and `false` for a merge that
+/// left the title and the body alone. Returns whether the document actually changed (and so whether
+/// the vector was recomputed).
+fn add_impl(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    mem: &Memory,
+    reset_coherent: bool,
+) -> Result<(i64, String, bool)> {
     let prepared = prepare(conn, embedder, mem)?;
+    let reembedded = prepared.needs_embed();
     // Create the vec table before the tx so its DDL is not inside it.
     index::vec::ensure(conn, embedder.dim())?;
     // Embed before the tx: inference is slow (SPEC §13) and must not hold the write lock.
-    let vector = if prepared.needs_embed() {
+    let vector = if reembedded {
         Some(embedder.embed_one(&prepared.doc_text)?)
     } else {
         None
     };
     let tx = conn.unchecked_transaction()?;
-    let id = apply(&tx, mem, &prepared, vector.as_deref())?;
+    let id = apply(&tx, mem, &prepared, vector.as_deref(), reset_coherent)?;
     tx.commit()?;
-    Ok((id, prepared.key))
+    Ok((id, prepared.key, reembedded))
+}
+
+/// A **partial** write to one memory: every field is optional and `None` means *leave it alone*.
+///
+/// This is the difference from [`add`], which is whole-row — an omitted field there is written
+/// empty. So the store can tell "not mentioned" from "cleared": `Some("")` empties `source`, while
+/// an empty `title`/`body` is refused, because a memory needs both.
+#[derive(Debug, Clone, Default)]
+pub struct Patch {
+    /// Which memory to write. Absent, the key is derived from `title`.
+    pub key: Option<String>,
+    /// A new title. May not be empty.
+    pub title: Option<String>,
+    /// A new body. May not be empty.
+    pub body: Option<String>,
+    /// New provenance. `Some("")` clears it — empty is a fact here.
+    pub source: Option<String>,
+    /// New tags. `Some(vec![])` clears them.
+    pub tags: Option<Vec<String>>,
+}
+
+/// What [`merge`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The row that was written (a slug derived from the title if no key was given).
+    pub key: String,
+    /// True when the key did not exist and a row was inserted.
+    pub created: bool,
+    /// True when the embedded document changed, so the vector was recomputed.
+    pub reembedded: bool,
+    /// True when the split-review verdict was cleared (the title or the body moved).
+    pub coherent_reset: bool,
+}
+
+/// Upsert ONE memory from a partial [`Patch`]: `None` keeps the stored value, `Some` replaces it.
+/// A key with no row is created, and then `title` and `body` are both required — there is nothing
+/// to keep.
+///
+/// Re-embeds only when the embedded document (`key` + tags + title + body) actually changes, and
+/// clears `coherent` only when the title or the body changes: a tag or a source is *filing*, not
+/// *meaning*, so it must not re-open the split review (SPEC §9).
+pub fn merge(conn: &Connection, embedder: &dyn Embedder, patch: &Patch) -> Result<MergeOutcome> {
+    let probe = Memory {
+        key: patch.key.clone().unwrap_or_default(),
+        title: patch.title.clone().unwrap_or_default(),
+        ..Default::default()
+    };
+    let key = resolve_key(conn, &probe)?;
+    let existing = get(conn, &key)?;
+
+    let (mem, reset_coherent, created) = match existing {
+        Some(old) => {
+            let title = patch.title.clone().unwrap_or_else(|| old.title.clone());
+            let body = patch.body.clone().unwrap_or_else(|| old.body.clone());
+            if title.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "`title` cannot be empty; omit it to leave the stored title alone".into(),
+                ));
+            }
+            if body.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "`body` cannot be empty; omit it to leave the stored body alone".into(),
+                ));
+            }
+            let reset = title != old.title || body != old.body;
+            let source = match &patch.source {
+                Some(s) => (!s.trim().is_empty()).then(|| s.clone()),
+                None => old.source.clone(),
+            };
+            (
+                Memory {
+                    key: key.clone(),
+                    title,
+                    body,
+                    tags: patch.tags.clone().unwrap_or_else(|| old.tags.clone()),
+                    source,
+                    ..Default::default()
+                },
+                reset,
+                false,
+            )
+        }
+        None => {
+            let title = patch.title.clone().unwrap_or_default();
+            let body = patch.body.clone().unwrap_or_default();
+            if title.trim().is_empty() || body.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "a new memory needs both a `title` and a `body`; an existing key can be patched \
+                     field by field"
+                        .into(),
+                ));
+            }
+            (
+                Memory {
+                    key: key.clone(),
+                    title,
+                    body,
+                    tags: patch.tags.clone().unwrap_or_default(),
+                    source: patch.source.clone().filter(|s| !s.trim().is_empty()),
+                    ..Default::default()
+                },
+                false,
+                true,
+            )
+        }
+    };
+
+    let (_id, key, reembedded) = add_impl(conn, embedder, &mem, reset_coherent)?;
+    Ok(MergeOutcome {
+        key,
+        created,
+        reembedded,
+        coherent_reset: reset_coherent,
+    })
 }
 
 /// A write resolved *outside* the transaction: the key, the embedded document, its hash, and
@@ -199,10 +328,11 @@ pub(crate) fn apply(
     mem: &Memory,
     prepared: &Prepared,
     vector: Option<&[f32]>,
+    reset_coherent: bool,
 ) -> Result<i64> {
     let id = match prepared.existing {
         Some((id, _)) => {
-            update_row(tx, id, mem, &prepared.doc_hash)?;
+            update_row(tx, id, mem, &prepared.doc_hash, reset_coherent)?;
             id
         }
         None => insert_row(tx, &prepared.key, mem, &prepared.doc_hash)?,
@@ -214,12 +344,20 @@ pub(crate) fn apply(
     Ok(id)
 }
 
-/// The `UPDATE` half of [`add`]: the key already exists.
-fn update_row(tx: &Connection, id: i64, mem: &Memory, doc_hash: &str) -> Result<()> {
+/// The `UPDATE` half of [`add`]: the key already exists. `reset_coherent` clears the split-review
+/// verdict — right for a whole-row write (the row's shape may have changed), wrong for a merge that
+/// only touched a tag or a source.
+fn update_row(
+    tx: &Connection,
+    id: i64,
+    mem: &Memory,
+    doc_hash: &str,
+    reset_coherent: bool,
+) -> Result<()> {
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5, doc_hash = ?6,
-                coherent = NULL,
+                coherent = CASE WHEN ?8 THEN NULL ELSE coherent END,
                 updated = COALESCE(NULLIF(?7, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -229,7 +367,8 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, doc_hash: &str) -> Result<
             tags::encode(&mem.tags),
             mem.source,
             doc_hash,
-            mem.updated
+            mem.updated,
+            reset_coherent
         ],
     )?;
     Ok(())

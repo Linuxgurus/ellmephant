@@ -21,6 +21,11 @@ pub enum Error {
     #[error("no such memory: {0}")]
     NotFound(String),
 
+    /// A write the store refuses: a field that may not be empty, or a create missing its minimum.
+    /// The message is written to be read by the caller — it says what to do instead.
+    #[error("{0}")]
+    Invalid(String),
+
     /// A project key that resolves to no row — the project half of [`Error::NotFound`].
     #[error("no such project: {0}")]
     NoProject(String),

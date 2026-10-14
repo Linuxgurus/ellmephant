@@ -91,12 +91,13 @@ impl Session {
             .ok_or_else(|| Error::Config("encoder was not loaded".into()))
     }
 
-    /// Upsert a memory (SPEC §7) and return its resolved key.
-    pub fn add(&mut self, mem: &Memory) -> Result<String> {
+    /// Upsert a memory from a partial patch (SPEC §7): `None` fields keep their stored value, so one
+    /// field can change without resending the row. The encoder is always loaded — the document may
+    /// have moved — but the store re-embeds only when it actually did.
+    pub fn memory_merge(&mut self, patch: &store::Patch) -> Result<store::MergeOutcome> {
         self.ensure_embedder()?;
         let embedder = self.embedder()?;
-        let (_id, key) = store::add(&self.conn, embedder, mem)?;
-        Ok(key)
+        store::merge(&self.conn, embedder, patch)
     }
 
     /// Fetch one memory by key, or [`Error::NotFound`].
@@ -197,14 +198,10 @@ impl Session {
         tags::list(&self.conn)
     }
 
-    /// Upsert a project; `preload` (`Some`) replaces its ordered preload wholesale. No encoder —
-    /// a project is structure, not a document.
-    pub fn project_upsert(
-        &self,
-        project: &project::Project,
-        preload: Option<&[String]>,
-    ) -> Result<String> {
-        project::upsert(&self.conn, project, preload)
+    /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a
+    /// project is structure, not a document.
+    pub fn project_merge(&self, patch: &project::Patch) -> Result<project::MergeOutcome> {
+        project::merge(&self.conn, patch)
     }
 
     /// One project with both relations resolved — the "stand inside it" read.

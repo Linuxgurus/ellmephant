@@ -403,6 +403,154 @@ fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<
     Ok(())
 }
 
+/// A **partial** write to one project: every field is optional and `None` means *leave it alone*.
+///
+/// `Some("")` clears a field where empty is a **fact** (`goal`, `state`) and is **refused** where
+/// empty is nonsense (`title`, `status`); `Some(vec![])` clears a list (`owner` = unassigned,
+/// `tags`, `preload`). The dates are not ordinary field values — `start_date` is never cleared and
+/// `end_date` follows `status` — but a stated `start_date` (a backfill) and `end_date` are honoured.
+#[derive(Debug, Clone, Default)]
+pub struct Patch {
+    /// Which project to write. Absent, the key is derived from `title`.
+    pub key: Option<String>,
+    /// A new title. May not be empty.
+    pub title: Option<String>,
+    /// A new goal. `Some("")` clears it.
+    pub goal: Option<String>,
+    /// New current-state prose. `Some("")` clears it.
+    pub state: Option<String>,
+    /// A new status. May not be empty; it carries the `end_date` rules.
+    pub status: Option<String>,
+    /// A new owner set. `Some(vec![])` unassigns it.
+    pub owner: Option<Vec<String>>,
+    /// New tags. `Some(vec![])` clears them.
+    pub tags: Option<Vec<String>>,
+    /// A new ordered preload. `Some(vec![])` clears it.
+    pub preload: Option<Vec<String>>,
+    /// A backfilled start (`YYYY-MM-DD`). Empty leaves the stored one alone — it is never cleared.
+    pub start_date: Option<String>,
+    /// An end date — only legal with a status in [`ENDED_STATUSES`].
+    pub end_date: Option<String>,
+}
+
+/// What [`merge`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The row that was written (a slug derived from the title if no key was given).
+    pub key: String,
+    /// True when the key did not exist and a row was inserted. This is the tell for a caller who
+    /// meant to *edit* a project and instead named a new one — see the `key` note on [`merge`].
+    pub created: bool,
+}
+
+/// Upsert ONE project from a partial [`Patch`]: `None` keeps the stored value, `Some` replaces it.
+/// A key with no row is created, and then `title` is required — there is nothing to keep.
+///
+/// **`key` is an ADDRESS, not a field.** It selects the row to write; it never renames one. A patch
+/// that names a different key therefore addresses a different project — creating one if it does not
+/// exist — and `created` is how the caller finds out that is what happened. Renaming is a different
+/// operation entirely (it would have to rewrite `[[prj:key]]` bodies and `mem_preload` entries
+/// everywhere), so it does not belong in a field write.
+///
+/// Merging reads the stored row first, folds the patch onto it, and hands the result to [`upsert`],
+/// so every rule stays in one place: `status` still carries the `end_date` rules, a reopen still
+/// clears the end, `start_date` is still stamped once and never cleared, and `preload` still
+/// replaces the ordered list wholesale.
+pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
+    // Empty is an instruction only where empty is a fact. These two are not: refusing is the honest
+    // answer, and it is what stops `status: ""` from silently meaning `todo`.
+    if patch.status.as_ref().is_some_and(|s| s.trim().is_empty()) {
+        return Err(Error::Project(
+            "`status` cannot be empty; omit it to leave the stored status alone".into(),
+        ));
+    }
+    if patch.title.as_ref().is_some_and(|t| t.trim().is_empty()) {
+        return Err(Error::Project(
+            "`title` cannot be empty; omit it to leave the stored title alone".into(),
+        ));
+    }
+
+    let probe = Project {
+        key: patch.key.clone().unwrap_or_default(),
+        title: patch.title.clone().unwrap_or_default(),
+        ..Default::default()
+    };
+    let key = resolve_key(conn, &probe)?;
+    let existing = get(conn, &key)?;
+    let created = existing.is_none();
+
+    let merged = match &existing {
+        Some(old) => Project {
+            key: key.clone(),
+            title: patch.title.clone().unwrap_or_else(|| old.title.clone()),
+            goal: patch.goal.clone().unwrap_or_else(|| old.goal.clone()),
+            state: patch.state.clone().unwrap_or_else(|| old.state.clone()),
+            status: patch.status.clone().unwrap_or_else(|| old.status.clone()),
+            owner: patch.owner.clone().unwrap_or_else(|| old.owner.clone()),
+            tags: patch.tags.clone().unwrap_or_else(|| old.tags.clone()),
+            start_date: patch
+                .start_date
+                .clone()
+                .unwrap_or_else(|| old.start_date.clone()),
+            ..Default::default()
+        },
+        None => {
+            if patch.title.as_ref().is_none_or(|t| t.trim().is_empty()) {
+                return Err(Error::Project(
+                    "a new project needs a `title`; an existing key can be patched field by field"
+                        .into(),
+                ));
+            }
+            Project {
+                key: key.clone(),
+                title: patch.title.clone().unwrap_or_default(),
+                goal: patch.goal.clone().unwrap_or_default(),
+                state: patch.state.clone().unwrap_or_default(),
+                status: patch.status.clone().unwrap_or_default(),
+                owner: patch.owner.clone().unwrap_or_default(),
+                tags: patch.tags.clone().unwrap_or_default(),
+                start_date: patch.start_date.clone().unwrap_or_default(),
+                ..Default::default()
+            }
+        }
+    };
+
+    // The dates follow the event, not the caller: validate the status, then let it decide the end.
+    let status = choice(&merged.status, STATUSES, "todo", "status")?;
+    let ended = ENDED_STATUSES.contains(&status.as_str());
+    let stated_end = patch.end_date.clone().filter(|d| !d.trim().is_empty());
+    // The same refusal `upsert` makes — kept here rather than silently dropping the field, because
+    // an end date on a project that has not ended is the caller contradicting themselves.
+    if stated_end.is_some() && !ended {
+        return Err(Error::Project(format!(
+            "`end_date` on a project that has not ended (`status` is `{status}`): set `status` to {} \
+             to end it, or leave the date out",
+            ENDED_STATUSES.join(" or ")
+        )));
+    }
+    let end_date = if ended {
+        stated_end
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|old| old.end_date.clone())
+                    .filter(|d| !d.is_empty())
+            })
+            .unwrap_or_default()
+    } else {
+        // Reopening clears the end.
+        String::new()
+    };
+    let merged = Project {
+        status,
+        end_date,
+        ..merged
+    };
+
+    let key = upsert(conn, &merged, patch.preload.as_deref())?;
+    Ok(MergeOutcome { key, created })
+}
+
 /// The canonical column list shared by every project read. The `mem_preload` column is deliberately
 /// absent: [`preload`] is a *relation*, read by that function and never mapped onto [`Project`].
 const PROJECT_COLUMNS: &str =

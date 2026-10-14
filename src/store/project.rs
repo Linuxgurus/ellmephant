@@ -1,29 +1,31 @@
 //! Projects: the **structures** half of the store (SPEC §7.1).
 //!
 //! A project is an activity completed over time — work with a beginning, a current state, and a
-//! place to stand: a key, a status, prose, and two relations to memories. A memory is the other
+//! place to stand: a key, a status, prose, and one relation to memories. A memory is the other
 //! half of the store: one body of closely related facts, matched by meaning, so it carries the
 //! machinery (votes, visits, a coherence verdict, an embedding) that a project has no use for — a
 //! shape is not something you match by meaning. Their keys are **plain names** — a project and a
-//! memory may share one — so a *reference* carries the type instead: `[[prj-x]]` is not a project
-//! link, `[[prj:x]]` is (see [`links::PROJECT_MARKER`]), and `memory_link.to_type` records which
-//! table an edge names. That is what lets a key cross between the two graphs (a memory body may
-//! write `[[prj:x]]`) without either
-//! graph having to know about the other.
+//! memory may share one — so a *reference* carries the type instead: `[[prj:x]]` crosses to the
+//! other table (see [`links::PROJECT_MARKER`]), and `memory_link.to_type` records which table an
+//! edge names.
 //!
-//! Two relations, opposite directions, different meanings:
+//! One relation, and one convention:
 //!
 //! - [`preload`] — project → memory, **ordered**, stored as the `mem_preload` column (`preload` is
 //!   the *relation's* name; the column carries it, prefixed so a reader of `project` can see that
 //!   its contents are memory keys and not tags). About *attention*: "to work in here, load
 //!   these." A project preloads memories it did not author (conventions, boot notes). It is a
 //!   **column** on `project`, not a tie table: order is a property of the list, and nothing here
-//!   is cross-row (contrast [`apply_home`], where one home genuinely is).
-//! - [`contains`] — memory → project. About *provenance*: "born here / belongs here." One home,
-//!   which the schema enforces rather than merely asking for.
+//!   is cross-row.
+//! - **membership is a TAG**, not a relation. A memory belongs to a project by carrying the
+//!   `prj:<key>` tag, intersected with topic tags by the ordinary `tags` filter — `prj:seaweedfs`
+//!   plus `storage` is "the storage memories belonging to seaweedfs". There is no `project_memory`
+//!   table and no `Home`: a memory may belong to any number of projects, nothing needs maintaining,
+//!   and nothing can dangle. The reversal (and why `contains` was a mistake) is migration `0007`
+//!   and SPEC §7.1.
 //!
-//! Both are by-key, with no foreign keys — the same discipline as `memory_link.to_key`, so a
-//! forward reference is possible and rot is *detected* ([`dangling`]) instead of raising a
+//! The reference is by-key, with no foreign keys — the same discipline as `memory_link.to_key`, so
+//! a forward reference is possible and rot is *detected* ([`dangling`]) instead of raising a
 //! broken-FK error.
 
 use std::collections::{HashMap, HashSet};
@@ -124,8 +126,11 @@ pub struct Project {
     /// Last-update timestamp — last *write*, which is not the same as last *work*.
     #[serde(default)]
     pub updated: String,
-    /// When the work started, ISO date. Stamped once on first write and correctable afterwards:
-    /// [`created`] is when the row appeared, which is not the same thing — a project written down
+    /// When the work started, ISO date. Stated by the caller, or **derived from the status**:
+    /// stamped when a project stops being `todo`, since work cannot have started while it is only a
+    /// todo. **Never cleared** — a project pushed back to `todo` keeps it, so a non-empty start on a
+    /// `todo` project is the record that it was worked on once and parked. Also correctable:
+    /// [`created`] is when the *row* appeared, which is not the same thing — a project written down
     /// three weeks late started three weeks ago.
     #[serde(default)]
     pub start_date: String,
@@ -148,29 +153,13 @@ pub struct Ref {
     pub title: Option<String>,
 }
 
-/// A project with both its relations resolved — "stand inside it".
+/// A project with its relation resolved — "stand inside it".
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
     /// The project itself.
     pub project: Project,
     /// Ordered preload (`project → memory`), titles hydrated where they resolve.
     pub preload: Vec<Ref>,
-    /// Memories that call this their home (`memory → project`), key order.
-    pub contains: Vec<Ref>,
-}
-
-/// Which project a memory belongs to. Defaults to [`Home::Keep`], so an upsert that says nothing
-/// about provenance never silently orphans a memory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Home {
-    /// Leave the current home alone.
-    #[default]
-    Keep,
-    /// Detach: this memory has no home.
-    Clear,
-    /// Belong to this project (a plain name, or `prj:`/`prj-` prefixed — all three agree). An error
-    /// if another project already owns it.
-    Set(String),
 }
 
 /// A `project_list` filter: structured predicates plus the lexical leg, all intersecting.
@@ -180,6 +169,8 @@ pub struct Filter {
     pub status: Option<String>,
     /// Every listed tag must be present (AND).
     pub tags: Vec<String>,
+    /// Every listed owner must be present (AND), matched case-insensitively like `tags`.
+    pub owner: Vec<String>,
     /// Literal/regex pattern over `key`/`title`/`goal`/`state`; `None` = no lexical leg.
     pub pattern: Option<String>,
     /// How `pattern` is read.
@@ -254,9 +245,13 @@ fn date_field(value: &str, field: &str) -> Result<String> {
 ///
 /// Returns the resolved key. `goal`/`state`/`tags`/`status`/`owner` are written as given, so a
 /// re-upsert is whole-row — read the project first if you mean to edit one field. The dates are the
-/// exception, and deliberately so: `start_date` is stamped once and left alone afterwards, and
-/// `end_date` follows `status` rather than the caller's silence. `created`/`updated` are the row's
-/// own timestamps and never move backwards.
+/// exception, and deliberately so — both follow an *event* rather than the caller's silence.
+/// `start_date` is the caller's if they state one; otherwise it is stamped when the project stops
+/// being `todo`, because work cannot have started while it is only a todo. It is then **never
+/// cleared**: a project pushed back to `todo` keeps its start, which is itself the record that the
+/// project was worked on once and parked. `end_date` follows `status` into [`ENDED_STATUSES`] and
+/// *does* clear on reopen — because it tracks a current state, where `start_date` records a past
+/// fact. `created`/`updated` are the row's own timestamps and never move backwards.
 pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Result<String> {
     let key = resolve_key(conn, p)?;
     let status = choice(&p.status, STATUSES, "todo", "status")?;
@@ -278,7 +273,9 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                  COALESCE(NULLIF(?8, ''), datetime('now')),
                  COALESCE(NULLIF(?9, ''), datetime('now')),
-                 COALESCE(NULLIF(?10, ''), datetime('now')),
+                 CASE WHEN ?10 <> '' THEN ?10
+                      WHEN ?5 <> 'todo' THEN datetime('now')
+                      ELSE '' END,
                  CASE WHEN ?12 THEN COALESCE(NULLIF(?11, ''), datetime('now')) ELSE '' END)
          ON CONFLICT(key) DO UPDATE SET
              title = excluded.title,
@@ -288,7 +285,10 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
              owner = excluded.owner,
              tags = excluded.tags,
              updated = excluded.updated,
-             start_date = CASE WHEN ?10 <> '' THEN ?10 ELSE project.start_date END,
+             start_date = CASE WHEN ?10 <> '' THEN ?10
+                               WHEN project.start_date <> '' THEN project.start_date
+                               WHEN ?5 <> 'todo' THEN datetime('now')
+                               ELSE '' END,
              end_date = CASE WHEN ?12
                              THEN COALESCE(NULLIF(?11, ''), NULLIF(project.end_date, ''),
                                            datetime('now'))
@@ -325,7 +325,7 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
 /// can never occur inside one and the delimiter needs no escaping.
 ///
 /// `preload` holds **memory** keys, so a `prj:` token here is an error rather than a silent no-op:
-/// it names the other kind. (Membership in a project is `project_memory`, not this list.)
+/// it names the other kind. (Membership in a project is the `prj:` tag, not this list.)
 fn encode_preload(keys: &[String]) -> Result<String> {
     let mut seen = HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -403,60 +403,6 @@ fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<
     Ok(())
 }
 
-/// Apply a [`Home`] verdict to `memory_key` inside the caller's transaction (the memory write
-/// path calls this, so membership lands atomically with the row).
-///
-/// `Home::Set` requires the project to exist — a typo in a home is a mistake, not a forward
-/// reference — and refuses to move a memory that another project already owns.
-pub fn apply_home(tx: &Connection, memory_key: &str, home: &Home) -> Result<()> {
-    match home {
-        Home::Keep => Ok(()),
-        Home::Clear => {
-            tx.execute(
-                "DELETE FROM project_memory WHERE memory_key = ?1",
-                params![memory_key],
-            )?;
-            Ok(())
-        }
-        Home::Set(project) => {
-            let project = normalize_key(project);
-            if !exists(tx, &project)? {
-                return Err(Error::NoProject(project));
-            }
-            let current: Option<String> = tx
-                .query_row(
-                    "SELECT project_key FROM project_memory WHERE memory_key = ?1",
-                    params![memory_key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(current) = current
-                && current != project
-            {
-                return Err(Error::Project(format!(
-                    "`{memory_key}` already belongs to `{current}` \
-                     (one home per memory; detach with project: \"\" first)"
-                )));
-            }
-            tx.execute(
-                "INSERT OR REPLACE INTO project_memory (memory_key, project_key) VALUES (?1, ?2)",
-                params![memory_key, project],
-            )?;
-            Ok(())
-        }
-    }
-}
-
-/// Whether a project row exists.
-fn exists(conn: &Connection, key: &str) -> Result<bool> {
-    let found: Option<i64> = conn
-        .query_row("SELECT 1 FROM project WHERE key = ?1", params![key], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    Ok(found.is_some())
-}
-
 /// The canonical column list shared by every project read. The `mem_preload` column is deliberately
 /// absent: [`preload`] is a *relation*, read by that function and never mapped onto [`Project`].
 const PROJECT_COLUMNS: &str =
@@ -494,20 +440,6 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Project>> {
         .optional()?)
 }
 
-/// Run a `(key, title)` query for one project and collect [`Ref`]s in query order. The join is a
-/// `LEFT JOIN`, so a key that resolves to nothing comes back with `title: None` rather than
-/// vanishing — the read reports rot, it does not hide it.
-fn refs(conn: &Connection, sql: &str, key: &str) -> Result<Vec<Ref>> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![normalize_key(key)], |r| {
-        Ok(Ref {
-            key: r.get(0)?,
-            title: r.get::<_, Option<String>>(1)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// The ordered preload (`project → memory`), titles hydrated where they resolve.
 ///
 /// The list is one column, so this is a parse plus a single lookup for the titles — which are
@@ -542,25 +474,13 @@ pub fn preload(conn: &Connection, key: &str) -> Result<Vec<Ref>> {
         .collect())
 }
 
-/// The memories that call `key` home (`memory → project`), key order.
-pub fn contains(conn: &Connection, key: &str) -> Result<Vec<Ref>> {
-    refs(
-        conn,
-        "SELECT c.memory_key, m.title FROM project_memory c
-           LEFT JOIN memory m ON m.key = c.memory_key
-          WHERE c.project_key = ?1 ORDER BY c.memory_key",
-        key,
-    )
-}
-
-/// The project plus both relations — the `project_get` read ("stand inside it").
+/// The project plus its preload — the `project_get` read ("stand inside it").
 pub fn view(conn: &Connection, key: &str) -> Result<Option<View>> {
     let Some(project) = get(conn, key)? else {
         return Ok(None);
     };
     Ok(Some(View {
         preload: preload(conn, &project.key)?,
-        contains: contains(conn, &project.key)?,
         project,
     }))
 }
@@ -568,7 +488,8 @@ pub fn view(conn: &Connection, key: &str) -> Result<Option<View>> {
 /// Every project matching `filter`, key order. `state` rides along; the caller decides what to
 /// render (the list wire leaves it out).
 ///
-/// The predicates intersect, like a memory search: status, then tags (AND), then the lexical leg.
+/// The predicates intersect, like a memory search: status, then tags (AND), then owner (AND), then
+/// the lexical leg.
 /// The pattern is compiled once ([`Matcher::new`]) and matched over `key`/`title`/`goal`/`state` —
 /// the same leg `memory_search` uses, over the project columns.
 pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
@@ -586,6 +507,15 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
         .iter()
         .filter_map(|t| tags::normalize(t))
         .collect();
+    // Owners are free text: the codec keeps names as typed (only the *set* is canonical), so a filter
+    // folds case and compares — the same latitude `tags` gives, minus the whitespace folding, which
+    // would rewrite a person's name.
+    let owners: Vec<String> = filter
+        .owner
+        .iter()
+        .map(|name| name.trim().to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
 
     let mut stmt = conn.prepare(&format!(
         "SELECT {PROJECT_COLUMNS} FROM project ORDER BY key"
@@ -600,6 +530,12 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
         if !wanted.iter().all(|t| project.tags.contains(t)) {
             continue;
         }
+        if !owners
+            .iter()
+            .all(|want| project.owner.iter().any(|o| o.to_lowercase() == *want))
+        {
+            continue;
+        }
         if let Some(matcher) = &matcher {
             let fields = [&project.key, &project.title, &project.goal, &project.state];
             if !fields.into_iter().any(|f| matcher.matches(f)) {
@@ -611,32 +547,15 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
     Ok(out)
 }
 
-/// Project-side rot: `preload`/`contains` keys that resolve to no memory.
+/// Project-side rot: `preload` keys that resolve to no memory.
 ///
-/// Membership cannot outlive a project — [`apply_home`] requires the project to exist and a
-/// project is never deleted (`status = aborted` instead) — so the only rot here is a dangling memory
-/// key: a forward reference the audit surfaces, exactly as SPEC §8 does for `[[…]]`.
-///
-/// `contains` is a table, so SQL finds its rot directly; `preload` is a column (`mem_preload`), so
-/// its list is parsed here and checked against the live memory keys. Both feed one report, so the
-/// audit reads the same either way.
+/// `preload` is a column (`mem_preload`), so its list is parsed here and checked against the live
+/// memory keys. A key that names nothing is a forward reference the audit surfaces, exactly as
+/// SPEC §8 does for `[[…]]` — never a broken-FK error.
 pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
-    // Every target here is a memory: membership (`project_memory`) and `preload` both name memories,
-    // so the kind is not in question — only whether the row exists.
-    let mut rows: Vec<(String, links::Kind, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT c.memory_key, c.project_key FROM project_memory c
-              WHERE c.memory_key NOT IN (SELECT key FROM memory)",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                links::Kind::Memory,
-                r.get::<_, String>(1)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
+    // Every target here is a memory (`preload` names memory keys), so the kind is not in question —
+    // only whether the row exists.
+    let mut rows: Vec<(String, links::Kind, String)> = Vec::new();
     let present: HashSet<String> = {
         let mut stmt = conn.prepare("SELECT key FROM memory")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -660,11 +579,6 @@ pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
 /// How many projects exist (reported by `doctor`).
 pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT count(*) FROM project", [], |r| r.get(0))?)
-}
-
-/// How many memories have a home (reported by `doctor`).
-pub fn homed(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT count(*) FROM project_memory", [], |r| r.get(0))?)
 }
 
 /// `project_list` for the MCP wire: a `cols` header plus positional rows, one per line (the
@@ -694,7 +608,7 @@ pub fn list_to_wire_json(rows: &[Project]) -> Result<String> {
 }
 
 /// `project_get` for the MCP wire: the project as a keyed object (one row, many fields) plus the
-/// two ordered relations as their own `cols`/`rows` tables.
+/// ordered preload as its own `cols`/`rows` table.
 pub fn view_to_wire_json(view: &View) -> Result<String> {
     let table = |refs: &[Ref]| {
         let rows: Vec<serde_json::Value> = refs
@@ -704,11 +618,9 @@ pub fn view_to_wire_json(view: &View) -> Result<String> {
         crate::wire::rows_array(&rows)
     };
     Ok(format!(
-        "{{\"project\":{},\"preload\":{{\"cols\":[\"key\",\"title\"],\"rows\":{}}},\
-          \"contains\":{{\"cols\":[\"key\",\"title\"],\"rows\":{}}}}}",
+        "{{\"project\":{},\"preload\":{{\"cols\":[\"key\",\"title\"],\"rows\":{}}}}}",
         serde_json::to_string(&view.project)?,
         table(&view.preload),
-        table(&view.contains),
     ))
 }
 

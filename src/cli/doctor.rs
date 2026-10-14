@@ -96,13 +96,10 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     let tag_count = tags::list(conn)?.len();
     println!("  tags           {tag_count} tag(s)");
     // Projects are a second table, not a second graph: report them on their own line, with the
-    // project-side rot (`preload`/`contains` keys that resolve to no memory) alongside it.
+    // project-side rot (`preload` keys that resolve to no memory) alongside it.
     let projects = project::count(conn)?;
-    let homed = project::homed(conn)?;
     let project_rot = project::dangling(conn)?.len();
-    println!(
-        "  projects       {projects} project(s), {homed} memory home(s), {project_rot} dangling"
-    );
+    println!("  projects       {projects} project(s), {project_rot} dangling preload key(s)");
     println!(
         "  vectors        {} row(s) without a vector",
         (memories - vectors).max(0)

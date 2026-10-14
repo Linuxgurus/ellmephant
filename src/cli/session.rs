@@ -104,15 +104,6 @@ impl Session {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
-    /// Upsert a memory *and* set (or clear) its project home (SPEC §7.1) — one transaction, so a
-    /// memory is never stored without the provenance the caller asked for.
-    pub fn add_with_home(&mut self, mem: &Memory, home: project::Home) -> Result<String> {
-        self.ensure_embedder()?;
-        let embedder = self.embedder()?;
-        let (_id, key) = store::add_with_home(&self.conn, embedder, mem, home)?;
-        Ok(key)
-    }
-
     /// Fetch one memory and count the read (the `visits` telemetry). The read path uses this;
     /// the write path's existence check uses [`show`](Self::show), which must not count.
     pub fn fetch(&self, key: &str) -> Result<Memory> {
@@ -226,7 +217,7 @@ impl Session {
         project::list(&self.conn, filter)
     }
 
-    /// Project-side rot: `preload`/`contains` keys that resolve to no memory (`doctor`).
+    /// Project-side rot: `preload` keys that resolve to no memory (`doctor`).
     pub fn project_dangling(&self) -> Result<Vec<links::Dangling>> {
         project::dangling(&self.conn)
     }

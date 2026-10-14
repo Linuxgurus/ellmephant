@@ -64,7 +64,7 @@ The decisions the code obeys:
                                   ▼
                    index::vec  (one document vector per row)
                                   ▼
-      SQLite  memory.db  —  the truth:  `memory` (facts) · `project` · `project_memory` (structures)
+      SQLite  memory.db  —  the truth:  `memory` (facts) · `project` (structures)
       everything else derived & rebuildable:  `memory_vec` · `memory_link`
                                   ▼
       embed::qwen3  (candle, in-binary)  —  weights under ~/.ellmephant/models/
@@ -81,7 +81,7 @@ Five layers, one crate:
 |---|---|---|
 | Storage | `db`, `migrations/` | open SQLite, pragmas, schema, `meta` kv |
 | Write path | `store`, `embed`, `index/vec` | upsert a row: key, one hash, tags, links, one vector |
-| Structures | `store::project` | projects: identity, the ordered preload, membership (one home) |
+| Structures | `store::project` | projects: identity, the ordered preload (membership is a tag) |
 | Read path | `search`, `index/vec` | one semantic phrase → KNN over the document vectors |
 | Interfaces | `cli`, `mcp` | MCP server (HTTP default, stdio option); `doctor` + `model` for operations |
 | Tooling | `model`, `bench` | weights cache, latency + golden-eval measurements |
@@ -92,11 +92,12 @@ One SQLite file holds two kinds of thing, and both are truth:
 
 - **`memory`** — memories: one body of closely related facts each, embedded as one document and
   matched by meaning.
-- **`project`** and **`project_memory`** — projects (v5): an activity completed over time, with its
-  own fields, its ordered `mem_preload` list as a column, and its one relation to memories
-  (`project_memory`, `memory_key` as `PRIMARY KEY`, so a memory has exactly one home). A project
-  carries no embedding, no telemetry and no coherence verdict — those belong to facts, the thing
-  matched by meaning. See SPEC §7.1.
+- **`project`** — projects (v5): an activity completed over time, with its own fields and its
+  ordered `mem_preload` list as a column. Its one relation to memories is *preload*; membership is
+  not a relation at all — a memory joins a project by carrying the `prj:<key>` tag (v7 dropped the
+  `project_memory` table that used to enforce a single home; see SPEC §7.1). A project carries no
+  embedding, no telemetry and no coherence verdict — those belong to facts, the thing matched by
+  meaning.
 
 Everything else is **derived** from those rows and can be rebuilt at any time:
 
@@ -176,7 +177,7 @@ rename OLD NEW` rewrites the tokens and repoints the memory edges in one transac
 
 ## Maintenance
 
-The rows are the source of truth — `memory`, `project`, `project_memory`; every index on top of them
+The rows are the source of truth — `memory`, `project`; every index on top of them
 is rebuildable.
 
 - `reembed` drops and recreates the vec0 table when the embedder's width changes, recomputes

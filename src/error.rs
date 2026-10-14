@@ -25,8 +25,8 @@ pub enum Error {
     #[error("no such project: {0}")]
     NoProject(String),
 
-    /// A project-layer rule was violated: an empty key, an unknown status, a `prj:` marker where
-    /// only memories belong, or a second home for a memory that already belongs to a project.
+    /// A project-layer rule was violated: an empty key, an unknown status, or a `prj:` marker where
+    /// only memories belong.
     #[error("project error: {0}")]
     Project(String),
 

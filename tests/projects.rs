@@ -1,8 +1,9 @@
-//! Integration: the project tables — identity, the two relations, and one home (SPEC §7.1).
+//! Integration: the project tables — identity and the one relation (SPEC §7.1).
 //!
 //! Runs offline against a real store file with the deterministic [`HashEmbedder`]. The sharpest
-//! assertions are that a home lands in the *same transaction* as the row it describes, and that a
-//! memory cannot be moved into a second project.
+//! assertions are that a `preload` key which resolves to nothing is *reported* rather than hidden,
+//! and that membership is nothing but a tag — a memory joins a project by carrying `prj:<key>`, so
+//! its members are found with the ordinary `tags` filter.
 
 mod common;
 
@@ -10,7 +11,7 @@ use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
 use ellmephant::store::links;
-use ellmephant::store::project::{self, Home};
+use ellmephant::store::project;
 use ellmephant::store::{self, Memory};
 use rusqlite::{Connection, params};
 
@@ -105,7 +106,7 @@ fn an_aborted_project_is_ended_not_gone() {
 }
 
 #[test]
-fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
+fn a_start_is_never_invented_and_the_end_follows_the_status() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
@@ -114,18 +115,29 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     project::upsert(&conn, &p, None).expect("upsert");
     let fresh = project::get(&conn, "x").unwrap().expect("exists");
     assert!(
-        !fresh.start_date.is_empty(),
-        "start is stamped, not asked for"
+        fresh.start_date.is_empty(),
+        "no start is stamped: the store never invents a date nobody stated"
     );
     assert!(fresh.end_date.is_empty(), "a running project has no end");
 
-    // A later write does not move the start -- unlike `updated`, which is *supposed* to move.
+    // An explicit start lands, and a later write leaves it alone -- unlike `updated`, which is
+    // *supposed* to move.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.start_date = "2026-09-01".into();
+    project::upsert(&conn, &p, None).expect("state a start");
+    let started = project::get(&conn, "x").unwrap().expect("exists");
+    assert_eq!(started.start_date, "2026-09-01", "an explicit start lands");
+
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.state = "now with more prose".into();
     project::upsert(&conn, &p, None).expect("touch");
     let touched = project::get(&conn, "x").unwrap().expect("exists");
-    assert_eq!(touched.start_date, fresh.start_date, "the start stays put");
+    assert_eq!(
+        touched.start_date, started.start_date,
+        "the start stays put"
+    );
     assert!(
         touched.updated >= fresh.updated,
         "the touch timestamp moves"
@@ -360,82 +372,94 @@ fn preload_survives_a_reopen_in_order() {
 }
 
 #[test]
-fn contains_is_one_home_and_a_reupsert_keeps_it() {
+fn a_project_tag_is_how_memories_join() {
+    use ellmephant::search::{MatchMode, Query};
+
+    // Membership is a TAG, not a relation: `prj:<key>` names the project, nothing enforces a single
+    // home (a fact may bear on two projects), and nothing can dangle. A project's memories are
+    // therefore just the rows carrying its tag.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     seed_project(&conn, "chronos");
-    seed_project(&conn, "sessions");
 
-    // The memory is born in `chronos`.
-    let (_id, key) = store::add_with_home(
-        &conn,
-        &embedder,
-        &memory("a", "fact"),
-        Home::Set("chronos".into()),
-    )
-    .expect("add with a home");
-    assert_eq!(key, "a");
-    let owned: Vec<String> = project::contains(&conn, "chronos")
-        .unwrap()
-        .iter()
-        .map(|r| r.key.clone())
-        .collect();
-    assert_eq!(owned, vec!["a"]);
+    let mut m = memory("a", "fact");
+    m.tags = vec!["prj:chronos".into(), "storage".into()];
+    store::add(&conn, &embedder, &m).expect("add");
 
-    // A plain re-upsert must NOT orphan it — the whole reason membership is not a column the
-    // memory write path rewrites.
-    store::add(&conn, &embedder, &memory("a", "fact, edited")).expect("re-upsert");
+    let hits = |tags: &[&str]| -> Vec<String> {
+        let q = Query {
+            text: None,
+            pattern: None,
+            mode: MatchMode::Literal,
+            k: 10,
+            max_distance: None,
+            expand: 0,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            min_chars: None,
+            max_chars: None,
+            coherent: None,
+        };
+        ellmephant::search::run(&conn, None, &q)
+            .expect("search")
+            .hits
+            .iter()
+            .map(|h| h.key.clone())
+            .collect()
+    };
     assert_eq!(
-        project::contains(&conn, "chronos").unwrap().len(),
-        1,
-        "the home survives a re-upsert"
+        hits(&["prj:chronos"]),
+        vec!["a"],
+        "the project tag finds it"
     );
-
-    // A second home is refused, and the memory is not silently moved.
-    let err = store::add_with_home(
-        &conn,
-        &embedder,
-        &memory("a", "fact"),
-        Home::Set("sessions".into()),
-    )
-    .unwrap_err();
-    assert!(format!("{err}").contains("already belongs"), "{err}");
-    assert_eq!(project::contains(&conn, "sessions").unwrap().len(), 0);
-    assert_eq!(project::contains(&conn, "chronos").unwrap().len(), 1);
-
-    // The same home is a no-op; `Clear` detaches.
-    store::add_with_home(
-        &conn,
-        &embedder,
-        &memory("a", "fact"),
-        Home::Set("chronos".into()),
-    )
-    .expect("re-setting the same home is fine");
-    store::add_with_home(&conn, &embedder, &memory("a", "fact"), Home::Clear).expect("detach");
-    assert!(project::contains(&conn, "chronos").unwrap().is_empty());
+    assert_eq!(
+        hits(&["prj:chronos", "storage"]),
+        vec!["a"],
+        "intersected with a topic tag, still found"
+    );
+    assert!(
+        hits(&["prj:chronos", "tax"]).is_empty(),
+        "a topic tag it does not carry excludes it"
+    );
+    assert!(
+        hits(&["prj: seaweedfs"]).is_empty(),
+        "filters fold whitespace like writes do -- an unfolded spelling is a name nobody wrote"
+    );
 }
 
 #[test]
-fn a_home_that_does_not_exist_rolls_the_whole_write_back() {
+fn list_filters_by_owner() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
-    let embedder = HashEmbedder::new(DIM);
 
-    // A home is a deliberate act, so a typo is an error — not a forward reference.
-    let err = store::add_with_home(
-        &conn,
-        &embedder,
-        &memory("a", "fact"),
-        Home::Set("ghost".into()),
-    )
-    .unwrap_err();
-    assert!(matches!(err, ellmephant::Error::NoProject(_)), "{err}");
+    let mut p = project_fixture("ours");
+    p.title = "Ours".into();
+    p.owner = vec!["James".into(), "Cline".into()];
+    project::upsert(&conn, &p, None).expect("upsert");
 
-    // …and because membership lands in the row's transaction, the row is not written either.
-    assert!(
-        store::get(&conn, "a").unwrap().is_none(),
-        "the memory must not survive a rejected home"
+    let mut p = project_fixture("theirs");
+    p.title = "Theirs".into();
+    p.owner = vec!["James".into()];
+    project::upsert(&conn, &p, None).expect("upsert");
+
+    let by = |owners: &[&str]| -> Vec<String> {
+        let filter = project::Filter {
+            owner: owners.iter().map(|o| (*o).to_string()).collect(),
+            ..Default::default()
+        };
+        project::list(&conn, &filter)
+            .expect("list")
+            .iter()
+            .map(|p| p.key.clone())
+            .collect()
+    };
+    assert_eq!(by(&["Cline"]), vec!["ours"], "only one project lists Cline");
+    assert_eq!(by(&["james"]), vec!["ours", "theirs"], "case-insensitive");
+    assert_eq!(by(&["Cline", "James"]), vec!["ours"], "names intersect");
+    assert_eq!(
+        by(&["nobody"]),
+        Vec::<String>::new(),
+        "an unknown name matches none"
     );
 }
 
@@ -702,13 +726,6 @@ fn the_wire_shapes_are_positional_and_self_describing() {
     seed_memory(&conn, &embedder, "a");
     let key = seed_project(&conn, "chronos");
     project::upsert(&conn, &project_fixture("chronos"), Some(&["a".to_string()])).unwrap();
-    store::add_with_home(
-        &conn,
-        &embedder,
-        &memory("b", "fact"),
-        Home::Set("chronos".into()),
-    )
-    .unwrap();
 
     let list = project::list(&conn, &project::Filter::default()).unwrap();
     let wire = project::list_to_wire_json(&list).unwrap();
@@ -735,9 +752,8 @@ fn the_wire_shapes_are_positional_and_self_describing() {
     assert_eq!(v["project"]["key"], serde_json::json!("chronos"));
     assert_eq!(v["preload"]["cols"], serde_json::json!(["key", "title"]));
     assert_eq!(v["preload"]["rows"][0][0], serde_json::json!("a"));
-    assert_eq!(
-        v["contains"]["rows"][0][0],
-        serde_json::json!("b"),
-        "only the homed memory is contained"
+    assert!(
+        v.get("contains").is_none(),
+        "there is no `contains`: membership is a tag now"
     );
 }

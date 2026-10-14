@@ -40,6 +40,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0006_link_type.sql"),
         "link type: bare keys, memory_link.to_type",
     ),
+    (
+        7,
+        include_str!("../../migrations/0007_drop_project_memory.sql"),
+        "retire the one-home association: drop project_memory",
+    ),
 ];
 
 /// Current schema version recorded in the file.

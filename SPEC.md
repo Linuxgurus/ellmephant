@@ -265,10 +265,14 @@ CREATE TABLE project (             -- the key IS the identity: no rowid-derived 
   end_date    TEXT NOT NULL DEFAULT '',         -- when it ENDED: done or aborted alike
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))));
 
-CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
+CREATE TABLE project_memory (      -- RETIRED in 0007; see "Membership is a TAG" below
   memory_key  TEXT PRIMARY KEY,
   project_key TEXT NOT NULL);
 ```
+> **0007 dropped `project_memory`.** It modelled a memory as belonging to at most one project; that
+> was wrong twice over (a per-project set is a garbage pail to curate forever, and "one home"
+> invents a membership claim for a fact bearing on two projects). Membership is a tag now —
+> `prj:<key>` — and the DDL above is kept only as the record of what was removed.
 
 - **`owner` is a set of names, and the names are free text.** Comma-joined, trimmed, de-duped
   case-insensitively and sorted (`James`, not `james`; one person, one entry) — but never checked
@@ -278,8 +282,9 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   blank `owner` is unassigned, which is a fact rather than a missing field. A `CHECK` could not
   validate the *elements* of a comma list anyway, the same reason `tags` has none.
 
-- **Two dates, and they are the project's, not the row's.** `start_date` is stamped on the first
-  write and can be corrected afterwards; `end_date` is stamped when `status` becomes `done` or
+- **Two dates, and they are the project's, not the row's.** `start_date` is written when it is
+  stated and left empty otherwise — never stamped, because the store does not invent a date nobody
+  asserted — and can be corrected afterwards; `end_date` is stamped when `status` becomes `done` or
   `aborted`, never moves while the project stays ended (an unrelated later write does not touch it),
   and is cleared when the project is reopened. Neither is `created`/`updated`: a project written down
   three weeks late *started* three weeks ago, and `updated` moves on any write, so it cannot answer
@@ -289,35 +294,32 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   because a date that does not sort as it reads breaks every "what ended in September" query
   silently.
 
-- **One tie table, not two: a relation earns a table only when its invariant is cross-row.**
-  `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a
-  column, because a column cannot see other rows. `preload` does not: a memory may sit in many
-  projects' lists, and its **order is a property of the list**, not of each edge — so it is a
-  column (`mem_preload`), with no `position` column shuffling a rowset back into order. A key is
-  `[a-z0-9-]` (`slug::slugify`), so a comma can never occur inside one: the delimiter is safe by
-  construction, not by convention.
-- **Two relations, opposite directions, different meanings.** `preload` is project → memory and
-  **ordered**: *"to work in here, load these"* — a project preloads memories it did not author
-  (conventions, boot notes). `contains` is memory → project: *"born here / belongs here."*
-  Neither contains the other; collapse them and you get either noise (load everything) or
-  starvation (only what it wrote).
-- **One home is a constraint, not a convention:** `memory_key` is the `PRIMARY KEY` of
-  `project_memory`, so a memory belongs to at most one project and a second home is an error.
-- **A membership lands inside the memory's own transaction** (`store::add_with_home`), because a
-  memory is born *with* its provenance. An upsert that says nothing about a project
-  (`Home::Keep`) leaves the existing home alone: membership is not a column the row rewrite
-  touches, so a re-upsert cannot silently orphan it.
+- **No tie table: a relation earns a table only when its invariant is cross-row, and `preload`'s
+  is not one.** A memory may sit in many projects' lists, and its **order is a property of the
+  list**, not of each edge — so it is a column (`mem_preload`), with no `position` column
+  shuffling a rowset back into order. A key is `[a-z0-9-]` (`slug::slugify`), so a comma can never
+  occur inside one: the delimiter is safe by construction, not by convention.
+- **One relation: `preload`.** project → memory, **ordered** — *"to work in here, load these"* — a
+  project preloads memories it did not author (conventions, boot notes). Its only unique job is
+  order; the *set* comes from tags.
+- **Membership is a TAG, not a relation** (0007 — the reversal). A memory belongs to a project by
+  carrying the `prj:<key>` tag, intersected with topic tags by the ordinary `tags` filter:
+  `prj:seaweedfs` + `storage` is *"the storage memories belonging to seaweedfs"*. There is no
+  `project_memory` table and no home to set, because a per-project memory set is a garbage pail
+  that must be curated forever, and "one home" manufactures a membership claim for a fact that
+  legitimately bears on two projects. A tag is decided once, when the memory is written, and
+  nothing can dangle. The table 0007 dropped was always empty — nothing needed converting.
+- **`prj:<key>` marks a project in a tag; every other tag is a topic.** The colon is visible
+  against a dash-heavy tag vocabulary (`rust-lang`, `wash-sales`, `cline-home`), and `:` cannot
+  occur in a slug, so no name can squat it.
 - **No foreign keys, exactly like `memory_link.to_key`:** a `preload` reference is a forward
   reference, allowed, and rot is *detected* (`store::project::dangling`, `project_get` reports a
   null title, `doctor` counts it) rather than raising a broken-FK error.
-- **A home must exist** — a typo in a home is a mistake, not a forward reference — but a `preload`
-  entry need not: a project may be created before its memories.
 - **A link to a project is not membership.** `[[prj:x]]` is a `see` edge (navigation, attention);
-  `contains` means born here. So `links::dangling` resolves a target against the table its
-  `to_type` names — and nothing else: a `prj:sessions` link is not fixed by a *memory* called
-  `sessions`.
-- **No delete.** A project ends with `status = done` or `aborted`; the `preload` list and the `contains` edges
-  cannot outlive one.
+  membership is the tag. So `links::dangling` resolves a target against the table its `to_type`
+  names — and nothing else: a `prj:sessions` link is not fixed by a *memory* called `sessions`.
+- **No delete.** A project ends with `status = done` or `aborted`; the `preload` list cannot
+  outlive one.
 
 ## 8. Cross-links (wiki semantics)
 
@@ -355,7 +357,7 @@ The store is **atomics-first**; generalization is derived, not stored.
 - **General views are computed at query time** (fan-out / one-hop expansion), never written.
   Store the atoms, synthesize the whole.
 - **A sparse pointer tier** (`*-overview` notes) is allowed for routing/navigation only —
-  pointers, not content; governed by "one home per fact, cross-link don't duplicate."
+  pointers, not content; governed by "one memory per fact, cross-link don't duplicate."
 - **Write policy** (guided via the tool descriptions; the **smart-caveman** style is defined
   once in the server instructions, the rest on `memory_upsert`):
   **smart-caveman** — drop filler, articles and glue words, keep high-signal words ·
@@ -597,8 +599,9 @@ any model is touched; flags are re-checked the same way after they override the 
 - **Preload** — a project's ordered list of memory keys to load as context for working in it
   ("to work in here, load these"): the boot set, generalized. The order is the payload. The
   *relation* is `preload`; the column that stores it is `mem_preload`.
-- **Home** — the project a memory belongs to, via `contains`. One per memory — enforced by the
-  schema, not by convention.
+- **Membership** — a memory belongs to a project by carrying the `prj:<key>` tag, intersected with
+  topic tags by the ordinary `tags` filter (`prj:seaweedfs` + `storage` is "the storage memories
+  belonging to seaweedfs"). No relation, no per-memory limit, nothing to maintain (0007).
 - **Derived view / profile** — a composed answer built at query time from atoms; never stored.
 - **Key** — the global-unique slug; identity *and* link target (wiki semantics).
 - **Title / body** — the one-liner and the fact; stored literally and folded into the document embedding.

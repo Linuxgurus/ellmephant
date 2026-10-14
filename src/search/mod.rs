@@ -380,11 +380,13 @@ fn lexical_set(conn: &Connection, q: &Query) -> Result<Option<HashSet<i64>>> {
 
 /// Whether `mem` satisfies every structured predicate in `q` (tags AND, size range, coherence).
 fn passes(mem: &Memory, q: &Query) -> bool {
-    if !q
-        .tags
-        .iter()
-        .all(|want| mem.tags.iter().any(|t| t.eq_ignore_ascii_case(want.trim())))
-    {
+    // A tag is normalised on the way IN (`tags::encode`: trim, lowercase, whitespace -> `-`), so a
+    // filter must normalise the same way on the way OUT — otherwise a tag can be *written* that can
+    // never be *queried*: `prj: seaweedfs` stores as `prj:-seaweedfs`, and the raw string never
+    // matches it. (The project filter already did this; the memory one did not.)
+    if !q.tags.iter().all(|want| {
+        crate::store::tags::normalize(want).is_some_and(|want| mem.tags.iter().any(|t| t == &want))
+    }) {
         return false;
     }
     let chars = embedded_len(mem);

@@ -252,8 +252,8 @@ full workflow.
 
 - One static binary, one SQLite file. The Qwen3 encoder runs in-process via candle — no Python, no
   ONNX Runtime, no sidecar.
-- The rows are the source of truth — `memory`, and the `project`/`project_memory` tables behind
-  projects. The vector index (`sqlite-vec` `vec0`) and the link graph are derived and rebuildable.
+- The rows are the source of truth — `memory`, and the `project` table behind projects. The vector
+  index (`sqlite-vec` `vec0`) and the link graph are derived and rebuildable.
 - Store directory is `/data` (`ELLMEPHANT_HOME=/data`); the image's default command is the MCP
   server, binding `0.0.0.0:8888`.
 - Weights cache at `<home>/models/`, sha-pinned per revision; `--offline` forbids network and

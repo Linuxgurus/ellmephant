@@ -1,0 +1,13 @@
+-- 0007: retire the one-home association (SPEC §7.1).
+--
+-- `contains` (memory -> project, PRIMARY KEY on memory_key) modelled a memory as BELONGING to at
+-- most one project. It was wrong twice over: a per-project memory set is a garbage pail that has to
+-- be curated forever, and one home manufactures a membership claim for a fact that legitimately
+-- touches two projects. The fix is not a better relation but a smaller one — project <-> memory
+-- linkage is now just a TAG on the memory, `prj:<key>`, which needs no table, no constraint and no
+-- maintenance, and which composes with the topic tags the store already has: `prj:seaweedfs` plus
+-- `storage` is "the storage memories belonging to seaweedfs".
+--
+-- The table goes outright. 0005 introduced it and no live store ever held a row (`contains` was
+-- empty everywhere it existed), so there is nothing to convert — dropping it loses nothing.
+DROP TABLE project_memory;

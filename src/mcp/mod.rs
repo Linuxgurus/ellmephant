@@ -64,8 +64,9 @@ small words out; drop filler, articles, glue. List-shaped reads return a positio
 `cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
 when a memory shapes your task, `memory_upvote` it — the store's own rankings ride on your votes. \
 A project is an activity over time — a container you can stand inside: \
-`project_upsert` writes one, `project_get` reads one with its `preload`/`contains`, `project_list` \
-shows them all; a memory JOINS a project by home (`memory_upsert`'s `project`) and POINTS at one \
+`project_upsert` writes one, `project_get` reads one with its `preload`, `project_list` \
+shows them all; a memory JOINS a project by carrying the `prj:<key>` TAG (search it — intersect \
+with a topic tag to narrow to one facet) and POINTS at one \
 from its body with `[[prj:key]]` (a bare `[[key]]` is a memory; keys are plain names, and the two \
 tables may share one). \
 Tool descriptions are the spec.";
@@ -133,17 +134,19 @@ who exists (and `me` would mean whatever reader asks). `preload` is the ORDERED 
 context to work \
 in here; it replaces the previous list, and it may name memories this project did not author \
 (conventions, boot notes). `start_date`/`end_date` are ISO dates (`YYYY-MM-DD`): `start_date` is \
-stamped on the first write and correctable after, and `end_date` is stamped when `status` becomes \
-done|aborted — `status` says HOW it ended, the date only says WHEN, and reopening clears it. A write \
-is whole-row, so `project_get` first if you mean to edit one \
-field. A memory joins a project by HOME, which is `memory_upsert`'s `project`.";
+written only when you state one and left empty otherwise — never stamped; `end_date` is stamped \
+when `status` becomes done|aborted — `status` says HOW it ended, the date only says WHEN, and \
+reopening clears it. A write is whole-row, so `project_get` first if you mean to edit one field. A \
+memory joins a project by carrying the `prj:<key>` TAG; nothing links it. List a project's memories \
+with `memory_search`'s `tags` filter.";
 
 /// `project_get` description.
 const PROJECT_GET_DESCRIPTION: &str = "\
-Read one project whole, with both relations resolved — `preload` (the ordered context to load, \
-project -> memory) and `contains` (the memories born here, memory -> project; one home each). \
-A referenced key whose title is null resolves to nothing: a forward reference or rot. The read \
-reports it rather than hiding it.";
+Read one project whole, with its `preload` resolved — the ordered context to load (project -> \
+memory), titles hydrated. A referenced key whose title is null resolves to nothing: a forward \
+reference or rot. The read reports it rather than hiding it. Membership is a TAG, not a relation: \
+a project's memories are the ones carrying `prj:<key>`, found with `memory_search`'s `tags` filter \
+(intersect with a topic tag to narrow to one facet).";
 
 /// `project_list` description.
 const PROJECT_LIST_DESCRIPTION: &str = "\
@@ -173,12 +176,6 @@ pub struct UpsertParams {
     #[serde(default)]
     #[schemars(description = "Aspects of the subject, e.g. storage, gotchas.")]
     pub tags: Vec<String>,
-    /// Project home.
-    #[serde(default)]
-    #[schemars(
-        description = "Project this was born in (a plain name; `prj:`/`prj-` accepted and stripped). Omit = keep the current home; \"\" = detach. One home per memory."
-    )]
-    pub project: Option<String>,
 }
 
 impl UpsertParams {
@@ -191,16 +188,6 @@ impl UpsertParams {
             source: self.source,
             tags: self.tags,
             ..Default::default()
-        }
-    }
-
-    /// The provenance this write expresses: absent = keep the current home, `""` = detach, else
-    /// belong to that project. [`project::Home::Keep`] is what makes a re-upsert safe.
-    fn home(&self) -> project::Home {
-        match self.project.as_deref() {
-            None => project::Home::Keep,
-            Some(raw) if raw.trim().is_empty() => project::Home::Clear,
-            Some(raw) => project::Home::Set(raw.to_string()),
         }
     }
 }
@@ -487,6 +474,12 @@ pub struct ProjectListParams {
     #[serde(default)]
     #[schemars(description = "Tag filter; a project must carry EVERY listed tag.")]
     pub tags: Vec<String>,
+    /// Owner filter (AND).
+    #[serde(default)]
+    #[schemars(
+        description = "Owner filter; a project must list EVERY given name (case-insensitive)."
+    )]
+    pub owner: Vec<String>,
     /// The literal/regex pattern.
     #[serde(default)]
     #[schemars(
@@ -617,16 +610,11 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
-        let home = p.home();
         let mem = p.into_memory();
         let tags = mem.tags.clone();
         let body_bytes = mem.body.len();
-        // `Home::Keep` is the common path (a write with no opinion about provenance).
         let key = self
-            .with_store("memory_upsert", move |s| match home {
-                project::Home::Keep => s.add(&mem),
-                home => s.add_with_home(&mem, home),
-            })
+            .with_store("memory_upsert", move |s| s.add(&mem))
             .await?;
         tracing::info!(tool = "memory_upsert", key = %key, tags = ?tags, body_bytes, "memory stored");
         Ok(json_ok(
@@ -999,7 +987,6 @@ impl MemoryServer {
             tool = "project_get",
             key = %key,
             preload = view.preload.len(),
-            contains = view.contains.len(),
             "project read"
         );
         project::view_to_wire_json(&view).map_err(|e| e.to_string())
@@ -1024,6 +1011,7 @@ impl MemoryServer {
         let filter = project::Filter {
             status: p.status,
             tags: p.tags,
+            owner: p.owner,
             pattern: p.pattern,
             mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
         };

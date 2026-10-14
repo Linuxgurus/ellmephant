@@ -44,10 +44,17 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     assert!(db::migrate::latest() >= 2, "telemetry migration exists");
     assert!(db::migrate::latest() >= 5, "projects migration exists");
     assert!(db::migrate::latest() >= 6, "link-type migration exists");
+    assert!(db::migrate::latest() >= 7, "one-home removal exists");
 
-    for name in ["memory", "memory_link", "meta", "project", "project_memory"] {
+    for name in ["memory", "memory_link", "meta", "project"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
+    // 0007 retired the one-home association: membership is a tag now, so the table must be GONE —
+    // and must never creep back.
+    assert!(
+        !object_exists(&conn, "table", "project_memory"),
+        "project_memory should have been dropped by 0007"
+    );
     // v2 keeps one embedding per row: guard against a BM25/tag table being reintroduced.
     for name in ["memory_fts", "tag", "memory_tag"] {
         assert!(
@@ -116,9 +123,7 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // rolled back.
     let conn = db::open(&paths).unwrap();
     insert(&conn, "keep-me", "Kept", "survives the upgrade");
-    for table in ["project", "project_memory"] {
-        conn.execute(&format!("DROP TABLE {table}"), []).unwrap();
-    }
+    conn.execute("DROP TABLE project", []).unwrap();
     conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
         .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
@@ -127,9 +132,7 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // Opening it again runs only the newer steps, and the rows are untouched.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
-    for table in ["project", "project_memory"] {
-        assert!(object_exists(&conn, "table", table), "missing {table}");
-    }
+    assert!(object_exists(&conn, "table", "project"), "missing project");
     assert_eq!(
         count(&conn, "SELECT count(*) FROM memory"),
         1,
@@ -141,19 +144,30 @@ fn a_v4_store_gains_the_project_tables_on_open() {
 fn a_v5_store_gets_bare_keys_and_typed_edges() {
     let (_dir, paths) = temp_store();
 
-    // The state an earlier v5 build left behind: prefixed project keys, membership and edges that
-    // named them by prefix, and no `to_type` column to say so.
+    // The state an earlier v5 build left behind: prefixed project keys, a one-home membership row,
+    // and edges that named them by prefix — with no `to_type` column to say so.
     let conn = db::open(&paths).unwrap();
     conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
         .unwrap();
     insert(&conn, "source", "Source", "points at [[prj-chronos]]");
     let from_id = conn.last_insert_rowid();
-    for sql in [
+    conn.execute(
         "INSERT INTO project (key, title) VALUES ('prj-chronos', 'Chronos')",
+        [],
+    )
+    .unwrap();
+    // A v5 store still HOLDS the one-home table (0007 has not run yet), so the fixture rebuilds it —
+    // otherwise 0006's backfill below would have nothing to rewrite.
+    conn.execute(
+        "CREATE TABLE project_memory (memory_key TEXT PRIMARY KEY, project_key TEXT NOT NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO project_memory (memory_key, project_key) VALUES ('source', 'prj-chronos')",
-    ] {
-        conn.execute(sql, []).unwrap();
-    }
+        [],
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO memory_link (from_id, to_key, rel) VALUES (?1, 'prj-chronos', 'see')",
         params![from_id],
@@ -162,7 +176,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.pragma_update(None, "user_version", 5).unwrap();
     drop(conn);
 
-    // 0006 interprets the prefix exactly once — while it still means something.
+    // 0006 interprets the prefix exactly once — while it still means something — and 0007 then
+    // retires the one-home table entirely.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(
         count(&conn, "SELECT count(*) FROM project WHERE key = 'chronos'"),
@@ -172,18 +187,14 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM project_memory WHERE project_key = 'chronos'"
-        ),
-        1,
-        "so did the membership that described it"
-    );
-    assert_eq!(
-        count(
-            &conn,
             "SELECT count(*) FROM memory_link WHERE to_key = 'chronos' AND to_type = 'project'"
         ),
         1,
         "and the edge is now typed, with its key stripped"
+    );
+    assert!(
+        !object_exists(&conn, "table", "project_memory"),
+        "0007 dropped the one-home table on the way through"
     );
     assert!(
         ellmephant::store::links::dangling(&conn)

@@ -574,54 +574,62 @@ async fn projects_round_trip_over_the_transport() {
         v["preload"]["rows"][0][1],
         serde_json::json!("Read me first")
     );
-    assert_eq!(v["contains"]["rows"], serde_json::json!([]));
+    assert!(
+        v.get("contains").is_none(),
+        "membership is a tag now: there is no `contains` table on the wire"
+    );
 
-    // A memory JOINs the project by home — set in the memory write, not the project write.
-    let homed = call(
+    // A memory JOINS the project by carrying its tag — set on the memory write, never a relation,
+    // and read back with the ordinary `tags` filter.
+    let tagged = call(
         &client,
         "memory_upsert",
         serde_json::json!({
             "key": "chronos-design",
             "title": "Chronos design v0",
             "body": "bells + periods",
-            "project": "chronos"
+            "tags": ["prj:chronos", "design"]
         }),
     )
     .await;
-    assert!(!homed.is_error.unwrap_or(false), "{}", text(&homed));
+    assert!(!tagged.is_error.unwrap_or(false), "{}", text(&tagged));
 
-    let after = call(
+    let members = call(
         &client,
-        "project_get",
-        serde_json::json!({ "key": "chronos" }),
+        "memory_search",
+        serde_json::json!({ "tags": ["prj:chronos", "design"] }),
     )
     .await;
-    let v: serde_json::Value = serde_json::from_str(&text(&after)).expect("json");
+    let found: serde_json::Value = serde_json::from_str(&text(&members)).expect("json");
     assert_eq!(
-        v["contains"]["rows"][0][0],
-        serde_json::json!("chronos-design")
+        found["hits"][0][0],
+        serde_json::json!("chronos-design"),
+        "the project tag, intersected with a topic tag, finds its members"
     );
 
-    // One home per memory: a second project is a tool error, not a silent move.
+    // A second project is not a second home: a memory may carry as many project tags as it likes.
     call(
         &client,
         "project_upsert",
         serde_json::json!({ "key": "sessions", "title": "Sessions" }),
     )
     .await;
-    let moved = call(
+    let both = call(
         &client,
         "memory_upsert",
         serde_json::json!({
             "key": "chronos-design",
             "title": "Chronos design v0",
             "body": "bells + periods",
-            "project": "sessions"
+            "tags": ["prj:chronos", "prj:sessions", "design"]
         }),
     )
     .await;
-    assert_eq!(moved.is_error, Some(true), "a second home must be refused");
-    assert!(text(&moved).contains("already belongs"), "{}", text(&moved));
+    assert!(
+        !both.is_error.unwrap_or(false),
+        "two project tags are fine — nothing enforces one home: {}",
+        text(&both)
+    );
 
     // `project_list` is the cheap index, and its filters intersect.
     let all = call(&client, "project_list", serde_json::json!({})).await;

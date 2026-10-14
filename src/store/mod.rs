@@ -132,22 +132,9 @@ fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> 
 /// A non-empty `mem.created`/`mem.updated` is honoured; empty strings fall back to
 /// `datetime('now')`, which is what the CLI/MCP write path passes.
 ///
-/// No opinion about provenance — a project home is [`add_with_home`].
+/// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
+/// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(i64, String)> {
-    add_with_home(conn, embedder, mem, project::Home::Keep)
-}
-
-/// [`add`], plus a verdict on which project the memory belongs to ([`project::Home`]).
-///
-/// The membership lands in the **same transaction** as the row, so a home is never half-written;
-/// `Home::Keep` (what [`add`] passes) leaves an existing home untouched, which is what keeps a
-/// re-upsert from silently orphaning a memory.
-pub fn add_with_home(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-    mem: &Memory,
-    home: project::Home,
-) -> Result<(i64, String)> {
     let prepared = prepare(conn, embedder, mem)?;
     // Create the vec table before the tx so its DDL is not inside it.
     index::vec::ensure(conn, embedder.dim())?;
@@ -159,9 +146,6 @@ pub fn add_with_home(
     };
     let tx = conn.unchecked_transaction()?;
     let id = apply(&tx, mem, &prepared, vector.as_deref())?;
-    // A bad home (unknown project, or a second home) rolls the whole write back: the tx is
-    // dropped without commit.
-    project::apply_home(&tx, &prepared.key, &home)?;
     tx.commit()?;
     Ok((id, prepared.key))
 }

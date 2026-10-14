@@ -82,8 +82,9 @@ mcp-memory-service → typed edges + tag AND/OR).
   `ureq` (weights fetch, rustls), `rmcp` + `axum`/`tokio` (the MCP server), `clap` (three verbs),
   `serde`/`serde_json`, `toml` + `serde` config, `sha2`, `regex`, `thiserror`,
   `tracing`/`tracing-subscriber`. (No `hf-hub` — see §6.2.)
-- **Process model:** one **long-lived** process (REPL or `mcp`) holds the model warm
-  (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
+- **Process model:** one **long-lived** process — the MCP server — holds the model warm
+  (~1.2 GB resident) and one writer connection. (The REPL and the one-shot flags that each paid a
+  cold start were removed; see §11.)
   A shared daemon is *optional* and only if bare one-shot latency annoys us (see §15).
 - **Indexes are derived:** the document vectors (`memory_vec`) and links (`memory_link`) are all
   rebuildable from the rows. The rows are truth — `memory` and the project tables (§7.1) — and there
@@ -337,6 +338,9 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   a backlink of a memory that happens to share its name.
 - **Rename:** keys are near-immutable; `rename` deliberately rewrites `[[oldkey]]` across
   bodies **and** repoints edges — memory edges only, so a project's incoming links are untouched.
+  **No interface exposes it today**: the CLI verb was its only caller and went with the REPL, so
+  `store::links::rename` is reachable only from tests. A `memory_rename` tool is the obvious way back;
+  the decision is open.
 - **Embedding:** `[[...]]` stripped from the embed projection.
 - Key charset `[a-z0-9-]+`; the link regex is `\[\[((?:prj:)?[a-z0-9-]+)\]\]`.
 
@@ -491,7 +495,6 @@ client of it. `doctor` is the read-only digest that survives; the `stats` digest
 - `~/.ellmephant/config.toml` — model, dim, precision, instruction, defaults (flags override).
 - `~/.ellmephant/models/` — weights cache, laid out per §6.1 (`<owner>--<repo>/<sha>/`). Not
   `HF_HOME`: we own this layout so `doctor`/`gc` and `--model-dir` stay simple.
-- `~/.ellmephant/history` — REPL history.
 - `meta` table mirrors model/dim/instruction for drift detection at startup.
 
 Model config keys (all optional; flags override, and `ELLMEPHANT_OFFLINE=1` overrides `offline`):
@@ -546,10 +549,11 @@ any model is touched; flags are re-checked the same way after they override the 
    `bench` / `--golden` / `--sweep`; default `k=10`; recall@3 gate 0.8. Grown from real usage.
 2. **MCP tool schema + annotations** — shipped (P7): 9 tools with JSON-Schema params and
    read-only / destructive / idempotent hints (`src/mcp`).
-3. **Rename implementation + collision policy** — shipped (P9): one transaction rewrites
-   `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).
-4. **Daemon vs not** — decided: no daemon in v1. The REPL and the MCP server both keep the
-   encoder warm, which is what the daemon would have bought (PLAN §2 #4).
+3. **Rename implementation + collision policy** — shipped (P9) in the store layer: one transaction
+   rewrites `[[old]]` and repoints edges; refuses to clobber an existing key
+   (`store::links::rename`). No interface calls it (§8).
+4. **Daemon vs not** — decided: no daemon in v1. The MCP server keeps the encoder warm, which is
+   what the daemon would have bought (PLAN §2 #4).
 5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`. A fresh store
    applies `0001…0005` in order, so it opens at the current schema (**v5** today); an existing store
    is stepped up to it on open.
@@ -573,9 +577,10 @@ any model is touched; flags are re-checked the same way after they override the 
 4. Embedder: candle Qwen3 load + embed projection + pooling.
 5. Write path: upsert, tags, links, one document vector (skip the re-embed when the document hash is unchanged).
 6. Read path: semantic phrase → KNN → hydrate.
-7. CLI REPL + one-shot flags.
+7. CLI REPL + one-shot flags — **built, then removed** (MCP is the interface; §11).
 8. MCP server (HTTP default, stdio option).
-9. `reembed`, dangling-link audit, `rename`.
+9. `reembed` and the dangling-link audit — shipped; `rename` lives in the store layer with no
+   interface today.
 10. `bench` + golden queries; tune.
 
 ## 17. Glossary

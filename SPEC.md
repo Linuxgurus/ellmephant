@@ -12,8 +12,8 @@
 ellmephant is a **single-binary, SQLite-backed long-term memory for AI agents**: the
 embedder engine is compiled into the binary, one SQLite file is the sole source of truth,
 and a *rebuildable* vector + link index sits on top of it. It speaks MCP (so
-any client — Cline, TypingMind — shares the same memory) and ships an interactive REPL for
-the human. The name is LLM + elephant; the animal is the aspiration, the software is the
+any client — Cline, TypingMind — shares the same memory) and serves that one store to all of
+them. The name is LLM + elephant; the animal is the aspiration, the software is the
 attempt.
 
 ## 1. Why build it
@@ -33,7 +33,7 @@ attempt.
 - Retrieval by **meaning** (a semantic phrase, KNN) or by **literal** (a substring/regex `pattern`),
   with optional structured filters (tags, size, coherence); `key`/`tags` remain identity and lookup.
 - Wiki-style links with backlinks and one-hop graph expansion.
-- Multi-client via MCP; interactive REPL for humans.
+- Multi-client via MCP: one shared memory, many clients (Cline, TypingMind, anything that speaks MCP).
 
 **Non-goals**
 
@@ -77,11 +77,11 @@ mcp-memory-service → typed edges + tag AND/OR).
 ## 5. Architecture
 
 - **Language:** Rust (edition 2024+).
-- **Crates:** `rusqlite` (feature `bundled`), `sqlite-vec` (auto-extension), `candle-core`
-  + `candle-transformers` (encoder plumbing), `tokenizers` 0.22, `safetensors`,
-  `ureq` (weights fetch, rustls), `rustyline` (REPL), `tabled`/`comfy-table` (output), `clap`,
-  `serde`/`serde_json`, `toml` + `serde` config, `sha2`, an MCP server (`rmcp`, HTTP default).
-  (No `hf-hub` — see §6.2.)
+- **Crates:** `rusqlite` (feature `bundled`), `sqlite-vec` (auto-extension), the `encoder` feature
+  (`candle-core`/`candle-nn`/`candle-transformers` + `tokenizers`; `--no-default-features` drops it),
+  `ureq` (weights fetch, rustls), `rmcp` + `axum`/`tokio` (the MCP server), `clap` (three verbs),
+  `serde`/`serde_json`, `toml` + `serde` config, `sha2`, `regex`, `thiserror`,
+  `tracing`/`tracing-subscriber`. (No `hf-hub` — see §6.2.)
 - **Process model:** one **long-lived** process (REPL or `mcp`) holds the model warm
   (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
   A shared daemon is *optional* and only if bare one-shot latency annoys us (see §15).
@@ -466,20 +466,20 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   A **finder, not a judge**: because `key`+tags are folded into the document, merely-related
   memories cluster too, so candidates are judged (`memory_get` both) before merging. No bodies.
 
-**CLI** — three faces over one core:
+**CLI** — the shipped verbs, and nothing else:
 
-- `ellmephant` → **REPL** (rustyline: history at `~/.ellmephant/history`, completion;
-  bordered tables for results). Commands: `add`, `search`, `show`, `rm`, `useful`, `coherent`,
-  `list`, `tags`, `stats`, `rename`, `reembed`, `links`, `model`, `help`, `quit`.
-- One-shot flags for scripting: `ellmephant search "..." --json`.
-- `ellmephant search` takes the same §10 filters (`--tag`, `--min-chars`, `--max-chars`,
-  `--coherent`); `ellmephant coherent KEY [true|false|null]` sets the split-review verdict.
-- `ellmephant list [--json]` → the memory index (`key`, `tags`, `title`, no bodies).
-- `ellmephant stats [--json]` (alias `summary`) → a read-only digest: counts, on-disk size and
-  body/title spread, tag shape (distinct, placements, singletons, top-N, per-memory / per-tag
-  averages, coverage), link shape (edges, linked, orphans, dangling), usage telemetry (visits,
-  useful, most-useful, hot-but-unvoted) and recent activity (§14).
+- `ellmephant` (no subcommand) / `ellmephant mcp [--stdio]` → the **MCP server**; HTTP on the
+  configured port (8888) unless `--stdio`. This is the whole read/write path; the tool surface is
+  §9–§10.
+- `ellmephant doctor` → paths, schema version and derived-index health: vectors, links, tags,
+  projects, and every kind of rot.
 - `ellmephant model` → weights cache: `status` | `fetch` | `rm` (§6.5).
+
+An interactive **REPL** and the one-shot store verbs (`add`, `search`, `show`, `list`, `stats`,
+`coherent`, `tags`, `links`, `rename`, `reembed`) were **removed**, deliberately: a human-facing
+CLI is not a goal (§2), MCP is the read/write path, and anything scriptable is better served as a
+client of it. `doctor` is the read-only digest that survives; the `stats` digest of §14 is the
+`memory_stats` tool.
 - `ellmephant mcp` → MCP server; Streamable HTTP on `port` (default 8888) at `/mcp`; `--stdio` for stdio.
 
 **Portability:** the store is one file (`~/.ellmephant/memory.db`), so moving a machine is a copy.
@@ -554,8 +554,8 @@ any model is touched; flags are re-checked the same way after they override the 
    applies `0001…0005` in order, so it opens at the current schema (**v5** today); an existing store
    is stepped up to it on open.
 6. **Tags** — decided: stored on each row (comma-joined) and folded into the document embedding;
-   `ellmephant tags` derives the vocabulary and counts. Dangling `[[key]]` targets are audited by
-   `links`.
+   the vocabulary and its counts come from the `memory_stats` tool (and `doctor`). Dangling
+   `[[key]]` targets are counted by `doctor`.
 7. **Persist `embed_text` vs recompute** — decided: recompute. The per-row `hash`
    (`store::row_hash`) decides when a re-embed is needed; nothing extra is stored.
 8. **`--expand` hop semantics + bundle shape** — shipped (P5): breadth-first over

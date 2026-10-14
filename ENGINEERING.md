@@ -53,7 +53,7 @@ The decisions the code obeys:
 
 ```
    clients                                    you
-   Cline · TypingMind · any MCP client        REPL · one-shot CLI
+   Cline · TypingMind · any MCP client        doctor · model (ops only)
               │                                        │
               │  MCP over HTTP (or stdio)              │  one shared core
               └───────────────────┬────────────────────┘
@@ -83,7 +83,7 @@ Five layers, one crate:
 | Write path | `store`, `embed`, `index/vec` | upsert a row: key, one hash, tags, links, one vector |
 | Structures | `store::project` | projects: identity, the ordered preload, membership (one home) |
 | Read path | `search`, `index/vec` | one semantic phrase → KNN over the document vectors |
-| Interfaces | `cli`, `mcp` | REPL + one-shot, MCP server (HTTP default, stdio option) |
+| Interfaces | `cli`, `mcp` | MCP server (HTTP default, stdio option); `doctor` + `model` for operations |
 | Tooling | `model`, `bench` | weights cache, latency + golden-eval measurements |
 
 ## Storage model
@@ -170,7 +170,7 @@ cannot occur in a slug, so no name can squat on the marker, and the type rides o
 name. At write time a link becomes a derived
 `memory_link` edge; search finds forward links and backlinks, and `--expand` walks them. Links
 are **by key, never by id**, so they survive a `reembed` and forward references. A `[[key]]`
-with no target is reported by `ellmephant links` as a warning rather than an error (per kind: a
+with no target is reported by `doctor` as a count rather than an error (per kind: a
 missing memory and a missing project are different rot). `ellmephant
 rename OLD NEW` rewrites the tokens and repoints the memory edges in one transaction.
 
@@ -219,7 +219,7 @@ src/
 ├── store/             add/get + projects + derived indexes (slug, tags, links) + maintain (reembed)
 ├── index/             the vec0 (KNN) document-vector table
 ├── search/            the semantic phrase search over the store
-├── cli/               subcommands, repl, session, output formatting
+├── cli/               doctor, model, session (the MCP server is the interface)
 ├── mcp/               MCP server (HTTP default; stdio option)
 └── bench/             timings, golden eval (recall@k + MRR), sweeps
 migrations/            NNNN_*.sql, embedded with include_str!

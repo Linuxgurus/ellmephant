@@ -230,7 +230,7 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 A project is **an activity completed over time** — work with a beginning, a current state, and a
 place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
 prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`dead`), an
-`owner` (a set of `me`|`James`|`us`), `tags`, and a `preload` — the **ordered** list of memories to load as
+`owner` (a set of names), `tags`, and a `preload` — the **ordered** list of memories to load as
 context to work in here, which is the boot set generalized to every project. It is **listed** by
 field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by `project_get`,
 which resolves both of its relations to memories. Projects are never embedded: a shape is not
@@ -250,7 +250,7 @@ CREATE TABLE project (             -- the key IS the identity: no rowid-derived 
   goal    TEXT NOT NULL DEFAULT '',        -- what this is for
   state   TEXT NOT NULL DEFAULT '',        -- mutable current-state prose
   status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|dead
-  owner   TEXT NOT NULL DEFAULT 'us',      -- comma-joined set: me|James|us
+  owner   TEXT NOT NULL DEFAULT '',      -- comma-joined names, e.g. 'Cline,James'
   tags    TEXT NOT NULL DEFAULT '',
   preload TEXT NOT NULL DEFAULT '',        -- comma-joined keys, ORDERED: attention
   created TEXT NOT NULL DEFAULT (datetime('now')),
@@ -262,9 +262,13 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   project_key TEXT NOT NULL);
 ```
 
-- **`owner` is a set,** stored comma-joined and validated in Rust (`james` → `James` — one person,
-  one name — then sorted and deduped). A `CHECK` cannot validate the *elements* of a comma list,
-  which is the same reason `tags` has none.
+- **`owner` is a set of names, and the names are free text.** Comma-joined, trimmed, de-duped
+  case-insensitively and sorted (`James`, not `james`; one person, one entry) — but never checked
+  against a list, because the code has no list to check against. It cannot: the store does not know
+  who exists, and `me`/`us` would be worse than useless in a store two agents share, since they mean
+  whoever happens to be reading. A name nobody recognises is a typo, not a schema violation — and a
+  blank `owner` is unassigned, which is a fact rather than a missing field. A `CHECK` could not
+  validate the *elements* of a comma list anyway, the same reason `tags` has none.
 
 - **One tie table, not two: a relation earns a table only when its invariant is cross-row.**
   `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a

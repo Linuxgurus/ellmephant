@@ -65,10 +65,9 @@ fn upsert_and_get_round_trip_with_defaults() {
     assert_eq!(got.title, "Chronos — the timing subsystem");
     assert_eq!(got.goal, "Place my own intent into a future I won't occupy");
     assert_eq!(got.status, "todo", "empty status takes the default");
-    assert_eq!(
-        got.owner,
-        vec!["us".to_string()],
-        "empty owner takes the default"
+    assert!(
+        got.owner.is_empty(),
+        "an unowned project is unassigned -- the code has no owner to default to"
     );
     assert_eq!(
         got.tags,
@@ -82,7 +81,7 @@ fn upsert_and_get_round_trip_with_defaults() {
 }
 
 #[test]
-fn an_unknown_status_or_owner_is_rejected() {
+fn an_unknown_status_is_rejected() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
@@ -91,16 +90,26 @@ fn an_unknown_status_or_owner_is_rejected() {
     p.status = "zombie".into();
     let err = project::upsert(&conn, &p, None).unwrap_err();
     assert!(format!("{err}").contains("unknown status"), "{err}");
-
-    let mut p = project_fixture("x");
-    p.title = "X".into();
-    p.owner = vec!["nobody".to_string()];
-    let err = project::upsert(&conn, &p, None).unwrap_err();
-    assert!(format!("{err}").contains("unknown owner"), "{err}");
     assert!(
         project::get(&conn, "prj-x").unwrap().is_none(),
         "nothing written"
     );
+}
+
+#[test]
+fn an_unknown_owner_is_not_an_error() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    // No vocabulary exists to reject against: whoever writes a project owns it, and the store has
+    // no business guessing who that is.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.owner = vec!["nobody-you-know".to_string()];
+    let key = project::upsert(&conn, &p, None).expect("free text owner is accepted");
+
+    let got = project::get(&conn, &key).unwrap().expect("exists");
+    assert_eq!(got.owner, vec!["nobody-you-know".to_string()]);
 }
 
 #[test]
@@ -110,21 +119,21 @@ fn an_owner_set_round_trips_through_one_column() {
 
     let mut p = project_fixture("x");
     p.title = "X".into();
-    p.owner = vec!["us".to_string(), "james".to_string()];
+    p.owner = vec!["James".to_string(), "Cline".to_string()];
     project::upsert(&conn, &p, None).expect("upsert");
 
     let got = project::get(&conn, "prj-x").unwrap().expect("exists");
     assert_eq!(
         got.owner,
-        vec!["James".to_string(), "us".to_string()],
-        "canonical spelling, sorted"
+        vec!["Cline".to_string(), "James".to_string()],
+        "sorted, in the spelling it was given"
     );
     let raw: String = conn
         .query_row("SELECT owner FROM project WHERE key = 'prj-x'", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(raw, "James,us", "one column, comma-joined");
+    assert_eq!(raw, "Cline,James", "one column, comma-joined");
 }
 
 #[test]

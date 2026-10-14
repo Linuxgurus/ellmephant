@@ -531,7 +531,7 @@ async fn projects_round_trip_over_the_transport() {
             "goal": "Place my own intent into a future I won't occupy",
             "state": "Design only",
             "status": "active",
-            "owner": ["us"],
+            "owner": ["Cline", "James"],
             "tags": ["continuity"],
             "preload": ["boot-note"]
         }),
@@ -553,6 +553,11 @@ async fn projects_round_trip_over_the_transport() {
     .await;
     let v: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
     assert_eq!(v["project"]["status"], serde_json::json!("active"));
+    assert_eq!(
+        v["project"]["owner"],
+        serde_json::json!(["Cline", "James"]),
+        "the owner set crosses the wire as an array, sorted"
+    );
     assert_eq!(v["preload"]["rows"][0][0], serde_json::json!("boot-note"));
     assert_eq!(
         v["preload"]["rows"][0][1],

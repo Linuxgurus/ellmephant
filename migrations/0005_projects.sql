@@ -19,10 +19,12 @@
 -- `[a-z0-9-]` (slug.rs), so a comma can never occur inside one -- the delimiter is safe by
 -- construction, not by convention.
 
--- `owner` is a SET: comma-joined names from a small vocabulary (`me`, `James`, `us`), sorted and
--- deduped by the codec. It is validated in Rust rather than by a CHECK, because a CHECK cannot
--- validate the *elements* of a comma list -- the same reason `tags` has no CHECK either. A key is
--- `[a-z0-9-]`, so the comma stays unambiguous.
+-- `owner` is a SET of names, comma-joined: 'Cline,James'. FREE TEXT -- no vocabulary, no `me`/`us`.
+-- The store does not know who exists and must not pretend to: `me` resolves differently for every
+-- reader, and a shared store cannot carry an indexical. `status` is validated in Rust, and `owner`
+-- is *not*, because a CHECK cannot validate the *elements* of a comma list -- the same reason `tags`
+-- has no CHECK either. Names are trimmed, deduped case-insensitively and sorted by the codec; a
+-- blank `owner` means unassigned, which is a fact about the project, not a missing field.
 
 CREATE TABLE project (
   key     TEXT PRIMARY KEY,                     -- 'prj-…'; identity and link target
@@ -30,7 +32,7 @@ CREATE TABLE project (
   goal    TEXT NOT NULL DEFAULT '',             -- what this is for
   state   TEXT NOT NULL DEFAULT '',             -- mutable current-state prose
   status  TEXT NOT NULL DEFAULT 'todo',         -- todo|active|paused|done|dead
-  owner   TEXT NOT NULL DEFAULT 'us',           -- comma-joined set: me|James|us
+  owner   TEXT NOT NULL DEFAULT '',             -- comma-joined names, e.g. 'Cline,James'
   tags    TEXT NOT NULL DEFAULT '',             -- comma-joined, sorted (the memory codec)
   preload TEXT NOT NULL DEFAULT '',             -- comma-joined keys, ORDERED by priority
   created TEXT NOT NULL DEFAULT (datetime('now')),

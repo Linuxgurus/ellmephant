@@ -125,7 +125,8 @@ ordered `preload`. A project is the structure half of the store and a container 
 inside; facts go in memories, where the store matches them by meaning. `key` is `prj-…` (a bare \
 name is prefixed). \
 `status` is todo|active|paused|done|dead — `dead` is how a project ends, there is no delete; \
-`owner` is a set drawn from me|James|us. `preload` is the ORDERED list of memory keys to load as \
+`owner` is a set of names, e.g. [\"Cline\",\"James\"] — free text, since the store keeps no list of \
+who exists (and `me` would mean whatever reader asks). `preload` is the ORDERED list of memory keys to load as \
 context to work \
 in here; it replaces the previous list, and it may name memories this project did not author \
 (conventions, boot notes). A write is whole-row, so `project_get` first if you mean to edit one \
@@ -422,7 +423,9 @@ pub struct ProjectUpsertParams {
     pub status: Option<String>,
     /// Whose it is.
     #[serde(default)]
-    #[schemars(description = "Whose it is: a set of me | James | us (default us).")]
+    #[schemars(
+        description = "Whose it is: a set of names, e.g. [\"Cline\",\"James\"]. Free text; empty = unassigned."
+    )]
     pub owner: Option<Vec<String>>,
     /// Aspect tags.
     #[serde(default)]

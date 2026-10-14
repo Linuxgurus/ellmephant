@@ -10,7 +10,7 @@ normative specification see [`SPEC.md`](SPEC.md).
 - [Versioning](#versioning)
 - [Publishing a release](#publishing-a-release)
 - [Releasing the chart](#releasing-the-chart)
-- [Harbor publishing](#harbor-publishing)
+- [Publishing](#publishing)
 - [Pre-releases](#pre-releases)
 - [Hotfixes](#hotfixes)
 - [Gotchas](#gotchas)
@@ -34,12 +34,14 @@ describe - `ci.yml`, `docker-release.yml`, `chart-release.yml` - were deleted in
 every path and claim that mentioned them was stale.
 
 - **`.forgejo/workflows/publish-dev.yml`** - fires on a push to `dev`, plus manual dispatch. Builds
-  the runtime image on the cluster (natively amd64) and pushes it to Harbor as `edge` and
-  `sha-<commit>`. It replaced the old `.githooks/post-commit` hook, which built with podman on
-  whichever developer machine happened to be awake. It publishes **the image only**.
-- **TODO: nothing publishes the chart.** A chart change needs `make chart-push` by hand until a
-  `publish-chart.yml` exists alongside `publish-dev.yml` - the runner already has Harbor access, so
-  the workflow is the obvious shape. See [Harbor publishing](#harbor-publishing).
+  the runtime image on the cluster (natively amd64) and publishes it to **both** registries:
+  `edge` + `sha-<commit>` to private Harbor, then the same digests mirrored to public GHCR. It
+  replaced the old `.githooks/post-commit` hook, which built with podman on whichever developer
+  machine happened to be awake. See [Publishing](#publishing).
+- **TODO: nothing publishes the chart.** A chart change needs `make chart-push` by hand (straight to
+  private Harbor) until a `publish-chart.yml` exists alongside `publish-dev.yml`. The chart has no
+  **public** home at all yet, which matters more than the automation: users outside the LAN cannot
+  install it.
 - **`.forgejo/workflows/smoke.yml`** - manual dispatch only. A diagnostic for the runner itself
   (does a job start, does `actions/checkout` resolve, can a job reach the Docker daemon), written
   when nothing on the instance had yet executed a job. Not a check of the code.
@@ -167,27 +169,51 @@ make chart-lint
 make chart-template
 ```
 
-## Harbor publishing
+## Publishing
 
-Harbor is `harbor.vn.linuxguru.net`, reachable only from the LAN - which is why the publisher runs
-**inside the cluster**: the Forgejo runner can reach Harbor, a GitHub runner could not.
+Two registries, one build:
 
-A push to `dev` publishes the **image** itself. `.forgejo/workflows/publish-dev.yml` builds it
-natively (amd64) and pushes `edge` + `sha-<commit>`.
+- **Harbor** (`harbor.vn.linuxguru.net/library/ellmephant`) is **private** — LAN-only, and what the
+  cluster pulls.
+- **GHCR** (`ghcr.io/jdblack/ellmephant`) is **public** — the same image, mirrored, for everyone else.
 
-The **chart is not published by any workflow yet** - that is the remaining gap, and it wants a
-`.forgejo/workflows/publish-chart.yml` like `publish-dev.yml` (the runner can reach Harbor, so nothing
-is in the way). `TODO`. Until it exists, push it by hand:
+A push to `dev` publishes both. `.forgejo/workflows/publish-dev.yml` builds natively on the cluster
+(amd64), pushes `edge` + `sha-<commit>` to Harbor, then **re-tags** and pushes those same digests to
+GHCR: `docker tag`, never a rebuild, so the image the cluster runs and the image anyone can pull are
+provably the same bytes. The public mirror is why the runner has to reach `ghcr.io` as well as the
+LAN.
+
+Credentials are repo-level Actions secrets:
+
+| secret | what it is |
+|---|---|
+| `HARBOR_USER` / `HARBOR_TOKEN` | the Harbor robot `robot$library+forgejo` (pull, push, tag-create — no delete), written by `module.forgejo_setup` in stacks/mantle |
+| `GHCR_USER` / `GHCR_TOKEN` | the public mirror — **not** written by that module; the token needs `write:packages` |
+
+Without the GHCR pair the mirror step **fails and says so** rather than skipping quietly: a public
+publish that silently stops is worse than one that complains.
+
+Tags published today are `edge` and `sha-<commit>`, on both registries — including the **public**
+GHCR one, so `ghcr.io/jdblack/ellmephant:edge` is pullable right now. There is **no `latest` and no
+version tag**, which is the one thing README's quickstart still assumes
+(`ghcr.io/jdblack/ellmephant:latest`); that needs a release publisher (see
+[Publishing a release](#publishing-a-release)).
+
+The **chart is not published by any workflow yet**, and it needs to be, because Harbor is private and
+the chart has no public home at all. Shape: a `.forgejo/workflows/publish-chart.yml` like
+`publish-dev.yml` (the runner can reach both registries), pushing to Harbor *and* mirroring to
+something public — `oci://ghcr.io/jdblack/charts/ellmephant` is the natural one, since GHCR serves
+OCI artifacts too. `TODO`. Until then, push it by hand:
 
 ```sh
 helm registry login harbor.vn.linuxguru.net     # one-time; helm keeps its own credential store
-make chart-push                                 # package + push to oci://…/library/charts
+make chart-push                                 # package + push to oci://…/library/charts (PRIVATE)
 ```
 
 An image built by hand (`make docker-build`, needs `make builder-image` once) goes up with
 `podman push`, but leave that to the workflow unless you are publishing a version the workflow cannot.
 
-Point the cluster at the mirror with:
+Point the cluster at Harbor:
 
 ```sh
 --set image.repository=harbor.vn.linuxguru.net/library/ellmephant
@@ -270,9 +296,18 @@ stand behind - by hand, since nothing does it for you.
   would double an emulated local build for no user. A by-hand `make docker-build` on Apple Silicon
   is that same slow, emulated build (and it wants `make builder-image` once, or it rebuilds every
   dependency).
-- **`charts/ellmephant/values.yaml` defaults to a ghcr image.** Nothing in this repository publishes
-  to ghcr any more; the cluster overrides `image.repository` to Harbor. Until the public registry is
-  decided, treat that default as stale.
+- **Harbor is private; GHCR is the public face.** Same build, two registries, mirrored by
+  `publish-dev.yml` with `docker tag` (so both carry the same digest). Only `edge` and `sha-<commit>`
+  exist: **no `latest`, no version tag** until a release publisher exists.
+- **The GHCR mirror needs its own secrets.** `GHCR_USER` / `GHCR_TOKEN` (token needs
+  `write:packages`) are not written by `module.forgejo_setup` the way `HARBOR_*` are. Missing them
+  fails the mirror step loudly.
+- **A ghcr package can start private.** After the first successful mirror, check the package's
+  visibility under Package settings if anonymous pulls are wanted — "public registry" is a setting,
+  not a consequence of pushing.
+- **`charts/ellmephant/values.yaml` defaults to the ghcr image** — correct, since ghcr is public. But
+  `artifacthub.io/images` names `:1.1.0`, which does not exist publicly (no release publisher), and
+  nothing guards the version any more.
 - **`artifacthub.io/images` is no longer guarded.** The check that kept its tag equal to
   `Cargo.toml`'s version lived in the deleted `ci.yml`, so an unbumped entry now ships a stale
   reference.

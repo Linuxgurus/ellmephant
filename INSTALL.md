@@ -97,17 +97,18 @@ See the [README](README.md) for usage, including the MCP server on a host and in
 
 A chart ships in [`charts/ellmephant/`](charts/ellmephant/): one Deployment, a store PVC, and an
 optional separate weights-cache PVC, serving MCP over HTTP on port 8888. It defaults to the public
-image `ghcr.io/jdblack/ellmephant` — **note that nothing in this repository publishes to ghcr any
-more**, so override the repository if you pull from somewhere else (the maintainer's cluster points it
-at Harbor via `image.repository`).
+image `ghcr.io/jdblack/ellmephant`, which is the mirror of what the maintainer's cluster runs: a push
+to `dev` publishes `edge` and `sha-<commit>` there. There is **no `latest` yet**, so pin a tag
+(`…:edge`, or a specific `…:sha-abcdef1`).
 
 ```sh
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-The chart is published to **Harbor**, as an OCI artifact, by hand (`make chart-push`): the workflow
-that attached it to a GitHub Release was deleted with the rest of the GitHub Actions setup, so there
-is no release asset to install from any more. Install straight from OCI:
+**The chart itself is not published publicly yet.** The maintainer's Harbor is LAN-only, and the
+Forgejo workflow that will mirror the chart to a public registry does not exist (`TODO` in
+[`DEVELOPMENT.md`](DEVELOPMENT.md)). So install it from a checkout, as above — or, from inside the
+LAN, from the private registry:
 
 ```sh
 helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0

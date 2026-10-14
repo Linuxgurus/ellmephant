@@ -12,10 +12,9 @@ PVC. No sidecars, no operators.
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-The chart is published to Harbor as an OCI artifact, by hand — `make chart-push` (see
-[`DEVELOPMENT.md`](../../DEVELOPMENT.md)). The workflow that used to attach it to a GitHub Release
-was deleted with the rest of the GitHub Actions setup, so there is no release asset to install from
-and no Helm repo index to `helm repo add`:
+**The chart is not published to a public registry yet.** `make chart-push` publishes it to the
+maintainer's Harbor, which is LAN-only (see [`DEVELOPMENT.md`](../../DEVELOPMENT.md)); mirroring it
+somewhere public is a `TODO`. So install from a checkout, as above, or from inside the LAN:
 
 ```sh
 helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0

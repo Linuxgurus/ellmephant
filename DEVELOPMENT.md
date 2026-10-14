@@ -28,31 +28,41 @@ release-grade - and, if the version was bumped, publishes an image.
 
 ## The workflows
 
-- **`.github/workflows/ci.yml`** - runs on every push to `main` and every pull request. Format,
-  clippy, tests (both feature sets), a no-push Docker build, and the chart gate (lint, render
-  every value shape, and the two version guards). Gate, not publisher.
-- **`.github/workflows/docker-release.yml`** - the image publisher. Fires on a push to `main`, a
-  push to `dev`, a `v*` tag, or manually. It reads the version from `Cargo.toml` and pushes the
-  image to `ghcr.io/<owner>/ellmephant`.
-- **`.github/workflows/chart-release.yml`** - the chart publisher. Fires on a push to `main` that
-  touches `charts/**`. Packages each chart and attaches it to a GitHub Release tagged
-  `<chart>-<version>` (`--latest=false`, so a chart release never claims the repository's "Latest
-  release"). Release assets only: no Pages, no `gh-pages`, no registry, no third-party action.
+Everything runs on **Forgejo** (`git.vn.linuxguru.net`) from
+[`.forgejo/workflows/`](.forgejo/workflows/). The GitHub Actions workflows this section used to
+describe - `ci.yml`, `docker-release.yml`, `chart-release.yml` - were deleted in `6b16f5b`, so
+every path and claim that mentioned them was stale.
 
-What the publisher emits, per event:
+- **`.forgejo/workflows/publish-dev.yml`** - fires on a push to `dev`, plus manual dispatch. Builds
+  the runtime image on the cluster (natively amd64) and pushes it to Harbor as `edge` and
+  `sha-<commit>`. It replaced the old `.githooks/post-commit` hook, which built with podman on
+  whichever developer machine happened to be awake. It publishes **the image only**.
+- **`.forgejo/workflows/smoke.yml`** - manual dispatch only. A diagnostic for the runner itself
+  (does a job start, does `actions/checkout` resolve, can a job reach the Docker daemon), written
+  when nothing on the instance had yet executed a job. Not a check of the code.
+- **Nothing runs on a pull request.** There is no CI gate on this repository: a PR shows **no
+  statuses at all**, so a green-looking PR means nothing has been verified. The checks are yours to
+  run, and they are the ones that matter:
 
-| Event | Condition | Image tag(s) |
-|---|---|---|
-| push to `main` | `Cargo.toml` version bumped, `vX.Y.Z` not yet tagged | `X.Y.Z`, `X.Y`, `X`, `latest` |
-| push to `main` | `Cargo.toml` version already tagged | *(nothing - a no-op)* |
-| push to `main` | version is a pre-release, e.g. `1.1.0-rc.1` | `1.1.0-rc.1` only |
-| push to `dev` | always | `edge`, `sha-<commit>` |
-| push tag `v1.1.0` | - | `1.1.0`, `1.1`, `1`, `latest` |
-| push tag `v1.1.0-rc.1` | - | `1.1.0-rc.1` only |
-| manual dispatch | - | `edge`, `sha-<commit>` |
+  ```sh
+  cargo fmt --check
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test                                  # and again with --no-default-features
+  make chart-lint && make chart-template
+  ```
 
-On a release it also creates and pushes the annotated tag `vX.Y.Z`, so the git history records
-the release without a separate step.
+  Run the cargo steps one at a time - they contend on the target-dir lock.
+
+What gets published, per event:
+
+| Event | Image tag(s) |
+|---|---|
+| push to `dev` | `edge`, `sha-<commit>` (Harbor, built on the cluster) |
+| manual dispatch of `publish-dev` | the same |
+| anything else | nothing |
+
+**Nothing publishes a version.** No tag is created for you, and a push to `main` publishes nothing -
+see [Publishing a release](#publishing-a-release).
 
 `edge` is a **moving** tag: it always points at the newest `dev` build. It is not a version, and
 a `-dev` suffix is deliberately not used - a version per commit would be meaningless and would
@@ -60,10 +70,10 @@ churn. `sha-<commit>` pins one exact build if you need to go back.
 
 ## Day to day: when to commit and push
 
-- **Commit and push to `dev` freely.** Small, self-contained commits. Every push runs CI and
-  republishes `edge`. If it builds and the tests pass, it may go in.
-- **Merge `dev` -> `main` when you want to release.** Bump the version first (see below); if the
-  version is unchanged, the merge publishes nothing.
+- **Commit and push to `dev` freely.** Small, self-contained commits. Every push republishes
+  `edge`. Run the gates yourself first - nothing else will (there is no PR CI).
+- **Merge `dev` -> `main` when the code is release-grade.** That merge publishes nothing by itself:
+  a stable release is a deliberate, manual step, and today that step does not exist (below).
 - **Tag by hand only for out-of-band releases** - a pre-release cut from `dev`, or a hotfix. The
   normal path needs no manual tag.
 
@@ -79,8 +89,10 @@ git push -u origin fix-search-ranking      # open a PR into dev
 ## Versioning
 
 Versions are [SemVer](https://semver.org/), and `Cargo.toml`'s `version` is the source of truth:
-for `ellmephant --version`, and for the release workflow. The `Cargo.lock` entry for the crate
-must agree. **Bumping this version is what triggers a release.**
+for `ellmephant --version`, and for the image tags. The `Cargo.lock` entry for the crate must agree.
+**A version bump used to trigger a release when it reached `main`; that publisher is gone** (see
+[The workflows](#the-workflows)), so a bump now only records intent - publishing it is a manual
+step, and for a stable image there is currently no step at all.
 
 - `MAJOR` - incompatible change to the CLI, the MCP tool surface, or the on-disk schema.
 - `MINOR` - new, backwards-compatible capability.
@@ -98,56 +110,54 @@ The Helm chart has its own version, deliberately **not** locked to the crate:
 | `appVersion` (e.g. `1.0.0`) | the app release the chart defaults to | keep it equal to `Cargo.toml`'s `version` |
 
 `image.tag` is empty by default, so it resolves to `appVersion` - a stale `appVersion` silently
-ships a stale image. CI enforces both: `appVersion` must equal `Cargo.toml`, and a chart change
-must touch `Chart.yaml` (otherwise the `<chart>-<version>` release already exists, the job skips
-it, and nothing publishes). Staying on `0.x` until the values surface settles is intentional.
+ships a stale image. **Nothing enforces either rule any more**: the guard lived in the deleted
+GitHub `ci.yml`, so check them yourself (a chart change must also carry its own `version` bump, or
+nothing distinguishes the new chart from the old one). Staying on `0.x` until the values surface
+settles is intentional.
 
 ## Publishing a release
 
-The workflow does the tagging and the image; you only bump the version and merge.
+**There is no automated stable release.** The workflow that read `Cargo.toml`, created the tag
+`vX.Y.Z` and published `X.Y.Z` / `X.Y` / `X` / `latest` was `docker-release.yml`, deleted in
+`6b16f5b`. Nothing tags a release for you, nothing moves `latest`, and `main` is not wired to
+publish anything: `dev` is the only branch that publishes, and what it publishes is `edge`.
 
-1. On `dev`, bump `version` in `Cargo.toml` (and its `Cargo.lock` entry); commit and push.
-2. Merge `dev` into `main` and push.
-3. The workflow reads the version, tags `vX.Y.Z`, and publishes `X.Y.Z`, `X.Y`, `X`, `latest`.
-
-```sh
-# version already bumped and committed on dev
-git switch main && git merge --no-ff dev && git push origin main
-# -> tag v1.1.0 created; image 1.1.0, 1.1, 1, latest published
-```
-
-4. Optionally publish a GitHub Release for the new tag:
+What remains is manual:
 
 ```sh
-gh release create v1.1.0 --title 'v1.1.0' --generate-notes
+make harbor-publish        # chart -> oci://…/library/charts + image rebuilt locally (edge, sha-<short>)
+make chart-push            # the chart alone
 ```
 
-If you merge to `main` without changing the version, the workflow detects that `vX.Y.Z` already
-exists and does nothing. Only a version bump publishes.
+Neither produces a **versioned** tag - the script pushes `edge` and `sha-<short>`, in every mode. So
+releasing `1.1.0` today means: bump the version, build the commit, and push it under its own tag by
+hand (`podman tag` + `podman push`, once `helm registry login` has been done). Restoring a publisher
+is open work, and it has to run somewhere that can reach Harbor - the **Forgejo** runner can, since
+it is on the LAN; a GitHub runner could not, which is what the old workflow papered over.
 
 ## Releasing the chart
 
-The chart lives in [`charts/ellmephant/`](charts/ellmephant/).
-[`chart-release.yml`](.github/workflows/chart-release.yml) packages each chart under `charts/` and
-attaches it to a GitHub Release tagged `<chart>-<version>`. That is the whole publish path:
-`helm package` plus the preinstalled `gh` CLI, so there is **nothing to set up by hand** - no
-Pages, no `gh-pages` branch, no registry.
+The chart lives in [`charts/ellmephant/`](charts/ellmephant/). `chart-release.yml` - which packaged
+it and attached it to a GitHub Release - was deleted with the rest of the GitHub workflows, so the
+chart's publish path is now **Harbor, by hand**:
+
+```sh
+make chart-push            # helm package + helm push to oci://harbor.vn.linuxguru.net/library/charts
+```
 
 To cut a chart release:
 
-1. Bump `version` in `charts/ellmephant/Chart.yaml` (patch is almost always right).
-2. Commit and merge into `main`.
+1. Bump `version` in `charts/ellmephant/Chart.yaml` (patch is almost always right), and keep
+   `appVersion` equal to `Cargo.toml`'s version.
+2. Commit, then push the chart: `make chart-push`.
 
-The workflow skips a `<chart>-<version>` release that already exists, so it is a no-op unless the
-version moved. There is no `index.yaml`, so `helm repo add` does not apply - users install the
-asset directly:
+There is no `index.yaml`, so `helm repo add` does not apply - the chart installs straight from OCI:
 
 ```sh
-helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.1/ellmephant-0.2.1.tgz
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
 ```
 
-Local sanity before you push (also what CI runs):
+Local sanity before you push - the same two commands the chart gate used to run in CI:
 
 ```sh
 make chart-lint
@@ -156,35 +166,31 @@ make chart-template
 
 ## Dev publishing to Harbor
 
-Harbor is `harbor.vn.linuxguru.net`, reachable only from the LAN, so a GitHub runner cannot push
-to it: this step is local by necessity. `dev` is wired to publish itself.
+Harbor is `harbor.vn.linuxguru.net`, reachable only from the LAN - which is why the publisher runs
+**inside the cluster**: the Forgejo runner can reach Harbor, a GitHub runner could not.
 
-On a commit to `dev`, `.githooks/post-commit` backgrounds `scripts/harbor-publish.sh`, which:
+A push to `dev` publishes itself. `.forgejo/workflows/publish-dev.yml` builds the image natively
+(amd64) and pushes `edge` + `sha-<commit>`. It is the **image only** - the chart is not part of that
+workflow, so a chart change needs `make chart-push`.
 
-1. packages the chart and `helm push`es it to `oci://harbor.vn.linuxguru.net/library/charts`;
-2. builds the `linux/amd64` image with `podman` and pushes it to Harbor as `edge` + `sha-<short>`.
-
-Building locally is the normal process: the publish owns its own build, so a green CI run is never
-on the critical path and there is nothing to wait for. (`podman build` on Apple Silicon is an
-emulated amd64 rebuild, so it is slow - but self-contained.) `HARBOR_IMAGE_MODE=mirror` pulls the
-CI-built GHCR image instead (fast, but couples the publish to CI); `HARBOR_IMAGE_MODE=skip` skips
-the image.
-
-One-time, per clone:
+To publish by hand from the LAN (chart, image, or both):
 
 ```sh
-make harbor-hooks                               # git config core.hooksPath .githooks
-helm registry login harbor.vn.linuxguru.net     # podman already holds its own credential
+make harbor-publish                             # chart + image (image built locally with podman)
+SKIP_CHART=1 make harbor-publish                # image only
+make chart-push                                 # chart only
+tail -f .tmp/harbor-publish.log                 # when it runs in the background
 ```
 
-Watch it, skip it, or run it by hand:
+One-time setup for the by-hand path:
 
 ```sh
-tail -f .tmp/harbor-publish.log
-SKIP_HARBOR=1 git commit -m '...'               # one commit, no publish
-make harbor-publish                             # run it now
-SOURCE_TAG=1.1.0 HARBOR_IMAGE_MODE=mirror make harbor-publish   # mirror a released main image
+helm registry login harbor.vn.linuxguru.net     # podman keeps its own credential store
 ```
+
+**`HARBOR_IMAGE_MODE=mirror` no longer works.** It pulls `ghcr.io/jdblack/ellmephant:$SOURCE_TAG`
+and waits up to `WAIT_SECONDS` (1800) for that image to appear, but nothing publishes to GHCR any
+more: it hangs for half an hour and exits 1. Leave the mode at its default (`build`).
 
 Point the cluster at the mirror with:
 
@@ -209,25 +215,21 @@ and resource names are unchanged.
 
 ## Pre-releases
 
-A pre-release is a versioned, immutable artifact for testing ahead of a stable release.
+A pre-release is a versioned, immutable artifact for testing ahead of a stable release. Both forms
+below used to be a workflow; with the publisher gone they are the *intent* plus the tag you make by
+hand, and the image has to be pushed under that tag yourself.
 
-**Automatic (preferred):** set the `Cargo.toml` version to the pre-release and merge to `main`,
-exactly as for a stable release. A `-rc`/`-beta`/`-alpha` version publishes **only its own tag**
-- it never moves `latest`, `1`, or `1.1`, so a broken candidate cannot leak into production
-pulls. To promote it, bump the version to the final one and merge again.
+**Preferred:** set the `Cargo.toml` version to the pre-release, e.g. `1.1.0-rc.1`, so the build
+records what it was - and merge to `main` as usual. Nothing publishes from that merge; push the image
+under the pre-release tag only, never `latest`.
 
-**Manual:** tag a `dev` (or `main`) commit directly, when you do not want to touch the manifest:
+**Manual:** tag the commit directly, when you do not want to touch the manifest. The tag is a record:
+nothing builds from it any more.
 
 ```sh
 git switch dev && git pull
 git tag -a v1.1.0-rc.1 -m 'ellmephant 1.1.0-rc.1'
-git push origin v1.1.0-rc.1                # -> image 1.1.0-rc.1 ONLY
-```
-
-Mark pre-release GitHub Releases accordingly so they do not claim "Latest":
-
-```sh
-gh release create v1.1.0-rc.1 --prerelease --generate-notes
+git push origin v1.1.0-rc.1
 ```
 
 ## Hotfixes
@@ -238,48 +240,43 @@ A stable release is broken. Base the fix on the tag, not on `dev`.
 git switch -c hotfix-1.1.1 v1.1.0
 # ...fix, bump Cargo.toml (and Cargo.lock) to 1.1.1, commit...
 git switch main && git merge --no-ff hotfix-1.1.1
-git push origin main                       # -> tag v1.1.1 + image 1.1.1 published
+git push origin main                       # publishes nothing - the publisher is gone (above)
 git switch dev && git merge --no-ff hotfix-1.1.1 && git push   # keep dev from regressing
 ```
 
+The fix is not released until an image carrying it is pushed to Harbor under the tag you mean to
+stand behind - by hand, since nothing does it for you.
+
 ## Gotchas
 
-- **A version bump is the release trigger.** A merge to `main` that does not change `Cargo.toml`
-  publishes nothing. Bump to release.
-- **The auto-created tag does not start a second run.** The workflow pushes `vX.Y.Z` with the
-  built-in `GITHUB_TOKEN`, and GitHub does not let `GITHUB_TOKEN`-triggered pushes start new
-  workflow runs. That is why the image is published in the same run; you get one run, not two.
-- **Workflow permissions must allow writes.** This workflow asks for `contents: write` and
-  `packages: write`. If the repository or organisation sets *Settings -> Actions -> Workflow
-  permissions* to read-only, the block cannot elevate and the tag push / image push fails.
-- **A tag builds the workflow as of the tagged commit.** A tag-triggered run uses the workflow
-  file that exists *at that tag*. Tag a commit that already contains the workflow, or nothing
-  fires.
-- **Never add a raw `latest` tag rule.** `latest` is owned by `type=semver`'s `latest=auto`, which
-  skips pre-releases. A hand-rolled `latest` rule would move it onto an `-rc`.
-- **ghcr packages start private.** After the first publish, set visibility under Package settings
-  if anonymous pulls are wanted.
-- **Platforms.** Versioned releases are published for `linux/amd64` and `linux/arm64` (QEMU on the
-  runner), so Apple Silicon and arm64 hosts pull a native image instead of emulating amd64.
-  `dev`/`edge` builds are **amd64 only** - the cluster is amd64, and building the arm64 half too
-  would double a local, emulated build for no user.
-- **A chart change without a version bump publishes nothing.** `chart-release.yml` skips a
-  `<chart>-<version>` release that already exists, silently. CI fails the PR instead - but only on
-  a PR, so a direct push to `main` gets the silent no-op.
-- **The chart release cannot hang off the `v*` tag.** `docker-release.yml` pushes that tag with
-  `GITHUB_TOKEN`, which does not start other workflows - so `chart-release.yml` triggers on the
-  `charts/**` push to `main` instead, and fires independently of app releases.
-- **Chart releases are release assets, not a Helm repo.** There is no `index.yaml`, so
-  `helm repo add` does not apply: install by asset URL, or from the Harbor OCI mirror.
-- **Chart releases must not claim "Latest".** `--latest=false` keeps a chart release from taking
-  the repository's "Latest release" badge away from the app's `v*` releases.
-- **The Harbor hook is per clone.** `core.hooksPath` is local config, not committed - run
-  `make harbor-hooks` in a fresh clone or the hook silently does not exist.
-- **The Harbor hook builds locally, so it never waits on CI.** The image is built and pushed from
-  the working tree, so it does not depend on a green Actions run (nor does it require the commit to
-  be pushed first) - just expect a slow, emulated amd64 build on Apple Silicon. `SKIP_HARBOR=1`
-  skips the hook.
-- **Harbor needs its own login for helm.** podman and helm keep separate credential stores; the
-  hook's chart push fails until `helm registry login harbor.vn.linuxguru.net` has been run once.
-- **`artifacthub.io/images` is guarded too.** CI asserts the tag it names equals `Cargo.toml`'s
-  version, so a bump that misses it fails the build instead of shipping a stale reference.
+- **A version bump publishes nothing.** It records intent in `Cargo.toml` (`--version`) and feeds the
+  chart's `appVersion`; the publisher that used to act on it is gone.
+- **There is no CI.** A PR shows zero statuses, so a green-looking PR has verified nothing. Run
+  `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` (both
+  feature sets), `make chart-lint` and `make chart-template` yourself - one cargo step at a time, since
+  they contend on the target-dir lock.
+- **Publishing needs Harbor access, which is LAN-only.** The Forgejo runner has it (repo secrets
+  `HARBOR_USER`/`HARBOR_TOKEN`; the Harbor robot `robot$library+forgejo`, scoped to pull, push and
+  tag-create on `library` - notably it cannot delete). A GitHub-hosted runner never will.
+- **`HARBOR_IMAGE_MODE=mirror` is broken.** It waits 30 minutes for a GHCR image that no longer gets
+  built, then exits 1. Leave the mode at its default (`build`).
+- **The git hook is gone.** `.githooks/` was deleted with the old workflows, along with the
+  `make harbor-hooks` target it needed - publishing on `dev` is the Forgejo workflow's job.
+- **The chart is not published by the workflow.** `publish-dev.yml` pushes the image only; a chart
+  change needs `make chart-push` by hand.
+- **A chart change needs its own `version` bump, and a matching `appVersion`.** Nothing checks either
+  any more - a stale `appVersion` silently ships a stale image, since `image.tag` is empty by default.
+- **Chart and image live in separate Harbor repos** (`library/charts/ellmephant` vs
+  `library/ellmephant`). One repo would share a tag namespace, and a chart version like `1.0.0` would
+  collide with an image tag.
+- **Harbor needs its own login for helm.** podman and helm keep separate credential stores, so
+  `make chart-push` fails until `helm registry login harbor.vn.linuxguru.net` has been run once.
+- **Platforms.** `edge`/`sha-*` are built **amd64 only** - the cluster is amd64, and an arm64 half
+  would double an emulated local build for no user. A by-hand `make harbor-publish` on Apple Silicon
+  is that same slow, emulated build.
+- **`charts/ellmephant/values.yaml` defaults to a ghcr image.** Nothing in this repository publishes
+  to ghcr any more; the cluster overrides `image.repository` to Harbor. Until the public registry is
+  decided, treat that default as stale.
+- **`artifacthub.io/images` is no longer guarded.** The check that kept its tag equal to
+  `Cargo.toml`'s version lived in the deleted `ci.yml`, so an unbumped entry now ships a stale
+  reference.

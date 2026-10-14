@@ -86,7 +86,8 @@ mcp-memory-service → typed edges + tag AND/OR).
   (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
   A shared daemon is *optional* and only if bare one-shot latency annoys us (see §15).
 - **Indexes are derived:** the document vectors (`memory_vec`) and links (`memory_link`) are all
-  rebuildable from `memory`. Only `memory` is truth — no FTS index, no tag tables.
+  rebuildable from the rows. The rows are truth — `memory` and the project tables (§7.1) — and there
+  is no FTS index or tag table, so nothing else needs keeping in sync.
 
 ## 6. Embedder
 
@@ -536,8 +537,9 @@ any model is touched; flags are re-checked the same way after they override the 
    `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).
 4. **Daemon vs not** — decided: no daemon in v1. The REPL and the MCP server both keep the
    encoder warm, which is what the daemon would have bought (PLAN §2 #4).
-5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`; the first
-   run bootstraps schema v1.
+5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`. A fresh store
+   applies `0001…0005` in order, so it opens at the current schema (**v5** today); an existing store
+   is stepped up to it on open.
 6. **Tags** — decided: stored on each row (comma-joined) and folded into the document embedding;
    `ellmephant tags` derives the vocabulary and counts. Dangling `[[key]]` targets are audited by
    `links`.

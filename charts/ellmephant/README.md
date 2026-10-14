@@ -12,17 +12,10 @@ PVC. No sidecars, no operators.
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-[`chart-release.yml`](../../.github/workflows/chart-release.yml) packages the chart and attaches it
-to a GitHub Release tagged `ellmephant-<version>` — release assets only, so there is no Helm repo
-index and nothing to `helm repo add`. Install straight from the asset URL:
-
-```sh
-helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.0/ellmephant-0.2.0.tgz
-```
-
-Or from an OCI mirror, if one exists (see [`DEVELOPMENT.md`](../../DEVELOPMENT.md) for the Harbor
-recipe):
+The chart is published to Harbor as an OCI artifact, by hand — `make chart-push` (see
+[`DEVELOPMENT.md`](../../DEVELOPMENT.md)). The workflow that used to attach it to a GitHub Release
+was deleted with the rest of the GitHub Actions setup, so there is no release asset to install from
+and no Helm repo index to `helm repo add`:
 
 ```sh
 helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0

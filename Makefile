@@ -21,7 +21,7 @@ BUILDER_IMAGE   ?= $(HARBOR)/ellmephant-builder:$(BUILDER_PROFILE)-$(BUILDER_HAS
 KUBE_VERSION ?= 1.34.0
 
 .PHONY: build release test fmt clippy lint doc docker-build docker-run clean \
-        chart-lint chart-template chart-package chart-push harbor-publish harbor-hooks \
+        chart-lint chart-template chart-package chart-push harbor-publish \
         builder-image
 
 build:        ## debug build
@@ -66,13 +66,9 @@ chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: h
 harbor-publish:  ## push this commit to Harbor: chart + image (builds the image locally)
 	scripts/harbor-publish.sh
 
-builder-image:   ## build + push the dependency image (rare, slow; CI does it when Cargo.lock moves)
+builder-image:   ## build + push the dependency image (rare, slow; publish-dev builds it when the input hash moves)
 	docker build -f Dockerfile.builder -t $(BUILDER_IMAGE) .
 	docker push $(BUILDER_IMAGE)
-
-harbor-hooks:    ## install the repo's git hooks into this clone (core.hooksPath)
-	git config core.hooksPath .githooks
-	@echo "hooks installed: core.hooksPath -> .githooks"
 
 clean:
 	$(CARGO) clean

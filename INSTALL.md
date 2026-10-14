@@ -97,19 +97,20 @@ See the [README](README.md) for usage, including the MCP server on a host and in
 
 A chart ships in [`charts/ellmephant/`](charts/ellmephant/): one Deployment, a store PVC, and an
 optional separate weights-cache PVC, serving MCP over HTTP on port 8888. It defaults to the public
-image `ghcr.io/jdblack/ellmephant`.
+image `ghcr.io/jdblack/ellmephant` — **note that nothing in this repository publishes to ghcr any
+more**, so override the repository if you pull from somewhere else (the maintainer's cluster points it
+at Harbor via `image.repository`).
 
 ```sh
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-Releases are cut by [`chart-release.yml`](.github/workflows/chart-release.yml): the packaged chart
-is attached to a GitHub Release tagged `ellmephant-<version>`. Release assets only — no registry
-and no Helm repo index — so install straight from the asset URL:
+The chart is published to **Harbor**, as an OCI artifact, by hand (`make chart-push`): the workflow
+that attached it to a GitHub Release was deleted with the rest of the GitHub Actions setup, so there
+is no release asset to install from any more. Install straight from OCI:
 
 ```sh
-helm install ellmephant \
-  https://github.com/jdblack/ellmephant/releases/download/ellmephant-0.2.0/ellmephant-0.2.0.tgz
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
 ```
 
 Point the MCP client at `http://ellmephant.ellmephant.svc:8888/mcp`. The store lives on the

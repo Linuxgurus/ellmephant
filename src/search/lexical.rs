@@ -6,7 +6,7 @@
 //! and answers a plain boolean per row; [`run`](super::run) intersects that set with the rest of
 //! the query.
 //!
-//! No FTS index and no `LIKE`: `memory` is the only source of truth (SPEC §5/§7), so there is
+//! No FTS index and no `LIKE`: the rows are the only source of truth (SPEC §5/§7), so there is
 //! nothing to keep in sync — a scan over a store of thousands is cheap. Matching is
 //! case-insensitive in both modes.
 

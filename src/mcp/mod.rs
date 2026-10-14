@@ -73,7 +73,8 @@ const REEMBED_DESCRIPTION: &str = "\
 Recompute every stored vector and rebuild the derived vector index. Needed when the encoder \
 changes — a different model, projection or dimension — because the vector table's width is fixed \
 when it is created, and the store refuses to reinterpret stored vectors rather than hand back \
-wrong neighbours. `memory` (keys, tags, titles, bodies) is the only source of truth; everything \
+wrong neighbours. The rows (`memory` — keys, tags, titles, bodies; `project` — a project's own \
+fields) are the source of truth; everything \
 this touches is derived, so nothing written can be lost and re-running it is harmless. Heavy: it \
 loads the encoder and re-embeds the whole store in one call, so call it once and wait, rather \
 than retrying it.";

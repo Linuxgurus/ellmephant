@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Publish the current commit to Harbor - the in-cluster registry that GitHub runners cannot
-# reach (it is LAN-only), which is the whole reason this runs locally.
+# Publish the current commit to Harbor - the in-cluster registry, LAN-only, and reachable by the
+# Forgejo runner. This script is the BY-HAND path (`make harbor-publish`): a push to `dev` is
+# published automatically by `.forgejo/workflows/publish-dev.yml`, which builds natively and pushes
+# the *image only*.
 #
 # Two artifacts go up, under SEPARATE repos so their tags never collide:
 #   1. the chart, as an OCI artifact at `.../library/charts/ellmephant` (pushed immediately);
 #   2. the image at `.../library/ellmephant`, tagged `edge` and `sha-<short>`.
 #
-# The image is BUILT HERE by default (podman, linux/amd64) - the normal process. We do NOT wait
-# on GitHub CI to build the edge image: the publish owns its own build, so a green Actions run is
-# never on the critical path. HARBOR_IMAGE_MODE=mirror pulls the CI-built GHCR image instead
-# (fast, but couples the publish to CI); =skip pushes no image at all.
+# The image is BUILT HERE by default (podman, linux/amd64). NOTE: the image is only ever tagged
+# `edge` and `sha-<short>` -- this script publishes no version tag.
 #
-# Run in the background by .githooks/post-commit on `dev`; also by hand:
+# HARBOR_IMAGE_MODE=mirror pulls the GHCR image instead -- but nothing publishes to GHCR any more
+# (that was the deleted GitHub workflow), so mirror mode now waits WAIT_SECONDS for an image that
+# will never appear and exits 1. =skip pushes no image at all.
+#
+# Also by hand:
 #   make harbor-publish
 #   SKIP_CHART=1 make harbor-publish          # image only (chart content unchanged)
 #

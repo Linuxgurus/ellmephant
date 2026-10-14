@@ -170,7 +170,8 @@ rename OLD NEW` rewrites the tokens and repoints the edges in one transaction.
 
 ## Maintenance
 
-The `memory` table is the source of truth; every index on top of it is rebuildable.
+The rows are the source of truth — `memory`, `project`, `project_memory`; every index on top of them
+is rebuildable.
 
 - `reembed` drops and recreates the vec0 table when the embedder's width changes, recomputes
   every row's document vector, rewrites each row's `doc_hash`, and records

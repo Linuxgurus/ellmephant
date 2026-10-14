@@ -125,6 +125,10 @@ You never run any of it yourself; just say things like "What do you remember abo
 Maintenance is the same story: adding, updating, linking, deleting — it all happens through the
 assistant, in conversation. There are no commands for you to run.
 
+Alongside the memories sit **projects**: an activity over time — a goal, where it stands, who owns
+it, when it started and when it ended — that carries its own context and holds the memories written
+for it. "What am I working on?" and "what did I finish last month?" come out of the same store.
+
 ---
 
 ## Don't lose your data
@@ -248,8 +252,8 @@ full workflow.
 
 - One static binary, one SQLite file. The Qwen3 encoder runs in-process via candle — no Python, no
   ONNX Runtime, no sidecar.
-- The `memory` table is the source of truth. The vector index (`sqlite-vec` `vec0`) and the link
-  graph are derived and rebuildable.
+- The rows are the source of truth — `memory`, and the `project`/`project_memory` tables behind
+  projects. The vector index (`sqlite-vec` `vec0`) and the link graph are derived and rebuildable.
 - Store directory is `/data` (`ELLMEPHANT_HOME=/data`); the image's default command is the MCP
   server, binding `0.0.0.0:8888`.
 - Weights cache at `<home>/models/`, sha-pinned per revision; `--offline` forbids network and

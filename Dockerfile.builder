@@ -27,9 +27,14 @@ FROM rust:1-bookworm
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     CARGO_PROFILE_RELEASE_LTO=false
 
-# `gold` ships with binutils and beats the default `ld` (bfd). `lld` is not installed in this
-# image; note gold is itself deprecated upstream, so lld is the eventual answer.
-ENV RUSTFLAGS="-C link-arg=-fuse-ld=gold"
+# `lld`, not `gold`: rustc now warns on every gold link -- "the gold linker is deprecated and has
+# known bugs with Rust" -- and its advice is LLD. The Debian package is what a `cc -fuse-ld=lld`
+# resolves to; rustc's own preference on this toolchain is its bundled `rust-lld`.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends lld \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
 WORKDIR /src
 

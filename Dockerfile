@@ -9,11 +9,16 @@
 ARG BUILDER=rust:1-bookworm
 FROM ${BUILDER} AS builder
 
-# These MUST match Dockerfile.builder: the profile is part of cargo's dependency fingerprint, so a
-# mismatch here makes cargo rebuild every dependency the image was built to provide.
+# These MUST match Dockerfile.builder: BOTH the profile and `RUSTFLAGS` are part of cargo's
+# dependency fingerprint, so a mismatch here makes cargo rebuild every dependency the image was
+# built to provide. `lld` comes from the builder image; this install is for the no-argument build
+# above, whose base is a plain `rust:` image carrying no lld of its own.
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     CARGO_PROFILE_RELEASE_LTO=false
-ENV RUSTFLAGS="-C link-arg=-fuse-ld=gold"
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+RUN command -v ld.lld > /dev/null || (apt-get update \
+ && apt-get install -y --no-install-recommends lld \
+ && rm -rf /var/lib/apt/lists/*)
 
 WORKDIR /src
 

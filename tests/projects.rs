@@ -185,12 +185,15 @@ fn preload_is_ordered_and_replaced_wholesale() {
     // The list is ONE column on the row, in list order — no tie table, no `position`.
     let raw: String = conn
         .query_row(
-            "SELECT preload FROM project WHERE key = ?1",
+            "SELECT mem_preload FROM project WHERE key = ?1",
             params![key],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(raw, "c,a,b");
+    assert_eq!(
+        raw, "c,a,b",
+        "comma-joined memory keys, ordered by priority"
+    );
 
     // A second `Some` replaces the list; `None` leaves it alone.
     project::upsert(&conn, &project_fixture("chronos"), Some(&["b".to_string()])).expect("replace");

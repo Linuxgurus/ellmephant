@@ -15,9 +15,9 @@
 -- `contains` has one -- a memory has at most one home, anywhere, which a column cannot express
 -- because a column cannot see other rows -- so it gets a table. `preload` has none (a memory
 -- may sit in many projects' lists) and its order is a property of the LIST rather than of each
--- edge, so it is a column: no `position` column shuffling a rowset back into order. A key is
--- `[a-z0-9-]` (slug.rs), so a comma can never occur inside one -- the delimiter is safe by
--- construction, not by convention.
+-- edge, so it is a column (`mem_preload`): no `position` column shuffling a rowset back into
+-- order. A key is `[a-z0-9-]` (slug.rs), so a comma can never occur inside one -- the delimiter
+-- is safe by construction, not by convention.
 
 -- `owner` is a SET of names, comma-joined: 'Cline,James'. FREE TEXT -- no vocabulary, no `me`/`us`.
 -- The store does not know who exists and must not pretend to: `me` resolves differently for every
@@ -27,20 +27,20 @@
 -- blank `owner` means unassigned, which is a fact about the project, not a missing field.
 
 CREATE TABLE project (
-  key     TEXT PRIMARY KEY,                     -- 'prj-…'; identity and link target
-  title   TEXT NOT NULL,                        -- smart-caveman one-liner
-  goal    TEXT NOT NULL DEFAULT '',             -- what this is for
-  state   TEXT NOT NULL DEFAULT '',             -- mutable current-state prose
-  status  TEXT NOT NULL DEFAULT 'todo',         -- todo|active|paused|done|aborted
-  owner   TEXT NOT NULL DEFAULT '',             -- comma-joined names, e.g. 'Cline,James'
-  tags    TEXT NOT NULL DEFAULT '',             -- comma-joined, sorted (the memory codec)
-  preload TEXT NOT NULL DEFAULT '',             -- comma-joined keys, ORDERED by priority
-  created TEXT NOT NULL DEFAULT (datetime('now')),
-  updated TEXT NOT NULL DEFAULT (datetime('now')),
+  key         TEXT PRIMARY KEY,                 -- 'prj-…'; identity and link target
+  title       TEXT NOT NULL,                    -- smart-caveman one-liner
+  goal        TEXT NOT NULL DEFAULT '',         -- what this is for
+  state       TEXT NOT NULL DEFAULT '',         -- mutable current-state prose
+  status      TEXT NOT NULL DEFAULT 'todo',     -- todo|active|paused|done|aborted
+  owner       TEXT NOT NULL DEFAULT '',         -- comma-joined names, e.g. 'Cline,James'
+  tags        TEXT NOT NULL DEFAULT '',         -- comma-joined, sorted (the memory codec)
+  mem_preload TEXT NOT NULL DEFAULT '',         -- comma-joined memory keys, ORDERED by priority
+  created     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated     TEXT NOT NULL DEFAULT (datetime('now')),
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))
 );
 
--- `preload` — project -> memory, ORDERED (the `preload` column above). About ATTENTION: "to work
+-- `preload` — project -> memory, ORDERED (the `mem_preload` column above). About ATTENTION: "to work
 -- in here, load these." A project preloads memories it did NOT author (conventions, boot notes);
 -- it is the boot set, generalized to every project.
 

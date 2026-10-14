@@ -62,7 +62,7 @@ The decisions the code obeys:
                    index::vec  (one document vector per row)
                                   ▼
       SQLite  memory.db  —  `memory` rows are the source of truth
-      structures (not derived):  project (with its ordered preload column) · project_memory
+      structures (not derived):  project (with its ordered `mem_preload` column) · project_memory
       derived & rebuildable:  memory_vec · memory_link
                                   ▼
       embed::qwen3  (candle, in-binary)  —  weights under ~/.ellmephant/models/
@@ -99,7 +99,7 @@ target). Dimensions are frozen at `CREATE`; changing the embedder's width is a d
 `reembed`, not an implicit migration.
 
 **Two more tables are NOT derived: the project tables** (v5). `project` — carrying its ordered
-`preload` list as a column — and `project_memory` (memory → project, `memory_key` as `PRIMARY KEY`
+`mem_preload` list as a column — and `project_memory` (memory → project, `memory_key` as `PRIMARY KEY`
 so a memory has exactly one home) are source-of-truth alongside `memory`. They hold the *structure*
 half of the store: a project's own fields, plus its two relations to memories, with no embedding,
 telemetry or coherence verdict — those belong to facts, which are the thing matched by meaning. A

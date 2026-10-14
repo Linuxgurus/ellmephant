@@ -230,7 +230,7 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 A project is **an activity completed over time** — work with a beginning, a current state, and a
 place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
 prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`aborted`), an
-`owner` (a set of names), `tags`, and a `preload` — the **ordered** list of memories to load as
+`owner` (a set of names), `tags`, and a `preload` — the `mem_preload` column, the **ordered** list of memories to load as
 context to work in here, which is the boot set generalized to every project. It is **listed** by
 field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by `project_get`,
 which resolves both of its relations to memories. Projects are never embedded: a shape is not
@@ -245,16 +245,16 @@ because `memory_link.to_key` is a `TEXT` key and not a foreign key.
 
 ```sql
 CREATE TABLE project (             -- the key IS the identity: no rowid-derived id, no vector
-  key     TEXT PRIMARY KEY,
-  title   TEXT NOT NULL,
-  goal    TEXT NOT NULL DEFAULT '',        -- what this is for
-  state   TEXT NOT NULL DEFAULT '',        -- mutable current-state prose
-  status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|aborted
-  owner   TEXT NOT NULL DEFAULT '',      -- comma-joined names, e.g. 'Cline,James'
-  tags    TEXT NOT NULL DEFAULT '',
-  preload TEXT NOT NULL DEFAULT '',        -- comma-joined keys, ORDERED: attention
-  created TEXT NOT NULL DEFAULT (datetime('now')),
-  updated TEXT NOT NULL DEFAULT (datetime('now')),
+  key         TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  goal        TEXT NOT NULL DEFAULT '',         -- what this is for
+  state       TEXT NOT NULL DEFAULT '',         -- mutable current-state prose
+  status      TEXT NOT NULL DEFAULT 'todo',     -- todo|active|paused|done|aborted
+  owner       TEXT NOT NULL DEFAULT '',         -- comma-joined names, e.g. 'Cline,James'
+  tags        TEXT NOT NULL DEFAULT '',
+  mem_preload TEXT NOT NULL DEFAULT '',         -- comma-joined memory keys, ORDERED by priority
+  created     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated     TEXT NOT NULL DEFAULT (datetime('now')),
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))));
 
 CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
@@ -274,9 +274,9 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a
   column, because a column cannot see other rows. `preload` does not: a memory may sit in many
   projects' lists, and its **order is a property of the list**, not of each edge — so it is a
-  column, with no `position` column shuffling a rowset back into order. A key is `[a-z0-9-]`
-  (`slug::slugify`), so a comma can never occur inside one: the delimiter is safe by construction,
-  not by convention.
+  column (`mem_preload`), with no `position` column shuffling a rowset back into order. A key is
+  `[a-z0-9-]` (`slug::slugify`), so a comma can never occur inside one: the delimiter is safe by
+  construction, not by convention.
 - **Two relations, opposite directions, different meanings.** `preload` is project → memory and
   **ordered**: *"to work in here, load these"* — a project preloads memories it did not author
   (conventions, boot notes). `contains` is memory → project: *"born here / belongs here."*
@@ -558,7 +558,8 @@ any model is touched; flags are re-checked the same way after they override the 
   `state` prose, a `status`, an `owner` set, `tags`, and an ordered `preload`. Listed by field
   (`project_list`), read whole by `project_get`. Never embedded (§7.1).
 - **Preload** — a project's ordered list of memory keys to load as context for working in it
-  ("to work in here, load these"): the boot set, generalized. The order is the payload.
+  ("to work in here, load these"): the boot set, generalized. The order is the payload. The
+  *relation* is `preload`; the column that stores it is `mem_preload`.
 - **Home** — the project a memory belongs to, via `contains`. One per memory — enforced by the
   schema, not by convention.
 - **Derived view / profile** — a composed answer built at query time from atoms; never stored.

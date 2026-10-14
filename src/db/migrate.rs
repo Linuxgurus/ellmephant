@@ -33,7 +33,7 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
     (
         5,
         include_str!("../../migrations/0005_projects.sql"),
-        "projects: project, preload, contains",
+        "projects: project, project_memory",
     ),
 ];
 

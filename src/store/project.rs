@@ -10,7 +10,9 @@
 //!
 //! Two relations, opposite directions, different meanings:
 //!
-//! - [`preload`] — project → memory, **ordered**. About *attention*: "to work in here, load
+//! - [`preload`] — project → memory, **ordered**, stored as the `mem_preload` column (`preload` is
+//!   the *relation's* name; the column carries it, prefixed so a reader of `project` can see that
+//!   its contents are memory keys and not tags). About *attention*: "to work in here, load
 //!   these." A project preloads memories it did not author (conventions, boot notes). It is a
 //!   **column** on `project`, not a tie table: order is a property of the list, and nothing here
 //!   is cross-row (contrast [`apply_home`], where one home genuinely is).
@@ -222,7 +224,7 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
     Ok(key)
 }
 
-/// Encode an ordered preload as the `project.preload` column: keys slugified, blanks dropped and
+/// Encode an ordered preload as the `project.mem_preload` column: keys slugified, blanks dropped and
 /// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
 /// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
 /// can never occur inside one and the delimiter needs no escaping.
@@ -243,7 +245,7 @@ fn encode_preload(keys: &[String]) -> String {
     out.join(",")
 }
 
-/// Decode `project.preload` back into its ordered keys. Inverse of [`encode_preload`], minus the
+/// Decode `project.mem_preload` back into its ordered keys. Inverse of [`encode_preload`], minus the
 /// normalisation that already happened on the way in.
 fn decode_preload(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -289,7 +291,7 @@ fn decode_owners(raw: &str) -> Vec<String> {
 /// forward reference) and surfaces in [`dangling`].
 fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<()> {
     tx.execute(
-        "UPDATE project SET preload = ?2 WHERE key = ?1",
+        "UPDATE project SET mem_preload = ?2 WHERE key = ?1",
         params![project_key, encode_preload(keys)],
     )?;
     Ok(())
@@ -349,8 +351,8 @@ fn exists(conn: &Connection, key: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-/// The canonical column list shared by every project read. `preload` is deliberately absent: it is
-/// a *relation*, read by [`preload`] and never mapped onto [`Project`].
+/// The canonical column list shared by every project read. The `mem_preload` column is deliberately
+/// absent: [`preload`] is a *relation*, read by that function and never mapped onto [`Project`].
 const PROJECT_COLUMNS: &str = "key, title, goal, state, status, owner, tags, created, updated";
 
 /// Map one `project` row (the canonical column list) to a [`Project`].
@@ -403,7 +405,7 @@ fn refs(conn: &Connection, sql: &str, key: &str) -> Result<Vec<Ref>> {
 pub fn preload(conn: &Connection, key: &str) -> Result<Vec<Ref>> {
     let raw: Option<String> = conn
         .query_row(
-            "SELECT preload FROM project WHERE key = ?1",
+            "SELECT mem_preload FROM project WHERE key = ?1",
             params![normalize_key(key)],
             |r| r.get(0),
         )
@@ -505,9 +507,9 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
 /// project is never deleted (`status = aborted` instead) — so the only rot here is a dangling memory
 /// key: a forward reference the audit surfaces, exactly as SPEC §8 does for `[[…]]`.
 ///
-/// `contains` is a table, so SQL finds its rot directly; `preload` is a column, so its list is
-/// parsed here and checked against the live memory keys. Both feed one report, so the audit reads
-/// the same either way.
+/// `contains` is a table, so SQL finds its rot directly; `preload` is a column (`mem_preload`), so
+/// its list is parsed here and checked against the live memory keys. Both feed one report, so the
+/// audit reads the same either way.
 pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
     let mut rows: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
@@ -522,7 +524,7 @@ pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<HashSet<_>>>()?
     };
-    let mut stmt = conn.prepare("SELECT key, preload FROM project")?;
+    let mut stmt = conn.prepare("SELECT key, mem_preload FROM project")?;
     let projects = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in projects {
         let (project_key, raw) = row?;

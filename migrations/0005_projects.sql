@@ -1,10 +1,24 @@
 -- 0005_projects — the project tables: the *structures* half of the store.
 --
--- A project is NOT a memory. Memories are FACTS -- voted, ranked, judged for coherence,
--- searched by meaning. Projects are STRUCTURES -- identity, fields, relations; none of the
--- fact-machinery applies. Two kinds of thing, two tables (the model wins over the cheap
--- "project = memory + type"). Keys carry the `prj-` prefix so the type is visible wherever a
--- key travels, including into `memory_link.to_key`, which is a TEXT key and not an FK.
+-- A memory (`memory`) is one body of closely related facts: written terse, one document vector
+-- over it, matched by meaning -- and so voted, ranked and judged for coherence.
+--
+-- A project (`project`) is an activity completed over time: work with a beginning, a current state
+-- and a place to stand, made of identity, fields and relations. Listed by field, read whole, and
+-- never matched by meaning.
+--
+-- Those two are what the store knows. Everything else is DERIVED from them and can be rebuilt at
+-- any time: `memory_vec` (the KNN index over the document vectors) and `memory_link` (the `[[key]]`
+-- graph) are computed from the rows and hold no fact of their own. The project tables are truth in
+-- the same sense `memory` is -- `project` carries a project's own fields, `project_memory` its one
+-- relation to memories -- so nothing else needs keeping in sync.
+--
+-- Keys carry the `prj-` prefix so the type is visible wherever a key travels, including into
+-- `memory_link.to_key`, which is a TEXT key and not an FK.
+--
+-- Two kinds of thing, two sets of tables, split where the machinery changes: "project = a memory
+-- with a type" would ship cheaply and model nothing, because the machinery a fact needs -- votes,
+-- a coherence verdict, an embedding -- is exactly what a structure has no use for.
 --
 -- Deliberately NO foreign keys, exactly like `memory_link.to_key`: these are by-key edges, so
 -- a forward reference is possible and rot is *detected* by the audit instead of raising a

@@ -352,8 +352,8 @@ The store is **atomics-first**; generalization is derived, not stored.
   is a **read**. Review a fat row with `memory_search` (`min_chars`, `coherent: "!true"` — the rows
   not proven coherent), split it by hand, then stamp the verdict (`memory_coherent`). An upsert
   resets the verdict to unjudged, so an edit re-opens review.
-- **Read policy:** return **titles, tags and scores**, never dumps (tokens regress otherwise);
-  the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
+- **Read policy:** ask for **keys plus titles, tags and scores** (`fields`) — never dumps (tokens
+  regress otherwise); the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
   at a small `k`, judged from titles/tags/distances, `memory_get` only the hit(s) you'll use,
   widening (`k`) only if none fit.
 
@@ -515,7 +515,8 @@ any model is touched; flags are re-checked the same way after they override the 
 
 - **False-memory hazard:** semantic neighbors can be confidently *wrong*. Mitigate: return the
   distance, keep tags honest, don't over-trust, use one-hop expansion for context.
-- **Fat returns regress token cost** below plain `grep` — titles-not-bodies is a *requirement*.
+- **Fat returns regress token cost** below plain `grep` — keys-not-bodies is a *requirement*, and
+  even `title`/`tags` are asked for (`fields`), never sent unbidden.
 - **Write quality governs everything** — low friction means more (and sloppier) writes.
 - **bf16 CPU emulation** may be slow → `--precision f16`.
 - **Loss of greppability** (SQLite isn't `rg`) — retrieval is semantic; the store is one copyable

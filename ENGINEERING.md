@@ -26,24 +26,26 @@ The decisions the code obeys:
 - **`store ≠ embed`.** The row keeps the full, literal text; one **document** (`key` + tags +
   title + link-stripped body) is embedded. The embedding strategy can change without losing what
   was written.
-- **Everything but `memory` and the projects is derived.** The vector index and the link graph are
-  rebuildable from the rows (the `memory_reembed` tool). The relational store must never lie; there
-  is no FTS index and no tag table to keep in sync.
-- **Memories are facts; projects are structures.** A memory is one body of closely related facts,
-  so it is embedded and matched by meaning — which is what makes voting, ranking and the coherence
-  verdict meaningful. A project is an activity over time, so it is listed by field and read whole —
-  which is what makes embedding it pointless. Two kinds of thing, two sets of tables, and the split
-  is drawn where the *machinery* changes rather than on a hunch: "project = memory + type" was
-  rejected because it ships cheaply at the cost of the model (SPEC §7.1). **Inside a structure, a
-  relation earns its own table only when its invariant is cross-row:** `contains` has one (a memory
+- **A memory is one body of closely related facts**, embedded as one document and matched by
+  meaning — which is what makes voting, ranking and the coherence verdict meaningful.
+- **A project is an activity completed over time.** Work with a beginning, a current state and a
+  place to stand: identity, fields, and its relations to memories. Listed by field and read whole —
+  which is what makes embedding it pointless, so it carries no vector, no votes and no verdict of
+  its own.
+- **Everything else is derived.** `memory_vec` (the KNN index) and `memory_link` (the `[[key]]`
+  graph) are computed from the rows and rebuildable at any time (the `memory_reembed` tool). The
+  relational store must never lie, so there is no FTS index and no tag table to keep in sync.
+- **The two kinds live in different tables, split where the machinery changes** — not on a hunch:
+  "project = memory + type" would ship cheaply and model nothing (SPEC §7.1). **Inside a structure,
+  a relation earns its own table only when its invariant is cross-row:** `contains` has one (a memory
   has one home, *anywhere* — a column cannot see other rows), `preload` does not (ordered, and order
   is a property of the list, so it is a column). Their keys carry the `prj-` prefix, which is the
   seam that keeps this one store instead of two graphs that never touch.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
-- **Titles, not dumps.** Search returns `key`/`title`/`tags` and (for a semantic phrase) the
-  cosine distance, so the caller can judge confidence and control token cost; the body is a
-  deliberate `memory_get` away.
+- **Keys, not dumps.** A hit is `key` alone — the caller names the extra `fields` it wants
+  (`title`, `tags`, `coherent`, `chars`, `distance`) — so a search can never bloat context, and the
+  body is always a deliberate `memory_get` away.
 - **One binary, no runtime.** No interpreter, no service, no shared library.
 
 ## Architecture
@@ -61,9 +63,8 @@ The decisions the code obeys:
                                   ▼
                    index::vec  (one document vector per row)
                                   ▼
-      SQLite  memory.db  —  `memory` rows are the source of truth
-      structures (not derived):  project (with its ordered `mem_preload` column) · project_memory
-      derived & rebuildable:  memory_vec · memory_link
+      SQLite  memory.db  —  the truth:  `memory` (facts) · `project` · `project_memory` (structures)
+      everything else derived & rebuildable:  `memory_vec` · `memory_link`
                                   ▼
       embed::qwen3  (candle, in-binary)  —  weights under ~/.ellmephant/models/
 ```
@@ -86,8 +87,17 @@ Five layers, one crate:
 
 ## Storage model
 
-One SQLite file is the source of truth. The `memory` table holds the rows; two derived indexes
-sit on top and can be rebuilt from the rows at any time:
+One SQLite file holds two kinds of thing, and both are truth:
+
+- **`memory`** — memories: one body of closely related facts each, embedded as one document and
+  matched by meaning.
+- **`project`** and **`project_memory`** — projects (v5): an activity completed over time, with its
+  own fields, its ordered `mem_preload` list as a column, and its one relation to memories
+  (`project_memory`, `memory_key` as `PRIMARY KEY`, so a memory has exactly one home). A project
+  carries no embedding, no telemetry and no coherence verdict — those belong to facts, the thing
+  matched by meaning. See SPEC §7.1.
+
+Everything else is **derived** from those rows and can be rebuilt at any time:
 
 - `memory_vec` — `sqlite-vec` `vec0` KNN index over the document embeddings.
 - `memory_link` — the `[[key]]` link graph, forward edges and backlinks.
@@ -98,17 +108,12 @@ body changes the document). Ids are local; `key` is the stable identity (upsert 
 target). Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate
 `reembed`, not an implicit migration.
 
-**Two more tables are NOT derived: the project tables** (v5). `project` — carrying its ordered
-`mem_preload` list as a column, plus its own `start_date`/`end_date` (`created`/`updated` are the
-row's timestamps and answer a different question) — and `project_memory` (memory → project, `memory_key` as `PRIMARY KEY`
-so a memory has exactly one home) are source-of-truth alongside `memory`. They hold the *structure*
-half of the store: a project's own fields, plus its two relations to memories, with no embedding,
-telemetry or coherence verdict — those belong to facts, which are the thing matched by meaning. A
-relation earns its own table only when its invariant is cross-row: `contains` has one, `preload`
-does not (a memory may sit in many projects' lists, and order is a property of the list, so it is a
-column rather than a `position`-ordered rowset). Their keys carry the `prj-` prefix — which is what
-lets a key cross between the two graphs, since `memory_link.to_key` is a `TEXT` key and
-`links::dangling` resolves a target against both tables. See SPEC §7.1.
+Inside a structure, a relation earns its own table only when its invariant is cross-row: `contains`
+has one (a memory has one home, *anywhere* — a column cannot see other rows), `preload` does not
+(a memory may sit in many projects' lists, and order is a property of the list, so it is a column
+rather than a `position`-ordered rowset). Project keys carry the `prj-` prefix, which lets a key
+cross between the two graphs: `memory_link.to_key` is a `TEXT` key, and `links::dangling` resolves a
+target against both tables.
 
 ## Embeddings
 
@@ -152,8 +157,8 @@ it, not `k`. There is no regex/key leg — `key`/`tags` are part of the embedded
 
 Results are ordered by ascending distance. A hit carries no body: the terminal shows
 `key`/`title`/`tags`/`distance`; the MCP wire returns **`key` alone by default** unless the
-caller names extra `fields` (§10 of `SPEC.md`). The read policy is titles and tags, never full
-dumps; a body is a `show`/`memory_get` away.
+caller names extra `fields` (§10 of `SPEC.md`). The read policy is **keys by default, titles and
+tags and distances when asked, never dumps**; a body is a `show`/`memory_get` away.
 
 ## Wiki links
 

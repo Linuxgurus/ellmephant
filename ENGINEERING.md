@@ -29,14 +29,16 @@ The decisions the code obeys:
 - **Everything but `memory` and the projects is derived.** The vector index and the link graph are
   rebuildable from the rows (the `memory_reembed` tool). The relational store must never lie; there
   is no FTS index and no tag table to keep in sync.
-- **Facts vs structures.** Memories are facts (voted, ranked, judged for coherence, searched by
-  meaning); projects are structures (identity, fields, relations). Two kinds of thing, two sets of
-  tables — "project = memory + type" was rejected because it ships cheaply at the cost of the
-  model. **Inside a structure, a relation earns its own table only when its invariant is
-  cross-row:** `contains` has one (a memory has one home, *anywhere* — a column cannot see other
-  rows), `preload` does not (ordered, and order is a property of the list, so it is a column).
-  Their keys carry the `prj-` prefix, which is the seam that keeps this one store instead of
-  two graphs that never touch (SPEC §7.1).
+- **Memories are facts; projects are structures.** A memory is one body of closely related facts,
+  so it is embedded and matched by meaning — which is what makes voting, ranking and the coherence
+  verdict meaningful. A project is an activity over time, so it is listed by field and read whole —
+  which is what makes embedding it pointless. Two kinds of thing, two sets of tables, and the split
+  is drawn where the *machinery* changes rather than on a hunch: "project = memory + type" was
+  rejected because it ships cheaply at the cost of the model (SPEC §7.1). **Inside a structure, a
+  relation earns its own table only when its invariant is cross-row:** `contains` has one (a memory
+  has one home, *anywhere* — a column cannot see other rows), `preload` does not (ordered, and order
+  is a property of the list, so it is a column). Their keys carry the `prj-` prefix, which is the
+  seam that keeps this one store instead of two graphs that never touch.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
 - **Titles, not dumps.** Search returns `key`/`title`/`tags` and (for a semantic phrase) the
@@ -96,15 +98,16 @@ body changes the document). Ids are local; `key` is the stable identity (upsert 
 target). Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate
 `reembed`, not an implicit migration.
 
-**Two more tables are NOT derived: the project structures** (v5). `project` — carrying its ordered
+**Two more tables are NOT derived: the project tables** (v5). `project` — carrying its ordered
 `preload` list as a column — and `project_memory` (memory → project, `memory_key` as `PRIMARY KEY`
-so a memory has exactly one home) hold *structures*, not facts: no embedding, no telemetry, no
-coherence verdict. A relation earns its own table only when its invariant is cross-row: `contains`
-has one, `preload` does not (a memory may sit in many projects' lists, and order is a property of
-the list, so it is a column rather than a `position`-ordered rowset). They are source-of-truth
-alongside `memory`, and their keys carry the `prj-` prefix — which is what lets a key cross between
-the two graphs, since `memory_link.to_key` is a `TEXT` key and `links::dangling` resolves a target
-against both tables. See SPEC §7.1.
+so a memory has exactly one home) are source-of-truth alongside `memory`. They hold the *structure*
+half of the store: a project's own fields, plus its two relations to memories, with no embedding,
+telemetry or coherence verdict — those belong to facts, which are the thing matched by meaning. A
+relation earns its own table only when its invariant is cross-row: `contains` has one, `preload`
+does not (a memory may sit in many projects' lists, and order is a property of the list, so it is a
+column rather than a `position`-ordered rowset). Their keys carry the `prj-` prefix — which is what
+lets a key cross between the two graphs, since `memory_link.to_key` is a `TEXT` key and
+`links::dangling` resolves a target against both tables. See SPEC §7.1.
 
 ## Embeddings
 

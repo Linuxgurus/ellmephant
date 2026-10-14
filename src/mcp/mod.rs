@@ -63,7 +63,7 @@ const INSTRUCTIONS: &str = "ellmephant = Memory storage in smart-caveman style �
 small words out; drop filler, articles, glue. List-shaped reads return a positional table: a \
 `cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
 when a memory shapes your task, `memory_upvote` it — the store's own rankings ride on your votes. \
-Structures are not facts: a project (`prj-…`) is a container you can stand inside — \
+A project (`prj-…`) is an activity over time — a container you can stand inside: \
 `project_upsert` writes one, `project_get` reads one with its `preload`/`contains`, `project_list` \
 shows them all; a memory JOINS a project by home (`memory_upsert`'s `project`). \
 Tool descriptions are the spec.";
@@ -120,9 +120,10 @@ the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen �
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
-Create or replace a project — the STRUCTURES half of the store: identity, status, prose, and an \
-ordered `preload`. Not a memory: memories are facts (voted, ranked, judged, searched by meaning); \
-a project is a container you can stand inside. `key` is `prj-…` (a bare name is prefixed). \
+Create or replace a project — an activity completed over time: identity, status, prose, and an \
+ordered `preload`. A project is the structure half of the store and a container you can stand \
+inside; facts go in memories, where the store matches them by meaning. `key` is `prj-…` (a bare \
+name is prefixed). \
 `status` is todo|active|paused|done|dead — `dead` is how a project ends, there is no delete; \
 `owner` is me|James|us. `preload` is the ORDERED list of memory keys to load as context to work \
 in here; it replaces the previous list, and it may name memories this project did not author \

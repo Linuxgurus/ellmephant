@@ -1,10 +1,12 @@
 //! Projects: the **structures** half of the store (SPEC §7.1).
 //!
-//! A project is not a memory. Memories are FACTS — voted, ranked, judged for coherence, searched
-//! by meaning. Projects are STRUCTURES — a key, a status, prose, and two relations. None of the
-//! fact-machinery applies, so they live in their own tables and their keys carry the `prj-`
-//! prefix, which is what lets a key cross between the two graphs (a memory body may write
-//! `[[prj-x]]`) without either graph having to know about the other.
+//! A project is an activity completed over time — work with a beginning, a current state, and a
+//! place to stand: a key, a status, prose, and two relations to memories. A memory is the other
+//! half of the store: one body of closely related facts, matched by meaning, so it carries the
+//! machinery (votes, visits, a coherence verdict, an embedding) that a project has no use for — a
+//! shape is not something you match by meaning. Their keys carry the `prj-` prefix, which is what
+//! lets a key cross between the two graphs (a memory body may write `[[prj-x]]`) without either
+//! graph having to know about the other.
 //!
 //! Two relations, opposite directions, different meanings:
 //!

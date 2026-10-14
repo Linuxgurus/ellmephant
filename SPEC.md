@@ -173,6 +173,16 @@ Fetching is **first-run, opt-in, and the only network code in the binary**.
 
 ## 7. Data model
 
+**A memory is one body of text holding closely related facts.** It is identified by a `key` (a
+global-unique slug) and gisted by its `title`; the facts live in the `body`, written in
+smart-caveman. It carries `tags` — a normalised, comma-joined list of aspects — and a `source`
+(where it came from: a command, a path, a repo, a quote). A memory is **found** by meaning (the
+semantic `query`) or by a literal/`regex` `pattern`, and narrowed by structured filters (tags,
+size, coherence); it is **read whole** by `memory_get`; and it **points** at other rows with
+`[[key]]` — another memory's key, or a project's (`[[prj-…]]`). Its row also holds runtime
+bookkeeping (`visits`, `times_useful`, `coherent`) that is never written by hand and never
+embedded.
+
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -217,11 +227,21 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 
 ### 7.1 Projects — the structures half (v5)
 
-A project is not a memory, and the schema says so. **Memories are facts** — voted, ranked, judged
-for coherence, searched by meaning. **Projects are structures** — identity, fields, relations;
-none of the fact-machinery applies. They are separate tables, and their keys carry the **`prj-`
-prefix**, which is what lets a key travel between the two graphs: a memory body may write
-`[[prj-chronos]]`, because `memory_link.to_key` is a `TEXT` key and not a foreign key.
+A project is **an activity completed over time** — work with a beginning, a current state, and a
+place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
+prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`dead`), an
+`owner` (`me`|`James`|`us`), `tags`, and a `preload` — the **ordered** list of memories to load as
+context to work in here, which is the boot set generalized to every project. It is **listed** by
+field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by `project_get`,
+which resolves both of its relations to memories. Projects are never embedded: a shape is not
+something you match by meaning.
+
+Memories and projects are the two halves of one store, and the line between them is drawn where the
+machinery changes. A memory is a **fact** — voted, ranked, judged for coherence, matched by meaning.
+A project is a **structure** — identity, fields, relations — so none of that machinery applies to
+it. That is why they are separate tables, and why a project's keys carry the **`prj-` prefix**,
+which is what lets a key travel between the two graphs: a memory body may write `[[prj-chronos]]`,
+because `memory_link.to_key` is a `TEXT` key and not a foreign key.
 
 ```sql
 CREATE TABLE project (             -- the key IS the identity: no rowid-derived id, no vector
@@ -524,6 +544,16 @@ any model is touched; flags are re-checked the same way after they override the 
 ## 17. Glossary
 
 - **Atomic / atom** — one memory row; a single fact. The storage + embedding unit.
+- **Memory** — one body of text holding closely related facts: a `key` (identity *and* link
+  target), a `title` (the gist), a `body` (the facts), `tags` and a `source`. Found by meaning or
+  by a literal/regex pattern, read whole by `memory_get`, cross-linked with `[[key]]`.
+- **Project** — an activity completed over time: a `prj-…` key, a `title`, a `goal`, mutable
+  `state` prose, a `status`, an `owner`, `tags`, and an ordered `preload`. Listed by field
+  (`project_list`), read whole by `project_get`. Never embedded (§7.1).
+- **Preload** — a project's ordered list of memory keys to load as context for working in it
+  ("to work in here, load these"): the boot set, generalized. The order is the payload.
+- **Home** — the project a memory belongs to, via `contains`. One per memory — enforced by the
+  schema, not by convention.
 - **Derived view / profile** — a composed answer built at query time from atoms; never stored.
 - **Key** — the global-unique slug; identity *and* link target (wiki semantics).
 - **Title / body** — the one-liner and the fact; stored literally and folded into the document embedding.
@@ -531,6 +561,7 @@ any model is touched; flags are re-checked the same way after they override the 
 - **Smart-caveman** — the writing style: drop filler, articles and glue words; keep signal.
 - **Document** — the text embedded for a row: `key`, tags, title and the link-stripped body.
 - **store ≠ embed** — the row keeps full text; the vector is over a link-stripped projection.
-- **Semantic** — the phrase-match method: embed the query and take the KNN (the only leg).
+- **Semantic** — the phrase-match method: embed the query and take the KNN. The ranked leg; the
+  literal/regex `pattern` is the other one, and the two do not fuse (§10).
 - **Model cache** — the external weights dir (`~/.ellmephant/models/<owner>--<repo>/<sha>/`), a
   flat, sha-pinned, manifest-backed copy of the encoder's files; data, not code (§6.1).

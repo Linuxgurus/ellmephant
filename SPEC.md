@@ -232,22 +232,24 @@ CREATE TABLE project (             -- the key IS the identity: no rowid-derived 
   status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|dead
   owner   TEXT NOT NULL DEFAULT 'us',      -- me|James|us
   tags    TEXT NOT NULL DEFAULT '',
+  preload TEXT NOT NULL DEFAULT '',        -- comma-joined keys, ORDERED: attention
   created TEXT NOT NULL DEFAULT (datetime('now')),
   updated TEXT NOT NULL DEFAULT (datetime('now')),
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead')),
   CHECK (owner IN ('me', 'James', 'us')));
-
-CREATE TABLE project_preload (     -- project -> memory, ORDERED: attention
-  project_key TEXT    NOT NULL,
-  memory_key  TEXT    NOT NULL,
-  position    INTEGER NOT NULL,
-  PRIMARY KEY (project_key, memory_key)) WITHOUT ROWID;
 
 CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   memory_key  TEXT PRIMARY KEY,
   project_key TEXT NOT NULL);
 ```
 
+- **One tie table, not two: a relation earns a table only when its invariant is cross-row.**
+  `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a
+  column, because a column cannot see other rows. `preload` does not: a memory may sit in many
+  projects' lists, and its **order is a property of the list**, not of each edge — so it is a
+  column, with no `position` column shuffling a rowset back into order. A key is `[a-z0-9-]`
+  (`slug::slugify`), so a comma can never occur inside one: the delimiter is safe by construction,
+  not by convention.
 - **Two relations, opposite directions, different meanings.** `preload` is project → memory and
   **ordered**: *"to work in here, load these"* — a project preloads memories it did not author
   (conventions, boot notes). `contains` is memory → project: *"born here / belongs here."*
@@ -266,7 +268,8 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   entry need not: a project may be created before its memories.
 - **A link to a project is not membership.** `[[prj-x]]` is a `see` edge (navigation, attention);
   `contains` means born here. So `links::dangling` resolves a target against **both** tables.
-- **No delete.** A project ends with `status = dead`; `preload`/`contains` edges cannot outlive one.
+- **No delete.** A project ends with `status = dead`; the `preload` list and the `contains` edges
+  cannot outlive one.
 
 ## 8. Cross-links (wiki semantics)
 

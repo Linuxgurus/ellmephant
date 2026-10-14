@@ -9,7 +9,9 @@
 //! Two relations, opposite directions, different meanings:
 //!
 //! - [`preload`] — project → memory, **ordered**. About *attention*: "to work in here, load
-//!   these." A project preloads memories it did not author (conventions, boot notes).
+//!   these." A project preloads memories it did not author (conventions, boot notes). It is a
+//!   **column** on `project`, not a tie table: order is a property of the list, and nothing here
+//!   is cross-row (contrast [`apply_home`], where one home genuinely is).
 //! - [`contains`] — memory → project. About *provenance*: "born here / belongs here." One home,
 //!   which the schema enforces rather than merely asking for.
 //!
@@ -17,7 +19,7 @@
 //! forward reference is possible and rot is *detected* ([`dangling`]) instead of raising a
 //! broken-FK error.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -220,27 +222,44 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
     Ok(key)
 }
 
-/// Replace `project_key`'s ordered preload. Duplicates collapse to their first position; blank
-/// keys are dropped. A key that resolves to no memory is *allowed* (a forward reference) and
-/// surfaces in [`dangling`].
-fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<()> {
-    tx.execute(
-        "DELETE FROM project_preload WHERE project_key = ?1",
-        params![project_key],
-    )?;
+/// Encode an ordered preload as the `project.preload` column: keys slugified, blanks dropped and
+/// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
+/// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
+/// can never occur inside one and the delimiter needs no escaping.
+fn encode_preload(keys: &[String]) -> String {
     let mut seen = HashSet::new();
-    let mut position = 0i64;
+    let mut out: Vec<String> = Vec::new();
     for key in keys {
-        let memory_key = slug::slugify(key);
-        if memory_key.is_empty() || !seen.insert(memory_key.clone()) {
+        // A blank entry means nothing to load. Checked *before* slugifying: `slug::slugify` never
+        // returns empty (it falls back to `untitled`), so a blank would otherwise become a key.
+        if key.trim().is_empty() {
             continue;
         }
-        tx.execute(
-            "INSERT INTO project_preload (project_key, memory_key, position) VALUES (?1, ?2, ?3)",
-            params![project_key, memory_key, position],
-        )?;
-        position += 1;
+        let memory_key = slug::slugify(key);
+        if seen.insert(memory_key.clone()) {
+            out.push(memory_key);
+        }
     }
+    out.join(",")
+}
+
+/// Decode `project.preload` back into its ordered keys. Inverse of [`encode_preload`], minus the
+/// normalisation that already happened on the way in.
+fn decode_preload(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Replace `project_key`'s ordered preload (one column, one write). Duplicates collapse to their
+/// first position; blank keys are dropped. A key that resolves to no memory is *allowed* (a
+/// forward reference) and surfaces in [`dangling`].
+fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<()> {
+    tx.execute(
+        "UPDATE project SET preload = ?2 WHERE key = ?1",
+        params![project_key, encode_preload(keys)],
+    )?;
     Ok(())
 }
 
@@ -298,7 +317,8 @@ fn exists(conn: &Connection, key: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-/// The canonical column list shared by every project read.
+/// The canonical column list shared by every project read. `preload` is deliberately absent: it is
+/// a *relation*, read by [`preload`] and never mapped onto [`Project`].
 const PROJECT_COLUMNS: &str = "key, title, goal, state, status, owner, tags, created, updated";
 
 /// Map one `project` row (the canonical column list) to a [`Project`].
@@ -344,14 +364,37 @@ fn refs(conn: &Connection, sql: &str, key: &str) -> Result<Vec<Ref>> {
 }
 
 /// The ordered preload (`project → memory`), titles hydrated where they resolve.
+///
+/// The list is one column, so this is a parse plus a single lookup for the titles — which are
+/// then put back into *list* order, because the query's order must never leak into the result.
 pub fn preload(conn: &Connection, key: &str) -> Result<Vec<Ref>> {
-    refs(
-        conn,
-        "SELECT p.memory_key, m.title FROM project_preload p
-           LEFT JOIN memory m ON m.key = p.memory_key
-          WHERE p.project_key = ?1 ORDER BY p.position",
-        key,
-    )
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT preload FROM project WHERE key = ?1",
+            params![normalize_key(key)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let keys = raw.map_or_else(Vec::new, |raw| decode_preload(&raw));
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; keys.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT key, title FROM memory WHERE key IN ({placeholders})"
+    ))?;
+    let titles: HashMap<String, String> = stmt
+        .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    Ok(keys
+        .into_iter()
+        .map(|key| Ref {
+            title: titles.get(&key).cloned(),
+            key,
+        })
+        .collect())
 }
 
 /// The memories that call `key` home (`memory → project`), key order.
@@ -428,20 +471,37 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
 /// Membership cannot outlive a project — [`apply_home`] requires the project to exist and a
 /// project is never deleted (`status = dead` instead) — so the only rot here is a dangling memory
 /// key: a forward reference the audit surfaces, exactly as SPEC §8 does for `[[…]]`.
+///
+/// `contains` is a table, so SQL finds its rot directly; `preload` is a column, so its list is
+/// parsed here and checked against the live memory keys. Both feed one report, so the audit reads
+/// the same either way.
 pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
-    let mut stmt = conn.prepare(
-        "SELECT to_key, from_key FROM (
-             SELECT p.memory_key AS to_key, p.project_key AS from_key
-               FROM project_preload p
-              WHERE p.memory_key NOT IN (SELECT key FROM memory)
-             UNION
-             SELECT c.memory_key, c.project_key
-               FROM project_memory c
-              WHERE c.memory_key NOT IN (SELECT key FROM memory)
-         ) ORDER BY to_key, from_key",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    links::group_dangling(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT c.memory_key, c.project_key FROM project_memory c
+              WHERE c.memory_key NOT IN (SELECT key FROM memory)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let present: HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT key FROM memory")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()?
+    };
+    let mut stmt = conn.prepare("SELECT key, preload FROM project")?;
+    let projects = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in projects {
+        let (project_key, raw) = row?;
+        for key in decode_preload(&raw) {
+            if !present.contains(&key) {
+                rows.push((key, project_key.clone()));
+            }
+        }
+    }
+    // `group_dangling` folds *consecutive* rows, so the sort is load-bearing.
+    rows.sort();
+    links::group_dangling(rows)
 }
 
 /// How many projects exist (reported by `doctor`).
@@ -516,5 +576,24 @@ mod tests {
         assert_eq!(choice("", OWNERS, "us", "owner").unwrap(), "us");
         let err = choice("nope", STATUSES, "todo", "status").unwrap_err();
         assert!(format!("{err}").contains("unknown status"), "{err}");
+    }
+
+    #[test]
+    fn preload_codec_keeps_order_and_drops_noise() {
+        let keys = vec![
+            "boot-note".to_string(),
+            "  Chronos Rules ".to_string(),
+            "boot-note".to_string(), // a duplicate collapses to its first position
+            String::new(),           // blank: dropped, never `untitled`
+            "   ".to_string(),
+        ];
+        // Order is the payload, so nothing is sorted the way `tags` sorts.
+        assert_eq!(encode_preload(&keys), "boot-note,chronos-rules");
+        assert_eq!(encode_preload(&[]), "");
+        assert_eq!(decode_preload(""), Vec::<String>::new());
+        assert_eq!(
+            decode_preload("a,b"),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 }

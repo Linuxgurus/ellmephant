@@ -10,6 +10,14 @@
 -- a forward reference is possible and rot is *detected* by the audit instead of raising a
 -- broken-FK error. `key` is the primary key -- a project has no rowid-derived identity and no
 -- vector, so the key IS the identity.
+--
+-- ONE tie table, not two. A relation earns a table only when its invariant is CROSS-ROW.
+-- `contains` has one -- a memory has at most one home, anywhere, which a column cannot express
+-- because a column cannot see other rows -- so it gets a table. `preload` has none (a memory
+-- may sit in many projects' lists) and its order is a property of the LIST rather than of each
+-- edge, so it is a column: no `position` column shuffling a rowset back into order. A key is
+-- `[a-z0-9-]` (slug.rs), so a comma can never occur inside one -- the delimiter is safe by
+-- construction, not by convention.
 
 CREATE TABLE project (
   key     TEXT PRIMARY KEY,                     -- 'prj-…'; identity and link target
@@ -19,22 +27,16 @@ CREATE TABLE project (
   status  TEXT NOT NULL DEFAULT 'todo',         -- todo|active|paused|done|dead
   owner   TEXT NOT NULL DEFAULT 'us',           -- me|James|us
   tags    TEXT NOT NULL DEFAULT '',             -- comma-joined, sorted (the memory codec)
+  preload TEXT NOT NULL DEFAULT '',             -- comma-joined keys, ORDERED by priority
   created TEXT NOT NULL DEFAULT (datetime('now')),
   updated TEXT NOT NULL DEFAULT (datetime('now')),
   CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead')),
   CHECK (owner IN ('me', 'James', 'us'))
 );
 
--- `preload` — project -> memory, ORDERED. About ATTENTION: "to work in here, load these."
--- A project preloads memories it did NOT author (conventions, boot notes); it is the boot
--- set, generalized to every project.
-CREATE TABLE project_preload (
-  project_key TEXT    NOT NULL,
-  memory_key  TEXT    NOT NULL,
-  position    INTEGER NOT NULL,
-  PRIMARY KEY (project_key, memory_key)
-) WITHOUT ROWID;
-CREATE INDEX idx_preload_order ON project_preload(project_key, position);
+-- `preload` — project -> memory, ORDERED (the `preload` column above). About ATTENTION: "to work
+-- in here, load these." A project preloads memories it did NOT author (conventions, boot notes);
+-- it is the boot set, generalized to every project.
 
 -- `contains` — memory -> project. About PROVENANCE: "born here / belongs here." One home, not
 -- many, which is why `memory_key` is the PRIMARY KEY: a second home is a constraint failure,

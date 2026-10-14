@@ -15,6 +15,18 @@ fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
     ) > 0
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("table_info");
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .expect("columns");
+    names
+        .filter_map(std::result::Result::ok)
+        .any(|c| c == column)
+}
+
 fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     conn.execute(
         "INSERT INTO memory (key, title, body, doc_hash) VALUES (?1, ?2, ?3, 'h')",
@@ -32,14 +44,7 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     assert!(db::migrate::latest() >= 2, "telemetry migration exists");
     assert!(db::migrate::latest() >= 5, "projects migration exists");
 
-    for name in [
-        "memory",
-        "memory_link",
-        "meta",
-        "project",
-        "project_preload",
-        "project_memory",
-    ] {
+    for name in ["memory", "memory_link", "meta", "project", "project_memory"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
     // v2 keeps one embedding per row: guard against a BM25/tag table being reintroduced.
@@ -49,6 +54,16 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
             "{name} should not exist"
         );
     }
+    // The preload list is a COLUMN on `project`, not a tie table (0005's header says why):
+    // guard against a `project_preload` table creeping back.
+    assert!(
+        column_exists(&conn, "project", "preload"),
+        "project.preload is missing"
+    );
+    assert!(
+        !object_exists(&conn, "table", "project_preload"),
+        "preload is a column, not a table"
+    );
     assert!(
         object_exists(&conn, "index", "idx_link_to"),
         "missing index"
@@ -92,7 +107,7 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // A store from before projects existed: the tables gone, the version rolled back.
     let conn = db::open(&paths).unwrap();
     insert(&conn, "keep-me", "Kept", "survives the upgrade");
-    for table in ["project", "project_preload", "project_memory"] {
+    for table in ["project", "project_memory"] {
         conn.execute(&format!("DROP TABLE {table}"), []).unwrap();
     }
     conn.pragma_update(None, "user_version", 4).unwrap();
@@ -101,7 +116,7 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // Opening it again runs only the newer step, and the rows are untouched.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
-    for table in ["project", "project_preload", "project_memory"] {
+    for table in ["project", "project_memory"] {
         assert!(object_exists(&conn, "table", table), "missing {table}");
     }
     assert_eq!(

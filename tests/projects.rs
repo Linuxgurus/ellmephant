@@ -11,7 +11,7 @@ use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
 use ellmephant::store::project::{self, Home};
 use ellmephant::store::{self, Memory};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 const DIM: usize = 8;
 
@@ -131,6 +131,16 @@ fn preload_is_ordered_and_replaced_wholesale() {
     assert_eq!(keys, vec!["c", "a", "b"], "the ORDER is the point");
     assert!(refs.iter().all(|r| r.title.is_some()), "titles hydrate");
 
+    // The list is ONE column on the row, in list order — no tie table, no `position`.
+    let raw: String = conn
+        .query_row(
+            "SELECT preload FROM project WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, "c,a,b");
+
     // A second `Some` replaces the list; `None` leaves it alone.
     project::upsert(&conn, &project_fixture("chronos"), Some(&["b".to_string()])).expect("replace");
     assert_eq!(project::preload(&conn, &key).unwrap().len(), 1);
@@ -141,6 +151,29 @@ fn preload_is_ordered_and_replaced_wholesale() {
         1,
         "None keeps it"
     );
+}
+
+#[test]
+fn preload_survives_a_reopen_in_order() {
+    let (_dir, paths) = temp_store();
+    let embedder = HashEmbedder::new(DIM);
+    let conn = db::open(&paths).expect("open");
+    seed_memory(&conn, &embedder, "a");
+    seed_memory(&conn, &embedder, "b");
+    let key = seed_project(&conn, "chronos");
+    project::upsert(
+        &conn,
+        &project_fixture("chronos"),
+        Some(&["b".to_string(), "a".to_string()]),
+    )
+    .expect("set preload");
+    drop(conn);
+
+    // The order is *stored*, not recomputed on the way out.
+    let conn = db::open(&paths).expect("reopen");
+    let refs = project::preload(&conn, &key).unwrap();
+    let keys: Vec<&str> = refs.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(keys, vec!["b", "a"]);
 }
 
 #[test]

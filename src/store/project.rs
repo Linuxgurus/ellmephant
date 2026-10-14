@@ -126,9 +126,10 @@ pub struct Project {
     /// Last-update timestamp — last *write*, which is not the same as last *work*.
     #[serde(default)]
     pub updated: String,
-    /// When the work started, ISO date. Stamped once on first write and correctable afterwards:
-    /// [`created`] is when the row appeared, which is not the same thing — a project written down
-    /// three weeks late started three weeks ago.
+    /// When the work started, ISO date — empty until someone states it, because the store has no
+    /// basis to invent it. Correctable afterwards: [`created`] is when the *row* appeared, which is
+    /// not the same thing — a project written down three weeks late started three weeks ago, and
+    /// stamping `now` would assert the opposite.
     #[serde(default)]
     pub start_date: String,
     /// When it ended, ISO date — empty while the project runs. Stamped when `status` becomes one of

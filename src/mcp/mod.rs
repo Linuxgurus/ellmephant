@@ -433,7 +433,7 @@ pub struct ProjectUpsertParams {
     /// When the work started.
     #[serde(default)]
     #[schemars(
-        description = "When the work started, ISO `YYYY-MM-DD`. Stamped on first write if omitted; correct it to backfill a late entry."
+        description = "When the work started, ISO `YYYY-MM-DD`. Leave it out and it stays EMPTY — never stamped; state one to backfill a late entry."
     )]
     pub start_date: Option<String>,
     /// When it ended.
@@ -1260,6 +1260,26 @@ mod tests {
         assert!(
             !upsert.contains("`source` ="),
             "field defs belong on the fields: {upsert}"
+        );
+
+        // The `start_date` field description must not promise the OLD behaviour. The store no longer
+        // invents a start, and the description is read as law (SPEC §9), so a stale sentence there is
+        // a lie the model acts on — it is exactly how this drifted once already.
+        let start_desc = find("project_upsert")
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.get("start_date"))
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
+            .expect("start_date description")
+            .to_lowercase();
+        assert!(
+            start_desc.contains("empty"),
+            "the start_date description must say it stays empty: {start_desc}"
+        );
+        assert!(
+            !start_desc.contains("stamped on"),
+            "start_date is no longer stamped on write: {start_desc}"
         );
 
         // Search carries the semantic phrase (`query`), the lexical leg (`pattern` + `mode`) and the

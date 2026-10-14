@@ -10,7 +10,7 @@ normative specification see [`SPEC.md`](SPEC.md).
 - [Versioning](#versioning)
 - [Publishing a release](#publishing-a-release)
 - [Releasing the chart](#releasing-the-chart)
-- [Dev publishing to Harbor](#dev-publishing-to-harbor)
+- [Harbor publishing](#harbor-publishing)
 - [Pre-releases](#pre-releases)
 - [Hotfixes](#hotfixes)
 - [Gotchas](#gotchas)
@@ -37,6 +37,9 @@ every path and claim that mentioned them was stale.
   the runtime image on the cluster (natively amd64) and pushes it to Harbor as `edge` and
   `sha-<commit>`. It replaced the old `.githooks/post-commit` hook, which built with podman on
   whichever developer machine happened to be awake. It publishes **the image only**.
+- **TODO: nothing publishes the chart.** A chart change needs `make chart-push` by hand until a
+  `publish-chart.yml` exists alongside `publish-dev.yml` - the runner already has Harbor access, so
+  the workflow is the obvious shape. See [Harbor publishing](#harbor-publishing).
 - **`.forgejo/workflows/smoke.yml`** - manual dispatch only. A diagnostic for the runner itself
   (does a job start, does `actions/checkout` resolve, can a job reach the Docker daemon), written
   when nothing on the instance had yet executed a job. Not a check of the code.
@@ -125,15 +128,15 @@ publish anything: `dev` is the only branch that publishes, and what it publishes
 What remains is manual:
 
 ```sh
-make harbor-publish        # chart -> oci://…/library/charts + image rebuilt locally (edge, sha-<short>)
-make chart-push            # the chart alone
+make chart-push            # chart -> oci://…/library/charts (see Releasing the chart)
 ```
 
-Neither produces a **versioned** tag - the script pushes `edge` and `sha-<short>`, in every mode. So
+Nothing produces a **versioned image**: `dev` pushes only ever publish `edge` and `sha-<short>`. So
 releasing `1.1.0` today means: bump the version, build the commit, and push it under its own tag by
-hand (`podman tag` + `podman push`, once `helm registry login` has been done). Restoring a publisher
-is open work, and it has to run somewhere that can reach Harbor - the **Forgejo** runner can, since
-it is on the LAN; a GitHub runner could not, which is what the old workflow papered over.
+hand (`make docker-build`, then `podman tag` + `podman push`, once `helm registry login` has been
+done). Restoring a publisher is open work, and it has to run somewhere that can reach Harbor - the
+**Forgejo** runner can, since it is on the LAN; a GitHub runner could not, which is what the old
+workflow papered over.
 
 ## Releasing the chart
 
@@ -164,33 +167,25 @@ make chart-lint
 make chart-template
 ```
 
-## Dev publishing to Harbor
+## Harbor publishing
 
 Harbor is `harbor.vn.linuxguru.net`, reachable only from the LAN - which is why the publisher runs
 **inside the cluster**: the Forgejo runner can reach Harbor, a GitHub runner could not.
 
-A push to `dev` publishes itself. `.forgejo/workflows/publish-dev.yml` builds the image natively
-(amd64) and pushes `edge` + `sha-<commit>`. It is the **image only** - the chart is not part of that
-workflow, so a chart change needs `make chart-push`.
+A push to `dev` publishes the **image** itself. `.forgejo/workflows/publish-dev.yml` builds it
+natively (amd64) and pushes `edge` + `sha-<commit>`.
 
-To publish by hand from the LAN (chart, image, or both):
-
-```sh
-make harbor-publish                             # chart + image (image built locally with podman)
-SKIP_CHART=1 make harbor-publish                # image only
-make chart-push                                 # chart only
-tail -f .tmp/harbor-publish.log                 # when it runs in the background
-```
-
-One-time setup for the by-hand path:
+The **chart is not published by any workflow yet** - that is the remaining gap, and it wants a
+`.forgejo/workflows/publish-chart.yml` like `publish-dev.yml` (the runner can reach Harbor, so nothing
+is in the way). `TODO`. Until it exists, push it by hand:
 
 ```sh
-helm registry login harbor.vn.linuxguru.net     # podman keeps its own credential store
+helm registry login harbor.vn.linuxguru.net     # one-time; helm keeps its own credential store
+make chart-push                                 # package + push to oci://…/library/charts
 ```
 
-**`HARBOR_IMAGE_MODE=mirror` no longer works.** It pulls `ghcr.io/jdblack/ellmephant:$SOURCE_TAG`
-and waits up to `WAIT_SECONDS` (1800) for that image to appear, but nothing publishes to GHCR any
-more: it hangs for half an hour and exits 1. Leave the mode at its default (`build`).
+An image built by hand (`make docker-build`, needs `make builder-image` once) goes up with
+`podman push`, but leave that to the workflow unless you are publishing a version the workflow cannot.
 
 Point the cluster at the mirror with:
 
@@ -258,12 +253,12 @@ stand behind - by hand, since nothing does it for you.
 - **Publishing needs Harbor access, which is LAN-only.** The Forgejo runner has it (repo secrets
   `HARBOR_USER`/`HARBOR_TOKEN`; the Harbor robot `robot$library+forgejo`, scoped to pull, push and
   tag-create on `library` - notably it cannot delete). A GitHub-hosted runner never will.
-- **`HARBOR_IMAGE_MODE=mirror` is broken.** It waits 30 minutes for a GHCR image that no longer gets
-  built, then exits 1. Leave the mode at its default (`build`).
-- **The git hook is gone.** `.githooks/` was deleted with the old workflows, along with the
-  `make harbor-hooks` target it needed - publishing on `dev` is the Forgejo workflow's job.
 - **The chart is not published by the workflow.** `publish-dev.yml` pushes the image only; a chart
-  change needs `make chart-push` by hand.
+  change needs `make chart-push` by hand until a `publish-chart.yml` exists.
+- **`scripts/` is gone.** `scripts/harbor-publish.sh` was deleted once Forgejo took over the image:
+  it only ever pushed `edge` + `sha-<short>`, its `mirror` mode waited on a GHCR image nothing builds
+  any more, its build path was the slow one (no `--build-arg BUILDER`), and the chart half is
+  `make chart-push`.
 - **A chart change needs its own `version` bump, and a matching `appVersion`.** Nothing checks either
   any more - a stale `appVersion` silently ships a stale image, since `image.tag` is empty by default.
 - **Chart and image live in separate Harbor repos** (`library/charts/ellmephant` vs
@@ -272,8 +267,9 @@ stand behind - by hand, since nothing does it for you.
 - **Harbor needs its own login for helm.** podman and helm keep separate credential stores, so
   `make chart-push` fails until `helm registry login harbor.vn.linuxguru.net` has been run once.
 - **Platforms.** `edge`/`sha-*` are built **amd64 only** - the cluster is amd64, and an arm64 half
-  would double an emulated local build for no user. A by-hand `make harbor-publish` on Apple Silicon
-  is that same slow, emulated build.
+  would double an emulated local build for no user. A by-hand `make docker-build` on Apple Silicon
+  is that same slow, emulated build (and it wants `make builder-image` once, or it rebuilds every
+  dependency).
 - **`charts/ellmephant/values.yaml` defaults to a ghcr image.** Nothing in this repository publishes
   to ghcr any more; the cluster overrides `image.repository` to Harbor. Until the public registry is
   decided, treat that default as stale.

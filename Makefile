@@ -21,7 +21,7 @@ BUILDER_IMAGE   ?= $(HARBOR)/ellmephant-builder:$(BUILDER_PROFILE)-$(BUILDER_HAS
 KUBE_VERSION ?= 1.34.0
 
 .PHONY: build release test fmt clippy lint doc docker-build docker-run clean \
-        chart-lint chart-template chart-package chart-push harbor-publish \
+        chart-lint chart-template chart-package chart-push \
         builder-image
 
 build:        ## debug build
@@ -62,9 +62,6 @@ chart-package:   ## package the chart -> ellmephant-<version>.tgz
 chart-push: chart-package ## package + push the chart to Harbor as OCI (needs: helm registry login)
 	helm push ellmephant-*.tgz "oci://$(HARBOR_CHARTS)"
 	@rm -f ellmephant-*.tgz
-
-harbor-publish:  ## push this commit to Harbor: chart + image (builds the image locally)
-	scripts/harbor-publish.sh
 
 builder-image:   ## build + push the dependency image (rare, slow; publish-dev builds it when the input hash moves)
 	docker build -f Dockerfile.builder -t $(BUILDER_IMAGE) .

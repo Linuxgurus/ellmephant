@@ -153,6 +153,13 @@ its own tag, so a candidate can never move `latest`.
 So shipping is: **bump `Cargo.toml`, merge `dev` -> `main`.** The bump names the release; without one
 the merge republishes the previous version's tags with newer bytes.
 
+**A release that follows a `dev` build of the same tree is nearly instant** — the merge commit often
+has a tree byte-identical to the `dev` commit it merges, so every layer of the image build is a cache
+hit and the run finishes in seconds rather than minutes. That is not a skipped build: `docker run` on
+the published tag prints the expected version. A release that *does* change code pays the normal build
+time, and its dependency layer is already in Harbor from the `dev` run, so it never pays the ~250-crate
+install twice.
+
 ## Releasing the chart
 
 The chart lives in [`charts/ellmephant/`](charts/ellmephant/), and **`publish.yml` publishes it** on
@@ -326,9 +333,12 @@ chart goes with it. (If the fix should not become `latest`, publish it as a pre-
 - **The GHCR mirror needs its own secrets.** `GHCR_USER` / `GHCR_TOKEN` (token needs
   `write:packages`) are not written by `module.forgejo_setup` the way `HARBOR_*` are. Missing them
   fails the mirror step loudly.
-- **A ghcr package can start private.** After the first successful mirror, check the package's
-  visibility under Package settings if anonymous pulls are wanted — "public registry" is a setting,
-  not a consequence of pushing.
+- **Both ghcr packages have to be public, and the API will not make them so.** The image was flipped
+  by hand once; the *chart* package was created by the first release and defaulted to **private**, so
+  an anonymous `helm pull oci://ghcr.io/jdblack/charts/ellmephant` answers 401 while Harbor serves the
+  same chart happily. `PATCH /user/packages/container/charts%2Fellmephant {"visibility":"public"}`
+  returns `Not Found` — for user-owned packages visibility is a UI-only change: package settings, then
+  *Change visibility*. "Public registry" is a setting, not a consequence of pushing.
 - **`charts/ellmephant/values.yaml` defaults to the ghcr image**, which is correct: ghcr is public and
   the chart's empty `tag` resolves to `appVersion`, a *released* version.
 - **`artifacthub.io/images` is not guarded.** It names the released tag (`:1.2.0`) the way `appVersion`

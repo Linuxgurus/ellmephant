@@ -29,7 +29,7 @@ annotations:
       url: https://github.com/jdblack/ellmephant/blob/main/README.md
   artifacthub.io/images: |
     - name: ellmephant
-      image: ghcr.io/jdblack/ellmephant:1.1.0
+      image: ghcr.io/jdblack/ellmephant:edge
   artifacthub.io/changes: |
     - kind: removed
       description: "the optional TypingMind MCP connector (use the standalone compose stack in TYPINGMIND.md)"

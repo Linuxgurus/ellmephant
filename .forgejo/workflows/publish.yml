@@ -1,0 +1,149 @@
+name: publish
+
+# Publish `main`: build the image and the chart once, and push BOTH to BOTH registries.
+#
+#   Harbor  harbor.vn.linuxguru.net/...   PRIVATE -- LAN-only, what the cluster pulls
+#   GHCR    ghcr.io/jdblack/...           PUBLIC  -- the same bytes, mirrored
+#
+# `edge` is the tag that moves; `sha-<short>` is the immutable handle. There are no version tags and
+# no `latest`: what is published is whatever `main` is, and `edge` is the word for that.
+#
+# The build runs on the cluster, natively amd64. It replaces the old `.githooks/post-commit` hook,
+# which did the same job with podman on whichever developer machine happened to be awake (emulated
+# amd64 on Apple Silicon, and only if that machine was on).
+#
+# NOTE: Forgejo reads the workflow from the branch being pushed, so this file only RUNS from `main`.
+# That cuts both ways -- a change to it publishes nothing until it reaches `main`, and once it is on
+# `main`, every push there publishes. `workflow_dispatch` is the manual re-run (e.g. after rotating a
+# token).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: harbor.vn.linuxguru.net
+  IMAGE: harbor.vn.linuxguru.net/library/ellmephant
+  CHART_REPO: harbor.vn.linuxguru.net/library/charts
+  BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
+  GHCR_REGISTRY: ghcr.io
+  GHCR_IMAGE: ghcr.io/jdblack/ellmephant
+  GHCR_CHART_REPO: ghcr.io/jdblack/charts
+  CHART: charts/ellmephant
+  # Pinned so the job does not depend on what the runner image happens to ship. The act ecosystem's
+  # ubuntu image has node + git + docker and no helm (see smoke.yml).
+  HELM_VERSION: v3.16.3
+  # A cosmetic prefix only. The tag's real content is the input hash computed below, so a profile
+  # change or a dependency change moves the tag by itself -- there is nothing here to remember.
+  BUILDER_PROFILE: rust-lean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          set -eu
+          # The robot name contains a `$` (robot$library+forgejo); quoted, so the shell leaves it be.
+          echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+
+      # The public mirror needs its own credentials, and they are NOT written by
+      # `module.forgejo_setup` the way the Harbor robot is. Missing them FAILS the job rather than
+      # skipping the mirror: a public publish that silently stops is worse than one that complains.
+      - name: Log in to GHCR (public mirror)
+        env:
+          GHCR_USER: ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${GHCR_TOKEN:-}" ] || [ -z "${GHCR_USER:-}" ]; then
+            echo "GHCR_USER / GHCR_TOKEN are not set (repo secrets): the public mirror did NOT run."
+            echo "Set them (token needs write:packages) -- see DEVELOPMENT.md (Publishing)."
+            exit 1
+          fi
+          echo "$GHCR_TOKEN" | docker login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
+
+      # The dependency layer, prebuilt (Dockerfile.builder). Building it here, lazily, rather than
+      # in a separate path-filtered workflow, keeps this correct without depending on whether
+      # Forgejo's `on.push.paths` matches and without racing a second job on this one-at-a-time
+      # runner. A miss costs one slow build; it can never be *wrong*, because cargo recompiles
+      # whatever the image is missing.
+      # The dependency image is a pure function of exactly three files: the dependency set
+      # (`Cargo.toml`, `Cargo.lock`) and the build profile (`Dockerfile.builder`, which carries the
+      # codegen/linker ENVs). Hashing them together makes the TAG the fingerprint -- change any of
+      # the three and the tag moves on its own, so a stale image cannot be silently reused and
+      # nobody has to remember to bump anything.
+      #
+      # Order matters and must match the Makefile: Cargo.toml, Cargo.lock, Dockerfile.builder.
+      - name: Ensure the dependency image exists
+        run: |
+          set -eu
+          hash=$(cat Cargo.toml Cargo.lock Dockerfile.builder | sha256sum | cut -c1-8)
+          ref="$BUILDER:$BUILDER_PROFILE-$hash"
+          echo "dependency image: $ref"
+          if docker manifest inspect "$ref" > /dev/null 2>&1; then
+            echo "present"
+          else
+            echo "missing -- building it (slow, but only once per input change)"
+            docker build -f Dockerfile.builder -t "$ref" .
+            docker push "$ref"
+          fi
+          # Hand the exact tag to the build, so it cannot drift from the image this job verified.
+          echo "$ref" > .builder-ref
+
+      # One build, then a tag per registry: `docker tag` (never a rebuild) keeps the DIGEST identical,
+      # so the image the cluster runs and the image anyone can pull are provably the same bytes.
+      - name: Build and push the image (both registries)
+        run: |
+          set -eu
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "building $IMAGE:sha-$short"
+          docker build --platform linux/amd64 \
+            --build-arg BUILDER="$(cat .builder-ref)" \
+            -t "$IMAGE:edge" -t "$IMAGE:sha-$short" .
+          # sha-<short> first: it is the immutable handle, so it exists before the moving tag.
+          docker push "$IMAGE:sha-$short"
+          docker push "$IMAGE:edge"
+          for tag in "sha-$short" "edge"; do
+            docker tag "$IMAGE:$tag" "$GHCR_IMAGE:$tag"
+            docker push "$GHCR_IMAGE:$tag"
+          done
+          echo "published the image as sha-$short + edge, to Harbor and GHCR"
+
+      # After the image, so a chart whose defaults name a tag is never ahead of the tag existing.
+      - name: Package and push the chart (both registries)
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+          GHCR_USER: ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -eu
+          # The runner image has docker but not helm; pin our own rather than trust the image. (If a
+          # fatter image arrives later this costs one download, not a break.)
+          if ! command -v helm > /dev/null 2>&1; then
+            curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar xz
+            install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          fi
+          helm version --short
+
+          # helm keeps its OWN credential store (separate from docker's), so both registries need a
+          # login here even though docker is already authenticated to both.
+          echo "$HARBOR_TOKEN" | helm registry login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+          echo "$GHCR_TOKEN" | helm registry login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
+
+          helm package "$CHART" --destination .tmp/chart > /dev/null
+          pkg=$(ls .tmp/chart/*.tgz)
+          echo "pushing $(basename "$pkg")"
+          # Harbor first (private, what the cluster installs from), then the SAME .tgz to GHCR.
+          # `helm push` derives the final path segment from the chart's `name`, so the two repos
+          # differ only by their parent path -- the chart stays `ellmephant`, and its labels,
+          # selectors and resource names are unchanged.
+          helm push "$pkg" "oci://$CHART_REPO"
+          helm push "$pkg" "oci://$GHCR_CHART_REPO"
+          echo "published the chart to $CHART_REPO and $GHCR_CHART_REPO"

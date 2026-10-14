@@ -12,13 +12,15 @@ PVC. No sidecars, no operators.
 helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-namespace
 ```
 
-**The chart is not published to a public registry yet.** `make chart-push` publishes it to the
-maintainer's Harbor, which is LAN-only (see [`DEVELOPMENT.md`](../../DEVELOPMENT.md)); mirroring it
-somewhere public is a `TODO`. So install from a checkout, as above, or from inside the LAN:
+**The chart is published to both registries by the Forgejo `publish.yml` on every push to `main`** —
+private Harbor for the cluster, public GHCR for everyone else. Public install:
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
+helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.0
 ```
+
+There is no `index.yaml` and no Helm repo to `helm repo add`. On the LAN, the same chart lives at
+`oci://harbor.vn.linuxguru.net/library/charts/ellmephant`.
 
 Then point an MCP client at the Service, path `/mcp`:
 

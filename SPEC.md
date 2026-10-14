@@ -282,11 +282,13 @@ CREATE TABLE project_memory (      -- RETIRED in 0007; see "Membership is a TAG"
   blank `owner` is unassigned, which is a fact rather than a missing field. A `CHECK` could not
   validate the *elements* of a comma list anyway, the same reason `tags` has none.
 
-- **Two dates, and they are the project's, not the row's.** `start_date` is written when it is
-  stated and left empty otherwise — never stamped, because the store does not invent a date nobody
-  asserted — and can be corrected afterwards; `end_date` is stamped when `status` becomes `done` or
+- **Two dates, and they are the project's, not the row's.** `start_date` is the caller's if stated;
+  otherwise it is stamped when the project stops being `todo` — work cannot have started while it is
+  only a todo — and it is **never cleared**, so a start on a `todo` project records that the project
+  was worked on once and parked. `end_date` is stamped when `status` becomes `done` or
   `aborted`, never moves while the project stays ended (an unrelated later write does not touch it),
-  and is cleared when the project is reopened. Neither is `created`/`updated`: a project written down
+  and *is* cleared when the project is reopened: it tracks a current state, where `start_date`
+  records a past fact. Neither is `created`/`updated`: a project written down
   three weeks late *started* three weeks ago, and `updated` moves on any write, so it cannot answer
   "when did this finish". The column is `end_date` rather than `finished`/`completed` because
   `status` says **how** it ended and an aborted project was never *completed* — a date that tried to

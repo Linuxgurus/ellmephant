@@ -106,7 +106,7 @@ fn an_aborted_project_is_ended_not_gone() {
 }
 
 #[test]
-fn a_start_is_never_invented_and_the_end_follows_the_status() {
+fn a_stated_start_is_kept_and_the_end_follows_the_status() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
@@ -116,7 +116,7 @@ fn a_start_is_never_invented_and_the_end_follows_the_status() {
     let fresh = project::get(&conn, "x").unwrap().expect("exists");
     assert!(
         fresh.start_date.is_empty(),
-        "no start is stamped: the store never invents a date nobody stated"
+        "a todo has not started, so there is no start to record"
     );
     assert!(fresh.end_date.is_empty(), "a running project has no end");
 
@@ -192,6 +192,62 @@ fn a_start_is_never_invented_and_the_end_follows_the_status() {
             .unwrap()
             .end_date
             .is_empty()
+    );
+}
+
+#[test]
+fn a_start_is_derived_from_leaving_todo_and_never_cleared() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    // Born a todo: nothing has started, so there is nothing to record.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    project::upsert(&conn, &p, None).expect("create");
+    assert!(
+        project::get(&conn, "x")
+            .unwrap()
+            .unwrap()
+            .start_date
+            .is_empty(),
+        "a todo project has not started"
+    );
+
+    // Leaving `todo` IS the event — work began, and the store now knows when.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "active".into();
+    project::upsert(&conn, &p, None).expect("activate");
+    let started = project::get(&conn, "x").unwrap().unwrap();
+    assert!(
+        !started.start_date.is_empty(),
+        "leaving todo stamps the start"
+    );
+
+    // ...and it is never cleared. Pushing the project back to `todo` keeps the date, which is the
+    // record that someone worked on it and parked it.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "todo".into();
+    project::upsert(&conn, &p, None).expect("park");
+    assert_eq!(
+        project::get(&conn, "x").unwrap().unwrap().start_date,
+        started.start_date,
+        "a start survives a return to todo — it is the hint that the project was dicked with"
+    );
+
+    // A project born already started gets the same fact from the same rule.
+    let mut p = project_fixture("y");
+    p.title = "Y".into();
+    p.status = "active".into();
+    project::upsert(&conn, &p, None).expect("create active");
+    assert!(
+        !project::get(&conn, "y")
+            .unwrap()
+            .unwrap()
+            .start_date
+            .is_empty(),
+        "a project born active has started"
     );
 }
 

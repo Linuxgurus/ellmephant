@@ -126,10 +126,12 @@ pub struct Project {
     /// Last-update timestamp — last *write*, which is not the same as last *work*.
     #[serde(default)]
     pub updated: String,
-    /// When the work started, ISO date — empty until someone states it, because the store has no
-    /// basis to invent it. Correctable afterwards: [`created`] is when the *row* appeared, which is
-    /// not the same thing — a project written down three weeks late started three weeks ago, and
-    /// stamping `now` would assert the opposite.
+    /// When the work started, ISO date. Stated by the caller, or **derived from the status**:
+    /// stamped when a project stops being `todo`, since work cannot have started while it is only a
+    /// todo. **Never cleared** — a project pushed back to `todo` keeps it, so a non-empty start on a
+    /// `todo` project is the record that it was worked on once and parked. Also correctable:
+    /// [`created`] is when the *row* appeared, which is not the same thing — a project written down
+    /// three weeks late started three weeks ago.
     #[serde(default)]
     pub start_date: String,
     /// When it ended, ISO date — empty while the project runs. Stamped when `status` becomes one of
@@ -243,10 +245,13 @@ fn date_field(value: &str, field: &str) -> Result<String> {
 ///
 /// Returns the resolved key. `goal`/`state`/`tags`/`status`/`owner` are written as given, so a
 /// re-upsert is whole-row — read the project first if you mean to edit one field. The dates are the
-/// exception, and deliberately so: `start_date` is written only when the caller states one and is
-/// left alone otherwise (stamping it would invent a fact nobody asserted), and `end_date` follows
-/// `status` rather than the caller's silence. `created`/`updated` are the row's own timestamps and
-/// never move backwards.
+/// exception, and deliberately so — both follow an *event* rather than the caller's silence.
+/// `start_date` is the caller's if they state one; otherwise it is stamped when the project stops
+/// being `todo`, because work cannot have started while it is only a todo. It is then **never
+/// cleared**: a project pushed back to `todo` keeps its start, which is itself the record that the
+/// project was worked on once and parked. `end_date` follows `status` into [`ENDED_STATUSES`] and
+/// *does* clear on reopen — because it tracks a current state, where `start_date` records a past
+/// fact. `created`/`updated` are the row's own timestamps and never move backwards.
 pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Result<String> {
     let key = resolve_key(conn, p)?;
     let status = choice(&p.status, STATUSES, "todo", "status")?;
@@ -268,7 +273,9 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                  COALESCE(NULLIF(?8, ''), datetime('now')),
                  COALESCE(NULLIF(?9, ''), datetime('now')),
-                 ?10,
+                 CASE WHEN ?10 <> '' THEN ?10
+                      WHEN ?5 <> 'todo' THEN datetime('now')
+                      ELSE '' END,
                  CASE WHEN ?12 THEN COALESCE(NULLIF(?11, ''), datetime('now')) ELSE '' END)
          ON CONFLICT(key) DO UPDATE SET
              title = excluded.title,
@@ -278,7 +285,10 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
              owner = excluded.owner,
              tags = excluded.tags,
              updated = excluded.updated,
-             start_date = CASE WHEN ?10 <> '' THEN ?10 ELSE project.start_date END,
+             start_date = CASE WHEN ?10 <> '' THEN ?10
+                               WHEN project.start_date <> '' THEN project.start_date
+                               WHEN ?5 <> 'todo' THEN datetime('now')
+                               ELSE '' END,
              end_date = CASE WHEN ?12
                              THEN COALESCE(NULLIF(?11, ''), NULLIF(project.end_date, ''),
                                            datetime('now'))

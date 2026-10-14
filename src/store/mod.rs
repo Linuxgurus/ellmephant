@@ -110,13 +110,14 @@ fn resolve_key(conn: &Connection, mem: &Memory) -> Result<String> {
 /// Replace the outgoing `[[key]]` edges for `id` with those parsed from `body`.
 fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> Result<()> {
     conn.execute("DELETE FROM memory_link WHERE from_id = ?1", params![id])?;
-    for target in links::extract_links(body) {
-        if target == key {
+    for (kind, target) in links::extract_links(body) {
+        if kind == links::Kind::Memory && target == key {
             continue; // a self-link carries no navigation value
         }
         conn.execute(
-            "INSERT OR IGNORE INTO memory_link (from_id, to_key, rel) VALUES (?1, ?2, 'see')",
-            params![id, target],
+            "INSERT OR IGNORE INTO memory_link (from_id, to_key, to_type, rel)
+             VALUES (?1, ?2, ?3, 'see')",
+            params![id, target, kind.as_str()],
         )?;
     }
     Ok(())

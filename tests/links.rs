@@ -141,12 +141,12 @@ fn a_link_to_a_project_resolves_and_is_not_rot() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    // A memory may link to a project — the `prj-` prefix is what makes a key cross between the
+    // A memory may link to a project — the `prj:` marker is what makes a key cross between the
     // two tables without either graph knowing about the other.
     ellmephant::store::project::upsert(
         &conn,
         &ellmephant::store::project::Project {
-            key: "prj-chronos".into(),
+            key: "chronos".into(),
             title: "Chronos".into(),
             ..Default::default()
         },
@@ -157,7 +157,7 @@ fn a_link_to_a_project_resolves_and_is_not_rot() {
         &conn,
         &embedder,
         "a",
-        "works in [[prj-chronos]] and [[ghost]]",
+        "works in [[prj:chronos]] and [[ghost]]",
     );
 
     let dangling = links::dangling(&conn).expect("dangling");

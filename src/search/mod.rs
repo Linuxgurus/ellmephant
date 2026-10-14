@@ -497,13 +497,17 @@ fn expand_frontier(
 
 /// Neighbours of `(id, key)` in both directions: outgoing `[[…]]` edges and incoming
 /// backlinks, as `(id, key)` pairs.
+///
+/// Memory kind only, both ways: a `[[prj:x]]` edge points at a project, which is not a memory
+/// neighbour — and because keys are bare, a project's edge would otherwise look like an edge to the
+/// memory that happens to share its name.
 fn adjacent(conn: &Connection, id: i64, key: &str) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.key FROM memory_link l JOIN memory m ON m.key = l.to_key
-          WHERE l.from_id = ?1
+          WHERE l.from_id = ?1 AND l.to_type = 'memory'
          UNION
          SELECT m.id, m.key FROM memory_link l JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key = ?2",
+          WHERE l.to_key = ?2 AND l.to_type = 'memory'",
     )?;
     let rows = stmt.query_map(rusqlite::params![id, key], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let mut out = Vec::new();

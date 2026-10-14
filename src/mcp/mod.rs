@@ -63,9 +63,11 @@ const INSTRUCTIONS: &str = "ellmephant = Memory storage in smart-caveman style �
 small words out; drop filler, articles, glue. List-shaped reads return a positional table: a \
 `cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
 when a memory shapes your task, `memory_upvote` it — the store's own rankings ride on your votes. \
-A project (`prj-…`) is an activity over time — a container you can stand inside: \
+A project is an activity over time — a container you can stand inside: \
 `project_upsert` writes one, `project_get` reads one with its `preload`/`contains`, `project_list` \
-shows them all; a memory JOINS a project by home (`memory_upsert`'s `project`). \
+shows them all; a memory JOINS a project by home (`memory_upsert`'s `project`) and POINTS at one \
+from its body with `[[prj:key]]` (a bare `[[key]]` is a memory; keys are plain names, and the two \
+tables may share one). \
 Tool descriptions are the spec.";
 
 /// `memory_reembed` description: the only path out of a model or dimension change.
@@ -123,8 +125,8 @@ the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen �
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
 Create or replace a project — an activity completed over time: identity, status, prose, and an \
 ordered `preload`. A project is the structure half of the store and a container you can stand \
-inside; facts go in memories, where the store matches them by meaning. `key` is `prj-…` (a bare \
-name is prefixed). \
+inside; facts go in memories, where the store matches them by meaning. `key` is a plain slug — the \
+name is the identity, `prj:`/`prj-` are accepted and stripped, and a memory may share it. \
 `status` is todo|active|paused|done|aborted — `done` and `aborted` both end a project, and there is no delete; \
 `owner` is a set of names, e.g. [\"Cline\",\"James\"] — free text, since the store keeps no list of \
 who exists (and `me` would mean whatever reader asks). `preload` is the ORDERED list of memory keys to load as \
@@ -174,7 +176,7 @@ pub struct UpsertParams {
     /// Project home.
     #[serde(default)]
     #[schemars(
-        description = "Project this was born in (`prj-…`; a bare name is prefixed). Omit = keep the current home; \"\" = detach. One home per memory."
+        description = "Project this was born in (a plain name; `prj:`/`prj-` accepted and stripped). Omit = keep the current home; \"\" = detach. One home per memory."
     )]
     pub project: Option<String>,
 }
@@ -399,7 +401,7 @@ pub struct CoherentParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProjectKeyParams {
     /// The project's key.
-    #[schemars(description = "Project key (`prj-…`; a bare name is prefixed). Slug.")]
+    #[schemars(description = "Project key — a plain slug (`prj:`/`prj-` accepted and stripped).")]
     pub key: String,
 }
 
@@ -408,7 +410,7 @@ pub struct ProjectKeyParams {
 pub struct ProjectUpsertParams {
     /// Stable slug.
     #[serde(default)]
-    #[schemars(description = "Stable slug (`prj-…`); reuse replaces that project.")]
+    #[schemars(description = "Stable slug — a plain name; reuse replaces that project.")]
     pub key: Option<String>,
     /// Salient one-liner.
     #[schemars(description = "One sharp line.")]

@@ -4,8 +4,11 @@
 //! place to stand: a key, a status, prose, and two relations to memories. A memory is the other
 //! half of the store: one body of closely related facts, matched by meaning, so it carries the
 //! machinery (votes, visits, a coherence verdict, an embedding) that a project has no use for — a
-//! shape is not something you match by meaning. Their keys carry the `prj-` prefix, which is what
-//! lets a key cross between the two graphs (a memory body may write `[[prj-x]]`) without either
+//! shape is not something you match by meaning. Their keys are **plain names** — a project and a
+//! memory may share one — so a *reference* carries the type instead: `[[prj-x]]` is not a project
+//! link, `[[prj:x]]` is (see [`links::PROJECT_MARKER`]), and `memory_link.to_type` records which
+//! table an edge names. That is what lets a key cross between the two graphs (a memory body may
+//! write `[[prj:x]]`) without either
 //! graph having to know about the other.
 //!
 //! Two relations, opposite directions, different meanings:
@@ -33,8 +36,52 @@ use crate::search::MatchMode;
 use crate::search::lexical::Matcher;
 use crate::store::{links, slug, tags};
 
-/// Every project key starts with this.
-pub const KEY_PREFIX: &str = "prj-";
+/// The prefix a project key *used* to carry. Accepted on input (muscle memory, and every doc ever
+/// written), never produced: a key is a plain name now, so a project and a memory may share one.
+///
+/// Kept only for the input boundary — see [`strip_marker`], and migration `0006` for why the old
+/// spelling has to be *interpreted* exactly once, while it still means anything.
+const LEGACY_PREFIX: &str = "prj-";
+
+/// Strip an optional project marker from an argument that names a project: the argument's job
+/// already says "project", so `chronos`, `prj:chronos` and the legacy `prj-chronos` all name the
+/// same one.
+///
+/// **A link token is a different case.** Prose is written by a model about a name that may be
+/// ambiguous, so there the marker must be the unambiguous [`links::PROJECT_MARKER`]: `[[prj-foo]]`
+/// in a body means a memory *called* `prj-foo`, and only `[[prj:foo]]` crosses to the project.
+fn strip_marker(raw: &str) -> &str {
+    let raw = raw.trim();
+    match raw
+        .strip_prefix(links::PROJECT_MARKER)
+        .or_else(|| raw.strip_prefix(LEGACY_PREFIX))
+    {
+        Some(rest) => rest.trim(),
+        None => raw,
+    }
+}
+
+/// The canonical form of a project key: a plain slug, with any marker stripped. One helper, used by
+/// every entry point, so `"chronos"`, `"Chronos"`, `"prj:chronos"` and `"prj-chronos"` all mean the
+/// same project.
+pub fn normalize_key(raw: &str) -> String {
+    slug::slugify(strip_marker(raw))
+}
+
+/// Resolve a write's key: an explicit key is normalised; otherwise the title is slugified and a
+/// `-2`/`-3` suffix is added on collision.
+fn resolve_key(conn: &Connection, p: &Project) -> Result<String> {
+    if p.key.trim().is_empty() {
+        let base = normalize_key(&p.title);
+        let taken = taken_keys(conn, &base)?;
+        return Ok(slug::unique_slug(&base, &taken));
+    }
+    // A key that is *only* a marker would otherwise slugify to the `untitled` fallback.
+    if strip_marker(&p.key).trim().is_empty() {
+        return Err(Error::Project("empty project key".into()));
+    }
+    Ok(normalize_key(&p.key))
+}
 
 /// The legal `status` values. `done` and `aborted` both end a project — there is no delete.
 pub const STATUSES: &[&str] = &["todo", "active", "paused", "done", "aborted"];
@@ -50,7 +97,8 @@ pub const ENDED_STATUSES: &[&str] = &["done", "aborted"];
 /// ISO strings, so they sort as they read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Project {
-    /// Global-unique slug, always `prj-…`; identity and link target.
+    /// Global-unique slug within the project table — a plain name, shared with `memory` if it wants
+    /// one too; identity and link target.
     pub key: String,
     /// Smart-caveman one-liner.
     pub title: String,
@@ -120,7 +168,8 @@ pub enum Home {
     Keep,
     /// Detach: this memory has no home.
     Clear,
-    /// Belong to this project (normalised to `prj-…`). An error if another project already owns it.
+    /// Belong to this project (a plain name, or `prj:`/`prj-` prefixed — all three agree). An error
+    /// if another project already owns it.
     Set(String),
 }
 
@@ -135,37 +184,6 @@ pub struct Filter {
     pub pattern: Option<String>,
     /// How `pattern` is read.
     pub mode: MatchMode,
-}
-
-/// The canonical form of a project key: slugified, `prj-` prefixed. One helper, used by every
-/// entry point, so `"chronos"`, `"Chronos"` and `"prj-chronos"` all mean the same project.
-pub fn normalize_key(raw: &str) -> String {
-    let slug = slug::slugify(raw);
-    if slug.starts_with(KEY_PREFIX) {
-        slug
-    } else {
-        format!("{KEY_PREFIX}{slug}")
-    }
-}
-
-/// Whether a (already normalised) key is a project key.
-pub fn is_project_key(key: &str) -> bool {
-    key.starts_with(KEY_PREFIX)
-}
-
-/// Resolve a write's key: an explicit key is normalised; otherwise the title is slugified under
-/// the `prj-` prefix and a `-2`/`-3` suffix is added on collision.
-fn resolve_key(conn: &Connection, p: &Project) -> Result<String> {
-    if p.key.trim().is_empty() {
-        let base = normalize_key(&p.title);
-        let taken = taken_keys(conn, &base)?;
-        return Ok(slug::unique_slug(&base, &taken));
-    }
-    let key = normalize_key(&p.key);
-    if key == KEY_PREFIX {
-        return Err(Error::Project("empty project key".into()));
-    }
-    Ok(key)
 }
 
 /// Project keys sharing `base` as a prefix (collision avoidance). `base` is `[a-z0-9-]`, so its
@@ -301,21 +319,36 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
 /// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
 /// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
 /// can never occur inside one and the delimiter needs no escaping.
-fn encode_preload(keys: &[String]) -> String {
+/// Encode an ordered preload as the `project.mem_preload` column: keys slugified, blanks dropped and
+/// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
+/// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
+/// can never occur inside one and the delimiter needs no escaping.
+///
+/// `preload` holds **memory** keys, so a `prj:` token here is an error rather than a silent no-op:
+/// it names the other kind. (Membership in a project is `project_memory`, not this list.)
+fn encode_preload(keys: &[String]) -> Result<String> {
     let mut seen = HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    for key in keys {
+    for raw in keys {
         // A blank entry means nothing to load. Checked *before* slugifying: `slug::slugify` never
         // returns empty (it falls back to `untitled`), so a blank would otherwise become a key.
-        if key.trim().is_empty() {
+        if raw.trim().is_empty() {
             continue;
         }
-        let memory_key = slug::slugify(key);
+        let (kind, token) = links::parse_target(raw.trim());
+        if kind == links::Kind::Project {
+            return Err(Error::Project(format!(
+                "`preload` holds memory keys; `{raw}` names a project — write it `{}`, or forget the \
+                 marker to point at a memory of that name",
+                links::PROJECT_MARKER
+            )));
+        }
+        let memory_key = slug::slugify(&token);
         if seen.insert(memory_key.clone()) {
             out.push(memory_key);
         }
     }
-    out.join(",")
+    Ok(out.join(","))
 }
 
 /// Decode `project.mem_preload` back into its ordered keys. Inverse of [`encode_preload`], minus the
@@ -365,7 +398,7 @@ fn decode_owners(raw: &str) -> Vec<String> {
 fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<()> {
     tx.execute(
         "UPDATE project SET mem_preload = ?2 WHERE key = ?1",
-        params![project_key, encode_preload(keys)],
+        params![project_key, encode_preload(keys)?],
     )?;
     Ok(())
 }
@@ -448,7 +481,8 @@ fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
-/// Fetch one project by key (`prj-` is optional in the argument; see [`normalize_key`]).
+/// Fetch one project by key (a `prj:`/`prj-` marker is optional and stripped; see
+/// [`normalize_key`]).
 pub fn get(conn: &Connection, key: &str) -> Result<Option<Project>> {
     let key = normalize_key(key);
     Ok(conn
@@ -587,12 +621,20 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
 /// its list is parsed here and checked against the live memory keys. Both feed one report, so the
 /// audit reads the same either way.
 pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
-    let mut rows: Vec<(String, String)> = {
+    // Every target here is a memory: membership (`project_memory`) and `preload` both name memories,
+    // so the kind is not in question — only whether the row exists.
+    let mut rows: Vec<(String, links::Kind, String)> = {
         let mut stmt = conn.prepare(
             "SELECT c.memory_key, c.project_key FROM project_memory c
               WHERE c.memory_key NOT IN (SELECT key FROM memory)",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                links::Kind::Memory,
+                r.get::<_, String>(1)?,
+            ))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let present: HashSet<String> = {
@@ -606,7 +648,7 @@ pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
         let (project_key, raw) = row?;
         for key in decode_preload(&raw) {
             if !present.contains(&key) {
-                rows.push((key, project_key.clone()));
+                rows.push((key, links::Kind::Memory, project_key.clone()));
             }
         }
     }
@@ -675,19 +717,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_key_prefixes_and_slugs() {
-        assert_eq!(normalize_key("chronos"), "prj-chronos");
-        assert_eq!(normalize_key("Chronos"), "prj-chronos");
-        assert_eq!(normalize_key("prj-chronos"), "prj-chronos");
+    fn normalize_key_strips_markers_and_slugs() {
+        assert_eq!(normalize_key("chronos"), "chronos");
+        assert_eq!(normalize_key(" Chronos "), "chronos");
+        assert_eq!(normalize_key("prj:chronos"), "chronos");
+        assert_eq!(
+            normalize_key("prj-chronos"),
+            "chronos",
+            "the legacy spelling is accepted on input"
+        );
+        // Not a marker: a *name* that happens to read like one survives (a space, not a colon).
         assert_eq!(normalize_key("prj sessions"), "prj-sessions");
-        assert_eq!(normalize_key("  Deep Work  "), "prj-deep-work");
-    }
-
-    #[test]
-    fn is_project_key_reads_the_prefix() {
-        assert!(is_project_key("prj-x"));
-        assert!(!is_project_key("x"));
-        assert!(!is_project_key("todo-ellmephant-projects"));
+        assert_eq!(normalize_key("  Deep Work  "), "deep-work");
     }
 
     #[test]
@@ -711,8 +752,12 @@ mod tests {
             "   ".to_string(),
         ];
         // Order is the payload, so nothing is sorted the way `tags` sorts.
-        assert_eq!(encode_preload(&keys), "boot-note,chronos-rules");
-        assert_eq!(encode_preload(&[]), "");
+        assert_eq!(encode_preload(&keys).unwrap(), "boot-note,chronos-rules");
+        assert_eq!(encode_preload(&[]).unwrap(), "");
+        assert!(
+            encode_preload(&["prj:chronos".to_string()]).is_err(),
+            "a project marker is not a memory key"
+        );
         assert_eq!(decode_preload(""), Vec::<String>::new());
         assert_eq!(
             decode_preload("a,b"),

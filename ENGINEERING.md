@@ -39,8 +39,9 @@ The decisions the code obeys:
   "project = memory + type" would ship cheaply and model nothing (SPEC §7.1). **Inside a structure,
   a relation earns its own table only when its invariant is cross-row:** `contains` has one (a memory
   has one home, *anywhere* — a column cannot see other rows), `preload` does not (ordered, and order
-  is a property of the list, so it is a column). Their keys carry the `prj-` prefix, which is the
-  seam that keeps this one store instead of two graphs that never touch.
+  is a property of the list, so it is a column). A project's key is a **plain name** — a memory may
+  share it — so the seam that keeps this one store is the *reference*: `[[prj:x]]` in a body, and
+  `memory_link.to_type` on the edge.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
 - **Keys, not dumps.** A hit is `key` alone — the caller names the extra `fields` it wants
@@ -111,9 +112,9 @@ target). Dimensions are frozen at `CREATE`; changing the embedder's width is a d
 Inside a structure, a relation earns its own table only when its invariant is cross-row: `contains`
 has one (a memory has one home, *anywhere* — a column cannot see other rows), `preload` does not
 (a memory may sit in many projects' lists, and order is a property of the list, so it is a column
-rather than a `position`-ordered rowset). Project keys carry the `prj-` prefix, which lets a key
-cross between the two graphs: `memory_link.to_key` is a `TEXT` key, and `links::dangling` resolves a
-target against both tables.
+rather than a `position`-ordered rowset). Project keys are plain names, so what lets a key cross
+between the two graphs is the reference: `[[prj:x]]` in a body, and `memory_link.to_type` naming the
+table the key lives in. `links::dangling` resolves per kind.
 
 ## Embeddings
 
@@ -162,11 +163,16 @@ tags and distances when asked, never dumps**; a body is a `show`/`memory_get` aw
 
 ## Wiki links
 
-Links are authored inline in the body as `[[key]]`. At write time they become a derived
+Links are authored inline in the body as `[[key]]`, or `[[prj:key]]` to point at a project: links
+live in memory bodies, so a bare token means a memory and only the other kind needs saying. `:`
+cannot occur in a slug, so no name can squat on the marker, and the type rides on the **edge**
+(`memory_link.to_type`) rather than on the key — which is what lets a project and a memory share a
+name. At write time a link becomes a derived
 `memory_link` edge; search finds forward links and backlinks, and `--expand` walks them. Links
 are **by key, never by id**, so they survive a `reembed` and forward references. A `[[key]]`
-with no target is reported by `ellmephant links` as a warning rather than an error. `ellmephant
-rename OLD NEW` rewrites the tokens and repoints the edges in one transaction.
+with no target is reported by `ellmephant links` as a warning rather than an error (per kind: a
+missing memory and a missing project are different rot). `ellmephant
+rename OLD NEW` rewrites the tokens and repoints the memory edges in one transaction.
 
 ## Maintenance
 

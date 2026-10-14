@@ -21,12 +21,12 @@ pub enum Error {
     #[error("no such memory: {0}")]
     NotFound(String),
 
-    /// A project key that resolves to no row (the `prj-` counterpart of [`Error::NotFound`]).
+    /// A project key that resolves to no row — the project half of [`Error::NotFound`].
     #[error("no such project: {0}")]
     NoProject(String),
 
-    /// A project-layer rule was violated: a key without the `prj-` prefix, an unknown status, or a
-    /// second home for a memory that already belongs to a project.
+    /// A project-layer rule was violated: an empty key, an unknown status, a `prj:` marker where
+    /// only memories belong, or a second home for a memory that already belongs to a project.
     #[error("project error: {0}")]
     Project(String),
 

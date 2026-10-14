@@ -180,7 +180,7 @@ smart-caveman. It carries `tags` — a normalised, comma-joined list of aspects 
 (where it came from: a command, a path, a repo, a quote). A memory is **found** by meaning (the
 semantic `query`) or by a literal/`regex` `pattern`, and narrowed by structured filters (tags,
 size, coherence); it is **read whole** by `memory_get`; and it **points** at other rows with
-`[[key]]` — another memory's key, or a project's (`[[prj-…]]`). Its row also holds runtime
+`[[key]]` — another memory's key, or a project's (`[[prj:key]]`; see §8). Its row also holds runtime
 bookkeeping (`visits`, `times_useful`, `coherent`) that is never written by hand and never
 embedded.
 
@@ -208,7 +208,8 @@ CREATE VIRTUAL TABLE memory_vec USING vec0(
 
 CREATE TABLE memory_link (
   from_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
-  to_key  TEXT    NOT NULL,                     -- target KEY, not id
+  to_key  TEXT    NOT NULL,                     -- target KEY, not id: a plain name
+  to_type TEXT    NOT NULL DEFAULT 'memory',    -- memory|project (v6): WHICH table that name is in
   rel     TEXT    NOT NULL DEFAULT 'see',        -- see|supersedes|part-of|contradicts
   PRIMARY KEY (from_id, to_key, rel)
 ) WITHOUT ROWID;
@@ -229,7 +230,7 @@ the embedded document, and an upsert resets it to `NULL` (the row changed, so re
 ### 7.1 Projects — the structures half (v5)
 
 A project is **an activity completed over time** — work with a beginning, a current state, and a
-place to stand. It has a `key` (`prj-…`), a `title`, a `goal` (what it is for), a `state` (mutable
+place to stand. It has a `key` (a plain name, which a memory may share), a `title`, a `goal` (what it is for), a `state` (mutable
 prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`aborted`), an
 `owner` (a set of names), `tags`, a `preload` (the `mem_preload` column — the **ordered** list of
 memories to load as context to work in here, the boot set generalized to every project), and two
@@ -241,9 +242,11 @@ shape is not something you match by meaning.
 Memories and projects are the two halves of one store, and the line between them is drawn where the
 machinery changes. A memory is a **fact** — voted, ranked, judged for coherence, matched by meaning.
 A project is a **structure** — identity, fields, relations — so none of that machinery applies to
-it. That is why they are separate tables, and why a project's keys carry the **`prj-` prefix**,
-which is what lets a key travel between the two graphs: a memory body may write `[[prj-chronos]]`,
-because `memory_link.to_key` is a `TEXT` key and not a foreign key.
+it. That is why they are separate tables, and why a **key is a plain name**: a project and a memory
+may share one (`sessions` the project, `sessions` the memories about it — normal, not pathological),
+so the *table* is a row's type and the **reference** carries it. A memory body writes `[[prj:chronos]]`
+to cross into the other graph, and `memory_link.to_type` records which table an edge names, because
+`to_key` is a `TEXT` key and not a foreign key.
 
 ```sql
 CREATE TABLE project (             -- the key IS the identity: no rowid-derived id, no vector
@@ -308,24 +311,34 @@ CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
   null title, `doctor` counts it) rather than raising a broken-FK error.
 - **A home must exist** — a typo in a home is a mistake, not a forward reference — but a `preload`
   entry need not: a project may be created before its memories.
-- **A link to a project is not membership.** `[[prj-x]]` is a `see` edge (navigation, attention);
-  `contains` means born here. So `links::dangling` resolves a target against **both** tables.
+- **A link to a project is not membership.** `[[prj:x]]` is a `see` edge (navigation, attention);
+  `contains` means born here. So `links::dangling` resolves a target against the table its
+  `to_type` names — and nothing else: a `prj:sessions` link is not fixed by a *memory* called
+  `sessions`.
 - **No delete.** A project ends with `status = done` or `aborted`; the `preload` list and the `contains` edges
   cannot outlive one.
 
 ## 8. Cross-links (wiki semantics)
 
-- **Author:** inline `[[key]]` in `body` (canonical, greppable, exportable).
-- **Index:** parse to `memory_link(from_id, to_key, rel)` at write time — a *derived* index.
+- **Author:** inline `[[key]]` in `body` (canonical, greppable, exportable). `[[prj:key]]` crosses
+  into the structures half: links live in memory bodies, so a bare token is a *memory* and only the
+  other kind needs saying. `:` cannot occur in a slug (`[a-z0-9-]+`), so no name can squat on the
+  marker — and `[[prj-foo]]` is a memory *called* `prj-foo`, not a project.
+- **Index:** parse to `memory_link(from_id, to_key, to_type, rel)` at write time — a *derived* index.
+  The **type rides on the edge**, never on the key, because one name may exist in both tables
+  (`sessions` the project, `sessions` the memories about it).
 - **By key, never by id:** survives a `reembed`; supports forward refs; dangling links are
-  detected (non-fatal) rather than broken FKs:
-  `SELECT DISTINCT to_key FROM memory_link WHERE to_key NOT IN (SELECT key FROM memory);`
-- **Backlinks:** `SELECT from_id FROM memory_link WHERE to_key = ?` → powers one-hop graph
-  expansion in search and the "derived profile" assembly of §9.
+  detected (non-fatal) rather than broken FKs. Resolution is **per kind**, so a missing project and
+  a missing memory are different reports:
+  `SELECT to_key, to_type FROM memory_link l WHERE (l.to_type = 'memory' AND l.to_key NOT IN
+  (SELECT key FROM memory)) OR (l.to_type = 'project' AND l.to_key NOT IN (SELECT key FROM project));`
+- **Backlinks:** `SELECT from_id FROM memory_link WHERE to_key = ? AND to_type = 'memory'` → powers
+  one-hop graph expansion in search and the "derived profile" assembly of §9. A project edge is not
+  a backlink of a memory that happens to share its name.
 - **Rename:** keys are near-immutable; `rename` deliberately rewrites `[[oldkey]]` across
-  bodies **and** repoints edges.
+  bodies **and** repoints edges — memory edges only, so a project's incoming links are untouched.
 - **Embedding:** `[[...]]` stripped from the embed projection.
-- Key charset `[a-z0-9-]+` so the link regex is `\[\[([a-z0-9-]+)\]\]`.
+- Key charset `[a-z0-9-]+`; the link regex is `\[\[((?:prj:)?[a-z0-9-]+)\]\]`.
 
 ## 9. Memory philosophy (how memories are "tuned")
 
@@ -571,7 +584,8 @@ any model is touched; flags are re-checked the same way after they override the 
 - **Memory** — one body of text holding closely related facts: a `key` (identity *and* link
   target), a `title` (the gist), a `body` (the facts), `tags` and a `source`. Found by meaning or
   by a literal/regex pattern, read whole by `memory_get`, cross-linked with `[[key]]`.
-- **Project** — an activity completed over time: a `prj-…` key, a `title`, a `goal`, mutable
+- **Project** — an activity completed over time: a plain-name `key` (shared with `memory` if it
+  wants one), a `title`, a `goal`, mutable
   `state` prose, a `status`, an `owner` set, `tags`, an ordered `preload`, and `start_date`/`end_date`
   (the project's own dates; `status` says how it ended, `end_date` only says when). Listed by field
   (`project_list`), read whole by `project_get`. Never embedded (§7.1).

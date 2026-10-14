@@ -43,6 +43,7 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert!(db::migrate::latest() >= 2, "telemetry migration exists");
     assert!(db::migrate::latest() >= 5, "projects migration exists");
+    assert!(db::migrate::latest() >= 6, "link-type migration exists");
 
     for name in ["memory", "memory_link", "meta", "project", "project_memory"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
@@ -62,6 +63,11 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
             "project.{column} is missing"
         );
     }
+    // v6: an edge says which table its bare key names.
+    assert!(
+        column_exists(&conn, "memory_link", "to_type"),
+        "memory_link.to_type is missing"
+    );
     assert!(
         !object_exists(&conn, "table", "project_preload"),
         "preload is a column, not a table"
@@ -106,16 +112,19 @@ fn migrations_are_idempotent_across_reopen() {
 fn a_v4_store_gains_the_project_tables_on_open() {
     let (_dir, paths) = temp_store();
 
-    // A store from before projects existed: the tables gone, the version rolled back.
+    // A store from before projects existed: the tables gone, the link type gone, and the version
+    // rolled back.
     let conn = db::open(&paths).unwrap();
     insert(&conn, "keep-me", "Kept", "survives the upgrade");
     for table in ["project", "project_memory"] {
         conn.execute(&format!("DROP TABLE {table}"), []).unwrap();
     }
+    conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
-    // Opening it again runs only the newer step, and the rows are untouched.
+    // Opening it again runs only the newer steps, and the rows are untouched.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     for table in ["project", "project_memory"] {
@@ -125,6 +134,62 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         count(&conn, "SELECT count(*) FROM memory"),
         1,
         "an upgrade must not touch stored rows"
+    );
+}
+
+#[test]
+fn a_v5_store_gets_bare_keys_and_typed_edges() {
+    let (_dir, paths) = temp_store();
+
+    // The state an earlier v5 build left behind: prefixed project keys, membership and edges that
+    // named them by prefix, and no `to_type` column to say so.
+    let conn = db::open(&paths).unwrap();
+    conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
+        .unwrap();
+    insert(&conn, "source", "Source", "points at [[prj-chronos]]");
+    let from_id = conn.last_insert_rowid();
+    for sql in [
+        "INSERT INTO project (key, title) VALUES ('prj-chronos', 'Chronos')",
+        "INSERT INTO project_memory (memory_key, project_key) VALUES ('source', 'prj-chronos')",
+    ] {
+        conn.execute(sql, []).unwrap();
+    }
+    conn.execute(
+        "INSERT INTO memory_link (from_id, to_key, rel) VALUES (?1, 'prj-chronos', 'see')",
+        params![from_id],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 5).unwrap();
+    drop(conn);
+
+    // 0006 interprets the prefix exactly once — while it still means something.
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM project WHERE key = 'chronos'"),
+        1,
+        "the project key lost its prefix"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM project_memory WHERE project_key = 'chronos'"
+        ),
+        1,
+        "so did the membership that described it"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM memory_link WHERE to_key = 'chronos' AND to_type = 'project'"
+        ),
+        1,
+        "and the edge is now typed, with its key stripped"
+    );
+    assert!(
+        ellmephant::store::links::dangling(&conn)
+            .unwrap()
+            .is_empty(),
+        "the target exists, so nothing dangles"
     );
 }
 

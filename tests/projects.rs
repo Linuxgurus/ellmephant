@@ -9,6 +9,7 @@ mod common;
 use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
+use ellmephant::store::links;
 use ellmephant::store::project::{self, Home};
 use ellmephant::store::{self, Memory};
 use rusqlite::{Connection, params};
@@ -59,9 +60,12 @@ fn upsert_and_get_round_trip_with_defaults() {
         None,
     )
     .expect("upsert");
-    assert_eq!(key, "prj-chronos", "a bare name is prefixed");
+    assert_eq!(
+        key, "chronos",
+        "the key is a plain name, not a prefixed one"
+    );
 
-    let got = project::get(&conn, "prj-chronos").unwrap().expect("exists");
+    let got = project::get(&conn, "chronos").unwrap().expect("exists");
     assert_eq!(got.title, "Chronos — the timing subsystem");
     assert_eq!(got.goal, "Place my own intent into a future I won't occupy");
     assert_eq!(got.status, "todo", "empty status takes the default");
@@ -75,8 +79,10 @@ fn upsert_and_get_round_trip_with_defaults() {
     );
     assert!(!got.created.is_empty() && !got.updated.is_empty());
 
-    // `prj-` is optional on the read side.
+    // A `prj:`/`prj-` marker on the read side is optional — stripped, like everywhere else.
     assert!(project::get(&conn, "chronos").unwrap().is_some());
+    assert!(project::get(&conn, "prj:chronos").unwrap().is_some());
+    assert!(project::get(&conn, "prj-chronos").unwrap().is_some());
     assert!(project::get(&conn, "nope").unwrap().is_none());
 }
 
@@ -106,7 +112,7 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     let mut p = project_fixture("x");
     p.title = "X".into();
     project::upsert(&conn, &p, None).expect("upsert");
-    let fresh = project::get(&conn, "prj-x").unwrap().expect("exists");
+    let fresh = project::get(&conn, "x").unwrap().expect("exists");
     assert!(
         !fresh.start_date.is_empty(),
         "start is stamped, not asked for"
@@ -118,7 +124,7 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     p.title = "X".into();
     p.state = "now with more prose".into();
     project::upsert(&conn, &p, None).expect("touch");
-    let touched = project::get(&conn, "prj-x").unwrap().expect("exists");
+    let touched = project::get(&conn, "x").unwrap().expect("exists");
     assert_eq!(touched.start_date, fresh.start_date, "the start stays put");
     assert!(
         touched.updated >= fresh.updated,
@@ -130,7 +136,7 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     p.title = "X".into();
     p.status = "done".into();
     project::upsert(&conn, &p, None).expect("end it");
-    let ended = project::get(&conn, "prj-x").unwrap().expect("exists");
+    let ended = project::get(&conn, "x").unwrap().expect("exists");
     assert!(!ended.end_date.is_empty(), "done stamps the end");
     assert!(
         ended.end_date >= ended.start_date,
@@ -144,7 +150,7 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     p.goal = "a footnote, months later".into();
     project::upsert(&conn, &p, None).expect("touch");
     assert_eq!(
-        project::get(&conn, "prj-x").unwrap().unwrap().end_date,
+        project::get(&conn, "x").unwrap().unwrap().end_date,
         ended.end_date,
         "`updated` moves on a touch; the end does not"
     );
@@ -155,7 +161,7 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     p.status = "active".into();
     project::upsert(&conn, &p, None).expect("reopen");
     assert!(
-        project::get(&conn, "prj-x")
+        project::get(&conn, "x")
             .unwrap()
             .unwrap()
             .end_date
@@ -169,7 +175,7 @@ fn the_dates_are_stamped_once_and_the_end_follows_the_status() {
     p.status = "aborted".into();
     project::upsert(&conn, &p, None).expect("end it again");
     assert!(
-        !project::get(&conn, "prj-x")
+        !project::get(&conn, "x")
             .unwrap()
             .unwrap()
             .end_date
@@ -204,7 +210,7 @@ fn a_date_can_be_backfilled_but_not_invented() {
     let err = project::upsert(&conn, &p, None).unwrap_err();
     assert!(format!("{err}").contains("end_date"), "{err}");
     assert_eq!(
-        project::get(&conn, "prj-x").unwrap().unwrap().end_date,
+        project::get(&conn, "x").unwrap().unwrap().end_date,
         "2026-09-30",
         "the rejected write changed nothing"
     );
@@ -228,7 +234,7 @@ fn an_unknown_status_is_rejected() {
     let err = project::upsert(&conn, &p, None).unwrap_err();
     assert!(format!("{err}").contains("unknown status"), "{err}");
     assert!(
-        project::get(&conn, "prj-x").unwrap().is_none(),
+        project::get(&conn, "x").unwrap().is_none(),
         "nothing written"
     );
 }
@@ -259,14 +265,14 @@ fn an_owner_set_round_trips_through_one_column() {
     p.owner = vec!["James".to_string(), "Cline".to_string()];
     project::upsert(&conn, &p, None).expect("upsert");
 
-    let got = project::get(&conn, "prj-x").unwrap().expect("exists");
+    let got = project::get(&conn, "x").unwrap().expect("exists");
     assert_eq!(
         got.owner,
         vec!["Cline".to_string(), "James".to_string()],
         "sorted, in the spelling it was given"
     );
     let raw: String = conn
-        .query_row("SELECT owner FROM project WHERE key = 'prj-x'", [], |r| {
+        .query_row("SELECT owner FROM project WHERE key = 'x'", [], |r| {
             r.get(0)
         })
         .unwrap();
@@ -282,8 +288,8 @@ fn a_key_derives_from_the_title_and_avoids_collisions() {
     p.title = "Deep Work".into();
     let first = project::upsert(&conn, &p, None).expect("first");
     let second = project::upsert(&conn, &p, None).expect("second");
-    assert_eq!(first, "prj-deep-work");
-    assert_eq!(second, "prj-deep-work-2", "collision gets a suffix");
+    assert_eq!(first, "deep-work");
+    assert_eq!(second, "deep-work-2", "collision gets a suffix");
 }
 
 #[test]
@@ -370,7 +376,7 @@ fn contains_is_one_home_and_a_reupsert_keeps_it() {
     )
     .expect("add with a home");
     assert_eq!(key, "a");
-    let owned: Vec<String> = project::contains(&conn, "prj-chronos")
+    let owned: Vec<String> = project::contains(&conn, "chronos")
         .unwrap()
         .iter()
         .map(|r| r.key.clone())
@@ -381,7 +387,7 @@ fn contains_is_one_home_and_a_reupsert_keeps_it() {
     // memory write path rewrites.
     store::add(&conn, &embedder, &memory("a", "fact, edited")).expect("re-upsert");
     assert_eq!(
-        project::contains(&conn, "prj-chronos").unwrap().len(),
+        project::contains(&conn, "chronos").unwrap().len(),
         1,
         "the home survives a re-upsert"
     );
@@ -395,19 +401,19 @@ fn contains_is_one_home_and_a_reupsert_keeps_it() {
     )
     .unwrap_err();
     assert!(format!("{err}").contains("already belongs"), "{err}");
-    assert_eq!(project::contains(&conn, "prj-sessions").unwrap().len(), 0);
-    assert_eq!(project::contains(&conn, "prj-chronos").unwrap().len(), 1);
+    assert_eq!(project::contains(&conn, "sessions").unwrap().len(), 0);
+    assert_eq!(project::contains(&conn, "chronos").unwrap().len(), 1);
 
     // The same home is a no-op; `Clear` detaches.
     store::add_with_home(
         &conn,
         &embedder,
         &memory("a", "fact"),
-        Home::Set("prj-chronos".into()),
+        Home::Set("chronos".into()),
     )
     .expect("re-setting the same home is fine");
     store::add_with_home(&conn, &embedder, &memory("a", "fact"), Home::Clear).expect("detach");
-    assert!(project::contains(&conn, "prj-chronos").unwrap().is_empty());
+    assert!(project::contains(&conn, "chronos").unwrap().is_empty());
 }
 
 #[test]
@@ -448,14 +454,14 @@ fn list_filters_intersect() {
     };
     project::upsert(
         &conn,
-        &mk("prj-alpha", "active", vec!["continuity"], "ship the spine"),
+        &mk("alpha", "active", vec!["continuity"], "ship the spine"),
         None,
     )
     .unwrap();
     project::upsert(
         &conn,
         &mk(
-            "prj-beta",
+            "beta",
             "paused",
             vec!["continuity", "storage"],
             "store the facts",
@@ -465,7 +471,7 @@ fn list_filters_intersect() {
     .unwrap();
     project::upsert(
         &conn,
-        &mk("prj-gamma", "active", vec!["storage"], "store more"),
+        &mk("gamma", "active", vec!["storage"], "store more"),
         None,
     )
     .unwrap();
@@ -482,7 +488,7 @@ fn list_filters_intersect() {
     )
     .unwrap();
     let keys: Vec<&str> = active.iter().map(|p| p.key.as_str()).collect();
-    assert_eq!(keys, vec!["prj-alpha", "prj-gamma"], "key order");
+    assert_eq!(keys, vec!["alpha", "gamma"], "key order");
 
     // Tags are AND, not OR.
     let both = project::list(
@@ -494,7 +500,7 @@ fn list_filters_intersect() {
     )
     .unwrap();
     assert_eq!(both.len(), 1);
-    assert_eq!(both[0].key, "prj-beta");
+    assert_eq!(both[0].key, "beta");
 
     // The lexical leg reaches `goal` (and `state`), literal by default…
     let literal = project::list(
@@ -506,7 +512,7 @@ fn list_filters_intersect() {
     )
     .unwrap();
     assert_eq!(literal.len(), 1);
-    assert_eq!(literal[0].key, "prj-alpha");
+    assert_eq!(literal[0].key, "alpha");
 
     // …or as a regex, and a blank pattern is no leg at all.
     let regex = project::list(
@@ -519,7 +525,7 @@ fn list_filters_intersect() {
     )
     .unwrap();
     assert_eq!(regex.len(), 1);
-    assert_eq!(regex[0].key, "prj-beta");
+    assert_eq!(regex[0].key, "beta");
     let blank = project::list(
         &conn,
         &project::Filter {
@@ -576,6 +582,119 @@ fn dangling_reports_forward_references_and_keeps_them_visible() {
 }
 
 #[test]
+fn a_key_that_is_only_a_marker_is_rejected() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    for only in ["prj:", "prj-", "  prj:  "] {
+        let mut p = project_fixture("x");
+        p.key = only.into();
+        let err = project::upsert(&conn, &p, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("empty project key"),
+            "{only:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn preload_refuses_a_project_marker() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    // `mem_preload` holds MEMORY keys; a `prj:` token names the other kind, so say so rather than
+    // write a key that can never resolve.
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    let err = project::upsert(&conn, &p, Some(&["prj:chronos".to_string()])).unwrap_err();
+    assert!(format!("{err}").contains("preload"), "{err}");
+
+    // A bare name is a memory of that name — even one that reads like the legacy prefix, because in
+    // prose (and in this list) `prj-` is just letters.
+    project::upsert(&conn, &p, Some(&["prj-notes".to_string()])).expect("bare name is a memory");
+    assert_eq!(project::preload(&conn, "x").unwrap()[0].key, "prj-notes");
+}
+
+#[test]
+fn a_memory_and_a_project_may_share_a_name() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    // The case that moved the type out of the name: `sessions` is a project, and `sessions` is also
+    // what the memories about it get called.
+    project::upsert(&conn, &project_fixture("sessions"), None).expect("project");
+    store::add(
+        &conn,
+        &embedder,
+        &memory(
+            "sessions",
+            "see [[prj:sessions]] for the plan; [[ghost]] is rot",
+        ),
+    )
+    .expect("memory");
+
+    // Two rows, two tables, one name — and both are findable by it.
+    assert!(project::get(&conn, "sessions").unwrap().is_some());
+    assert!(store::get(&conn, "sessions").unwrap().is_some());
+
+    let edges: Vec<(String, String)> = conn
+        .prepare("SELECT to_key, to_type FROM memory_link ORDER BY to_key")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        edges,
+        vec![
+            ("ghost".to_string(), "memory".to_string()),
+            ("sessions".to_string(), "project".to_string())
+        ],
+        "the marker is what crosses to the other table"
+    );
+
+    // Rot says WHICH kind is missing: `ghost` is a memory that was never written.
+    let rot = links::dangling(&conn).unwrap();
+    assert_eq!(rot.len(), 1, "{rot:?}");
+    assert_eq!(rot[0].to_key, "ghost");
+    assert_eq!(rot[0].to_type, links::Kind::Memory);
+}
+
+#[test]
+fn a_project_link_is_not_a_memory_backlink() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    project::upsert(&conn, &project_fixture("sessions"), None).expect("project");
+    store::add(&conn, &embedder, &memory("about", "[[prj:sessions]]")).expect("pointer");
+    store::add(
+        &conn,
+        &embedder,
+        &memory("sessions", "the memory of the same name"),
+    )
+    .expect("memory");
+
+    // The edge is aimed at the PROJECT, so a memory called `sessions` has no backlinks from it...
+    assert!(links::backlinks(&conn, "sessions").unwrap().is_empty());
+
+    // ...and renaming that memory must not drag the project's edge along.
+    links::rename(&conn, "sessions", "session-notes").expect("rename");
+    let typed: Vec<(String, String)> = conn
+        .prepare("SELECT to_key, to_type FROM memory_link")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        typed,
+        vec![("sessions".to_string(), "project".to_string())],
+        "the project edge outlived the memory rename"
+    );
+}
+
+#[test]
 fn the_wire_shapes_are_positional_and_self_describing() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
@@ -607,13 +726,13 @@ fn the_wire_shapes_are_positional_and_self_describing() {
             "end_date"
         ])
     );
-    assert_eq!(v["projects"][0][0], serde_json::json!("prj-chronos"));
+    assert_eq!(v["projects"][0][0], serde_json::json!("chronos"));
     assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
 
     let view = project::view(&conn, &key).unwrap().unwrap();
     let wire = project::view_to_wire_json(&view).unwrap();
     let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
-    assert_eq!(v["project"]["key"], serde_json::json!("prj-chronos"));
+    assert_eq!(v["project"]["key"], serde_json::json!("chronos"));
     assert_eq!(v["preload"]["cols"], serde_json::json!(["key", "title"]));
     assert_eq!(v["preload"]["rows"][0][0], serde_json::json!("a"));
     assert_eq!(

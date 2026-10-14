@@ -13,8 +13,10 @@
 -- the same sense `memory` is -- `project` carries a project's own fields, `project_memory` its one
 -- relation to memories -- so nothing else needs keeping in sync.
 --
--- Keys carry the `prj-` prefix so the type is visible wherever a key travels, including into
--- `memory_link.to_key`, which is a TEXT key and not an FK.
+-- Keys are PLAIN NAMES: a project and a memory may share one ("sessions" is a project; "sessions" is
+-- also what the memories about it get called), so a key never carries its type. What carries it is
+-- the *table* a row lives in, and the *reference* that names one -- `[[prj:x]]` in a memory body,
+-- `memory_link.to_type` on an edge. See `0006` for the marker's one unambiguous spelling.
 --
 -- Two kinds of thing, two sets of tables, split where the machinery changes: "project = a memory
 -- with a type" would ship cheaply and model nothing, because the machinery a fact needs -- votes,
@@ -48,7 +50,7 @@
 -- blank `owner` means unassigned, which is a fact about the project, not a missing field.
 
 CREATE TABLE project (
-  key         TEXT PRIMARY KEY,                 -- 'prj-…'; identity and link target
+  key         TEXT PRIMARY KEY,                 -- a plain name; identity and link target
   title       TEXT NOT NULL,                    -- smart-caveman one-liner
   goal        TEXT NOT NULL DEFAULT '',         -- what this is for
   state       TEXT NOT NULL DEFAULT '',         -- mutable current-state prose

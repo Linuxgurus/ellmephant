@@ -541,15 +541,15 @@ async fn projects_round_trip_over_the_transport() {
     assert!(!stored.is_error.unwrap_or(false), "{}", text(&stored));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&text(&stored)).unwrap()["key"],
-        serde_json::json!("prj-chronos"),
-        "a bare name is prefixed"
+        serde_json::json!("chronos"),
+        "the key comes back as a plain name"
     );
 
     // `project_get` returns the project with its ordered preload.
     let got = call(
         &client,
         "project_get",
-        serde_json::json!({ "key": "prj-chronos" }),
+        serde_json::json!({ "key": "chronos" }),
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
@@ -635,7 +635,7 @@ async fn projects_round_trip_over_the_transport() {
     .await;
     let v: serde_json::Value = serde_json::from_str(&text(&active)).expect("json");
     assert_eq!(v["projects"].as_array().unwrap().len(), 1);
-    assert_eq!(v["projects"][0][0], serde_json::json!("prj-chronos"));
+    assert_eq!(v["projects"][0][0], serde_json::json!("chronos"));
 
     // An unknown project is a clean tool error.
     let missing = call(&client, "project_get", serde_json::json!({ "key": "nope" })).await;

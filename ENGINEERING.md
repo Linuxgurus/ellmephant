@@ -26,14 +26,27 @@ The decisions the code obeys:
 - **`store ≠ embed`.** The row keeps the full, literal text; one **document** (`key` + tags +
   title + link-stripped body) is embedded. The embedding strategy can change without losing what
   was written.
-- **Everything but `memory` is derived.** The vector index and the link graph are rebuildable
-  from the rows (the `memory_reembed` tool). The relational store must never lie; there is no FTS index
-  and no tag table to keep in sync.
+- **A memory is one body of closely related facts**, embedded as one document and matched by
+  meaning — which is what makes voting, ranking and the coherence verdict meaningful.
+- **A project is an activity completed over time.** Work with a beginning, a current state and a
+  place to stand: identity, fields, and its relations to memories. Listed by field and read whole —
+  which is what makes embedding it pointless, so it carries no vector, no votes and no verdict of
+  its own.
+- **Everything else is derived.** `memory_vec` (the KNN index) and `memory_link` (the `[[key]]`
+  graph) are computed from the rows and rebuildable at any time (the `memory_reembed` tool). The
+  relational store must never lie, so there is no FTS index and no tag table to keep in sync.
+- **The two kinds live in different tables, split where the machinery changes** — not on a hunch:
+  "project = memory + type" would ship cheaply and model nothing (SPEC §7.1). **Inside a structure,
+  a relation earns its own table only when its invariant is cross-row:** `contains` has one (a memory
+  has one home, *anywhere* — a column cannot see other rows), `preload` does not (ordered, and order
+  is a property of the list, so it is a column). A project's key is a **plain name** — a memory may
+  share it — so the seam that keeps this one store is the *reference*: `[[prj:x]]` in a body, and
+  `memory_link.to_type` on the edge.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
-- **Titles, not dumps.** Search returns `key`/`title`/`tags` and (for a semantic phrase) the
-  cosine distance, so the caller can judge confidence and control token cost; the body is a
-  deliberate `memory_get` away.
+- **Keys, not dumps.** A hit is `key` alone — the caller names the extra `fields` it wants
+  (`title`, `tags`, `coherent`, `chars`, `distance`) — so a search can never bloat context, and the
+  body is always a deliberate `memory_get` away.
 - **One binary, no runtime.** No interpreter, no service, no shared library.
 
 ## Architecture
@@ -51,8 +64,8 @@ The decisions the code obeys:
                                   ▼
                    index::vec  (one document vector per row)
                                   ▼
-      SQLite  memory.db  —  `memory` rows are the source of truth
-      derived & rebuildable:  memory_vec · memory_link
+      SQLite  memory.db  —  the truth:  `memory` (facts) · `project` · `project_memory` (structures)
+      everything else derived & rebuildable:  `memory_vec` · `memory_link`
                                   ▼
       embed::qwen3  (candle, in-binary)  —  weights under ~/.ellmephant/models/
 ```
@@ -68,14 +81,24 @@ Five layers, one crate:
 |---|---|---|
 | Storage | `db`, `migrations/` | open SQLite, pragmas, schema, `meta` kv |
 | Write path | `store`, `embed`, `index/vec` | upsert a row: key, one hash, tags, links, one vector |
+| Structures | `store::project` | projects: identity, the ordered preload, membership (one home) |
 | Read path | `search`, `index/vec` | one semantic phrase → KNN over the document vectors |
 | Interfaces | `cli`, `mcp` | REPL + one-shot, MCP server (HTTP default, stdio option) |
 | Tooling | `model`, `bench` | weights cache, latency + golden-eval measurements |
 
 ## Storage model
 
-One SQLite file is the source of truth. The `memory` table holds the rows; two derived indexes
-sit on top and can be rebuilt from the rows at any time:
+One SQLite file holds two kinds of thing, and both are truth:
+
+- **`memory`** — memories: one body of closely related facts each, embedded as one document and
+  matched by meaning.
+- **`project`** and **`project_memory`** — projects (v5): an activity completed over time, with its
+  own fields, its ordered `mem_preload` list as a column, and its one relation to memories
+  (`project_memory`, `memory_key` as `PRIMARY KEY`, so a memory has exactly one home). A project
+  carries no embedding, no telemetry and no coherence verdict — those belong to facts, the thing
+  matched by meaning. See SPEC §7.1.
+
+Everything else is **derived** from those rows and can be rebuilt at any time:
 
 - `memory_vec` — `sqlite-vec` `vec0` KNN index over the document embeddings.
 - `memory_link` — the `[[key]]` link graph, forward edges and backlinks.
@@ -85,6 +108,13 @@ per-row `doc_hash` decides when a row needs re-embedding (any change to the key,
 body changes the document). Ids are local; `key` is the stable identity (upsert target and link
 target). Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate
 `reembed`, not an implicit migration.
+
+Inside a structure, a relation earns its own table only when its invariant is cross-row: `contains`
+has one (a memory has one home, *anywhere* — a column cannot see other rows), `preload` does not
+(a memory may sit in many projects' lists, and order is a property of the list, so it is a column
+rather than a `position`-ordered rowset). Project keys are plain names, so what lets a key cross
+between the two graphs is the reference: `[[prj:x]]` in a body, and `memory_link.to_type` naming the
+table the key lives in. `links::dangling` resolves per kind.
 
 ## Embeddings
 
@@ -128,20 +158,26 @@ it, not `k`. There is no regex/key leg — `key`/`tags` are part of the embedded
 
 Results are ordered by ascending distance. A hit carries no body: the terminal shows
 `key`/`title`/`tags`/`distance`; the MCP wire returns **`key` alone by default** unless the
-caller names extra `fields` (§10 of `SPEC.md`). The read policy is titles and tags, never full
-dumps; a body is a `show`/`memory_get` away.
+caller names extra `fields` (§10 of `SPEC.md`). The read policy is **keys by default, titles and
+tags and distances when asked, never dumps**; a body is a `show`/`memory_get` away.
 
 ## Wiki links
 
-Links are authored inline in the body as `[[key]]`. At write time they become a derived
+Links are authored inline in the body as `[[key]]`, or `[[prj:key]]` to point at a project: links
+live in memory bodies, so a bare token means a memory and only the other kind needs saying. `:`
+cannot occur in a slug, so no name can squat on the marker, and the type rides on the **edge**
+(`memory_link.to_type`) rather than on the key — which is what lets a project and a memory share a
+name. At write time a link becomes a derived
 `memory_link` edge; search finds forward links and backlinks, and `--expand` walks them. Links
 are **by key, never by id**, so they survive a `reembed` and forward references. A `[[key]]`
-with no target is reported by `ellmephant links` as a warning rather than an error. `ellmephant
-rename OLD NEW` rewrites the tokens and repoints the edges in one transaction.
+with no target is reported by `ellmephant links` as a warning rather than an error (per kind: a
+missing memory and a missing project are different rot). `ellmephant
+rename OLD NEW` rewrites the tokens and repoints the memory edges in one transaction.
 
 ## Maintenance
 
-The `memory` table is the source of truth; every index on top of it is rebuildable.
+The rows are the source of truth — `memory`, `project`, `project_memory`; every index on top of them
+is rebuildable.
 
 - `reembed` drops and recreates the vec0 table when the embedder's width changes, recomputes
   every row's document vector, rewrites each row's `doc_hash`, and records
@@ -180,7 +216,7 @@ src/
 ├── model/             weights cache: resolve, fetch, verify
 ├── db/                open, pragmas, migrate(), meta key/value
 ├── embed/             Embedder trait, qwen3, tokenize, projection
-├── store/             add/get + derived indexes (slug, tags, links) + maintain (reembed)
+├── store/             add/get + projects + derived indexes (slug, tags, links) + maintain (reembed)
 ├── index/             the vec0 (KNN) document-vector table
 ├── search/            the semantic phrase search over the store
 ├── cli/               subcommands, repl, session, output formatting

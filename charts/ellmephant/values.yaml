@@ -7,8 +7,10 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/jdblack/ellmephant
-  # Defaults to the chart's appVersion when empty.
-  tag: ""
+  # `edge` is the published build: every push to `main` publishes the image under it (plus an
+  # immutable `sha-<commit>`). There are no version tags, so leaving this empty would resolve to
+  # `appVersion` and miss. Pin `sha-<commit>` if you need a build that cannot move.
+  tag: edge
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

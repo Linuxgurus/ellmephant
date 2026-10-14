@@ -146,13 +146,20 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     counts.truncate(TOP_TAGS);
 
-    let edges: i64 = conn.query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))?;
+    // Edge counts are MEMORY edges: a `[[prj:x]]` link names the other table, so it is not part of
+    // the memory graph's degree, orphans or components — with bare keys, a project edge would
+    // otherwise look like an edge to a memory that happens to share its name.
+    let edges: i64 = conn.query_row(
+        "SELECT count(*) FROM memory_link WHERE to_type = 'memory'",
+        [],
+        |r| r.get(0),
+    )?;
     let dangling = links::dangling(conn)?.len() as i64;
     // A memory is linked if it appears as an edge source or resolves as an edge target.
     let orphans: i64 = conn.query_row(
         "SELECT count(*) FROM memory m \
           WHERE m.id NOT IN (SELECT from_id FROM memory_link) \
-            AND m.key NOT IN (SELECT to_key FROM memory_link)",
+            AND m.key NOT IN (SELECT to_key FROM memory_link WHERE to_type = 'memory')",
         [],
         |r| r.get(0),
     )?;
@@ -248,7 +255,8 @@ fn component_sizes(conn: &Connection) -> Result<(i64, i64)> {
     let pos: HashMap<i64, usize> = nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
     let mut parent: Vec<usize> = (0..nodes.len()).collect();
-    let mut stmt = conn.prepare("SELECT from_id, to_key FROM memory_link")?;
+    let mut stmt =
+        conn.prepare("SELECT from_id, to_key FROM memory_link WHERE to_type = 'memory'")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (from_id, to_key) = row?;

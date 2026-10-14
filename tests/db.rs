@@ -15,6 +15,18 @@ fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
     ) > 0
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("table_info");
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .expect("columns");
+    names
+        .filter_map(std::result::Result::ok)
+        .any(|c| c == column)
+}
+
 fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     conn.execute(
         "INSERT INTO memory (key, title, body, doc_hash) VALUES (?1, ?2, ?3, 'h')",
@@ -30,8 +42,10 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
 
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert!(db::migrate::latest() >= 2, "telemetry migration exists");
+    assert!(db::migrate::latest() >= 5, "projects migration exists");
+    assert!(db::migrate::latest() >= 6, "link-type migration exists");
 
-    for name in ["memory", "memory_link", "meta"] {
+    for name in ["memory", "memory_link", "meta", "project", "project_memory"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
     // v2 keeps one embedding per row: guard against a BM25/tag table being reintroduced.
@@ -41,6 +55,23 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
             "{name} should not exist"
         );
     }
+    // The preload list is a COLUMN on `project`, not a tie table (0005's header says why):
+    // guard against a `project_preload` table creeping back.
+    for column in ["mem_preload", "start_date", "end_date"] {
+        assert!(
+            column_exists(&conn, "project", column),
+            "project.{column} is missing"
+        );
+    }
+    // v6: an edge says which table its bare key names.
+    assert!(
+        column_exists(&conn, "memory_link", "to_type"),
+        "memory_link.to_type is missing"
+    );
+    assert!(
+        !object_exists(&conn, "table", "project_preload"),
+        "preload is a column, not a table"
+    );
     assert!(
         object_exists(&conn, "index", "idx_link_to"),
         "missing index"
@@ -75,6 +106,91 @@ fn migrations_are_idempotent_across_reopen() {
     let conn = db::open(&paths).expect("second open");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 1);
+}
+
+#[test]
+fn a_v4_store_gains_the_project_tables_on_open() {
+    let (_dir, paths) = temp_store();
+
+    // A store from before projects existed: the tables gone, the link type gone, and the version
+    // rolled back.
+    let conn = db::open(&paths).unwrap();
+    insert(&conn, "keep-me", "Kept", "survives the upgrade");
+    for table in ["project", "project_memory"] {
+        conn.execute(&format!("DROP TABLE {table}"), []).unwrap();
+    }
+    conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
+        .unwrap();
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    drop(conn);
+
+    // Opening it again runs only the newer steps, and the rows are untouched.
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
+    for table in ["project", "project_memory"] {
+        assert!(object_exists(&conn, "table", table), "missing {table}");
+    }
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory"),
+        1,
+        "an upgrade must not touch stored rows"
+    );
+}
+
+#[test]
+fn a_v5_store_gets_bare_keys_and_typed_edges() {
+    let (_dir, paths) = temp_store();
+
+    // The state an earlier v5 build left behind: prefixed project keys, membership and edges that
+    // named them by prefix, and no `to_type` column to say so.
+    let conn = db::open(&paths).unwrap();
+    conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
+        .unwrap();
+    insert(&conn, "source", "Source", "points at [[prj-chronos]]");
+    let from_id = conn.last_insert_rowid();
+    for sql in [
+        "INSERT INTO project (key, title) VALUES ('prj-chronos', 'Chronos')",
+        "INSERT INTO project_memory (memory_key, project_key) VALUES ('source', 'prj-chronos')",
+    ] {
+        conn.execute(sql, []).unwrap();
+    }
+    conn.execute(
+        "INSERT INTO memory_link (from_id, to_key, rel) VALUES (?1, 'prj-chronos', 'see')",
+        params![from_id],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 5).unwrap();
+    drop(conn);
+
+    // 0006 interprets the prefix exactly once — while it still means something.
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM project WHERE key = 'chronos'"),
+        1,
+        "the project key lost its prefix"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM project_memory WHERE project_key = 'chronos'"
+        ),
+        1,
+        "so did the membership that described it"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM memory_link WHERE to_key = 'chronos' AND to_type = 'project'"
+        ),
+        1,
+        "and the edge is now typed, with its key stripped"
+    );
+    assert!(
+        ellmephant::store::links::dangling(&conn)
+            .unwrap()
+            .is_empty(),
+        "the target exists, so nothing dangles"
+    );
 }
 
 #[test]

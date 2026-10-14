@@ -30,6 +30,16 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0004_coherent.sql"),
         "coherent: split-review verdict",
     ),
+    (
+        5,
+        include_str!("../../migrations/0005_projects.sql"),
+        "projects: project, project_memory",
+    ),
+    (
+        6,
+        include_str!("../../migrations/0006_link_type.sql"),
+        "link type: bare keys, memory_link.to_type",
+    ),
 ];
 
 /// Current schema version recorded in the file.

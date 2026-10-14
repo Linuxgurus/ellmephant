@@ -6,7 +6,7 @@
 //! and answers a plain boolean per row; [`run`](super::run) intersects that set with the rest of
 //! the query.
 //!
-//! No FTS index and no `LIKE`: `memory` is the only source of truth (SPEC §5/§7), so there is
+//! No FTS index and no `LIKE`: the rows are the only source of truth (SPEC §5/§7), so there is
 //! nothing to keep in sync — a scan over a store of thousands is cheap. Matching is
 //! case-insensitive in both modes.
 
@@ -62,16 +62,21 @@ impl Matcher {
         }
     }
 
+    /// Whether `s` matches the pattern. The one predicate: [`hits`](Self::hits) is this over a
+    /// memory's three fields, and non-memory rows (a project's `key`/`title`/`goal`/`state`) call
+    /// it directly, so the lexical leg is not duplicated per table.
+    pub fn matches(&self, s: &str) -> bool {
+        match self.mode {
+            MatchMode::Literal => s.to_lowercase().contains(&self.needle),
+            MatchMode::Regex => self.re.as_ref().is_some_and(|re| re.is_match(s)),
+        }
+    }
+
     /// Whether `mem`'s `key`, `title` or `body` contains the pattern.
     pub fn hits(&self, mem: &Memory) -> bool {
-        match self.mode {
-            MatchMode::Literal => [&mem.key, &mem.title, &mem.body]
-                .into_iter()
-                .any(|field| field.to_lowercase().contains(&self.needle)),
-            MatchMode::Regex => [&mem.key, &mem.title, &mem.body]
-                .into_iter()
-                .any(|field| self.re.as_ref().is_some_and(|re| re.is_match(field))),
-        }
+        [&mem.key, &mem.title, &mem.body]
+            .into_iter()
+            .any(|field| self.matches(field))
     }
 }
 

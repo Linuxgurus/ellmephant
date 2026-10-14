@@ -86,7 +86,8 @@ mcp-memory-service → typed edges + tag AND/OR).
   (~1.2 GB resident) and one writer connection. One-shot CLI flags pay one cold start.
   A shared daemon is *optional* and only if bare one-shot latency annoys us (see §15).
 - **Indexes are derived:** the document vectors (`memory_vec`) and links (`memory_link`) are all
-  rebuildable from `memory`. Only `memory` is truth — no FTS index, no tag tables.
+  rebuildable from the rows. The rows are truth — `memory` and the project tables (§7.1) — and there
+  is no FTS index or tag table, so nothing else needs keeping in sync.
 
 ## 6. Embedder
 
@@ -173,6 +174,16 @@ Fetching is **first-run, opt-in, and the only network code in the binary**.
 
 ## 7. Data model
 
+**A memory is one body of text holding closely related facts.** It is identified by a `key` (a
+global-unique slug) and gisted by its `title`; the facts live in the `body`, written in
+smart-caveman. It carries `tags` — a normalised, comma-joined list of aspects — and a `source`
+(where it came from: a command, a path, a repo, a quote). A memory is **found** by meaning (the
+semantic `query`) or by a literal/`regex` `pattern`, and narrowed by structured filters (tags,
+size, coherence); it is **read whole** by `memory_get`; and it **points** at other rows with
+`[[key]]` — another memory's key, or a project's (`[[prj:key]]`; see §8). Its row also holds runtime
+bookkeeping (`visits`, `times_useful`, `coherent`) that is never written by hand and never
+embedded.
+
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -197,7 +208,8 @@ CREATE VIRTUAL TABLE memory_vec USING vec0(
 
 CREATE TABLE memory_link (
   from_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
-  to_key  TEXT    NOT NULL,                     -- target KEY, not id
+  to_key  TEXT    NOT NULL,                     -- target KEY, not id: a plain name
+  to_type TEXT    NOT NULL DEFAULT 'memory',    -- memory|project (v6): WHICH table that name is in
   rel     TEXT    NOT NULL DEFAULT 'see',        -- see|supersedes|part-of|contradicts
   PRIMARY KEY (from_id, to_key, rel)
 ) WITHOUT ROWID;
@@ -215,19 +227,118 @@ counters) and `coherent` (0004) — the §9 split-review verdict, a **nullable b
 unjudged, `TRUE` = one topic, `FALSE` = a grab-bag worth splitting). `coherent` is not part of
 the embedded document, and an upsert resets it to `NULL` (the row changed, so re-judge it).
 
+### 7.1 Projects — the structures half (v5)
+
+A project is **an activity completed over time** — work with a beginning, a current state, and a
+place to stand. It has a `key` (a plain name, which a memory may share), a `title`, a `goal` (what it is for), a `state` (mutable
+prose: where it stands, what's next), a `status` (`todo`|`active`|`paused`|`done`|`aborted`), an
+`owner` (a set of names), `tags`, a `preload` (the `mem_preload` column — the **ordered** list of
+memories to load as context to work in here, the boot set generalized to every project), and two
+dates: `start_date` (when the work started) and `end_date` (when it ended, if it has). It is
+**listed** by field (`project_list`: status, tags, a literal/regex pattern) and **read whole** by
+`project_get`, which resolves both of its relations to memories. Projects are never embedded: a
+shape is not something you match by meaning.
+
+Memories and projects are the two halves of one store, and the line between them is drawn where the
+machinery changes. A memory is a **fact** — voted, ranked, judged for coherence, matched by meaning.
+A project is a **structure** — identity, fields, relations — so none of that machinery applies to
+it. That is why they are separate tables, and why a **key is a plain name**: a project and a memory
+may share one (`sessions` the project, `sessions` the memories about it — normal, not pathological),
+so the *table* is a row's type and the **reference** carries it. A memory body writes `[[prj:chronos]]`
+to cross into the other graph, and `memory_link.to_type` records which table an edge names, because
+`to_key` is a `TEXT` key and not a foreign key.
+
+```sql
+CREATE TABLE project (             -- the key IS the identity: no rowid-derived id, no vector
+  key         TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  goal        TEXT NOT NULL DEFAULT '',         -- what this is for
+  state       TEXT NOT NULL DEFAULT '',         -- mutable current-state prose
+  status      TEXT NOT NULL DEFAULT 'todo',     -- todo|active|paused|done|aborted
+  owner       TEXT NOT NULL DEFAULT '',         -- comma-joined names, e.g. 'Cline,James'
+  tags        TEXT NOT NULL DEFAULT '',
+  mem_preload TEXT NOT NULL DEFAULT '',         -- comma-joined memory keys, ORDERED by priority
+  created     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated     TEXT NOT NULL DEFAULT (datetime('now')),
+  start_date  TEXT NOT NULL DEFAULT '',         -- when the WORK started
+  end_date    TEXT NOT NULL DEFAULT '',         -- when it ENDED: done or aborted alike
+  CHECK (status IN ('todo', 'active', 'paused', 'done', 'aborted'))));
+
+CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
+  memory_key  TEXT PRIMARY KEY,
+  project_key TEXT NOT NULL);
+```
+
+- **`owner` is a set of names, and the names are free text.** Comma-joined, trimmed, de-duped
+  case-insensitively and sorted (`James`, not `james`; one person, one entry) — but never checked
+  against a list, because the code has no list to check against. It cannot: the store does not know
+  who exists, and `me`/`us` would be worse than useless in a store two agents share, since they mean
+  whoever happens to be reading. A name nobody recognises is a typo, not a schema violation — and a
+  blank `owner` is unassigned, which is a fact rather than a missing field. A `CHECK` could not
+  validate the *elements* of a comma list anyway, the same reason `tags` has none.
+
+- **Two dates, and they are the project's, not the row's.** `start_date` is stamped on the first
+  write and can be corrected afterwards; `end_date` is stamped when `status` becomes `done` or
+  `aborted`, never moves while the project stays ended (an unrelated later write does not touch it),
+  and is cleared when the project is reopened. Neither is `created`/`updated`: a project written down
+  three weeks late *started* three weeks ago, and `updated` moves on any write, so it cannot answer
+  "when did this finish". The column is `end_date` rather than `finished`/`completed` because
+  `status` says **how** it ended and an aborted project was never *completed* — a date that tried to
+  say how would have to be wrong about one of them. Dates are ISO (`YYYY-MM-DD`) and shape-checked,
+  because a date that does not sort as it reads breaks every "what ended in September" query
+  silently.
+
+- **One tie table, not two: a relation earns a table only when its invariant is cross-row.**
+  `contains` needs one — "a memory has at most one home, *anywhere*" cannot be expressed as a
+  column, because a column cannot see other rows. `preload` does not: a memory may sit in many
+  projects' lists, and its **order is a property of the list**, not of each edge — so it is a
+  column (`mem_preload`), with no `position` column shuffling a rowset back into order. A key is
+  `[a-z0-9-]` (`slug::slugify`), so a comma can never occur inside one: the delimiter is safe by
+  construction, not by convention.
+- **Two relations, opposite directions, different meanings.** `preload` is project → memory and
+  **ordered**: *"to work in here, load these"* — a project preloads memories it did not author
+  (conventions, boot notes). `contains` is memory → project: *"born here / belongs here."*
+  Neither contains the other; collapse them and you get either noise (load everything) or
+  starvation (only what it wrote).
+- **One home is a constraint, not a convention:** `memory_key` is the `PRIMARY KEY` of
+  `project_memory`, so a memory belongs to at most one project and a second home is an error.
+- **A membership lands inside the memory's own transaction** (`store::add_with_home`), because a
+  memory is born *with* its provenance. An upsert that says nothing about a project
+  (`Home::Keep`) leaves the existing home alone: membership is not a column the row rewrite
+  touches, so a re-upsert cannot silently orphan it.
+- **No foreign keys, exactly like `memory_link.to_key`:** a `preload` reference is a forward
+  reference, allowed, and rot is *detected* (`store::project::dangling`, `project_get` reports a
+  null title, `doctor` counts it) rather than raising a broken-FK error.
+- **A home must exist** — a typo in a home is a mistake, not a forward reference — but a `preload`
+  entry need not: a project may be created before its memories.
+- **A link to a project is not membership.** `[[prj:x]]` is a `see` edge (navigation, attention);
+  `contains` means born here. So `links::dangling` resolves a target against the table its
+  `to_type` names — and nothing else: a `prj:sessions` link is not fixed by a *memory* called
+  `sessions`.
+- **No delete.** A project ends with `status = done` or `aborted`; the `preload` list and the `contains` edges
+  cannot outlive one.
+
 ## 8. Cross-links (wiki semantics)
 
-- **Author:** inline `[[key]]` in `body` (canonical, greppable, exportable).
-- **Index:** parse to `memory_link(from_id, to_key, rel)` at write time — a *derived* index.
+- **Author:** inline `[[key]]` in `body` (canonical, greppable, exportable). `[[prj:key]]` crosses
+  into the structures half: links live in memory bodies, so a bare token is a *memory* and only the
+  other kind needs saying. `:` cannot occur in a slug (`[a-z0-9-]+`), so no name can squat on the
+  marker — and `[[prj-foo]]` is a memory *called* `prj-foo`, not a project.
+- **Index:** parse to `memory_link(from_id, to_key, to_type, rel)` at write time — a *derived* index.
+  The **type rides on the edge**, never on the key, because one name may exist in both tables
+  (`sessions` the project, `sessions` the memories about it).
 - **By key, never by id:** survives a `reembed`; supports forward refs; dangling links are
-  detected (non-fatal) rather than broken FKs:
-  `SELECT DISTINCT to_key FROM memory_link WHERE to_key NOT IN (SELECT key FROM memory);`
-- **Backlinks:** `SELECT from_id FROM memory_link WHERE to_key = ?` → powers one-hop graph
-  expansion in search and the "derived profile" assembly of §9.
+  detected (non-fatal) rather than broken FKs. Resolution is **per kind**, so a missing project and
+  a missing memory are different reports:
+  `SELECT to_key, to_type FROM memory_link l WHERE (l.to_type = 'memory' AND l.to_key NOT IN
+  (SELECT key FROM memory)) OR (l.to_type = 'project' AND l.to_key NOT IN (SELECT key FROM project));`
+- **Backlinks:** `SELECT from_id FROM memory_link WHERE to_key = ? AND to_type = 'memory'` → powers
+  one-hop graph expansion in search and the "derived profile" assembly of §9. A project edge is not
+  a backlink of a memory that happens to share its name.
 - **Rename:** keys are near-immutable; `rename` deliberately rewrites `[[oldkey]]` across
-  bodies **and** repoints edges.
+  bodies **and** repoints edges — memory edges only, so a project's incoming links are untouched.
 - **Embedding:** `[[...]]` stripped from the embed projection.
-- Key charset `[a-z0-9-]+` so the link regex is `\[\[([a-z0-9-]+)\]\]`.
+- Key charset `[a-z0-9-]+`; the link regex is `\[\[((?:prj:)?[a-z0-9-]+)\]\]`.
 
 ## 9. Memory philosophy (how memories are "tuned")
 
@@ -255,8 +366,8 @@ The store is **atomics-first**; generalization is derived, not stored.
   is a **read**. Review a fat row with `memory_search` (`min_chars`, `coherent: "!true"` — the rows
   not proven coherent), split it by hand, then stamp the verdict (`memory_coherent`). An upsert
   resets the verdict to unjudged, so an edit re-opens review.
-- **Read policy:** return **titles, tags and scores**, never dumps (tokens regress otherwise);
-  the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
+- **Read policy:** ask for **keys plus titles, tags and scores** (`fields`) — never dumps (tokens
+  regress otherwise); the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
   at a small `k`, judged from titles/tags/distances, `memory_get` only the hit(s) you'll use,
   widening (`k`) only if none fit.
 
@@ -308,7 +419,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
 `memory_delete`, `memory_search`,
 `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
-`memory_dupes`.
+`memory_dupes`, `memory_reembed`, `project_upsert`, `project_get`, `project_list`.
 
 - **Each tool states its own law in its own description** — that is what the model actually
   reads, so nothing is written twice. The §9 write policy rides on `memory_upsert`'s
@@ -418,7 +529,8 @@ any model is touched; flags are re-checked the same way after they override the 
 
 - **False-memory hazard:** semantic neighbors can be confidently *wrong*. Mitigate: return the
   distance, keep tags honest, don't over-trust, use one-hop expansion for context.
-- **Fat returns regress token cost** below plain `grep` — titles-not-bodies is a *requirement*.
+- **Fat returns regress token cost** below plain `grep` — keys-not-bodies is a *requirement*, and
+  even `title`/`tags` are asked for (`fields`), never sent unbidden.
 - **Write quality governs everything** — low friction means more (and sloppier) writes.
 - **bf16 CPU emulation** may be slow → `--precision f16`.
 - **Loss of greppability** (SQLite isn't `rg`) — retrieval is semantic; the store is one copyable
@@ -438,8 +550,9 @@ any model is touched; flags are re-checked the same way after they override the 
    `[[old]]` and repoints edges; refuses to clobber an existing key (`store::links::rename`).
 4. **Daemon vs not** — decided: no daemon in v1. The REPL and the MCP server both keep the
    encoder warm, which is what the daemon would have bought (PLAN §2 #4).
-5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`; the first
-   run bootstraps schema v1.
+5. **Migration mechanics** — shipped (P1): `user_version` steps in `db::migrate`. A fresh store
+   applies `0001…0005` in order, so it opens at the current schema (**v5** today); an existing store
+   is stepped up to it on open.
 6. **Tags** — decided: stored on each row (comma-joined) and folded into the document embedding;
    `ellmephant tags` derives the vocabulary and counts. Dangling `[[key]]` targets are audited by
    `links`.
@@ -468,6 +581,19 @@ any model is touched; flags are re-checked the same way after they override the 
 ## 17. Glossary
 
 - **Atomic / atom** — one memory row; a single fact. The storage + embedding unit.
+- **Memory** — one body of text holding closely related facts: a `key` (identity *and* link
+  target), a `title` (the gist), a `body` (the facts), `tags` and a `source`. Found by meaning or
+  by a literal/regex pattern, read whole by `memory_get`, cross-linked with `[[key]]`.
+- **Project** — an activity completed over time: a plain-name `key` (shared with `memory` if it
+  wants one), a `title`, a `goal`, mutable
+  `state` prose, a `status`, an `owner` set, `tags`, an ordered `preload`, and `start_date`/`end_date`
+  (the project's own dates; `status` says how it ended, `end_date` only says when). Listed by field
+  (`project_list`), read whole by `project_get`. Never embedded (§7.1).
+- **Preload** — a project's ordered list of memory keys to load as context for working in it
+  ("to work in here, load these"): the boot set, generalized. The order is the payload. The
+  *relation* is `preload`; the column that stores it is `mem_preload`.
+- **Home** — the project a memory belongs to, via `contains`. One per memory — enforced by the
+  schema, not by convention.
 - **Derived view / profile** — a composed answer built at query time from atoms; never stored.
 - **Key** — the global-unique slug; identity *and* link target (wiki semantics).
 - **Title / body** — the one-liner and the fact; stored literally and folded into the document embedding.
@@ -475,6 +601,7 @@ any model is touched; flags are re-checked the same way after they override the 
 - **Smart-caveman** — the writing style: drop filler, articles and glue words; keep signal.
 - **Document** — the text embedded for a row: `key`, tags, title and the link-stripped body.
 - **store ≠ embed** — the row keeps full text; the vector is over a link-stripped projection.
-- **Semantic** — the phrase-match method: embed the query and take the KNN (the only leg).
+- **Semantic** — the phrase-match method: embed the query and take the KNN. The ranked leg; the
+  literal/regex `pattern` is the other one, and the two do not fuse (§10).
 - **Model cache** — the external weights dir (`~/.ellmephant/models/<owner>--<repo>/<sha>/`), a
   flat, sha-pinned, manifest-backed copy of the encoder's files; data, not code (§6.1).

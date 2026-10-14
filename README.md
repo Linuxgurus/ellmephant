@@ -65,7 +65,7 @@ You can run it either way: use the [Podman Compose setup](#optional-podman-compo
 below, or just run this command:
 
 ```sh
-podman run -d --rm -p 8888:8888 -v ellmephant-data:/data ghcr.io/jdblack/ellmephant:latest
+podman run -d --rm -p 8888:8888 -v ellmephant-data:/data ghcr.io/jdblack/ellmephant:edge
 # Or docker, if you're not on podman yet
 ```
 
@@ -111,7 +111,7 @@ long-running container needed:
     "ellmephant": {
       "command": "podman",
       "args": ["run", "--rm", "-i", "-v", "ellmephant-data:/data",
-               "ghcr.io/jdblack/ellmephant:latest", "mcp", "--stdio"]
+               "ghcr.io/jdblack/ellmephant:edge", "mcp", "--stdio"]
     }
   }
 }
@@ -124,6 +124,10 @@ You never run any of it yourself; just say things like "What do you remember abo
 "Save the important parts of this conversation to memory!" and it takes care of the rest.
 Maintenance is the same story: adding, updating, linking, deleting — it all happens through the
 assistant, in conversation. There are no commands for you to run.
+
+Alongside the memories sit **projects**: an activity over time — a goal, where it stands, who owns
+it, when it started and when it ended — that carries its own context and holds the memories written
+for it. "What am I working on?" and "what did I finish last month?" come out of the same store.
 
 ---
 
@@ -239,7 +243,7 @@ git clone https://github.com/jdblack/ellmephant.git && cd ellmephant
 podman build -t ellmephant:dev .
 ```
 
-Then use `ellmephant:dev` wherever this guide says `ghcr.io/jdblack/ellmephant:latest`. Fair
+Then use `ellmephant:dev` wherever this guide says `ghcr.io/jdblack/ellmephant:edge`. Fair
 warning: that first build compiles the whole ML stack (the SQLite/`sqlite-vec` C sources, the
 candle stack, ~400 crates) and can take 5–20 minutes. [`DEVELOPMENT.md`](DEVELOPMENT.md) has the
 full workflow.
@@ -248,8 +252,8 @@ full workflow.
 
 - One static binary, one SQLite file. The Qwen3 encoder runs in-process via candle — no Python, no
   ONNX Runtime, no sidecar.
-- The `memory` table is the source of truth. The vector index (`sqlite-vec` `vec0`) and the link
-  graph are derived and rebuildable.
+- The rows are the source of truth — `memory`, and the `project`/`project_memory` tables behind
+  projects. The vector index (`sqlite-vec` `vec0`) and the link graph are derived and rebuildable.
 - Store directory is `/data` (`ELLMEPHANT_HOME=/data`); the image's default command is the MCP
   server, binding `0.0.0.0:8888`.
 - Weights cache at `<home>/models/`, sha-pinned per revision; `--offline` forbids network and

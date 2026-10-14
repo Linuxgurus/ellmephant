@@ -26,9 +26,14 @@ The decisions the code obeys:
 - **`store ≠ embed`.** The row keeps the full, literal text; one **document** (`key` + tags +
   title + link-stripped body) is embedded. The embedding strategy can change without losing what
   was written.
-- **Everything but `memory` is derived.** The vector index and the link graph are rebuildable
-  from the rows (the `memory_reembed` tool). The relational store must never lie; there is no FTS index
-  and no tag table to keep in sync.
+- **Everything but `memory` and the projects is derived.** The vector index and the link graph are
+  rebuildable from the rows (the `memory_reembed` tool). The relational store must never lie; there
+  is no FTS index and no tag table to keep in sync.
+- **Facts vs structures.** Memories are facts (voted, ranked, judged for coherence, searched by
+  meaning); projects are structures (identity, fields, relations). Two kinds of thing, two sets of
+  tables — "project = memory + type" was rejected because it ships cheaply at the cost of the
+  model. Their keys carry the `prj-` prefix, which is the seam that keeps this one store instead of
+  two graphs that never touch (SPEC §7.1).
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
 - **Titles, not dumps.** Search returns `key`/`title`/`tags` and (for a semantic phrase) the
@@ -52,6 +57,7 @@ The decisions the code obeys:
                    index::vec  (one document vector per row)
                                   ▼
       SQLite  memory.db  —  `memory` rows are the source of truth
+      structures (not derived):  project · project_preload · project_memory
       derived & rebuildable:  memory_vec · memory_link
                                   ▼
       embed::qwen3  (candle, in-binary)  —  weights under ~/.ellmephant/models/
@@ -68,6 +74,7 @@ Five layers, one crate:
 |---|---|---|
 | Storage | `db`, `migrations/` | open SQLite, pragmas, schema, `meta` kv |
 | Write path | `store`, `embed`, `index/vec` | upsert a row: key, one hash, tags, links, one vector |
+| Structures | `store::project` | projects: identity, the ordered preload, membership (one home) |
 | Read path | `search`, `index/vec` | one semantic phrase → KNN over the document vectors |
 | Interfaces | `cli`, `mcp` | REPL + one-shot, MCP server (HTTP default, stdio option) |
 | Tooling | `model`, `bench` | weights cache, latency + golden-eval measurements |
@@ -85,6 +92,14 @@ per-row `doc_hash` decides when a row needs re-embedding (any change to the key,
 body changes the document). Ids are local; `key` is the stable identity (upsert target and link
 target). Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate
 `reembed`, not an implicit migration.
+
+**Three more tables are NOT derived: the project structures** (v5). `project`,
+`project_preload` (project → memory, ordered — the "load these to work in here" list) and
+`project_memory` (memory → project, `memory_key` as `PRIMARY KEY` so a memory has exactly one
+home) hold *structures*, not facts: no embedding, no telemetry, no coherence verdict. They are
+source-of-truth alongside `memory`, and their keys carry the `prj-` prefix — which is what lets a
+key cross between the two graphs, since `memory_link.to_key` is a `TEXT` key and `links::dangling`
+resolves a target against both tables. See SPEC §7.1.
 
 ## Embeddings
 
@@ -180,7 +195,7 @@ src/
 ├── model/             weights cache: resolve, fetch, verify
 ├── db/                open, pragmas, migrate(), meta key/value
 ├── embed/             Embedder trait, qwen3, tokenize, projection
-├── store/             add/get + derived indexes (slug, tags, links) + maintain (reembed)
+├── store/             add/get + projects + derived indexes (slug, tags, links) + maintain (reembed)
 ├── index/             the vec0 (KNN) document-vector table
 ├── search/            the semantic phrase search over the store
 ├── cli/               subcommands, repl, session, output formatting

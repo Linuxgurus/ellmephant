@@ -215,6 +215,59 @@ counters) and `coherent` (0004) — the §9 split-review verdict, a **nullable b
 unjudged, `TRUE` = one topic, `FALSE` = a grab-bag worth splitting). `coherent` is not part of
 the embedded document, and an upsert resets it to `NULL` (the row changed, so re-judge it).
 
+### 7.1 Projects — the structures half (v5)
+
+A project is not a memory, and the schema says so. **Memories are facts** — voted, ranked, judged
+for coherence, searched by meaning. **Projects are structures** — identity, fields, relations;
+none of the fact-machinery applies. They are separate tables, and their keys carry the **`prj-`
+prefix**, which is what lets a key travel between the two graphs: a memory body may write
+`[[prj-chronos]]`, because `memory_link.to_key` is a `TEXT` key and not a foreign key.
+
+```sql
+CREATE TABLE project (             -- the key IS the identity: no rowid-derived id, no vector
+  key     TEXT PRIMARY KEY,
+  title   TEXT NOT NULL,
+  goal    TEXT NOT NULL DEFAULT '',        -- what this is for
+  state   TEXT NOT NULL DEFAULT '',        -- mutable current-state prose
+  status  TEXT NOT NULL DEFAULT 'todo',    -- todo|active|paused|done|dead
+  owner   TEXT NOT NULL DEFAULT 'us',      -- me|James|us
+  tags    TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL DEFAULT (datetime('now')),
+  updated TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (status IN ('todo', 'active', 'paused', 'done', 'dead')),
+  CHECK (owner IN ('me', 'James', 'us')));
+
+CREATE TABLE project_preload (     -- project -> memory, ORDERED: attention
+  project_key TEXT    NOT NULL,
+  memory_key  TEXT    NOT NULL,
+  position    INTEGER NOT NULL,
+  PRIMARY KEY (project_key, memory_key)) WITHOUT ROWID;
+
+CREATE TABLE project_memory (      -- memory -> project: provenance, ONE home
+  memory_key  TEXT PRIMARY KEY,
+  project_key TEXT NOT NULL);
+```
+
+- **Two relations, opposite directions, different meanings.** `preload` is project → memory and
+  **ordered**: *"to work in here, load these"* — a project preloads memories it did not author
+  (conventions, boot notes). `contains` is memory → project: *"born here / belongs here."*
+  Neither contains the other; collapse them and you get either noise (load everything) or
+  starvation (only what it wrote).
+- **One home is a constraint, not a convention:** `memory_key` is the `PRIMARY KEY` of
+  `project_memory`, so a memory belongs to at most one project and a second home is an error.
+- **A membership lands inside the memory's own transaction** (`store::add_with_home`), because a
+  memory is born *with* its provenance. An upsert that says nothing about a project
+  (`Home::Keep`) leaves the existing home alone: membership is not a column the row rewrite
+  touches, so a re-upsert cannot silently orphan it.
+- **No foreign keys, exactly like `memory_link.to_key`:** a `preload` reference is a forward
+  reference, allowed, and rot is *detected* (`store::project::dangling`, `project_get` reports a
+  null title, `doctor` counts it) rather than raising a broken-FK error.
+- **A home must exist** — a typo in a home is a mistake, not a forward reference — but a `preload`
+  entry need not: a project may be created before its memories.
+- **A link to a project is not membership.** `[[prj-x]]` is a `see` edge (navigation, attention);
+  `contains` means born here. So `links::dangling` resolves a target against **both** tables.
+- **No delete.** A project ends with `status = dead`; `preload`/`contains` edges cannot outlive one.
+
 ## 8. Cross-links (wiki semantics)
 
 - **Author:** inline `[[key]]` in `body` (canonical, greppable, exportable).
@@ -308,7 +361,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
 `memory_delete`, `memory_search`,
 `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
-`memory_dupes`.
+`memory_dupes`, `memory_reembed`, `project_upsert`, `project_get`, `project_list`.
 
 - **Each tool states its own law in its own description** — that is what the model actually
   reads, so nothing is written twice. The §9 write policy rides on `memory_upsert`'s

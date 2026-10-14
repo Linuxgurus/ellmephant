@@ -10,6 +10,10 @@
 > constraints and no regex leg, rather than hybrid BM25∪KNN fusion. Where this plan still
 > describes FTS/RRF/`mode`/`scope`, `SPEC.md` §7/§9/§10 is authoritative — the phase history is
 > kept as the record of how the build went.
+>
+> **Structures (v2.1).** Projects shipped after these phases, as a second set of tables — `prj-`
+> keys, `preload` (project → memory, ordered) and `contains` (memory → project, one home) — so the
+> phase history below stays the record of the *memory* build. Normative shape: SPEC §7.1.
 
 ## 0. Scope of v1
 

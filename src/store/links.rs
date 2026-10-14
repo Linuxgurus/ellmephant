@@ -42,20 +42,11 @@ pub struct Dangling {
     pub from_keys: Vec<String>,
 }
 
-/// Every `[[key]]` target with no matching `memory.key`, grouped by target (SPEC §8 SQL),
-/// ordered by target key.
-pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
-    let mut stmt = conn.prepare(
-        "SELECT l.to_key, m.key FROM memory_link l
-           JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key NOT IN (SELECT key FROM memory)
-          ORDER BY l.to_key, m.key",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-
+/// Group ordered `(to_key, from_key)` rows into [`Dangling`]s. Shared by the `[[…]]` audit and the
+/// project audit, which both count rot the same way: one entry per unresolved target.
+pub fn group_dangling(rows: Vec<(String, String)>) -> Result<Vec<Dangling>> {
     let mut out: Vec<Dangling> = Vec::new();
-    for row in rows {
-        let (to_key, from_key) = row?;
+    for (to_key, from_key) in rows {
         match out.last_mut() {
             Some(group) if group.to_key == to_key => group.from_keys.push(from_key),
             _ => out.push(Dangling {
@@ -65,6 +56,25 @@ pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
         }
     }
     Ok(out)
+}
+
+/// Every `[[key]]` target that resolves to nothing, grouped by target (SPEC §8 SQL), ordered by
+/// target key.
+///
+/// **A target resolves against BOTH tables:** a memory may link to a project (`[[prj-chronos]]` —
+/// the `prj-` prefix is what makes that key self-describing), so a project key is not rot. A link
+/// to a project is still a `see` edge and not membership: `contains` means "born here", a link
+/// only points.
+pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.to_key, m.key FROM memory_link l
+           JOIN memory m ON m.id = l.from_id
+          WHERE l.to_key NOT IN (SELECT key FROM memory)
+            AND l.to_key NOT IN (SELECT key FROM project)
+          ORDER BY l.to_key, m.key",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    group_dangling(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// What a [`rename`] changed.

@@ -30,8 +30,16 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
 
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert!(db::migrate::latest() >= 2, "telemetry migration exists");
+    assert!(db::migrate::latest() >= 5, "projects migration exists");
 
-    for name in ["memory", "memory_link", "meta"] {
+    for name in [
+        "memory",
+        "memory_link",
+        "meta",
+        "project",
+        "project_preload",
+        "project_memory",
+    ] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
     // v2 keeps one embedding per row: guard against a BM25/tag table being reintroduced.
@@ -75,6 +83,32 @@ fn migrations_are_idempotent_across_reopen() {
     let conn = db::open(&paths).expect("second open");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 1);
+}
+
+#[test]
+fn a_v4_store_gains_the_project_tables_on_open() {
+    let (_dir, paths) = temp_store();
+
+    // A store from before projects existed: the tables gone, the version rolled back.
+    let conn = db::open(&paths).unwrap();
+    insert(&conn, "keep-me", "Kept", "survives the upgrade");
+    for table in ["project", "project_preload", "project_memory"] {
+        conn.execute(&format!("DROP TABLE {table}"), []).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    drop(conn);
+
+    // Opening it again runs only the newer step, and the rows are untouched.
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
+    for table in ["project", "project_preload", "project_memory"] {
+        assert!(object_exists(&conn, "table", table), "missing {table}");
+    }
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory"),
+        1,
+        "an upgrade must not touch stored rows"
+    );
 }
 
 #[test]

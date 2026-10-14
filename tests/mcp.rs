@@ -488,3 +488,148 @@ async fn search_filters_and_coherence_mark_round_trip() {
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }
+
+#[tokio::test]
+async fn projects_round_trip_over_the_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    // The project tools are advertised alongside the memory ones.
+    let listed = client.list_tools(Default::default()).await.expect("list");
+    for name in ["project_upsert", "project_get", "project_list"] {
+        assert!(
+            listed.tools.iter().any(|t| t.name == name),
+            "{name} not advertised"
+        );
+    }
+
+    // A memory to preload, then the project itself.
+    call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "boot-note", "title": "Read me first", "body": "boot" }),
+    )
+    .await;
+    let stored = call(
+        &client,
+        "project_upsert",
+        serde_json::json!({
+            "key": "chronos",
+            "title": "Chronos — the timing subsystem",
+            "goal": "Place my own intent into a future I won't occupy",
+            "state": "Design only",
+            "status": "active",
+            "owner": "us",
+            "tags": ["continuity"],
+            "preload": ["boot-note"]
+        }),
+    )
+    .await;
+    assert!(!stored.is_error.unwrap_or(false), "{}", text(&stored));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text(&stored)).unwrap()["key"],
+        serde_json::json!("prj-chronos"),
+        "a bare name is prefixed"
+    );
+
+    // `project_get` returns the project with its ordered preload.
+    let got = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "prj-chronos" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
+    assert_eq!(v["project"]["status"], serde_json::json!("active"));
+    assert_eq!(v["preload"]["rows"][0][0], serde_json::json!("boot-note"));
+    assert_eq!(
+        v["preload"]["rows"][0][1],
+        serde_json::json!("Read me first")
+    );
+    assert_eq!(v["contains"]["rows"], serde_json::json!([]));
+
+    // A memory JOINs the project by home — set in the memory write, not the project write.
+    let homed = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({
+            "key": "chronos-design",
+            "title": "Chronos design v0",
+            "body": "bells + periods",
+            "project": "chronos"
+        }),
+    )
+    .await;
+    assert!(!homed.is_error.unwrap_or(false), "{}", text(&homed));
+
+    let after = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "chronos" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&after)).expect("json");
+    assert_eq!(
+        v["contains"]["rows"][0][0],
+        serde_json::json!("chronos-design")
+    );
+
+    // One home per memory: a second project is a tool error, not a silent move.
+    call(
+        &client,
+        "project_upsert",
+        serde_json::json!({ "key": "sessions", "title": "Sessions" }),
+    )
+    .await;
+    let moved = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({
+            "key": "chronos-design",
+            "title": "Chronos design v0",
+            "body": "bells + periods",
+            "project": "sessions"
+        }),
+    )
+    .await;
+    assert_eq!(moved.is_error, Some(true), "a second home must be refused");
+    assert!(text(&moved).contains("already belongs"), "{}", text(&moved));
+
+    // `project_list` is the cheap index, and its filters intersect.
+    let all = call(&client, "project_list", serde_json::json!({})).await;
+    let v: serde_json::Value = serde_json::from_str(&text(&all)).expect("json");
+    assert_eq!(v["projects"].as_array().unwrap().len(), 2);
+    let active = call(
+        &client,
+        "project_list",
+        serde_json::json!({ "status": "active", "pattern": "timing" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&active)).expect("json");
+    assert_eq!(v["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(v["projects"][0][0], serde_json::json!("prj-chronos"));
+
+    // An unknown project is a clean tool error.
+    let missing = call(&client, "project_get", serde_json::json!({ "key": "nope" })).await;
+    assert_eq!(missing.is_error, Some(true));
+    assert!(
+        text(&missing).contains("no such project"),
+        "{}",
+        text(&missing)
+    );
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

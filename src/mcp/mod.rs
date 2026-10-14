@@ -37,7 +37,7 @@ use crate::error::Error;
 use crate::model;
 use crate::search::{Bundle, Field, Fields, MatchMode, Query, to_wire_json};
 use crate::store::links::backlinks_to_wire_json;
-use crate::store::{self, Memory};
+use crate::store::{self, Memory, project};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
@@ -51,6 +51,9 @@ pub const TOOLS: &[&str] = &[
     "memory_stats",
     "memory_dupes",
     "memory_reembed",
+    "project_upsert",
+    "project_get",
+    "project_list",
 ];
 
 /// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
@@ -60,10 +63,12 @@ const INSTRUCTIONS: &str = "ellmephant = Memory storage in smart-caveman style �
 small words out; drop filler, articles, glue. List-shaped reads return a positional table: a \
 `cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
 when a memory shapes your task, `memory_upvote` it — the store's own rankings ride on your votes. \
+Structures are not facts: a project (`prj-…`) is a container you can stand inside — \
+`project_upsert` writes one, `project_get` reads one with its `preload`/`contains`, `project_list` \
+shows them all; a memory JOINS a project by home (`memory_upsert`'s `project`). \
 Tool descriptions are the spec.";
 
-/// `memory_upsert` description. The write policy lives here and *only* here — the one thing the
-/// model reads before a write.
+/// `memory_reembed` description: the only path out of a model or dimension change.
 const REEMBED_DESCRIPTION: &str = "\
 Recompute every stored vector and rebuild the derived vector index. Needed when the encoder \
 changes — a different model, projection or dimension — because the vector table's width is fixed \
@@ -113,6 +118,31 @@ filter the whole store. Hits are `key`-only by default; `fields` adds more, body
 the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
 `max_distance`.";
 
+/// `project_upsert` description. The project write law lives here and *only* here.
+const PROJECT_UPSERT_DESCRIPTION: &str = "\
+Create or replace a project — the STRUCTURES half of the store: identity, status, prose, and an \
+ordered `preload`. Not a memory: memories are facts (voted, ranked, judged, searched by meaning); \
+a project is a container you can stand inside. `key` is `prj-…` (a bare name is prefixed). \
+`status` is todo|active|paused|done|dead — `dead` is how a project ends, there is no delete; \
+`owner` is me|James|us. `preload` is the ORDERED list of memory keys to load as context to work \
+in here; it replaces the previous list, and it may name memories this project did not author \
+(conventions, boot notes). A write is whole-row, so `project_get` first if you mean to edit one \
+field. A memory joins a project by HOME, which is `memory_upsert`'s `project`.";
+
+/// `project_get` description.
+const PROJECT_GET_DESCRIPTION: &str = "\
+Read one project whole, with both relations resolved — `preload` (the ordered context to load, \
+project -> memory) and `contains` (the memories born here, memory -> project; one home each). \
+A referenced key whose title is null resolves to nothing: a forward reference or rot. The read \
+reports it rather than hiding it.";
+
+/// `project_list` description.
+const PROJECT_LIST_DESCRIPTION: &str = "\
+List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `title`, `goal`; \
+never `state`, which is a `project_get` away). Filters intersect: `status`, `tags` (every listed \
+tag must be present) and a literal/regex `pattern` over `key`/`title`/`goal`/`state`. Omit them \
+all to list every project.";
+
 /// Parameters for [`MemoryServer::memory_upsert`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UpsertParams {
@@ -134,6 +164,12 @@ pub struct UpsertParams {
     #[serde(default)]
     #[schemars(description = "Aspects of the subject, e.g. storage, gotchas.")]
     pub tags: Vec<String>,
+    /// Project home.
+    #[serde(default)]
+    #[schemars(
+        description = "Project this was born in (`prj-…`; a bare name is prefixed). Omit = keep the current home; \"\" = detach. One home per memory."
+    )]
+    pub project: Option<String>,
 }
 
 impl UpsertParams {
@@ -146,6 +182,16 @@ impl UpsertParams {
             source: self.source,
             tags: self.tags,
             ..Default::default()
+        }
+    }
+
+    /// The provenance this write expresses: absent = keep the current home, `""` = detach, else
+    /// belong to that project. [`project::Home::Keep`] is what makes a re-upsert safe.
+    fn home(&self) -> project::Home {
+        match self.project.as_deref() {
+            None => project::Home::Keep,
+            Some(raw) if raw.trim().is_empty() => project::Home::Clear,
+            Some(raw) => project::Home::Set(raw.to_string()),
         }
     }
 }
@@ -342,6 +388,92 @@ pub struct CoherentParams {
     pub coherent: Option<bool>,
 }
 
+/// Parameters for [`MemoryServer::project_get`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectKeyParams {
+    /// The project's key.
+    #[schemars(description = "Project key (`prj-…`; a bare name is prefixed). Slug.")]
+    pub key: String,
+}
+
+/// Parameters for [`MemoryServer::project_upsert`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectUpsertParams {
+    /// Stable slug.
+    #[serde(default)]
+    #[schemars(description = "Stable slug (`prj-…`); reuse replaces that project.")]
+    pub key: Option<String>,
+    /// Salient one-liner.
+    #[schemars(description = "One sharp line.")]
+    pub title: String,
+    /// What this is for.
+    #[serde(default)]
+    #[schemars(description = "What this is for. One line.")]
+    pub goal: Option<String>,
+    /// Where it stands.
+    #[serde(default)]
+    #[schemars(description = "Mutable current-state prose: where it stands, what's next.")]
+    pub state: Option<String>,
+    /// Lifecycle.
+    #[serde(default)]
+    #[schemars(description = "todo | active | paused | done | dead (default todo).")]
+    pub status: Option<String>,
+    /// Whose it is.
+    #[serde(default)]
+    #[schemars(description = "me | James | us (default us).")]
+    pub owner: Option<String>,
+    /// Aspect tags.
+    #[serde(default)]
+    #[schemars(description = "Aspects of the subject, e.g. continuity, storage.")]
+    pub tags: Vec<String>,
+    /// The ordered context to load.
+    #[serde(default)]
+    #[schemars(
+        description = "ORDERED memory keys to load to work in here; replaces the previous list. May name memories this project did not author."
+    )]
+    pub preload: Option<Vec<String>>,
+}
+
+impl ProjectUpsertParams {
+    /// Split the request into the project and its optional (whole-list) preload.
+    fn into_parts(self) -> (project::Project, Option<Vec<String>>) {
+        let project = project::Project {
+            key: self.key.unwrap_or_default(),
+            title: self.title,
+            goal: self.goal.unwrap_or_default(),
+            state: self.state.unwrap_or_default(),
+            status: self.status.unwrap_or_default(),
+            owner: self.owner.unwrap_or_default(),
+            tags: self.tags,
+            ..Default::default()
+        };
+        (project, self.preload)
+    }
+}
+
+/// Parameters for [`MemoryServer::project_list`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectListParams {
+    /// Lifecycle filter.
+    #[serde(default)]
+    #[schemars(description = "Only this status.")]
+    pub status: Option<String>,
+    /// Tag filter (AND).
+    #[serde(default)]
+    #[schemars(description = "Tag filter; a project must carry EVERY listed tag.")]
+    pub tags: Vec<String>,
+    /// The literal/regex pattern.
+    #[serde(default)]
+    #[schemars(
+        description = "Literal/regex pattern over `key`/`title`/`goal`/`state`. Blank = no lexical leg."
+    )]
+    pub pattern: Option<String>,
+    /// How `pattern` is read.
+    #[serde(default)]
+    #[schemars(description = "How `pattern` is read: `literal` (substring, default) or `regex`.")]
+    pub mode: Option<MatchModeParam>,
+}
+
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
 #[derive(Clone)]
@@ -460,11 +592,16 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
+        let home = p.home();
         let mem = p.into_memory();
         let tags = mem.tags.clone();
         let body_bytes = mem.body.len();
+        // `Home::Keep` is the common path (a write with no opinion about provenance).
         let key = self
-            .with_store("memory_upsert", move |s| s.add(&mem))
+            .with_store("memory_upsert", move |s| match home {
+                project::Home::Keep => s.add(&mem),
+                home => s.add_with_home(&mem, home),
+            })
             .await?;
         tracing::info!(tool = "memory_upsert", key = %key, tags = ?tags, body_bytes, "memory stored");
         Ok(json_ok(
@@ -781,6 +918,95 @@ impl MemoryServer {
             "rebuilt": report.rebuilt,
             "model": report.model,
         })))
+    }
+
+    /// Create or replace a project — the structures half of the store.
+    #[tool(
+        name = "project_upsert",
+        description = PROJECT_UPSERT_DESCRIPTION,
+        annotations(
+            title = "Upsert project",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_upsert(
+        &self,
+        Parameters(p): Parameters<ProjectUpsertParams>,
+    ) -> std::result::Result<String, String> {
+        let (project, preload) = p.into_parts();
+        let preload_len = preload.as_ref().map(Vec::len);
+        let key = self
+            .with_store("project_upsert", move |s| {
+                s.project_upsert(&project, preload.as_deref())
+            })
+            .await?;
+        tracing::info!(tool = "project_upsert", key = %key, preload = ?preload_len, "project stored");
+        Ok(json_ok(
+            serde_json::json!({ "status": "stored", "key": key }),
+        ))
+    }
+
+    /// Read one project whole: its fields, its ordered preload, and the memories it owns.
+    #[tool(
+        name = "project_get",
+        description = PROJECT_GET_DESCRIPTION,
+        annotations(
+            title = "Get project",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_get(
+        &self,
+        Parameters(p): Parameters<ProjectKeyParams>,
+    ) -> std::result::Result<String, String> {
+        let key = p.key;
+        let lookup = key.clone();
+        let view = self
+            .with_store("project_get", move |s| s.project_view(&lookup))
+            .await?;
+        tracing::debug!(
+            tool = "project_get",
+            key = %key,
+            preload = view.preload.len(),
+            contains = view.contains.len(),
+            "project read"
+        );
+        project::view_to_wire_json(&view).map_err(|e| e.to_string())
+    }
+
+    /// List the projects: the cheap index (no `state`), with intersecting filters.
+    #[tool(
+        name = "project_list",
+        description = PROJECT_LIST_DESCRIPTION,
+        annotations(
+            title = "List projects",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_list(
+        &self,
+        Parameters(p): Parameters<ProjectListParams>,
+    ) -> std::result::Result<String, String> {
+        let filter = project::Filter {
+            status: p.status,
+            tags: p.tags,
+            pattern: p.pattern,
+            mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
+        };
+        let rows = self
+            .with_store("project_list", move |s| s.project_list(&filter))
+            .await?;
+        tracing::info!(tool = "project_list", projects = rows.len(), "projects");
+        project::list_to_wire_json(&rows).map_err(|e| e.to_string())
     }
 }
 

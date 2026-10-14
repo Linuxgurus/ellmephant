@@ -21,6 +21,15 @@ pub enum Error {
     #[error("no such memory: {0}")]
     NotFound(String),
 
+    /// A project key that resolves to no row (the `prj-` counterpart of [`Error::NotFound`]).
+    #[error("no such project: {0}")]
+    NoProject(String),
+
+    /// A project-layer rule was violated: a key without the `prj-` prefix, an unknown status or
+    /// owner, or a second home for a memory that already belongs to a project.
+    #[error("project error: {0}")]
+    Project(String),
+
     /// A malformed search pattern (a regex that will not compile); the message carries the
     /// compiler's complaint.
     #[error("invalid pattern: {0}")]

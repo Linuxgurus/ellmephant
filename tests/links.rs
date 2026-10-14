@@ -134,3 +134,33 @@ fn renaming_clears_a_dangling_edge() {
     links::rename(&conn, "stub", "later").expect("rename");
     assert!(links::dangling(&conn).unwrap().is_empty());
 }
+
+#[test]
+fn a_link_to_a_project_resolves_and_is_not_rot() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    // A memory may link to a project — the `prj-` prefix is what makes a key cross between the
+    // two tables without either graph knowing about the other.
+    ellmephant::store::project::upsert(
+        &conn,
+        &ellmephant::store::project::Project {
+            key: "prj-chronos".into(),
+            title: "Chronos".into(),
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("project");
+    seed(
+        &conn,
+        &embedder,
+        "a",
+        "works in [[prj-chronos]] and [[ghost]]",
+    );
+
+    let dangling = links::dangling(&conn).expect("dangling");
+    assert_eq!(dangling.len(), 1, "only the ghost is rot: {dangling:?}");
+    assert_eq!(dangling[0].to_key, "ghost");
+}

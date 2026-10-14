@@ -99,7 +99,7 @@ A chart ships in [`charts/ellmephant/`](charts/ellmephant/): one Deployment, a s
 optional separate weights-cache PVC, serving MCP over HTTP on port 8888. It defaults to the public
 image `ghcr.io/jdblack/ellmephant` — the public mirror of what the maintainer's cluster runs. It
 carries **releases**: a push to `main` publishes the version from `Cargo.toml` plus `latest`, so pull
-`:latest` (or pin a version, e.g. `:1.1.0`). The `edge` tag is the *dev* build and lives only in
+`:latest` (or pin a version, e.g. `:1.2.0`). The `edge` tag is the *dev* build and lives only in
 private Harbor.
 
 ```sh
@@ -110,7 +110,7 @@ The chart is published to **both** registries by the Forgejo `publish.yml` on ev
 public GHCR for anyone, private Harbor for the cluster. Install straight from OCI:
 
 ```sh
-helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.0
+helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.1
 ```
 
 Point the MCP client at `http://ellmephant.ellmephant.svc:8888/mcp`. The store lives on the

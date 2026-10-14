@@ -16,7 +16,7 @@ helm install ellmephant ./charts/ellmephant --namespace ellmephant --create-name
 `main`, or a `v*` tag. Private Harbor for the cluster, public GHCR for everyone else. Public install:
 
 ```sh
-helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.0
+helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.1
 ```
 
 There is no `index.yaml` and no Helm repo to `helm repo add`. On the LAN, the same chart lives at

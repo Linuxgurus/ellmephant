@@ -133,13 +133,13 @@ The Helm chart has its own version, deliberately **not** locked to the crate:
 
 | Field | Meaning | Rule |
 |---|---|---|
-| `version` (e.g. `0.2.0`) | the chart's own SemVer, and the OCI tag it is pushed under | bump it whenever `charts/**` changes |
+| `version` (e.g. `0.2.1`) | the chart's own SemVer, and the OCI tag it is pushed under | bump it whenever `charts/**` changes |
 | `appVersion` (e.g. `1.1.0`) | the app version the chart claims to carry, and the image tag it defaults to | keep it equal to `Cargo.toml`'s `version` |
 
 `image.tag` is left empty so it resolves to `appVersion` - the right default now that releases carry
 version tags, since `appVersion` tracks a released version. **Bump the chart's `version` when you
 change the chart**: `publish.yml` pushes the packaged chart under that version, so an unbumped chart
-silently *overwrites* the old `0.2.0` in both registries rather than sitting there as a no-op.
+silently *overwrites* the old `0.2.1` in both registries rather than sitting there as a no-op.
 Nothing enforces either rule (the guard died with the old `ci.yml`). Staying on `0.x` until the
 values surface settles is intentional.
 
@@ -171,13 +171,13 @@ There is no `index.yaml`, so `helm repo add` does not apply - the chart installs
 Public, for anyone:
 
 ```sh
-helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.0
+helm install ellmephant oci://ghcr.io/jdblack/charts/ellmephant --version 0.2.1
 ```
 
 On the LAN, which is what the maintainer's cluster does:
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.1
 ```
 
 Local sanity before you push - the two commands the chart gate used to run in CI - plus `make
@@ -246,13 +246,13 @@ The chart installs from its own nested repo over OCI - the closest thing to a `h
 here, and the path the cluster would actually use:
 
 ```sh
-helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.0
+helm install ellmephant oci://harbor.vn.linuxguru.net/library/charts/ellmephant --version 0.2.1
 ```
 
 The chart and the image live under *separate* Harbor repos - `library/charts/ellmephant` versus
 `library/ellmephant`. Harbor would happily co-locate an OCI chart and a container image under one
 repository name, but sharing a repo means sharing a tag namespace, and the chart's own SemVer
-(`0.2.0` today, `1.0.0` eventually) would collide with an image tag. Separate paths rule that out.
+(`0.2.1` today, `1.0.0` eventually) would collide with an image tag. Separate paths rule that out.
 Because `helm push` derives the final path segment from the chart's `name`, the split is a
 different *parent* path, not a renamed chart: the chart stays `ellmephant`, so its labels, selectors
 and resource names are unchanged.
@@ -329,9 +329,8 @@ chart goes with it. (If the fix should not become `latest`, publish it as a pre-
 - **A ghcr package can start private.** After the first successful mirror, check the package's
   visibility under Package settings if anonymous pulls are wanted — "public registry" is a setting,
   not a consequence of pushing.
-- **`charts/ellmephant/values.yaml` defaults to the ghcr image** — correct, since ghcr is public. But
-  `artifacthub.io/images` names `:1.1.0`, which does not exist publicly (no release publisher), and
-  nothing guards the version any more.
-- **`artifacthub.io/images` is no longer guarded.** The check that kept its tag equal to
-  `Cargo.toml`'s version lived in the deleted `ci.yml`, so an unbumped entry now ships a stale
-  reference.
+- **`charts/ellmephant/values.yaml` defaults to the ghcr image**, which is correct: ghcr is public and
+  the chart's empty `tag` resolves to `appVersion`, a *released* version.
+- **`artifacthub.io/images` is not guarded.** It names the released tag (`:1.2.0`) the way `appVersion`
+  does, and the check that kept the two equal to `Cargo.toml` lived in the deleted `ci.yml` — so bump
+  it by hand alongside `appVersion`, or it ships a stale reference.

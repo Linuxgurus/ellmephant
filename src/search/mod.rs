@@ -480,8 +480,22 @@ fn semantic_ids(
     text: &str,
 ) -> Result<Vec<(i64, f32)>> {
     let query_vector = embedder.embed_query(text)?;
+    let indexed = index::vec::count(conn)?;
+    if indexed == 0 {
+        // Nothing is indexed. An empty vector table WITH rows in `memory` is an unindexed store, not
+        // an empty one: an empty hit list reads as "nothing matched", which is the one answer that is
+        // false — so say what is wrong and how to fix it. No rows at all (a brand-new store) is
+        // genuinely empty, and there is nothing to match.
+        let rows: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+        if rows > 0 {
+            return Err(Error::Unavailable(format!(
+                "{rows} memory row(s) carry no vector — run `reembed`"
+            )));
+        }
+        return Ok(Vec::new());
+    }
     let hint = index::vec::Knn {
-        k: index::vec::count(conn)?.max(1) as usize,
+        k: indexed.max(1) as usize,
         max_distance: q.max_distance,
     };
     index::vec::knn(conn, &query_vector, &hint)

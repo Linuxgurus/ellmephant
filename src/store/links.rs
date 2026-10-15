@@ -222,6 +222,47 @@ pub struct MergeInto {
     pub preloads: usize,
 }
 
+/// Refuse a merge whose target does not already carry the source's prose.
+///
+/// [`merge_into`] repoints links and retires `from`; it never edits `into`'s body, because the prose
+/// fold is the caller's job. Which makes a merge a legal way to *destroy* prose: retire a memory
+/// carrying a fact the target lacks and the fact is simply gone, with a `200` that reports link
+/// counts and says nothing about the words. This turns the fold from a hope into a precondition.
+///
+/// The check is a whitespace-insensitive substring — the fold is a model's job, and anything
+/// stricter would refuse honest folds. Discarding prose on purpose has its own verb: a DELETE says
+/// "gone", a merge says "folded in", and this keeps the two from meaning the same thing.
+fn ensure_prose_folded(
+    conn: &Connection,
+    from_id: i64,
+    into_id: i64,
+    from: &str,
+    into: &str,
+) -> Result<()> {
+    let body = |id: i64| -> Result<String> {
+        conn.query_row("SELECT body FROM memory WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .map_err(Into::into)
+    };
+    if prose_is_folded(&body(from_id)?, &body(into_id)?) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "refusing to merge `{from}` into `{into}`: `{into}`'s body does not carry the facts in \
+         `{from}`'s, and a merge never edits the target's body — write the merged facts into `{into}` \
+         first (an ordinary upsert), then merge. To discard them on purpose, DELETE `{from}` instead: \
+         a merge folds, a delete discards."
+    )))
+}
+
+/// Whether `into` already carries `from`'s prose, ignoring how it is laid out on the line.
+fn prose_is_folded(from: &str, into: &str) -> bool {
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let from = squash(from);
+    from.is_empty() || squash(into).contains(&from)
+}
+
 /// Retire `from` into `into`: repoint every reference, then delete `from` (PLAN §3).
 ///
 /// Merging used to be a hand-fold plus `memory_delete`, which **breaks the graph** — every `[[from]]`
@@ -253,7 +294,8 @@ pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto
         .ok_or_else(|| Error::NotFound(key.to_string()))
     };
     let from_id = rowid(&from)?;
-    rowid(&into)?; // the target must exist: a merge into a typo would silently destroy the source
+    let into_id = rowid(&into)?; // must exist: a merge into a typo would silently destroy the source
+    ensure_prose_folded(conn, from_id, into_id, &from, &into)?;
 
     let tx = conn.unchecked_transaction()?;
     // The tokens. A bare `[[from]]` is a memory; `[[prj:from]]` names the other table and must not

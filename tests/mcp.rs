@@ -261,8 +261,12 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert!(!extra.is_error.unwrap_or(false), "{}", text(&extra));
-    // `memory_merge` retires one key into another, repointing its references (the safe merge).
-    for (key, body) in [("merge-old", "retired"), ("merge-new", "survivor")] {
+    // `memory_merge` retires one key into another, repointing its references (the safe merge). The
+    // survivor carries the retired body's prose first: a merge that would drop facts is refused.
+    for (key, body) in [
+        ("merge-old", "retired"),
+        ("merge-new", "survivor, now carrying: retired"),
+    ] {
         let r = call(
             &client,
             "memory_upsert",

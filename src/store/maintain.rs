@@ -45,16 +45,11 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     let dim = embedder.dim();
     let rebuilt = index::vec::stored_dim(conn)? != Some(dim);
     if rebuilt {
+        // A dimension change makes every stored vector the wrong width and therefore unreadable, so
+        // the table is dropped and recreated. The one path that cannot be a swap, because there is
+        // no old index worth keeping.
         index::vec::recreate(conn, dim)?;
-    } else {
-        index::vec::clear(conn)?; // full rebuild: drop any stale or orphaned vectors
     }
-    meta::set(conn, meta::DIM, &dim.to_string())?;
-    meta::set(conn, meta::MODEL, embedder.model_id())?;
-    meta::set(conn, meta::INSTRUCTION, instruction)?;
-    // The vectors now correspond to the *current* projection, so this is the one place the
-    // fingerprint legitimately moves ([`crate::index::vec::projection_stale`]).
-    meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
 
     // Snapshot the rows to embed before opening the write transaction.
     let rows: Vec<(i64, String, Vec<String>, String, String)> = {
@@ -73,10 +68,24 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     };
 
     let rows_count = rows.len();
-    // The batch embed stays inside the tx on purpose: a full rebuild wants one atomic swap
-    // of the whole index, and it is a deliberate, rare maintenance command.
+    let batches = rows_count.div_ceil(BATCH).max(1);
+    // ONE transaction, and the clear is INSIDE it. The clear used to run before the tx opened,
+    // which left `memory_vec` genuinely empty for the whole rebuild: `/health` reported `vectors: 0`
+    // and `/search` answered an empty hit list at HTTP 200 while the store still held every memory.
+    // A reader sees the OLD index until this commits, so a rebuild is slow, not broken.
     let tx = conn.unchecked_transaction()?;
-    for chunk in rows.chunks(BATCH) {
+    if !rebuilt {
+        index::vec::clear(&tx)?; // full rebuild: drop any stale or orphaned vectors, atomically
+    }
+    meta::set(&tx, meta::DIM, &dim.to_string())?;
+    meta::set(&tx, meta::MODEL, embedder.model_id())?;
+    meta::set(&tx, meta::INSTRUCTION, instruction)?;
+    // The vectors now correspond to the *current* projection, so this is the one place the
+    // fingerprint legitimately moves ([`crate::index::vec::projection_stale`]).
+    meta::set(&tx, meta::PROJECTION, &projection::fingerprint())?;
+
+    let mut done = 0;
+    for (batch, chunk) in rows.chunks(BATCH).enumerate() {
         let docs: Vec<String> = chunk
             .iter()
             .map(|(_, key, _tags, title, body)| projection::embed_document(key, title, body))
@@ -89,6 +98,16 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
                 params![id, row_hash(embedder, &docs[i])],
             )?;
         }
+        done += chunk.len();
+        // A real rebuild runs for minutes and used to log nothing between "starting" and the reply,
+        // so the only way to tell progress from a hang was to watch the CPU.
+        tracing::info!(
+            batch = batch + 1,
+            batches,
+            done,
+            rows = rows_count,
+            "reembed progress"
+        );
     }
     tx.commit()?;
 

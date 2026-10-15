@@ -181,8 +181,14 @@ impl Session {
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.
+    ///
+    /// A key with no row is [`Error::NotFound`], not an empty list: *no backlinks* and *no such
+    /// memory* are different answers, and it is the second one that matters to a caller deciding
+    /// whether a memory is safe to delete. The lookup goes through `store::get`, so the key is
+    /// normalised exactly as it is everywhere else.
     pub fn backlinks(&self, key: &str) -> Result<Vec<links::Backlink>> {
-        links::backlinks(&self.conn, key)
+        let mem = store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))?;
+        links::backlinks(&self.conn, &mem.key)
     }
 
     /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a

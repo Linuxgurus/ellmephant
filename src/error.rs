@@ -26,6 +26,17 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
 
+    /// A write past a store limit — the body cap. Its own variant so a door can answer 413 rather
+    /// than the generic 400: the request is well formed, it is simply too big.
+    #[error("{0}")]
+    TooLarge(String),
+
+    /// A derived index the caller needs is not there (an empty vector table with rows to read). A
+    /// read must say so rather than answer an empty result, because *no hits* and *no index* look
+    /// identical to a caller and only one of them is true.
+    #[error("index unavailable: {0}")]
+    Unavailable(String),
+
     /// A project key that resolves to no row — the project half of [`Error::NotFound`].
     #[error("no such project: {0}")]
     NoProject(String),

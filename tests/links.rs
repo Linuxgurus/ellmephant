@@ -221,17 +221,24 @@ fn merge_into_repoints_every_reference_and_retires_the_source() {
     let embedder = HashEmbedder::new(DIM);
 
     seed(&conn, &embedder, "old", "the retired facts");
-    seed(&conn, &embedder, "new", "the surviving facts");
+    // The fold comes FIRST: a merge refuses to drop prose the target does not already carry.
+    seed(
+        &conn,
+        &embedder,
+        "new",
+        "the surviving facts, now carrying: the retired facts",
+    );
     seed(&conn, &embedder, "a", "see [[old]] first");
     seed(&conn, &embedder, "b", "also [[old]] here");
+    let target_body = store::get(&conn, "new").unwrap().unwrap().body;
 
     let out = links::merge_into(&conn, "old", "new").expect("merge");
     assert_eq!(out.bodies, 2, "both referrers were rewritten");
     assert!(store::get(&conn, "old").unwrap().is_none(), "source gone");
     assert_eq!(
         store::get(&conn, "new").unwrap().unwrap().body,
-        "the surviving facts",
-        "the PROSE fold is the caller's: the survivor's body is untouched"
+        target_body,
+        "the PROSE fold is the caller's: the merge itself edits no prose"
     );
 
     for key in ["a", "b"] {
@@ -259,7 +266,7 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     seed(&conn, &embedder, "old", "retired");
-    seed(&conn, &embedder, "new", "survivor");
+    seed(&conn, &embedder, "new", "survivor, now carrying: retired");
     project::upsert(&conn, &project_fixture("p"), Some(&["old".to_string()])).expect("project");
     // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
     seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
@@ -289,7 +296,8 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     seed(&conn, &embedder, "old", "retired");
-    seed(&conn, &embedder, "new", "see [[old]]");
+    // `new` must already carry `old`'s prose, or the merge refuses.
+    seed(&conn, &embedder, "new", "see [[old]] — and retired");
 
     links::merge_into(&conn, "old", "new").expect("merge");
     let edges: i64 = conn

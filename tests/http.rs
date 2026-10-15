@@ -873,8 +873,17 @@ async fn write_routes_accept_the_mcp_arguments_as_a_body() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-    // `memory_merge` takes {from, into}.
-    seed(&app, "tok", "mb-into", "target", "t").await;
+    // `memory_merge` takes {from, into} — and a merge refuses to silently drop prose, so the target
+    // must already carry the source's. That is the documented order: write the facts into `into`
+    // first, then retire `from`.
+    seed(
+        &app,
+        "tok",
+        "mb-into",
+        "target",
+        "the target's own body, now carrying: text",
+    )
+    .await;
     let (status, body, _) = request(
         &app,
         Method::POST,
@@ -991,4 +1000,172 @@ async fn upvote_route_honours_the_mcp_batch_body() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// A store with rows but no vectors must SAY so rather than answer an empty list: a caller reads
+/// `hits: []` as "nothing matched" and stops asking, and that is the one answer that is a lie. This
+/// is the state an interrupted `reembed` leaves behind.
+#[tokio::test]
+async fn search_says_so_when_the_index_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(
+        &app,
+        "tok",
+        "idx-a",
+        "a memory",
+        "a body with words worth finding",
+    )
+    .await;
+
+    // The truth first: with vectors, the phrase finds it.
+    let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("idx-a"), "{body}");
+
+    // Now strip every vector, as a killed rebuild would.
+    {
+        ellmephant::index::vec::register_extension();
+        let conn = rusqlite::Connection::open(Paths::from_root(dir.path()).db()).unwrap();
+        ellmephant::index::vec::clear(&conn).unwrap();
+    }
+
+    let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("index unavailable"), "{body}");
+
+    // A store with no rows at all is empty, not broken: that search is still a plain 200.
+    let empty = tempfile::tempdir().unwrap();
+    let app = app_with_token(empty.path(), "tok");
+    let (status, body, _) = get(&app, "/search?q=anything&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `backlinks` on a key with no row is a 404, not an empty list: *no backlinks* and *no such memory*
+/// are different answers, and it is the second that decides whether a delete is safe.
+#[tokio::test]
+async fn backlinks_of_a_missing_memory_is_a_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let (status, body, _) = get(&app, "/memory/no-such-memory/backlinks?format=json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    seed(&app, "tok", "bl-target", "a target", "a body").await;
+    let (status, body, _) = get(&app, "/memory/bl-target/backlinks?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A body past the store's cap is refused with 413, rather than accepted and then ground through the
+/// encoder for minutes while the whole session waits behind it.
+#[tokio::test]
+async fn a_body_past_the_cap_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let cap = ellmephant::store::MAX_BODY_CHARS;
+
+    let too_big =
+        serde_json::json!({"key": "too-big", "title": "too big", "body": "x".repeat(cap + 1)})
+            .to_string();
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?format=json",
+        Some("tok"),
+        Some("application/json"),
+        &too_big,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("body too long"), "{body}");
+    let (status, _, _) = get(&app, "/memory/too-big?format=json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was stored");
+
+    // Exactly at the cap is allowed: a limit, not an off-by-one.
+    let at_cap = serde_json::json!({"key": "at-cap", "title": "at cap", "body": "y".repeat(cap)})
+        .to_string();
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?format=json",
+        Some("tok"),
+        Some("application/json"),
+        &at_cap,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A merge that would silently drop prose is refused. `into`'s body is never edited, so retiring a
+/// memory carrying a fact the target lacks deletes the fact and reports only link counts — which
+/// made the one operation called "tidying up" the one that could quietly lose the detail.
+#[tokio::test]
+async fn a_merge_that_would_drop_prose_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(
+        &app,
+        "tok",
+        "dup-into",
+        "the survivor",
+        "only the survivor's words",
+    )
+    .await;
+    seed(
+        &app,
+        "tok",
+        "dup-from",
+        "the duplicate",
+        "a fact only the duplicate carries",
+    )
+    .await;
+
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/dup-from/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"dup-from","into":"dup-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("refusing to merge"), "{body}");
+    assert!(
+        body.contains("DELETE"),
+        "it says how to discard on purpose: {body}"
+    );
+
+    // A refused merge retires nothing.
+    let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a refused merge must not delete the source"
+    );
+
+    // Fold the fact in first, and the same merge goes through.
+    seed(
+        &app,
+        "tok",
+        "dup-into",
+        "the survivor",
+        "only the survivor's words\na fact only the duplicate carries",
+    )
+    .await;
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/dup-from/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"dup-from","into":"dup-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the source retires once the fold is in"
+    );
 }

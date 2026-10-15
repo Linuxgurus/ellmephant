@@ -140,6 +140,27 @@ pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(
     Ok((id, key))
 }
 
+/// The largest body a memory may carry, in chars.
+///
+/// Past this the encoder stops being a write's cost and becomes an outage: measured on a real store
+/// at roughly 1.3-8.5 s per KB of body, a 16 KB body held the whole store for 51 s and a 1 MB one
+/// for minutes, because a write holds the session for its duration. A memory is one topic, not a
+/// payload — a body this long is several memories wearing one key.
+pub const MAX_BODY_CHARS: usize = 16_384;
+
+/// Refuse a body past [`MAX_BODY_CHARS`]. Every write path passes through [`add_impl`], so this is
+/// a property of the STORE rather than of whichever door asked.
+fn check_body(body: &str) -> Result<()> {
+    let len = body.chars().count();
+    if len > MAX_BODY_CHARS {
+        return Err(Error::TooLarge(format!(
+            "body too long: {len} chars (limit {MAX_BODY_CHARS}); a memory is one topic, not a \
+             payload — split it across memories and link them"
+        )));
+    }
+    Ok(())
+}
+
 /// [`add`] with the split-review verdict's fate made explicit. `reset_coherent` is `true` for a
 /// whole-row write — the row's shape may have changed, so re-judge it — and `false` for a merge that
 /// left the title and the body alone. Returns whether the document actually changed (and so whether
@@ -150,6 +171,7 @@ fn add_impl(
     mem: &Memory,
     reset_coherent: bool,
 ) -> Result<(i64, String, bool)> {
+    check_body(&mem.body)?;
     let prepared = prepare(conn, embedder, mem)?;
     let reembedded = prepared.needs_embed();
     // Create the vec table before the tx so its DDL is not inside it.

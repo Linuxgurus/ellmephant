@@ -197,10 +197,17 @@ fn error(json: bool, status: StatusCode, message: impl AsRef<str>) -> Response {
     }
 }
 
-/// 404 for a store error that names a missing row; 400 otherwise (a malformed request).
+/// 404 for a store error that names a missing row; 413 for a body past the store's cap; 503 for a
+/// derived index that is not there; 400 otherwise (a malformed request).
 fn error_status(message: &str) -> StatusCode {
     if message.starts_with("no such memory:") || message.starts_with("no such project:") {
         StatusCode::NOT_FOUND
+    } else if message.starts_with("body too long:") {
+        // The request is well formed and the caller is welcome; it is simply too big to hold.
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else if message.starts_with("index unavailable:") {
+        // Not the caller's fault and not permanent: the derived index needs rebuilding.
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_REQUEST
     }

@@ -89,6 +89,35 @@ fn digest_counts_spread_tags_and_links() {
 }
 
 #[test]
+fn the_digest_carries_the_encode_queue() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let spec = ellmephant::embed::VecSpec::of(&embedder);
+
+    // `store::add` and NOT `add_now`: the point is the unsettled document a write leaves behind.
+    store::add(&conn, &spec, &memory("queued", "owed a vector", &["k8s"])).expect("add");
+    let s = stats::compute(&conn).expect("stats");
+    assert_eq!(s.encode_pending, 1, "the write scheduled its document");
+    assert_eq!(s.encode_failed, 0, "and nothing has failed");
+    assert!(
+        s.encode_oldest_s.is_some(),
+        "a document that is waiting has an age — this is the number that shows a stalled worker"
+    );
+
+    // Settle it: the queue empties, and with it the age.
+    let processed = ellmephant::store::encode::drain(&conn, &embedder, &spec, 10).expect("drain");
+    assert_eq!(processed, 1);
+    let s = stats::compute(&conn).expect("stats");
+    assert_eq!(s.encode_pending, 0);
+    assert_eq!(s.encode_failed, 0);
+    assert_eq!(
+        s.encode_oldest_s, None,
+        "nothing queued, so nothing is waiting"
+    );
+}
+
+#[test]
 fn an_empty_store_is_all_zeroes_not_a_panic() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");

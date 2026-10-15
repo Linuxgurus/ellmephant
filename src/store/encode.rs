@@ -70,19 +70,53 @@ pub fn enqueue(conn: &Connection, key: &str, doc_hash: &str, priority: i32) -> R
     Ok(())
 }
 
+/// The schema version that introduced this table. A reader of an older store (the health probe, on a
+/// half-migrated or rolled-back store) must not query it: a missing table would answer the question
+/// "why is this store not ready?" with `no such table: encode_queue` instead of "schema behind binary".
+pub const SCHEMA: i32 = 8;
+
+/// The queue, as a metric: the backlog, the entries past [`MAX_ATTEMPTS`], and how long the oldest
+/// has waited. The three questions a queue has to answer — *how much, is it broken, is it stuck* —
+/// and none of them is a readiness gate: with a durable queue a non-empty backlog is NORMAL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Documents still owing a vector.
+    pub pending: i64,
+    /// Entries that have exhausted [`MAX_ATTEMPTS`] and are being skipped.
+    pub failed: i64,
+    /// Age of the oldest pending entry, in seconds — `None` when nothing is queued. A backlog that
+    /// only grows here is a worker that is not running, which nothing else would say.
+    pub oldest_s: Option<i64>,
+}
+
+/// Read the queue's shape. Three cheap aggregates, and deliberately the ONLY way to ask: `pending`
+/// and `failed` are heads of this, so a caller cannot get a count that disagrees with the others.
+pub fn counts(conn: &Connection) -> Result<Counts> {
+    Ok(conn.query_row(
+        "SELECT count(*),
+                coalesce(sum(CASE WHEN attempts >= ?1 THEN 1 ELSE 0 END), 0),
+                CAST(strftime('%s', 'now') - strftime('%s', min(queued_at)) AS INTEGER)
+           FROM encode_queue",
+        params![MAX_ATTEMPTS],
+        |r| {
+            Ok(Counts {
+                pending: r.get(0)?,
+                failed: r.get(1)?,
+                oldest_s: r.get(2)?,
+            })
+        },
+    )?)
+}
+
 /// How many documents still owe a vector — the encoder's backlog.
 pub fn pending(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT count(*) FROM encode_queue", [], |r| r.get(0))?)
+    Ok(counts(conn)?.pending)
 }
 
 /// How many entries have exhausted [`MAX_ATTEMPTS`] and are being skipped. Non-zero means something
 /// is failing in a way a retry will not fix, and it is deliberately visible rather than silent.
 pub fn failed(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM encode_queue WHERE attempts >= ?1",
-        params![MAX_ATTEMPTS],
-        |r| r.get(0),
-    )?)
+    Ok(counts(conn)?.failed)
 }
 
 /// The next entry to do: lowest priority first, then oldest, then key for a stable order.
@@ -253,12 +287,22 @@ fn settle(conn: &Connection, key: &str, claimed_hash: &str) -> Result<()> {
 ///
 /// Public because the worker drives the retry itself: it holds the store lock in two short pieces,
 /// so it cannot use [`drain`] and needs to record the failure between them.
-pub fn record_failure(conn: &Connection, key: &str, err: &Error) -> Result<()> {
+/// Count a failed embed attempt and return how many attempts the entry now has. The count is the
+/// caller's to report: a document that has just spent its [MAX_ATTEMPTS] is about to be skipped by
+/// [`next`], so whoever caused it should say so out loud rather than let it go quiet.
+pub fn record_failure(conn: &Connection, key: &str, err: &Error) -> Result<i64> {
     conn.execute(
         "UPDATE encode_queue SET attempts = attempts + 1, last_error = ?2 WHERE key = ?1",
         params![key, err.to_string()],
     )?;
-    Ok(())
+    Ok(conn
+        .query_row(
+            "SELECT attempts FROM encode_queue WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
 }
 
 /// Encode up to `limit` entries, highest priority first; returns how many were processed.
@@ -580,6 +624,58 @@ mod tests {
             0,
             "a re-enqueue resets the attempts"
         );
+    }
+
+    /// The three numbers a queue has to answer with — how much, is it broken, is it stuck — from the
+    /// one aggregate, so no reader can get a count that disagrees with the others. `oldest_s` is the
+    /// one that tells a slow worker from an absent one; nothing else in the store would say it.
+    #[test]
+    fn counts_reports_the_backlog_the_failures_and_the_oldest_wait() {
+        let (_d, conn) = store();
+        let embedder = HashEmbedder::new(8);
+        let spec = VecSpec::of(&embedder);
+
+        assert_eq!(
+            counts(&conn).unwrap(),
+            Counts::default(),
+            "an empty queue is zeroes and no age at all"
+        );
+
+        crate::store::add(&conn, &spec, &mem("a", "alpha")).unwrap();
+        let c = counts(&conn).unwrap();
+        assert_eq!(c.pending, 1);
+        assert_eq!(c.failed, 0);
+        assert_eq!(
+            c.oldest_s,
+            Some(0),
+            "queued this second, so zero seconds old"
+        );
+
+        // One document that keeps failing, one that eventually gives up on itself.
+        let err = Error::Config("no vector for you".into());
+        assert_eq!(record_failure(&conn, "a", &err).unwrap(), 1);
+        crate::store::add(&conn, &spec, &mem("b", "beta")).unwrap();
+        for attempt in 1..=MAX_ATTEMPTS {
+            assert_eq!(
+                record_failure(&conn, "b", &err).unwrap(),
+                attempt,
+                "record_failure hands back the count it just made, so a caller can report it"
+            );
+        }
+
+        let c = counts(&conn).unwrap();
+        assert_eq!(c.pending, 2, "an exhausted entry is still on the books");
+        assert_eq!(c.failed, 1, "and it is the one that has given up");
+        assert_eq!(pending(&conn).unwrap(), c.pending, "the heads agree");
+        assert_eq!(failed(&conn).unwrap(), c.failed);
+
+        // A working embedder clears the retryable one; the skipped one stays, by design, until it is
+        // written again — so `pending` never reaches zero here and `counts` says exactly that.
+        assert_eq!(drain(&conn, &embedder, &spec, 10).unwrap(), 1);
+        let c = counts(&conn).unwrap();
+        assert_eq!(c.pending, 1);
+        assert_eq!(c.failed, 1);
+        assert_eq!(next(&conn).unwrap(), None, "and it is not offered as work");
     }
 
     /// The P2 contract in one place: a **write queues the document and writes no vector**, and the

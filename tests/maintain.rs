@@ -7,7 +7,7 @@ mod common;
 
 use common::temp_store;
 use ellmephant::db;
-use ellmephant::embed::{Embedder, HashEmbedder, projection};
+use ellmephant::embed::{Embedder, HashEmbedder, VecSpec, projection};
 use ellmephant::index::vec;
 use ellmephant::store::{self, Memory, links, maintain};
 use rusqlite::{Connection, params};
@@ -51,9 +51,16 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
 
     // Swap to a wider model (a dim change `index::vec::ensure` would refuse).
     let wide = HashEmbedder::new(16);
-    let report = maintain::reembed(&conn, &wide, "test instruction").expect("reembed");
+    let spec = VecSpec::of(&wide);
+    let report = maintain::reembed(&conn, &spec, "test instruction").expect("reembed");
     assert!(report.rebuilt, "a dimension change recreates the tables");
-    assert_eq!((report.rows, report.dim), (2, 16));
+    assert_eq!(
+        (report.queued, report.dim),
+        (2, 16),
+        "every row is owed a vector at the new width"
+    );
+    // The vectors are the worker's job now, so settle exactly as it would.
+    common::settle(&conn, &wide);
 
     assert_eq!(vec::stored_dim(&conn).unwrap(), Some(16));
     assert_eq!(meta(&conn, "dim").as_deref(), Some("16"));
@@ -98,13 +105,19 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     vec::delete(&conn, a).unwrap();
     assert_eq!(vec::count(&conn).unwrap(), 1);
 
-    let report = maintain::reembed(&conn, &embedder, "").expect("reembed");
+    let spec = VecSpec::of(&embedder);
+    let report = maintain::reembed(&conn, &spec, "").expect("reembed");
     assert!(!report.rebuilt, "same dim keeps the table");
-    assert_eq!(report.rows, 2);
+    // ONE row is owed, not two: `b` still carries its vector and its document never moved, and the
+    // producer is precise about that. `a` is owed because it has no vector at all — which `doc_hash`
+    // cannot see, since the hash still says "indexed".
+    assert_eq!(report.queued, 1, "only the row with no vector is owed one");
+    common::settle(&conn, &embedder);
     assert_eq!(vec::count(&conn).unwrap(), 2, "the missing vector is back");
 
     let before = vec::get(&conn, a).unwrap();
-    maintain::reembed(&conn, &embedder, "").expect("reembed again");
+    let again = maintain::reembed(&conn, &spec, "").expect("reembed again");
+    assert_eq!(again.queued, 0, "a settled store owes nothing");
     assert_eq!(vec::get(&conn, a).unwrap(), before, "vectors are stable");
 }
 
@@ -124,7 +137,7 @@ fn reembed_records_the_projection_fingerprint() {
     );
     assert!(!vec::projection_stale(&conn).unwrap());
 
-    maintain::reembed(&conn, &embedder, "").expect("reembed");
+    maintain::reembed(&conn, &VecSpec::of(&embedder), "").expect("reembed");
     assert_eq!(
         meta(&conn, "projection").as_deref(),
         Some(projection::fingerprint().as_str()),
@@ -152,7 +165,7 @@ fn reembed_rebuilds_the_link_graph_from_the_bodies() {
     .expect("stale edge");
     assert_eq!(edge_count(&conn), 2, "[[b]] plus the stale [[ghost]]");
 
-    let report = maintain::reembed(&conn, &embedder, "").expect("reembed");
+    let report = maintain::reembed(&conn, &VecSpec::of(&embedder), "").expect("reembed");
     assert_eq!(report.linked, 2, "both rows were re-parsed");
     assert_eq!(
         edge_count(&conn),
@@ -181,7 +194,7 @@ fn reparse_applies_the_code_span_rule_to_an_existing_body() {
     .expect("legacy edge");
     assert_eq!(edge_count(&conn), 1);
 
-    maintain::reembed(&conn, &embedder, "").expect("reembed");
+    maintain::reembed(&conn, &VecSpec::of(&embedder), "").expect("reembed");
     assert_eq!(
         edge_count(&conn),
         0,

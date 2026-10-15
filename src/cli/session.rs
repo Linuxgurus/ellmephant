@@ -258,12 +258,14 @@ impl Session {
         Ok(stats)
     }
 
-    /// Recompute every vector and rebuild the derived indexes — the vector index and the `[[link]]`
-    /// graph — handling a model or dimension change (P9). Loads the encoder, so it is the heaviest
-    /// call the server makes; it backs the `memory_reembed` tool.
+    /// Queue every document that needs (re-)embedding, and rebuild the derived indexes that take no
+    /// model — the `[[link]]` graph, and the `vec0` table when the width changed (P9).
+    ///
+    /// **No encoder.** This used to recompute every vector under the store lock — ~45 minutes on a
+    /// 291-row store, which made it a total write outage — and now schedules the work and returns.
+    /// It backs the `memory_reembed` tool.
     pub fn reembed(&self) -> Result<maintain::Report> {
-        self.encoder
-            .with(|e| maintain::reembed(&self.conn, e, &self.cfg.instruction))
+        maintain::reembed(&self.conn, &self.vec_spec(), &self.cfg.instruction)
     }
 
     /// The head of the encode queue, or `None` when nothing is waiting to be embedded.

@@ -180,6 +180,19 @@ So empty is "no vector yet" and non-empty is "the vector for *this* text", while
 `existing doc_hash != new hash` test keeps working untouched. `insert_row` must admit `''` — the
 column is `NOT NULL` today and stays `NOT NULL`.
 
+**But `doc_hash` is not evidence that a vector EXISTS**, and that gap bit twice. A killed rebuild or a
+hand-deleted vector leaves the hash saying "indexed" while the index is torn. So:
+
+- [`claim`](src/store/encode.rs) asks the index as well — `indexed = doc_hash matches && the vector is
+  there` — one extra SELECT per job, buying a `needs_embed` that means what it says;
+- `reembed` compares against `index::vec::ids` rather than trusting the hash when deciding what to
+  queue. Without both, a rebuild would queue a torn row whose job then declined to do itself: nothing
+  embedded, nothing repaired, and no error anywhere.
+
+The general lesson, and it is the sort that is invisible in review: **a derived index needs a stamp
+that is *derived from the index*, or it will eventually lie about it.** `doc_hash` describes the text;
+it never claimed to describe the presence of the row in `memory_vec`.
+
 ### The edges the queue must also reach
 
 Every path that moves or kills a key carries its queue row with it, in the same transaction:
@@ -189,7 +202,7 @@ Every path that moves or kills a key carries its queue row with it, in the same 
 | `store::delete` | `DELETE FROM encode_queue WHERE key = ?` — a dead key must not be embedded |
 | `links::merge_into` (retires `from`) | same, for `from` |
 | `links::rename(old, new)` | re-enqueue `new`: the **key is part of the projection** (`embed_document` embeds it), so a rename moves the vector. Today it re-embeds inline (`links.rs:404`); it becomes an enqueue |
-| `store::maintain::reembed` | becomes a **producer** of enqueues — Phase 3 |
+| `store::maintain::reembed` | becomes a **producer** of enqueues — P4. It rebuilds the `vec0` table on a dim change (the one step that cannot be a swap) and queues every row that owes a vector: rebuilt, moved, **or missing from the index entirely**. `index::vec::ids` is what sees the last case; `doc_hash` cannot |
 
 ## The job
 

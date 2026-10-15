@@ -1379,16 +1379,16 @@ impl MemoryServer {
             .await?;
         tracing::info!(
             tool = "memory_reembed",
-            rows = report.rows,
+            queued = report.queued,
             dim = report.dim,
             rebuilt = report.rebuilt,
             model = %report.model,
-            "re-embedded the store"
+            "queued a re-embed of the store"
         );
         // `Report` is not Serialize; spell the fields out so the response stays explicit.
         Ok(json_ok(serde_json::json!({
-            "status": "re-embedded",
-            "rows": report.rows,
+            "status": "queued",
+            "queued": report.queued,
             "dim": report.dim,
             "rebuilt": report.rebuilt,
             "model": report.model,

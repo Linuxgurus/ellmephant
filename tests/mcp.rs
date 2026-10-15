@@ -966,12 +966,30 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         "near-identical rows must pair: {d}"
     );
 
-    // `memory_reembed` takes no arguments: it recomputes every vector and rebuilds the index.
+    // Tear the index, the way a killed rebuild would: drop one row's vector and leave its `doc_hash`
+    // still saying "indexed". That is precisely the case the hash alone cannot see.
+    {
+        ellmephant::index::vec::register_extension();
+        let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
+        let id: i64 = conn
+            .query_row("SELECT id FROM memory WHERE key = 'dup-a'", [], |r| {
+                r.get(0)
+            })
+            .expect("row id");
+        ellmephant::index::vec::delete(&conn, id).expect("tear the index");
+    }
+
+    // `memory_reembed` takes no arguments: it QUEUES every document that owes a vector and rebuilds the
+    // parts that take no model. It embeds nothing itself — the worker does that.
     let re = call(&client, "memory_reembed", serde_json::json!({})).await;
     assert!(!re.is_error.unwrap_or(false), "{}", text(&re));
     let r: serde_json::Value = serde_json::from_str(&text(&re)).expect("json");
-    assert_eq!(r["status"], serde_json::json!("re-embedded"));
-    assert!(r["rows"].as_u64().expect("rows") >= 2);
+    assert_eq!(r["status"], serde_json::json!("queued"));
+    assert_eq!(
+        r["queued"],
+        serde_json::json!(1),
+        "the torn row is owed a vector; the intact one is not"
+    );
     assert!(r["dim"].as_u64().expect("dim") > 0);
 
     client.cancel().await.expect("cancel");

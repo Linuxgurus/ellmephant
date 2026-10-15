@@ -219,6 +219,20 @@ pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(&format!("SELECT count(*) FROM {TABLE}"), [], |r| r.get(0))?)
 }
 
+/// Every `memory_id` that has a stored vector. Empty when the table has not been created.
+///
+/// `doc_hash` says "this row was indexed", which is not the same as "this row HAS a vector": a killed
+/// rebuild or a hand-deleted vector leaves the hash intact and the index torn. `reembed` uses this to
+/// see the difference.
+pub fn ids(conn: &Connection) -> Result<Vec<i64>> {
+    if !table_exists(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT memory_id FROM {TABLE}"))?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+}
+
 /// Whether the vec0 table has been created yet.
 fn table_exists(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(

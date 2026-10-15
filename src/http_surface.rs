@@ -1054,8 +1054,11 @@ pub async fn coherent(
     }
 }
 
-/// `POST /reembed` — recompute every vector (`memory_reembed`); the heaviest lock holder, so last
-/// in the route table and watched by `/health`.
+/// `POST /reembed` — queue every document that needs (re-)embedding (`memory_reembed`).
+///
+/// It used to be the heaviest lock holder in the store: one transaction from the first row to the last,
+/// ~45 minutes on a 291-row store, with every write timing out for the duration. Now it enqueues and
+/// returns, so it is one of the cheapest.
 pub async fn reembed(
     State(state): State<HttpState>,
     RawQuery(raw): RawQuery,
@@ -1077,22 +1080,22 @@ pub async fn reembed(
         Ok(report) => {
             tracing::info!(
                 area = scope.area,
-                rows = report.rows,
-                "re-embedded over http"
+                queued = report.queued,
+                "queued a re-embed over http"
             );
             render(
                 StatusCode::OK,
                 json,
                 json_ok(serde_json::json!({
-                    "status": "re-embedded",
-                    "rows": report.rows,
+                    "status": "queued",
+                    "queued": report.queued,
                     "dim": report.dim,
                     "rebuilt": report.rebuilt,
                     "model": report.model,
                 })),
                 format!(
-                    "re-embedded {} rows ({} rebuilt)",
-                    report.rows, report.rebuilt
+                    "queued {} document(s) for re-embedding ({} rebuilt)",
+                    report.queued, report.rebuilt
                 ),
             )
         }

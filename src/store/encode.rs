@@ -170,10 +170,15 @@ pub fn claim(conn: &Connection, spec: &VecSpec, key: &str) -> Result<Option<Clai
     };
     let doc = projection::embed_document(key, &title, &body);
     let doc_hash = row_hash(spec, &doc);
+    // `doc_hash` alone is NOT evidence that a vector exists: it survives a torn index — a killed
+    // rebuild, a hand-deleted vector — so the index itself is asked as well. That costs one SELECT per
+    // job and buys a `needs_embed` that means what it says, which is what lets `reembed` repair a
+    // torn index instead of queueing work that then declines to do itself.
+    let indexed = indexed_hash == doc_hash && index::vec::get(conn, id)?.is_some();
     Ok(Some(Claim {
         key: key.to_string(),
         id,
-        indexed: indexed_hash == doc_hash,
+        indexed,
         doc,
         doc_hash,
         claimed_hash,

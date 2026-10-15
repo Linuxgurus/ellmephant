@@ -37,7 +37,7 @@ use crate::error::Error;
 use crate::model;
 use crate::search::{Bundle, Field, Fields, MatchMode, Query, to_wire_json};
 use crate::store::links::backlinks_to_wire_json;
-use crate::store::{self, Memory, project};
+use crate::store::{self, project};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
@@ -87,7 +87,11 @@ Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clus
 per line; never a misc/gotchas bucket. Before saving, check: body hold ≥2 distinct topics? Split — \
 one call each, each atom stands alone (≥2-3 facts). Trim junk on edit — deepen the topic, never add \
 a second. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete` \
-Skip facts cheap to derive, live state, or one-off.";
+Skip facts cheap to derive, live state, or one-off. PATCHING: every field is optional — omit one and \
+the stored value is left alone, so a single field can change without resending the row. Empty is an \
+instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
+empty. A new key needs both a `title` and a `body`. Rewriting `title` or `body` re-opens the split \
+review (`coherent` resets); a tags or source change does not — filing is not meaning.";
 
 /// `memory_upvote` description. The feedback nudge, carried here only.
 const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \
@@ -124,7 +128,7 @@ the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen �
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
-Create or replace a project — an activity completed over time: identity, status, prose, and an \
+Create or patch a project — an activity completed over time: identity, status, prose, and an \
 ordered `preload`. A project is the structure half of the store and a container you can stand \
 inside; facts go in memories, where the store matches them by meaning. `key` is a plain slug — the \
 name is the identity, `prj:`/`prj-` are accepted and stripped, and a memory may share it. \
@@ -137,9 +141,13 @@ in here; it replaces the previous list, and it may name memories this project di
 yours if you state one, else it is stamped the moment the project stops being `todo` — a `todo` \
 project has NOT started — and it is never cleared, so a start on a `todo` project means it was \
 worked on once and parked. `end_date` is stamped when `status` becomes done|aborted — `status` says \
-HOW it ended, the date only says WHEN, and reopening clears it. A write is whole-row, so \
-`project_get` first if you mean to edit one field. A memory joins a project by carrying the \
-`prj:<key>` TAG; nothing links it. List a project's memories with `memory_search`'s `tags` filter.";
+HOW it ended, the date only says WHEN, and reopening clears it. PATCHING: every field is optional — \
+omit one and the stored value is left alone, so `project_get` is NOT required to edit a single \
+field. Empty is an instruction: `goal: \"\"`/`state: \"\"` clear, `owner: []` unassigns, and \
+`tags: []`/`preload: []` clear — but `title`/`status` may never be empty (an empty `status` is \
+refused, not quietly read as `todo`). A new key needs a `title`. A memory joins a project by \
+carrying the `prj:<key>` TAG; nothing links it. List a project's memories with `memory_search`'s \
+`tags` filter.";
 
 /// `project_get` description.
 const PROJECT_GET_DESCRIPTION: &str = "\
@@ -156,39 +164,47 @@ List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `
 tag must be present) and a literal/regex `pattern` over `key`/`title`/`goal`/`state`. Omit them \
 all to list every project.";
 
-/// Parameters for [`MemoryServer::memory_upsert`].
+/// Parameters for [`MemoryServer::memory_upsert`]. Every field is optional: an omitted field keeps
+/// the value already stored under `key`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UpsertParams {
     /// Stable slug.
     #[serde(default)]
-    #[schemars(description = "Stable slug; reuse replaces that memory.")]
+    #[schemars(description = "Stable slug. Reuse patches that memory; a new key is created.")]
     pub key: Option<String>,
     /// Salient one-liner.
-    #[schemars(description = "One sharp line.")]
-    pub title: String,
+    #[serde(default)]
+    #[schemars(description = "One sharp line. Omit to keep the stored one; never empty.")]
+    pub title: Option<String>,
     /// The facts.
-    #[schemars(description = "Facts, one per line. Link memory with `[[other-key]]`.")]
-    pub body: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Facts, one per line. Link memory with `[[other-key]]`. Omit to keep the stored body; never empty."
+    )]
+    pub body: Option<String>,
     /// Provenance.
     #[serde(default)]
-    #[schemars(description = "Proof stone: command/path/repo that derive this. Never live state.")]
+    #[schemars(
+        description = "Proof stone: command/path/repo that derive this. Never live state. Omit to keep it; an empty string clears it."
+    )]
     pub source: Option<String>,
     /// Aspect tags.
     #[serde(default)]
-    #[schemars(description = "Aspects of the subject, e.g. storage, gotchas.")]
-    pub tags: Vec<String>,
+    #[schemars(
+        description = "Aspects of the subject, e.g. storage, gotchas. Omit to keep the stored tags; `[]` clears them."
+    )]
+    pub tags: Option<Vec<String>>,
 }
 
 impl UpsertParams {
-    /// Convert the request into the storage/embedding unit.
-    fn into_memory(self) -> Memory {
-        Memory {
-            key: self.key.unwrap_or_default(),
+    /// Convert the request into a partial write — `None` means "leave this field alone".
+    fn into_patch(self) -> store::Patch {
+        store::Patch {
+            key: self.key,
             title: self.title,
             body: self.body,
             source: self.source,
             tags: self.tags,
-            ..Default::default()
         }
     }
 }
@@ -401,8 +417,9 @@ pub struct ProjectUpsertParams {
     #[schemars(description = "Stable slug — a plain name; reuse replaces that project.")]
     pub key: Option<String>,
     /// Salient one-liner.
-    #[schemars(description = "One sharp line.")]
-    pub title: String,
+    #[serde(default)]
+    #[schemars(description = "One sharp line. Omit to keep the stored one; never empty.")]
+    pub title: Option<String>,
     /// What this is for.
     #[serde(default)]
     #[schemars(description = "What this is for. One line.")]
@@ -413,7 +430,9 @@ pub struct ProjectUpsertParams {
     pub state: Option<String>,
     /// Lifecycle.
     #[serde(default)]
-    #[schemars(description = "todo | active | paused | done | aborted (default todo).")]
+    #[schemars(
+        description = "todo | active | paused | done | aborted. Omit to keep the stored status (a fresh project is `todo`); never empty."
+    )]
     pub status: Option<String>,
     /// Whose it is.
     #[serde(default)]
@@ -423,8 +442,10 @@ pub struct ProjectUpsertParams {
     pub owner: Option<Vec<String>>,
     /// Aspect tags.
     #[serde(default)]
-    #[schemars(description = "Aspects of the subject, e.g. continuity, storage.")]
-    pub tags: Vec<String>,
+    #[schemars(
+        description = "Aspects of the subject, e.g. continuity, storage. Omit to keep them; `[]` clears them."
+    )]
+    pub tags: Option<Vec<String>>,
     /// The ordered context to load.
     #[serde(default)]
     #[schemars(
@@ -446,21 +467,20 @@ pub struct ProjectUpsertParams {
 }
 
 impl ProjectUpsertParams {
-    /// Split the request into the project and its optional (whole-list) preload.
-    fn into_parts(self) -> (project::Project, Option<Vec<String>>) {
-        let project = project::Project {
-            key: self.key.unwrap_or_default(),
+    /// Convert the request into a partial write — `None` means "leave this field alone".
+    fn into_patch(self) -> project::Patch {
+        project::Patch {
+            key: self.key,
             title: self.title,
-            goal: self.goal.unwrap_or_default(),
-            state: self.state.unwrap_or_default(),
-            status: self.status.unwrap_or_default(),
-            owner: self.owner.unwrap_or_default(),
+            goal: self.goal,
+            state: self.state,
+            status: self.status,
+            owner: self.owner,
             tags: self.tags,
-            start_date: self.start_date.unwrap_or_default(),
-            end_date: self.end_date.unwrap_or_default(),
-            ..Default::default()
-        };
-        (project, self.preload)
+            preload: self.preload,
+            start_date: self.start_date,
+            end_date: self.end_date,
+        }
     }
 }
 
@@ -611,16 +631,24 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
-        let mem = p.into_memory();
-        let tags = mem.tags.clone();
-        let body_bytes = mem.body.len();
-        let key = self
-            .with_store("memory_upsert", move |s| s.add(&mem))
+        let patch = p.into_patch();
+        let outcome = self
+            .with_store("memory_upsert", move |s| s.memory_merge(&patch))
             .await?;
-        tracing::info!(tool = "memory_upsert", key = %key, tags = ?tags, body_bytes, "memory stored");
-        Ok(json_ok(
-            serde_json::json!({ "status": "stored", "key": key }),
-        ))
+        tracing::info!(
+            tool = "memory_upsert",
+            key = %outcome.key,
+            created = outcome.created,
+            reembedded = outcome.reembedded,
+            coherent_reset = outcome.coherent_reset,
+            "memory stored"
+        );
+        Ok(json_ok(serde_json::json!({
+            "status": if outcome.created { "created" } else { "updated" },
+            "key": outcome.key,
+            "reembedded": outcome.reembedded,
+            "coherent_reset": outcome.coherent_reset,
+        })))
     }
 
     /// Delete one memory by key.
@@ -950,17 +978,20 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        let (project, preload) = p.into_parts();
-        let preload_len = preload.as_ref().map(Vec::len);
-        let key = self
-            .with_store("project_upsert", move |s| {
-                s.project_upsert(&project, preload.as_deref())
-            })
+        let patch = p.into_patch();
+        let outcome = self
+            .with_store("project_upsert", move |s| s.project_merge(&patch))
             .await?;
-        tracing::info!(tool = "project_upsert", key = %key, preload = ?preload_len, "project stored");
-        Ok(json_ok(
-            serde_json::json!({ "status": "stored", "key": key }),
-        ))
+        tracing::info!(
+            tool = "project_upsert",
+            key = %outcome.key,
+            created = outcome.created,
+            "project stored"
+        );
+        Ok(json_ok(serde_json::json!({
+            "status": if outcome.created { "created" } else { "updated" },
+            "key": outcome.key,
+        })))
     }
 
     /// Read one project whole: its fields, its ordered preload, and the memories it owns.

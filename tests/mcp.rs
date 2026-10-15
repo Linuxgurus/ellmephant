@@ -657,3 +657,133 @@ async fn projects_round_trip_over_the_transport() {
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }
+
+#[tokio::test]
+async fn upsert_patches_one_field_over_the_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    // Create, with tags.
+    let created = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({
+            "key": "note", "title": "A note", "body": "the facts", "tags": ["alpha"]
+        }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&created)).expect("json");
+    assert_eq!(v["status"], serde_json::json!("created"));
+    assert_eq!(v["coherent_reset"], serde_json::json!(false));
+
+    // A verdict, so we can prove a patch does not un-judge the row.
+    call(
+        &client,
+        "memory_coherent",
+        serde_json::json!({ "key": "note", "coherent": true }),
+    )
+    .await;
+
+    // Patch ONE field: the tags are NOT resent, so they must survive.
+    let patched = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "note", "source": "cmd: prove" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&patched)).expect("json");
+    assert_eq!(v["status"], serde_json::json!("updated"));
+    assert_eq!(
+        v["reembedded"],
+        serde_json::json!(false),
+        "`source` is not part of the document"
+    );
+    assert_eq!(v["coherent_reset"], serde_json::json!(false));
+
+    let got = call(&client, "memory_get", serde_json::json!({ "key": "note" })).await;
+    let g: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
+    assert_eq!(g["body"], serde_json::json!("the facts"));
+    assert_eq!(g["source"], serde_json::json!("cmd: prove"));
+    assert_eq!(
+        g["tags"],
+        serde_json::json!(["alpha"]),
+        "an omitted field keeps its stored value -- tags are not wiped"
+    );
+    assert_eq!(
+        g["coherent"],
+        serde_json::json!(true),
+        "a field write must not re-open the split review"
+    );
+
+    // Clearing IS expressible: `[]` empties the tags.
+    call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "note", "tags": [] }),
+    )
+    .await;
+    let got = call(&client, "memory_get", serde_json::json!({ "key": "note" })).await;
+    let g: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
+    assert_eq!(g["tags"], serde_json::json!([]));
+
+    // A new key with no title is refused rather than written empty.
+    let bad = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "ghost", "source": "x" }),
+    )
+    .await;
+    assert!(bad.is_error.unwrap_or(false), "{}", text(&bad));
+
+    // Projects: patch one field, and an omitted `status` is NOT reset to `todo`.
+    let made = call(
+        &client,
+        "project_upsert",
+        serde_json::json!({ "key": "chronos", "title": "Chronos", "status": "active" }),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text(&made)).expect("json")["status"],
+        serde_json::json!("created"),
+        "a new key reports itself: this is what makes a mistyped key LOUD instead of a duplicate"
+    );
+    let set = call(
+        &client,
+        "project_upsert",
+        serde_json::json!({ "key": "chronos", "state": "Design only" }),
+    )
+    .await;
+    assert!(!set.is_error.unwrap_or(false), "{}", text(&set));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text(&set)).expect("json")["status"],
+        serde_json::json!("updated")
+    );
+    let got = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "chronos" }),
+    )
+    .await;
+    let g: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
+    assert_eq!(g["project"]["state"], serde_json::json!("Design only"));
+    assert_eq!(
+        g["project"]["status"],
+        serde_json::json!("active"),
+        "an omitted status keeps its stored value"
+    );
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

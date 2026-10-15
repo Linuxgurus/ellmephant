@@ -813,3 +813,306 @@ fn the_wire_shapes_are_positional_and_self_describing() {
         "there is no `contains`: membership is a tag now"
     );
 }
+
+#[test]
+fn merge_patches_one_field_and_leaves_the_rest_alone() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    let mut p = project_fixture("x");
+    p.title = "X — a title".into();
+    p.goal = "the goal".into();
+    p.state = "the state".into();
+    p.tags = vec!["storage".into()];
+    project::upsert(&conn, &p, None).expect("upsert");
+
+    // Only the goal: every other field is left exactly as it was.
+    let out = project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            goal: Some("a better goal".into()),
+            ..Default::default()
+        },
+    )
+    .expect("merge goal");
+    assert!(!out.created, "an existing key is patched, not created");
+    assert_eq!(out.key, "x");
+
+    let got = project::get(&conn, "x").unwrap().expect("exists");
+    assert_eq!(got.goal, "a better goal");
+    assert_eq!(got.title, "X — a title", "the other fields are untouched");
+    assert_eq!(got.state, "the state");
+    assert_eq!(got.tags, vec!["storage".to_string()]);
+}
+
+#[test]
+fn merge_keeps_the_status_when_it_is_not_the_field_being_written() {
+    // The footgun this design removes: an omitted `status` must not silently mean `todo`.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "active".into();
+    project::upsert(&conn, &p, None).expect("upsert");
+
+    project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            state: Some("where it stands".into()),
+            ..Default::default()
+        },
+    )
+    .expect("merge state");
+
+    let got = project::get(&conn, "x").unwrap().unwrap();
+    assert_eq!(
+        got.status, "active",
+        "a state edit must not un-start a project"
+    );
+    assert_eq!(got.state, "where it stands");
+}
+
+#[test]
+fn merge_clears_only_where_empty_is_a_fact() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.goal = "a goal".into();
+    p.state = "a state".into();
+    p.owner = vec!["Cline".into()];
+    p.tags = vec!["storage".into()];
+    project::upsert(&conn, &p, None).expect("upsert");
+
+    project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            goal: Some(String::new()),
+            state: Some(String::new()),
+            owner: Some(vec![]),
+            tags: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .expect("merge clears");
+
+    let got = project::get(&conn, "x").unwrap().unwrap();
+    assert_eq!(got.goal, "", "an empty goal is a fact");
+    assert_eq!(got.state, "");
+    assert!(got.owner.is_empty(), "an empty owner set is unassigned");
+    assert!(got.tags.is_empty());
+}
+
+#[test]
+fn merge_status_follows_the_project_date_rules() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    seed_project(&conn, "x");
+
+    let status = |s: &str| project::Patch {
+        key: Some("x".into()),
+        status: Some(s.into()),
+        ..Default::default()
+    };
+
+    // todo -> active stamps the start and leaves the end empty.
+    project::merge(&conn, &status("active")).expect("activate");
+    let started = project::get(&conn, "x").unwrap().unwrap();
+    assert!(!started.start_date.is_empty(), "work started");
+    assert!(started.end_date.is_empty());
+
+    // active -> done stamps the end.
+    project::merge(&conn, &status("done")).expect("finish");
+    let done = project::get(&conn, "x").unwrap().unwrap();
+    assert_eq!(done.status, "done");
+    assert!(!done.end_date.is_empty(), "`done` ends it");
+
+    // A merge that touches something else disturbs neither date.
+    project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            goal: Some("still done".into()),
+            ..Default::default()
+        },
+    )
+    .expect("bare patch");
+    let kept = project::get(&conn, "x").unwrap().unwrap();
+    assert_eq!(
+        kept.end_date, done.end_date,
+        "an unrelated write keeps the end"
+    );
+    assert_eq!(kept.start_date, done.start_date);
+
+    // done -> active clears the end and KEEPS the start (never cleared).
+    project::merge(&conn, &status("active")).expect("reopen");
+    let reopened = project::get(&conn, "x").unwrap().unwrap();
+    assert!(reopened.end_date.is_empty(), "reopening clears the end");
+    assert_eq!(
+        reopened.start_date, done.start_date,
+        "the start is a past fact and is never cleared"
+    );
+}
+
+#[test]
+fn merge_refuses_an_empty_status_and_needs_a_title_to_create() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    seed_project(&conn, "x");
+
+    // Empty is not an instruction here: it must not quietly read as `todo`.
+    let empty = project::Patch {
+        key: Some("x".into()),
+        status: Some(String::new()),
+        ..Default::default()
+    };
+    let err = project::merge(&conn, &empty).unwrap_err();
+    assert!(
+        format!("{err}").contains("`status` cannot be empty"),
+        "{err}"
+    );
+    assert_eq!(project::get(&conn, "x").unwrap().unwrap().status, "todo");
+
+    // An unknown status is still an error.
+    let bad = project::Patch {
+        key: Some("x".into()),
+        status: Some("nope".into()),
+        ..Default::default()
+    };
+    assert!(format!("{}", project::merge(&conn, &bad).unwrap_err()).contains("unknown status"));
+
+    // A create keeps the old minimum: you cannot make a nameless project.
+    let nameless = project::Patch {
+        key: Some("ghost".into()),
+        goal: Some("g".into()),
+        ..Default::default()
+    };
+    let err = project::merge(&conn, &nameless).unwrap_err();
+    assert!(format!("{err}").contains("needs a `title`"), "{err}");
+    assert!(
+        project::get(&conn, "ghost").unwrap().is_none(),
+        "nothing was written"
+    );
+}
+
+#[test]
+fn merge_preload_replaces_the_list_and_keeps_it_when_absent() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed_project(&conn, "x");
+    seed_memory(&conn, &embedder, "boot-note");
+    seed_memory(&conn, &embedder, "rules");
+
+    project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            preload: Some(vec!["rules".into(), "boot-note".into()]),
+            ..Default::default()
+        },
+    )
+    .expect("set preload");
+    let keys = |c: &Connection| -> Vec<String> {
+        project::preload(c, "x")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect()
+    };
+    assert_eq!(
+        keys(&conn),
+        vec!["rules", "boot-note"],
+        "order is the payload"
+    );
+
+    // Absent: the ordered list is untouched (this was already the rule; now it is the rule for
+    // every field).
+    project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            goal: Some("g".into()),
+            ..Default::default()
+        },
+    )
+    .expect("merge goal");
+    assert_eq!(keys(&conn), vec!["rules", "boot-note"]);
+
+    // `Some(vec![])` clears it.
+    project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            preload: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .expect("clear preload");
+    assert!(keys(&conn).is_empty());
+}
+
+#[test]
+fn merge_reports_a_create_so_a_mistyped_key_is_loud() {
+    // `key` is an ADDRESS, not a field: a patch naming a different key addresses a DIFFERENT row.
+    // That is a create, and `created` is the only thing that tells the caller it happened — without
+    // it, "I meant to edit `old`" silently leaves a duplicate behind.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let mut p = project_fixture("old");
+    p.title = "Old".into();
+    project::upsert(&conn, &p, None).expect("upsert");
+
+    let out = project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("odl".into()),
+            title: Some("Old".into()),
+            ..Default::default()
+        },
+    )
+    .expect("merge");
+
+    assert!(out.created, "a key change is a create, never a rename");
+    assert_eq!(out.key, "odl");
+    assert_eq!(
+        project::count(&conn).unwrap(),
+        2,
+        "the original survives: nothing renamed it"
+    );
+    assert!(project::get(&conn, "old").unwrap().is_some());
+}
+
+#[test]
+fn merge_refuses_an_end_date_on_a_project_that_has_not_ended() {
+    // A live project may not carry an end date — `upsert` says so. The merge must say so too, or a
+    // caller's `end_date` silently vanishes.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let mut p = project_fixture("x");
+    p.title = "X".into();
+    p.status = "active".into();
+    project::upsert(&conn, &p, None).expect("upsert");
+
+    let err = project::merge(
+        &conn,
+        &project::Patch {
+            key: Some("x".into()),
+            end_date: Some("2026-01-01".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("has not ended"), "{err}");
+    assert!(
+        project::get(&conn, "x")
+            .unwrap()
+            .unwrap()
+            .end_date
+            .is_empty(),
+        "nothing was written"
+    );
+}

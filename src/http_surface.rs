@@ -7,15 +7,16 @@
 //! read never queues behind a writer. **Auth before writes** — every `POST`/`PUT`/`DELETE` resolves
 //! a bearer to a scope first, and a rejection carries `WWW-Authenticate: Bearer` and nothing else.
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::http::{HttpState, probe};
 use crate::mcp::{
     CoherentFilter, DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SearchParams,
+    json_ok,
 };
 use crate::search::MatchMode;
 use crate::store::{self, links::backlinks_to_wire_json, project};
@@ -105,6 +106,57 @@ pub const ROUTES: &[Route] = &[
         tool: "project_list",
     },
 ];
+
+/// The resolved authority of a request. Today one constant covers the store; per-area credentials
+/// land later by resolving a different `Scope` in [`authorize`], and no handler changes.
+#[derive(Clone, Copy)]
+pub struct Scope {
+    /// The namespace this credential may write.
+    pub area: &'static str,
+    /// The namespace, once per-area credentials exist (`None` = the whole store).
+    pub namespace: Option<&'static str>,
+}
+
+/// The one scope every valid bearer resolves to today.
+const STORE_SCOPE: Scope = Scope {
+    area: "store",
+    namespace: None,
+};
+
+/// The largest request body accepted (a memory, not a payload).
+const MAX_BODY: usize = 4 * 1024 * 1024;
+
+/// Resolve a credential → a scope, or `None`. The seam: handlers receive the scope, never the token.
+fn resolve(provided: Option<&str>, expected: Option<&str>) -> Option<Scope> {
+    match (provided, expected) {
+        (Some(p), Some(e)) if p == e => Some(STORE_SCOPE),
+        _ => None,
+    }
+}
+
+/// The bearer on the request, if any.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Authorize a write: resolve the bearer, or hand back the bare 401 (no `resource_metadata`).
+#[allow(clippy::result_large_err)] // the Err is a ready-to-return response, not a value to carry
+fn authorize(state: &HttpState, headers: &HeaderMap, json: bool) -> Result<Scope, Response> {
+    resolve(bearer(headers), state.write_token()).ok_or_else(|| unauthorized(json))
+}
+
+/// The 401: `WWW-Authenticate: Bearer`, and **nothing more** — a `resource_metadata` challenge is
+/// what makes a client invent an OAuth flow.
+fn unauthorized(json: bool) -> Response {
+    let mut response = error(json, StatusCode::UNAUTHORIZED, "unauthorized");
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
 
 /// A text or JSON body with an explicit content type.
 fn render(status: StatusCode, json: bool, json_body: String, text_body: String) -> Response {
@@ -256,6 +308,174 @@ fn hex(b: u8) -> Option<u8> {
     (b as char).to_digit(16).map(|d| d as u8)
 }
 
+/// A parsed `text/plain` write: the named front matter and the verbatim body.
+#[derive(Debug, Default)]
+struct FrontMatter {
+    key: Option<String>,
+    title: Option<String>,
+    tags: Option<Vec<String>>,
+    source: Option<String>,
+    body: String,
+}
+
+/// Parse the front matter: `Key:`/`Title:`/`Tags:`/`Source:` before the first `---`, the body after
+/// it byte-for-byte with a trailing newline trimmed. An unknown field is an error that names it.
+fn front_matter(text: &str) -> Result<FrontMatter, String> {
+    let mut out = FrontMatter::default();
+    let mut header_end = text.len();
+    let mut body_start = text.len();
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == "---" {
+            header_end = pos;
+            body_start = pos + line.len();
+            break;
+        }
+        pos += line.len();
+    }
+    let body = &text[body_start..];
+    out.body = body.strip_suffix('\n').unwrap_or(body).to_string();
+    for line in text[..header_end].lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(format!("malformed front-matter line `{line}`"));
+        };
+        let value = value.trim();
+        match name.trim() {
+            "Key" => out.key = Some(value.to_string()),
+            "Title" => out.title = Some(value.to_string()),
+            "Source" => out.source = Some(value.to_string()),
+            "Tags" => {
+                out.tags = Some(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
+            other => return Err(format!("unknown front-matter field `{other}`")),
+        }
+    }
+    Ok(out)
+}
+
+/// A `memory_upsert` patch from a text body (`Key:` required: it is the address).
+fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
+    let fm = front_matter(text)?;
+    let Some(key) = fm.key else {
+        return Err("missing `Key:` front-matter field".to_string());
+    };
+    Ok(store::Patch {
+        key: Some(key),
+        title: fm.title,
+        body: Some(fm.body),
+        source: fm.source,
+        tags: fm.tags,
+    })
+}
+
+/// The JSON shape `POST /memory` accepts under `Content-Type: application/json`.
+#[derive(serde::Deserialize)]
+struct MemoryJson {
+    key: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    source: Option<String>,
+    tags: Option<Vec<String>>,
+}
+
+/// A `memory_upsert` patch from a JSON body.
+fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
+    let m: MemoryJson = serde_json::from_slice(bytes).map_err(|e| format!("bad JSON: {e}"))?;
+    Ok(store::Patch {
+        key: m.key,
+        title: m.title,
+        body: m.body,
+        source: m.source,
+        tags: m.tags,
+    })
+}
+
+/// The JSON shape `POST /project` accepts under `Content-Type: application/json`.
+#[derive(serde::Deserialize)]
+struct ProjectJson {
+    key: Option<String>,
+    title: Option<String>,
+    goal: Option<String>,
+    state: Option<String>,
+    status: Option<String>,
+    owner: Option<Vec<String>>,
+    tags: Option<Vec<String>>,
+    preload: Option<Vec<String>>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+}
+
+impl ProjectJson {
+    /// Fold the JSON onto a partial project patch.
+    fn into_patch(self) -> project::Patch {
+        project::Patch {
+            key: self.key,
+            title: self.title,
+            goal: self.goal,
+            state: self.state,
+            status: self.status,
+            owner: self.owner,
+            tags: self.tags,
+            preload: self.preload,
+            start_date: self.start_date,
+            end_date: self.end_date,
+        }
+    }
+}
+
+/// A project patch from a JSON body.
+fn project_patch_json(bytes: &[u8]) -> Result<project::Patch, String> {
+    let p: ProjectJson = serde_json::from_slice(bytes).map_err(|e| format!("bad JSON: {e}"))?;
+    Ok(p.into_patch())
+}
+
+/// A project patch from text front matter — the structured set is JSON's job, so text maps
+/// `Key`/`Title`/`Tags` and carries the body as the project's `goal`.
+fn project_patch_text(text: &str) -> Result<project::Patch, String> {
+    let fm = front_matter(text)?;
+    Ok(project::Patch {
+        key: fm.key,
+        title: fm.title,
+        goal: (!fm.body.is_empty()).then_some(fm.body),
+        tags: fm.tags,
+        state: None,
+        status: None,
+        owner: None,
+        preload: None,
+        start_date: None,
+        end_date: None,
+    })
+}
+
+/// Read a content type: JSON only when the caller says so.
+fn is_json_content(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("application/json"))
+        .unwrap_or(false)
+}
+
+/// Collect a request body, erroring (as a 400) past [`MAX_BODY`].
+async fn body_bytes(body: Body) -> Result<Vec<u8>, String> {
+    to_bytes(body, MAX_BODY)
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("bad body: {e}"))
+}
+
+/// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -444,6 +664,364 @@ pub async fn project_get(
                 json,
                 wire.clone(),
                 list_text("project", &wire),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /memory` — store one memory (`memory_upsert`); text front-matter or JSON.
+pub async fn upsert(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let patch = if is_json_content(&headers) {
+        memory_patch_json(&bytes)
+    } else {
+        memory_patch_text(&String::from_utf8_lossy(&bytes))
+    };
+    let patch = match patch {
+        Ok(p) => p,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("memory_upsert", move |s| s.memory_merge(&patch))
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, key = %out.key, "memory stored over http");
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({
+                    "status": if out.created { "created" } else { "updated" },
+                    "key": out.key,
+                    "reembedded": out.reembedded,
+                    "coherent_reset": out.coherent_reset,
+                })),
+                format!("stored {} (reembedded={})", out.key, out.reembedded),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `DELETE /memory/{key}` — remove one memory (`memory_delete`).
+pub async fn memory_delete(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let lookup = key.clone();
+    match server
+        .with_store("memory_delete", move |s| s.rm(&lookup))
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(area = scope.area, key = %key, "memory removed over http");
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({ "status": "removed", "key": key })),
+                format!("deleted {key}"),
+            )
+        }
+        Ok(false) => error(
+            json,
+            StatusCode::NOT_FOUND,
+            format!("no such memory: {key}"),
+        ),
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /memory/{key}/visit` — the split-out counter: the write `GET` refused to be.
+pub async fn visit(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let lookup = key.clone();
+    match server
+        .with_store("memory_visit", move |s| s.record_visit(&lookup))
+        .await
+    {
+        Ok(visits) => {
+            tracing::info!(area = scope.area, key = %key, visits, "visit counted over http");
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({ "status": "visited", "key": key, "visits": visits })),
+                format!("visited {key} (visits {visits})"),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /memory/{key}/upvote` — mark one memory useful (`memory_upvote`).
+pub async fn upvote(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let sweep = vec![key.clone()];
+    let lookup = key.clone();
+    match server
+        .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
+        .await
+    {
+        Ok((upvoted, _missing)) => match upvoted.into_iter().next() {
+            Some((_, times_useful)) => {
+                tracing::info!(area = scope.area, key = %key, "upvoted over http");
+                render(
+                    StatusCode::OK,
+                    json,
+                    json_ok(serde_json::json!({
+                        "status": "useful",
+                        "upvoted": [{ "key": key, "times_useful": times_useful }],
+                    })),
+                    format!("upvoted {key} (useful {times_useful})"),
+                )
+            }
+            None => error(
+                json,
+                StatusCode::NOT_FOUND,
+                format!("no such memory: {lookup}"),
+            ),
+        },
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /memory/{key}/merge?into=` — retire one memory into another (`memory_merge`).
+pub async fn merge(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Some(into) = params.maybe("into").map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "missing `into` parameter");
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let from = key.clone();
+    let target = into.clone();
+    match server
+        .with_store("memory_merge", move |s| s.merge_into(&from, &target))
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, from = %key, into = %into, "merged over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                format!("merged {key} -> {into} ({} refs repointed)", out.bodies),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `PUT /memory/{key}/coherent?value=true|false|null` — the split-review verdict (`memory_coherent`).
+pub async fn coherent(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let value = match params.get("value") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some("null") => None,
+        Some(other) => {
+            return error(
+                json,
+                StatusCode::BAD_REQUEST,
+                format!("bad `value`: {other} (one of: true, false, null)"),
+            );
+        }
+        None => return error(json, StatusCode::BAD_REQUEST, "missing `value` parameter"),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mark = key.clone();
+    match server
+        .with_store("memory_coherent", move |s| s.mark_coherent(&mark, value))
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(area = scope.area, key = %key, coherent = ?value, "marked over http");
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({ "status": "marked", "key": key, "coherent": value })),
+                format!(
+                    "marked {key} (coherent={})",
+                    value.map_or("null", |v| if v { "true" } else { "false" })
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /reembed` — recompute every vector (`memory_reembed`); the heaviest lock holder, so last
+/// in the route table and watched by `/health`.
+pub async fn reembed(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("memory_reembed", move |s| s.reembed())
+        .await
+    {
+        Ok(report) => {
+            tracing::info!(
+                area = scope.area,
+                rows = report.rows,
+                "re-embedded over http"
+            );
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({
+                    "status": "re-embedded",
+                    "rows": report.rows,
+                    "dim": report.dim,
+                    "rebuilt": report.rebuilt,
+                    "model": report.model,
+                })),
+                format!(
+                    "re-embedded {} rows ({} rebuilt)",
+                    report.rows, report.rebuilt
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /project` — create or replace a project (`project_upsert`); JSON or text front-matter.
+pub async fn project_upsert(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let patch = if is_json_content(&headers) {
+        project_patch_json(&bytes)
+    } else {
+        project_patch_text(&String::from_utf8_lossy(&bytes))
+    };
+    let patch = match patch {
+        Ok(p) => p,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("project_upsert", move |s| s.project_merge(&patch))
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, key = %out.key, "project stored over http");
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({
+                    "status": if out.created { "created" } else { "updated" },
+                    "key": out.key,
+                })),
+                format!(
+                    "stored project {} ({})",
+                    out.key,
+                    if out.created { "created" } else { "updated" }
+                ),
             )
         }
         Err(e) => error(json, error_status(&e), e),

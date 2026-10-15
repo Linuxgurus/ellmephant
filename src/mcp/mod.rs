@@ -1302,15 +1302,28 @@ pub fn http_router(
         .route("/health", axum::routing::get(crate::http::health))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
-        .route("/memory/{key}", axum::routing::get(surface::memory_get))
+        .route(
+            "/memory/{key}",
+            axum::routing::get(surface::memory_get).delete(surface::memory_delete),
+        )
         .route(
             "/memory/{key}/backlinks",
             axum::routing::get(surface::backlinks),
         )
+        .route("/memory/{key}/visit", axum::routing::post(surface::visit))
+        .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
+        .route("/memory/{key}/merge", axum::routing::post(surface::merge))
+        .route(
+            "/memory/{key}/coherent",
+            axum::routing::put(surface::coherent),
+        )
+        .route("/memory", axum::routing::post(surface::upsert))
         .route("/search", axum::routing::get(surface::search))
         .route("/dupes", axum::routing::get(surface::dupes))
         .route("/projects", axum::routing::get(surface::projects))
         .route("/project/{key}", axum::routing::get(surface::project_get))
+        .route("/project", axum::routing::post(surface::project_upsert))
+        .route("/reembed", axum::routing::post(surface::reembed))
         // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.
         .fallback(surface::not_found)
         .method_not_allowed_fallback(surface::method_not_allowed)

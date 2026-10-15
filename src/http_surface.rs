@@ -797,42 +797,62 @@ pub async fn upvote(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     let scope = match authorize(&state, &headers, json) {
         Ok(s) => s,
         Err(r) => return r,
     };
+    // MCP's `memory_upvote` takes `{"keys": [...]}` — a BATCH, and that is what a caller who knows the
+    // tool will send. Accept it; the path key is the one-key shorthand. A body that names other keys
+    // must never be ignored, and this route used to upvote the PATH key and silently drop the body.
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let keys = match body.as_ref().and_then(|b| b.get("keys")) {
+        Some(serde_json::Value::Array(items)) => {
+            let mut keys = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(k) => keys.push(k.to_string()),
+                    None => {
+                        return error(
+                            json,
+                            StatusCode::BAD_REQUEST,
+                            format!("bad `keys` entry: {item} (a string expected)"),
+                        );
+                    }
+                }
+            }
+            keys
+        }
+        Some(other) => {
+            return error(
+                json,
+                StatusCode::BAD_REQUEST,
+                format!("bad `keys`: {other} (an array of keys expected)"),
+            );
+        }
+        None => vec![key.clone()],
+    };
+    let named = keys.join(", ");
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let sweep = vec![key.clone()];
-    let lookup = key.clone();
-    match server
-        .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
-        .await
-    {
-        Ok((upvoted, _missing)) => match upvoted.into_iter().next() {
-            Some((_, times_useful)) => {
-                tracing::info!(area = scope.area, key = %key, "upvoted over http");
-                render(
-                    StatusCode::OK,
-                    json,
-                    json_ok(serde_json::json!({
-                        "status": "useful",
-                        "upvoted": [{ "key": key, "times_useful": times_useful }],
-                    })),
-                    format!("upvoted {key} (useful {times_useful})"),
-                )
-            }
-            None => error(
-                json,
-                StatusCode::NOT_FOUND,
-                format!("no such memory: {lookup}"),
-            ),
-        },
-        Err(e) => error(json, error_status(&e), e),
+    // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
+    // errors nor the JSON can drift apart.
+    match crate::mcp::upvote_sweep(server, keys).await {
+        Ok(payload) => {
+            tracing::info!(area = scope.area, keys = %named, "upvoted over http");
+            render(StatusCode::OK, json, payload, format!("upvoted {named}"))
+        }
+        Err(message) => {
+            let status = error_status(&message);
+            error(json, status, message)
+        }
     }
 }
 

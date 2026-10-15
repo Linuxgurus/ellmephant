@@ -916,3 +916,79 @@ async fn write_routes_accept_the_mcp_arguments_as_a_body() {
     let (_, got, _) = get(&app, "/memory/mb3?format=json").await;
     assert_eq!(coherent_of(&got), serde_json::json!(false), "{got}");
 }
+
+/// `memory_upvote` takes `{"keys": [...]}` — a BATCH — so the route must honour that body rather than
+/// silently upvoting the key in its own path, which is what it used to do. And the reply is the tool's
+/// reply, because both doors call one `upvote_sweep`.
+#[tokio::test]
+async fn upvote_route_honours_the_mcp_batch_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "uv-a", "a", "a").await;
+    seed(&app, "tok", "uv-b", "b", "b").await;
+
+    let times_useful = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["times_useful"].clone()
+    };
+
+    // A body naming OTHER keys: the path key must be left alone.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":["uv-b"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["upvoted"][0]["key"], "uv-b", "the body wins: {body}");
+    let (_, a, _) = get(&app, "/memory/uv-a?format=json").await;
+    assert_eq!(
+        times_useful(&a),
+        serde_json::json!(0),
+        "the path key is untouched"
+    );
+    let (_, b, _) = get(&app, "/memory/uv-b?format=json").await;
+    assert_eq!(times_useful(&b), serde_json::json!(1), "{b}");
+
+    // A batch reports the keys it could NOT find, exactly as the tool does.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":["uv-a","nope"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["upvoted"][0]["key"], "uv-a", "{body}");
+    assert_eq!(doc["missing"][0], "nope", "{body}");
+
+    // No body: the path key is the one-key shorthand (unchanged behaviour).
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-b/upvote?format=json",
+        Some("tok"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A sweep that hits nothing is a 404, as on the tool.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":["nope"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

@@ -748,6 +748,44 @@ fn log_search(
     }
 }
 
+/// The `memory_upvote` sweep, implemented ONCE for both doors.
+///
+/// The MCP tool and `POST /memory/{key}/upvote` share this, so they cannot drift in either the error
+/// they raise or the JSON they return. That is the whole point of a second door: not a second
+/// implementation, a second *way in*.
+pub(crate) async fn upvote_sweep(
+    server: &MemoryServer,
+    keys: Vec<String>,
+) -> std::result::Result<String, String> {
+    if keys.is_empty() {
+        return Err("memory_upvote needs at least one key".to_string());
+    }
+    let sweep = keys.clone();
+    let (upvoted, missing) = server
+        .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
+        .await
+        .map_err(|e| e.to_string())?;
+    // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
+    if upvoted.is_empty() {
+        return Err(Error::NotFound(keys.join(", ")).to_string());
+    }
+    tracing::info!(
+        tool = "memory_upvote",
+        upvoted = upvoted.len(),
+        missing = missing.len(),
+        "marked useful"
+    );
+    let upvoted: Vec<serde_json::Value> = upvoted
+        .into_iter()
+        .map(|(key, times_useful)| serde_json::json!({ "key": key, "times_useful": times_useful }))
+        .collect();
+    let mut result = serde_json::json!({ "status": "useful", "upvoted": upvoted });
+    if !missing.is_empty() {
+        result["missing"] = serde_json::json!(missing);
+    }
+    Ok(json_ok(result))
+}
+
 #[tool_router]
 impl MemoryServer {
     /// Store one atomic memory; upserts by key. See the description for the write law.
@@ -973,33 +1011,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        let keys = p.keys;
-        if keys.is_empty() {
-            return Err("memory_upvote needs at least one key".to_string());
-        }
-        let sweep = keys.clone();
-        let (upvoted, missing) = self
-            .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
-            .await?;
-        // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
-        if upvoted.is_empty() {
-            return Err(Error::NotFound(keys.join(", ")).to_string());
-        }
-        tracing::info!(
-            tool = "memory_upvote",
-            upvoted = upvoted.len(),
-            missing = missing.len(),
-            "marked useful"
-        );
-        let upvoted: Vec<serde_json::Value> = upvoted
-            .into_iter()
-            .map(|(key, times_useful)| serde_json::json!({ "key": key, "times_useful": times_useful }))
-            .collect();
-        let mut result = serde_json::json!({ "status": "useful", "upvoted": upvoted });
-        if !missing.is_empty() {
-            result["missing"] = serde_json::json!(missing);
-        }
-        Ok(json_ok(result))
+        upvote_sweep(self, p.keys).await
     }
 
     /// List the memories whose bodies link to `key`.

@@ -8,8 +8,10 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+use crate::embed::{Embedder, projection};
 use crate::error::{Error, Result};
-use crate::store::slug;
+use crate::index;
+use crate::store::{slug, tags};
 
 /// Capture a `[[key]]` or `[[prj:key]]` target. Key charset `[a-z0-9-]+`; the `prj:` marker is the
 /// only thing allowed before it.
@@ -152,13 +154,25 @@ pub struct RenameOutcome {
     pub edges: usize,
 }
 
-/// Rename a key in one transaction (SPEC §15 #3, PLAN §2 #3): move `memory.key`, rewrite
-/// every `[[old]]` token in every body, and repoint the incoming `memory_link` edges.
+/// Rename a key in one transaction (SPEC §15 #3, PLAN §2 #3): move `memory.key`, re-embed the row,
+/// rewrite every `[[old]]` token in every body, and repoint the incoming `memory_link` edges.
 ///
-/// Keys are near-immutable, so this is deliberate rather than routine. `[[…]]` is stripped
-/// from the embed projection, so a rename never invalidates a stored vector. Refuses to
-/// clobber an existing key; a same-key rename is a no-op.
-pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> {
+/// Keys are near-immutable, so this is deliberate rather than routine. **`key` IS in the embed
+/// projection**, so a rename changes the renamed row's document — its stored vector and `doc_hash`
+/// would otherwise keep describing the old key until something else touched the row. So the row is
+/// re-embedded here, the way [`crate::store::add`] does.
+///
+/// The rows whose bodies had `[[old]]` rewritten do **not** need it: `[[…]]` is stripped from the
+/// projection (SPEC §8), so their document — and therefore their vector — is unchanged by the token
+/// swap. (Their `updated` moves; that is the whole of it.)
+///
+/// Refuses to clobber an existing key; a same-key rename is a no-op.
+pub fn rename(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    old: &str,
+    new: &str,
+) -> Result<RenameOutcome> {
     let old = slug::slugify(old);
     let new = slug::slugify(new);
     if old == new {
@@ -169,16 +183,19 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
         });
     }
 
-    let tx = conn.unchecked_transaction()?;
-    let id: Option<i64> = tx
-        .query_row("SELECT id FROM memory WHERE key = ?1", params![old], |r| {
-            r.get(0)
-        })
+    // Read the row before moving it: the new document needs its title and tags, and the vector
+    // needs its rowid. `source` is not read — it is not part of the embed projection.
+    let row: Option<(i64, String, String, String)> = conn
+        .query_row(
+            "SELECT id, title, body, tags FROM memory WHERE key = ?1",
+            params![old],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()?;
-    let Some(id) = id else {
+    let Some((id, title, body, tags_raw)) = row else {
         return Err(Error::NotFound(old));
     };
-    let taken: Option<i64> = tx
+    let taken: Option<i64> = conn
         .query_row("SELECT id FROM memory WHERE key = ?1", params![new], |r| {
             r.get(0)
         })
@@ -187,9 +204,17 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
         return Err(Error::Config(format!("key {new:?} already exists")));
     }
 
+    // The document under the NEW key, hashed and embedded before the write lock — inference is
+    // slow and must not hold the lock (SPEC §13). The vec table is created outside the tx too.
+    let doc_text = projection::embed_document(&new, &tags::decode(&tags_raw), &title, &body);
+    let doc_hash = crate::store::row_hash(embedder, &doc_text);
+    index::vec::ensure(conn, embedder.dim())?;
+    let vector = embedder.embed_one(&doc_text)?;
+
+    let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "UPDATE memory SET key = ?2, updated = datetime('now') WHERE id = ?1",
-        params![id, new],
+        "UPDATE memory SET key = ?2, doc_hash = ?3, updated = datetime('now') WHERE id = ?1",
+        params![id, new, doc_hash],
     )?;
     // Keys are `[a-z0-9-]+`, so the literal token can only match the exact link; the LIKE
     // prefilter keeps the scan bounded (and its `%` are not user-controlled).
@@ -210,6 +235,7 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
           WHERE to_key = ?1 AND to_type = 'memory'",
         params![old, new],
     )?;
+    index::vec::upsert(&tx, id, &vector)?;
     tx.commit()?;
 
     Ok(RenameOutcome {

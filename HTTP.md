@@ -33,9 +33,44 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 | --- | --- | --- |
 | `GET /health` | read-only readiness + the writer witness | **implemented** |
 | `GET /bootstrap` | the boot payload in one read | planned |
-| `GET /memory/{key}` | one memory, body included | planned |
+| `GET /stats`, `GET /dupes`, `GET /projects` | the read surfaces | planned |
+| `GET /memory/{key}`, `GET /memory/{key}/backlinks` | one memory, body included | planned |
 | `GET /search?q=&k=&tags=` | the query surface | planned |
-| `POST /memory`, `DELETE /memory/{key}` | writes — **auth first** | planned |
+| `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes — **auth first** | planned |
+| `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes — **auth first** | planned |
+| `POST /reembed` | the heaviest op; last, because it holds the store lock | planned |
+
+**`/bootstrap` is a view, not a dump.** It carries the resident set a cold agent needs — the `cline-self`
+keys, the boot body, hot, todos, open projects, stats, health, links — and an index of the routes
+below, so everything else is one call away. It does **not** carry every body (there are hundreds): that
+is not a boot, it is a context fill. If a fact is not meant to be resident, `/bootstrap` must not
+smuggle it in.
+
+### Parity with MCP — the requirement, not a nice-to-have
+
+The MCP surface is 14 tools (`TOOLS` in `src/mcp/mod.rs`). A second door that cannot reach the same
+core is a door with a queue in front of it: boot over HTTP, still write over MCP, and a wedged MCP
+leaves the agent **read-only**. So every tool gets a route over the same `Session` call, and MCP
+becomes a compatibility shim for clients that speak it rather than a dependency of the agent.
+
+| MCP tool | HTTP | state |
+| --- | --- | --- |
+| `memory_get` | `GET /memory/{key}` | planned |
+| `memory_search` | `GET /search` | planned |
+| `memory_backlinks` | `GET /memory/{key}/backlinks` | planned |
+| `memory_stats` | `GET /stats` (also folded into `/health` and `/bootstrap`) | planned |
+| `memory_dupes` | `GET /dupes` | planned |
+| `project_get` / `project_list` | `GET /project/{key}` / `GET /projects` | planned |
+| `memory_upsert` | `POST /memory` | planned — auth first |
+| `memory_delete` | `DELETE /memory/{key}` | planned — auth first |
+| `memory_merge` | `POST /memory/{key}/merge` | planned — auth first |
+| `memory_upvote` | `POST /memory/{key}/upvote` | planned — auth first |
+| `memory_coherent` | `PUT /memory/{key}/coherent` | planned — auth first |
+| `project_upsert` | `POST /project` | planned — auth first |
+| `memory_reembed` | `POST /reembed` | planned — **last** |
+| — | `GET /health` | **implemented** |
+
+`/health` is the only row with no MCP equivalent: it is new capability, not a translation.
 
 ### Formats: text-first, and that is a design decision, not a preference
 

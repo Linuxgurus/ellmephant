@@ -125,13 +125,6 @@ impl Session {
         store::record_useful_many(&self.conn, keys)
     }
 
-    /// Bump `visits` for `key` and return the new total. For a body read that did **not** come through
-    /// `fetch` — a project `preload` hydrate returns bodies too. A plain increment: retrying it
-    /// double-counts, which is fine for a counter (HTTP.md invariant 1).
-    pub fn record_visit(&self, key: &str) -> Result<i64> {
-        store::record_visit(&self.conn, key)
-    }
-
     /// Set the split-review verdict for `key` (`Some(true)` coherent, `Some(false)` a
     /// grab-bag, `None` unjudged). Errors with [`Error::NotFound`] when the key is unknown.
     pub fn mark_coherent(&self, key: &str, coherent: Option<bool>) -> Result<()> {

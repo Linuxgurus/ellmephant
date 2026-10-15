@@ -773,40 +773,6 @@ pub async fn memory_delete(
     }
 }
 
-/// `POST /memory/{key}/visit` — the split-out counter: the write `GET` refused to be.
-pub async fn visit(
-    State(state): State<HttpState>,
-    Path(key): Path<String>,
-    RawQuery(raw): RawQuery,
-    headers: HeaderMap,
-) -> Response {
-    let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let lookup = key.clone();
-    match server
-        .with_store("memory_visit", move |s| s.record_visit(&lookup))
-        .await
-    {
-        Ok(visits) => {
-            tracing::info!(area = scope.area, key = %key, visits, "visit counted over http");
-            render(
-                StatusCode::OK,
-                json,
-                json_ok(serde_json::json!({ "status": "visited", "key": key, "visits": visits })),
-                format!("visited {key} (visits {visits})"),
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
-    }
-}
-
 /// `POST /memory/{key}/upvote` — mark one memory useful (`memory_upvote`).
 pub async fn upvote(
     State(state): State<HttpState>,

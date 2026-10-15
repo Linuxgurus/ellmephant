@@ -151,9 +151,10 @@ file can point at a URL and the agent's whole existence travels over HTTPS.
    because a fetch is evidence that needs no declaration: that is exactly the difference between `visits`
    and the *declared* `times_useful`. `GET /memory/{key}` therefore counts, and the two doors agree byte
    for byte. Everything else about a read stays pure; `/health` and `/bootstrap` write nothing at all.
-   `POST /memory/{key}/visit` remains for a body read that did **not** come through that route — a project
-   `preload` hydrate returns bodies too — and it is a plain increment, so retrying it double-counts. That
-   was always true; it is acceptable for a counter, and it is no longer dressed up as idempotent.
+   And MCP's `project_get` does **not** count the bodies it hydrates, so nothing here does either: no
+   route counts a read MCP would not. There is no `POST /memory/{key}/visit` — it existed only to work
+   around the old rule, and once the rule went it would have been the one reachable route with no
+   counterpart on the other door.
 2. **Writes take the store lock; reads do not.** `Session` is one connection behind one mutex, so a read
    that needs it queues behind a writer. `/health` and `/bootstrap` therefore answer from a **second,
    read-only connection** (`SQLITE_OPEN_READ_ONLY`), never from `Session`. Slice 1 proved the pattern.
@@ -184,7 +185,6 @@ Writes — **auth required**, all of them:
 | method | path | maps to | body / parameters |
 | --- | --- | --- | --- |
 | POST | `/memory` | `memory_upsert` | text front-matter, or JSON if `Content-Type: application/json` |
-| POST | `/memory/{key}/visit` | *(new)* | — count a body read that did not come through `GET /memory/{key}` (a `preload` hydrate, say) |
 | POST | `/memory/{key}/upvote` | `memory_upvote` | — |
 | POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>` |
 | PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null` |

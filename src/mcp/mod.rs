@@ -1359,7 +1359,6 @@ pub fn http_router(
             "/memory/{key}/backlinks",
             axum::routing::get(surface::backlinks),
         )
-        .route("/memory/{key}/visit", axum::routing::post(surface::visit))
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
         .route(

@@ -305,8 +305,9 @@ async fn reading_a_memory_counts_a_visit() {
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(second["visits"], 2, "and the second");
 
-    // The explicit counter still moves it, for a read that did not come through that route.
-    let (status, body, _) = request(
+    // There is no explicit counter to call. A route with no counterpart in the MCP boot would be one
+    // an agent could never discover, and `project_get` does not count hydrated bodies on either door.
+    let (status, _, _) = request(
         &app,
         Method::POST,
         "/memory/counted/visit?format=json",
@@ -315,9 +316,11 @@ async fn reading_a_memory_counts_a_visit() {
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let counted: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(counted["visits"], 3, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the split-out counter is gone"
+    );
 
     // And no OTHER read may touch a counter — only the one that returns a body.
     let total = |body: &str| -> i64 {

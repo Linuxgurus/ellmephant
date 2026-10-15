@@ -137,6 +137,10 @@ async fn health_cannot_create_a_store() {
     let (status, body, _) = get(&router(server, state), "/health").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.contains("store missing"), "{body}");
+    assert!(
+        body.contains("not in schema v8"),
+        "and the queue line admits it cannot be read, rather than reporting zeroes: {body}"
+    );
     assert!(!paths.db().exists(), "the probe must not create the store");
 }
 

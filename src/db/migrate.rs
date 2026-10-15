@@ -45,6 +45,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0007_drop_project_memory.sql"),
         "retire the one-home association: drop project_memory",
     ),
+    (
+        8,
+        include_str!("../../migrations/0008_encode_queue.sql"),
+        "encode queue: the documents that still owe the vector index",
+    ),
 ];
 
 /// Current schema version recorded in the file.

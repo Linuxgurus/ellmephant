@@ -2,6 +2,7 @@
 
 pub mod codec;
 pub mod dupes;
+pub mod encode;
 pub mod links;
 pub mod maintain;
 pub mod project;

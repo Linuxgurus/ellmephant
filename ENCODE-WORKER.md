@@ -189,25 +189,45 @@ Every path that moves or kills a key carries its queue row with it, in the same 
 ## The job
 
 ```rust
-/// Embed one queued document and index it. Safe to run at any time and more than once: the
-/// dequeue is conditional on the hash it embedded. Returns whether it did any work.
+/// A claimed document: the text to embed, plus the hash to clear when its vector is written.
+pub struct Claim { /* key, id, doc, doc_hash, claimed_hash, indexed */ }
+
+impl Claim {
+    pub fn doc(&self) -> &str;
+    /// False when the row already carries this text's vector (a duplicate job, or a re-enqueue whose
+    /// text never moved): the entry is still settled, but nothing is embedded.
+    pub fn needs_embed(&self) -> bool;
+}
+
+/// The READ half: take the head of `key`'s entry and build its document. Embeds nothing.
+pub fn claim(conn: &Connection, spec: &VecSpec, key: &str) -> Result<Option<Claim>>;
+
+/// The WRITE half: store `vector` and settle the entry. `vector` is `None` exactly when the claim
+/// needed no embed.
+pub fn settle_encoded(conn: &Connection, claim: &Claim, vector: Option<&[f32]>) -> Result<()>;
+
+/// Both halves plus the model call — for a caller holding NO store lock: tests, `?wait=true`.
 pub fn encode_one(conn: &Connection, embedder: &dyn Embedder, spec: &VecSpec, key: &str)
     -> Result<bool>;
 
-/// Drain the highest-priority entries until the queue is empty (or `limit` jobs). The
-/// synchronous door: `?wait=true` on a write, and every test that needs a vector *now*.
+/// Encode up to `limit` entries, highest priority first. The synchronous door, and the tests'.
 pub fn drain(conn: &Connection, embedder: &dyn Embedder, spec: &VecSpec, limit: usize)
     -> Result<usize>;
 ```
 
-`encode_one`, in full: read `(title, body, doc_hash)` for `key`; build the document with
-`projection::embed_document`; `embedder.embed_one`; then **one** transaction that upserts the
-vector, sets `doc_hash = row_hash(spec, &doc)`, and conditionally deletes the queue row. It is a
-plain function over a `Connection`, so it is unit-testable with `HashEmbedder` and idempotent by
-construction — no state, no thread, no lock of its own.
+**The two halves are the design, not a tidy-up.** The obvious shape — one function that reads, embeds
+and writes — is wrong here, and wrong for the exact reason this document exists: a caller that holds
+the store lock would hold it across the model call, which is the stall being removed. `claim` and
+`settle_encoded` are what let the worker lock, claim, **unlock**, embed, lock, settle. `encode_one` is
+the composition of the three, and it is only safe for a caller holding *no* lock.
 
-Both are inherent to a single writer, so `drain` is not a second implementation of the worker: the
-worker *is* `encode_one` in a loop. One code path, two drivers.
+Both halves are plain functions over a `Connection`: unit-testable with `HashEmbedder`, idempotent by
+construction, and carrying no state, no thread and no lock of their own.
+
+The worker does **not** use `drain`. Composing the halves itself is what buys it the released lock
+*and* a different retry shape — one attempt per pass with the sleep as backoff — where a wide `drain`
+burns the retries back to back. That is fine for the synchronous door: each failure is a local error,
+and `MAX_ATTEMPTS` bounds the total.
 
 ## The worker
 
@@ -232,11 +252,12 @@ One pass:
    `SELECT key FROM encode_queue ORDER BY priority, queued_at LIMIT 1`. A read-only connection takes
    **no session lock**, so an idle worker costs one indexed SELECT per interval and contends with
    nothing. Empty → sleep, look again.
-2. Claim through `with_store("memory_encode", …)` — a short lock — and read the row's text.
-3. **Release.** `embedder.embed_one` with the lock held *nowhere* in the path. This is where the
-   1.2 GB cold load happens: on the worker's thread, blocking the worker and not a request.
-4. `with_store("memory_encode_write", …)` — a short lock — write the vector, set `doc_hash`,
-   conditional dequeue.
+2. Claim through `with_store("memory_encode", …)` — a short lock — calling `encode::claim`, which
+   reads the row's current text and builds the document.
+3. **Release.** `embedder.embed_one(claim.doc())` with the lock held *nowhere* in the path. This is
+   where the 1.2 GB cold load happens: on the worker's thread, blocking the worker and not a request.
+4. `with_store("memory_encode_write", …)` — a short lock — `encode::settle_encoded`, which writes the
+   vector, advances `doc_hash`, and conditionally dequeues.
 5. Sleep `encode_interval_ms`, then look again.
 
 **Deliberately a poll, not a `Notify`.** A lost wake-up is a stall nobody can see, and a read-only

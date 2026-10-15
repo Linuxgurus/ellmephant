@@ -45,6 +45,7 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     assert!(db::migrate::latest() >= 5, "projects migration exists");
     assert!(db::migrate::latest() >= 6, "link-type migration exists");
     assert!(db::migrate::latest() >= 7, "one-home removal exists");
+    assert!(db::migrate::latest() >= 8, "encode queue exists");
 
     for name in ["memory", "memory_link", "meta", "project"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
@@ -126,6 +127,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute("DROP TABLE project", []).unwrap();
     conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
         .unwrap();
+    // A v4 store predates the encode queue as well.
+    conn.execute("DROP TABLE encode_queue", []).unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -174,6 +177,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
+    // A v5 store predates the encode queue too.
+    conn.execute("DROP TABLE encode_queue", []).unwrap();
     drop(conn);
 
     // 0006 interprets the prefix exactly once — while it still means something — and 0007 then

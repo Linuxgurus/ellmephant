@@ -228,16 +228,23 @@ impl HealthReport {
         ));
         out.push_str(&format!("  {:<12}{}\n", "writer", self.writer));
         // The queue: what the encoder owes, and whether any of it has given up. Never part of the
-        // status line — a backlog is a load, not a fault.
-        let queue = match self.encode_oldest_s {
-            Some(age) => format!(
+        // status line — a backlog is a load, not a fault. A store too old to HAVE the queue must say
+        // so rather than print zeroes, which would read as an all-clear on a store we cannot read.
+        let queue = if self.schema < encode::SCHEMA {
+            format!(
+                "not in schema v{} — the store is behind this binary",
+                encode::SCHEMA
+            )
+        } else if let Some(age) = self.encode_oldest_s {
+            format!(
                 "{} pending (oldest {}s), {} failed",
                 self.encode_pending, age, self.encode_failed
-            ),
-            None => format!(
+            )
+        } else {
+            format!(
                 "{} pending, {} failed",
                 self.encode_pending, self.encode_failed
-            ),
+            )
         };
         out.push_str(&format!("  {:<12}{queue}\n", "encode"));
         if let Some(reason) = &self.reason {

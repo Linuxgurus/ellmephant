@@ -79,7 +79,7 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
         assert_eq!(
             doc_hash,
             store::row_hash(
-                &wide,
+                &ellmephant::embed::VecSpec::of(&wide),
                 &projection::embed_document(&mem.key, &mem.title, &mem.body)
             )
         );

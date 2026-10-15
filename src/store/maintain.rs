@@ -12,7 +12,7 @@
 use rusqlite::{Connection, params};
 
 use crate::db::meta;
-use crate::embed::{Embedder, projection};
+use crate::embed::{Embedder, VecSpec, projection};
 use crate::error::Result;
 use crate::index;
 use crate::store::{links, row_hash, tags};
@@ -43,6 +43,7 @@ pub struct Report {
 /// the rows too, so a full rebuild is where a parser change (or an older body) catches up.
 pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) -> Result<Report> {
     let dim = embedder.dim();
+    let spec = VecSpec::of(embedder);
     let rebuilt = index::vec::stored_dim(conn)? != Some(dim);
     if rebuilt {
         // A dimension change makes every stored vector the wrong width and therefore unreadable, so
@@ -95,7 +96,7 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
             index::vec::upsert(&tx, *id, &vectors[i])?;
             tx.execute(
                 "UPDATE memory SET doc_hash = ?2 WHERE id = ?1",
-                params![id, row_hash(embedder, &docs[i])],
+                params![id, row_hash(&spec, &docs[i])],
             )?;
         }
         done += chunk.len();

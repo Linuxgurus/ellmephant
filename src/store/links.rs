@@ -401,7 +401,7 @@ pub fn rename(
     // The document under the NEW key, hashed and embedded before the write lock — inference is
     // slow and must not hold the lock (SPEC §13). The vec table is created outside the tx too.
     let doc_text = projection::embed_document(&new, &title, &body);
-    let doc_hash = crate::store::row_hash(embedder, &doc_text);
+    let doc_hash = crate::store::row_hash(&crate::embed::VecSpec::of(embedder), &doc_text);
     index::vec::ensure(conn, embedder.dim())?;
     let vector = embedder.embed_one(&doc_text)?;
 

@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::embed::{Embedder, projection};
+use crate::embed::{Embedder, VecSpec, projection};
 use crate::error::{Error, Result};
 use crate::index;
 
@@ -76,11 +76,16 @@ pub struct Summary {
 }
 
 /// `sha256(model|dim|text)` — the per-field re-embed trigger (SPEC §15 #7).
-pub fn row_hash(embedder: &dyn Embedder, text: &str) -> String {
+///
+/// Takes a [`VecSpec`] rather than a loaded [`Embedder`]: both inputs are *config*, so fingerprinting
+/// a document must never be a reason to load 1.2 GB of weights. The bytes hashed are unchanged —
+/// this is a signature change only, so no stored `doc_hash` moves (pinned by
+/// `row_hash_output_is_pinned`).
+pub fn row_hash(spec: &VecSpec, text: &str) -> String {
     let mut h = Sha256::new();
-    h.update(embedder.model_id().as_bytes());
+    h.update(spec.model_id.as_bytes());
     h.update(b"|");
-    h.update(embedder.dim().to_string().as_bytes());
+    h.update(spec.dim.to_string().as_bytes());
     h.update(b"|");
     h.update(text.as_bytes());
     crate::hex::encode(&h.finalize())
@@ -136,7 +141,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _) = add_impl(conn, embedder, mem, true)?;
+    let (id, key, _) = add_impl(conn, embedder, &VecSpec::of(embedder), mem, true)?;
     Ok((id, key))
 }
 
@@ -168,11 +173,12 @@ fn check_body(body: &str) -> Result<()> {
 fn add_impl(
     conn: &Connection,
     embedder: &dyn Embedder,
+    spec: &VecSpec,
     mem: &Memory,
     reset_coherent: bool,
 ) -> Result<(i64, String, bool)> {
     check_body(&mem.body)?;
-    let prepared = prepare(conn, embedder, mem)?;
+    let prepared = prepare(conn, spec, mem)?;
     let reembedded = prepared.needs_embed();
     // Create the vec table before the tx so its DDL is not inside it.
     index::vec::ensure(conn, embedder.dim())?;
@@ -293,7 +299,8 @@ pub fn merge(conn: &Connection, embedder: &dyn Embedder, patch: &Patch) -> Resul
         }
     };
 
-    let (_id, key, reembedded) = add_impl(conn, embedder, &mem, reset_coherent)?;
+    let (_id, key, reembedded) =
+        add_impl(conn, embedder, &VecSpec::of(embedder), &mem, reset_coherent)?;
     Ok(MergeOutcome {
         key,
         created,
@@ -321,14 +328,10 @@ impl Prepared {
 }
 
 /// Resolve a write without opening a transaction (reads only, no model call).
-pub(crate) fn prepare(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-    mem: &Memory,
-) -> Result<Prepared> {
+pub(crate) fn prepare(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<Prepared> {
     let key = resolve_key(conn, mem)?;
     let doc_text = projection::embed_document(&key, &mem.title, &mem.body);
-    let doc_hash = row_hash(embedder, &doc_text);
+    let doc_hash = row_hash(spec, &doc_text);
     let existing: Option<(i64, String)> = conn
         .query_row(
             "SELECT id, doc_hash FROM memory WHERE key = ?1",
@@ -577,15 +580,28 @@ pub fn summaries(conn: &Connection) -> Result<Vec<Summary>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::HashEmbedder;
 
     #[test]
     fn hash_changes_with_model_dim_and_text() {
-        let a = HashEmbedder::new(8);
-        let b = HashEmbedder::new(16);
-        assert_ne!(row_hash(&a, "x"), row_hash(&b, "x"), "dim must matter");
+        let a = VecSpec::new("model-a", 8);
+        let b = VecSpec::new("model-b", 8);
+        let wide = VecSpec::new("model-a", 16);
+        assert_ne!(row_hash(&a, "x"), row_hash(&wide, "x"), "dim must matter");
+        assert_ne!(row_hash(&a, "x"), row_hash(&b, "x"), "model must matter");
         assert_ne!(row_hash(&a, "x"), row_hash(&a, "y"), "text must matter");
         assert_eq!(row_hash(&a, "x"), row_hash(&a, "x"), "must be stable");
         assert_eq!(row_hash(&a, "x").len(), 64, "sha256 hex is 64 chars");
+    }
+
+    /// `row_hash` takes a [`VecSpec`] now instead of a loaded embedder. The hash is written into
+    /// every row of a live store, so a changed value would re-embed all of it — silently, and visible
+    /// only as a slow rebuild. This pins the exact bytes the old `sha256(model|dim|text)` produced
+    /// (`printf 'm|3|x' | shasum -a 256`), so the refactor cannot move it.
+    #[test]
+    fn row_hash_output_is_pinned() {
+        assert_eq!(
+            row_hash(&VecSpec::new("m", 3), "x"),
+            "37ea0bd227f4e7bd235c7f93353dfb9d87c811d7a6d4017a43c089cdda3dd26f"
+        );
     }
 }

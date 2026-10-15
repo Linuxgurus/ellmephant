@@ -14,6 +14,7 @@ use std::sync::Once;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::meta;
+use crate::embed::projection;
 use crate::error::{Error, Result};
 
 /// The single vec0 table holding one document embedding per memory.
@@ -92,8 +93,26 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
         Some(_) => {}
         None => meta::set(conn, meta::DIM, &dim.to_string())?,
     }
+    // Record the projection recipe the first time the index is touched, so a later change to what
+    // `embed_document` emits is *detected* rather than silently leaving every vector describing the
+    // old recipe. Only set when absent: a stored fingerprint is the baseline a mismatch is measured
+    // against, and a mere open must never overwrite it.
+    if meta::get(conn, meta::PROJECTION)?.is_none() {
+        meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
+    }
     conn.execute_batch(&create_sql(dim))?;
     Ok(())
+}
+
+/// Whether the stored vectors were built with a DIFFERENT projection than the code now emits —
+/// i.e. a re-embed is needed ([`crate::store::maintain::reembed`] rewrites the fingerprint).
+///
+/// `false` when nothing is recorded: an older store, or one with no vectors, has no baseline to
+/// compare against, and [`ensure`] records one the next time the index is touched. `doctor`
+/// surfaces the stale case so the drift is loud instead of silent.
+pub fn projection_stale(conn: &Connection) -> Result<bool> {
+    Ok(matches!(meta::get(conn, meta::PROJECTION)?, Some(stored)
+            if stored != projection::fingerprint()))
 }
 
 /// Drop and recreate the table for a *new* dimension, recording it in `meta`.
@@ -315,5 +334,26 @@ mod tests {
         .unwrap();
         assert_eq!(hits[0].0, 1, "exact match should rank first");
         assert!(hits[0].1 <= hits[1].1);
+    }
+
+    #[test]
+    fn projection_fingerprint_is_recorded_and_a_mismatch_reads_stale() {
+        let conn = conn();
+        ensure(&conn, 2).unwrap();
+        assert!(
+            !projection_stale(&conn).unwrap(),
+            "the first `ensure` records the current projection as the baseline"
+        );
+
+        // A fingerprint left by a *different* projection reads as stale...
+        meta::set(&conn, meta::PROJECTION, "0000deadbeef").unwrap();
+        assert!(projection_stale(&conn).unwrap());
+
+        // ...and a later `ensure` must NOT erase it — only a re-embed may move the baseline.
+        ensure(&conn, 2).unwrap();
+        assert!(
+            projection_stale(&conn).unwrap(),
+            "ensure never overwrites a recorded fingerprint"
+        );
     }
 }

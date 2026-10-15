@@ -43,6 +43,9 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     meta::set(conn, meta::DIM, &dim.to_string())?;
     meta::set(conn, meta::MODEL, embedder.model_id())?;
     meta::set(conn, meta::INSTRUCTION, instruction)?;
+    // The vectors now correspond to the *current* projection, so this is the one place the
+    // fingerprint legitimately moves ([`crate::index::vec::projection_stale`]).
+    meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
 
     // Snapshot the rows to embed before opening the write transaction.
     let rows: Vec<(i64, String, Vec<String>, String, String)> = {

@@ -102,3 +102,28 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     maintain::reembed(&conn, &embedder, "").expect("reembed again");
     assert_eq!(vec::get(&conn, a).unwrap(), before, "vectors are stable");
 }
+
+#[test]
+fn reembed_records_the_projection_fingerprint() {
+    // A change to what the projection emits would leave every stored vector describing the old
+    // recipe; the fingerprint in `meta` is what makes that drift detectable.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    add(&conn, &embedder, "a", "alpha beta", &[]);
+
+    // The write recorded the baseline (`index::vec::ensure`), so nothing is stale.
+    assert!(
+        meta(&conn, "projection").is_some(),
+        "the baseline is recorded on first use"
+    );
+    assert!(!vec::projection_stale(&conn).unwrap());
+
+    maintain::reembed(&conn, &embedder, "").expect("reembed");
+    assert_eq!(
+        meta(&conn, "projection").as_deref(),
+        Some(projection::fingerprint().as_str()),
+        "reembed writes the current projection fingerprint"
+    );
+    assert!(!vec::projection_stale(&conn).unwrap());
+}

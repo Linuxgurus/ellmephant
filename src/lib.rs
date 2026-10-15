@@ -11,6 +11,7 @@ pub mod db;
 pub mod embed;
 pub mod error;
 pub mod hex;
+pub mod http;
 pub mod index;
 pub mod mcp;
 pub mod model;

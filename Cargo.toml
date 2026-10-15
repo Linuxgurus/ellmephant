@@ -71,7 +71,7 @@ tokenizers = { version = "0.22", default-features = false, optional = true }
 rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 # Hosts rmcp's `StreamableHttpService` (a tower service) — MCP-over-HTTP is the `mcp` default.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 
 # `candle-core` is declared per-target: `metal`/`accelerate` (which transitively require
 # `objc2`) only exist on macOS. On other hosts it is plain CPU, so the Linux/Docker build

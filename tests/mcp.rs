@@ -370,7 +370,13 @@ fn payload(body: &str) -> serde_json::Value {
 #[tokio::test]
 async fn tools_round_trip_over_http() {
     let dir = tempfile::tempdir().unwrap();
-    let app = http_router(MemoryServer::new(session(dir.path())), "127.0.0.1");
+    let state = ellmephant::http::HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        std::sync::Arc::new(ellmephant::http::LockWatch::new()),
+        std::time::Instant::now(),
+    );
+    let app = http_router(MemoryServer::new(session(dir.path())), "127.0.0.1", state);
 
     // initialize issues a session id.
     let (status, session, body) = post(

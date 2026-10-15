@@ -586,6 +586,7 @@ pub struct ProjectListParams {
 #[derive(Clone)]
 pub struct MemoryServer {
     session: Arc<Mutex<Session>>,
+    watch: Arc<crate::http::LockWatch>,
 }
 
 impl MemoryServer {
@@ -596,7 +597,17 @@ impl MemoryServer {
 
     /// Build a server over a session already behind a shared lock (tests).
     pub fn from_shared(session: Arc<Mutex<Session>>) -> Self {
-        Self { session }
+        Self::with_watch(session, Arc::new(crate::http::LockWatch::new()))
+    }
+
+    /// Build a server sharing a writer witness with the plain-HTTP surface.
+    pub fn with_watch(session: Arc<Mutex<Session>>, watch: Arc<crate::http::LockWatch>) -> Self {
+        Self { session, watch }
+    }
+
+    /// The writer witness this server marks while a tool holds the store lock.
+    pub fn watch(&self) -> Arc<crate::http::LockWatch> {
+        Arc::clone(&self.watch)
     }
 
     /// Run `f` against the store on a blocking thread, turning an [`Error`] into a
@@ -612,6 +623,7 @@ impl MemoryServer {
         F: FnOnce(&mut Session) -> crate::error::Result<T> + Send + 'static,
     {
         let session = Arc::clone(&self.session);
+        let watch = Arc::clone(&self.watch);
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
             // The single connection is a mutex; a long re-embed or model load queues here.
@@ -624,6 +636,8 @@ impl MemoryServer {
                 wait_ms = wait.elapsed().as_millis() as u64,
                 "store lock acquired"
             );
+            // Witness the holder for exactly as long as the lock is held.
+            let _held = watch.held(tool);
             f(&mut guard).map_err(|e| e.to_string())
         })
         .await;
@@ -1206,7 +1220,18 @@ pub fn serve(
         offline = spec.offline,
         "starting ellmephant mcp"
     );
-    let server = MemoryServer::new(Session::open(paths, cfg, spec)?);
+    let watch = Arc::new(crate::http::LockWatch::new());
+    // `Session::open` moves `paths`/`cfg`, so the health state takes its own copies first.
+    let state = crate::http::HttpState::new(
+        paths.clone(),
+        cfg.clone(),
+        Arc::clone(&watch),
+        std::time::Instant::now(),
+    );
+    let server = MemoryServer::with_watch(
+        Arc::new(Mutex::new(Session::open(paths, cfg, spec)?)),
+        watch,
+    );
     // rmcp is async; the rest of ellmephant is not, so own the runtime here.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -1223,7 +1248,7 @@ pub fn serve(
                     .map_err(|e| Error::Config(format!("mcp server task failed: {e}")))?;
                 Ok(())
             }
-            Transport::Http { host, port } => serve_http(server, &host, port).await,
+            Transport::Http { host, port } => serve_http(server, &host, port, state).await,
         }
     })
 }
@@ -1235,7 +1260,11 @@ pub fn serve(
 /// (localhost / 127.0.0.1 / ::1) stands; any other bind (e.g. `0.0.0.0` in Docker) disables
 /// it, since remote clients arrive with a Host header we cannot enumerate. There is no auth —
 /// bind wide only behind a trusted network.
-pub fn http_router(server: MemoryServer, bind_host: &str) -> axum::Router {
+pub fn http_router(
+    server: MemoryServer,
+    bind_host: &str,
+    state: crate::http::HttpState,
+) -> axum::Router {
     let config = if is_loopback(bind_host) {
         StreamableHttpServerConfig::default()
     } else {
@@ -1255,7 +1284,10 @@ pub fn http_router(server: MemoryServer, bind_host: &str) -> axum::Router {
     sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
     let service: StreamableHttpService<MemoryServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), sessions.into(), config);
-    axum::Router::new().nest_service("/mcp", service)
+    axum::Router::new()
+        .route("/health", axum::routing::get(crate::http::health))
+        .nest_service("/mcp", service)
+        .with_state(state)
 }
 
 /// True for `localhost`, `127.0.0.0/8` and `::1`.
@@ -1268,11 +1300,16 @@ fn is_loopback(host: &str) -> bool {
 }
 
 /// Bind `host:port`, serve HTTP until Ctrl-C, and drain in-flight requests (SPEC §13).
-async fn serve_http(server: MemoryServer, host: &str, port: u16) -> crate::error::Result<()> {
+async fn serve_http(
+    server: MemoryServer,
+    host: &str,
+    port: u16,
+    state: crate::http::HttpState,
+) -> crate::error::Result<()> {
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     let addr = listener.local_addr()?;
     tracing::info!(%addr, "ellmephant mcp listening on http://{addr}/mcp");
-    let app = http_router(server, host);
+    let app = http_router(server, host, state);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

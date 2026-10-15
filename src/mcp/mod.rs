@@ -825,6 +825,158 @@ fn log_search(
     }
 }
 
+/// The store lock, with a poisoned mutex a plain error rather than a panic.
+///
+/// `with_store` reaches the same lock through `spawn_blocking`; the encode worker takes it directly,
+/// because it must hold it for two short pieces with a model call *between* them — which one blocking
+/// closure cannot express.
+#[cfg(feature = "encoder")]
+fn lock(session: &Arc<Mutex<Session>>) -> crate::error::Result<std::sync::MutexGuard<'_, Session>> {
+    session
+        .lock()
+        .map_err(|_| Error::Config("memory store lock poisoned".into()))
+}
+
+/// One pass: the head of the queue, embedded, then indexed. Returns whether it did a job.
+///
+/// The lock is taken twice and held across *neither* half of the model call — that is the entire
+/// design; everything else here is bookkeeping around it.
+#[cfg(feature = "encoder")]
+fn pass(
+    session: &Arc<Mutex<Session>>,
+    watch: &crate::http::LockWatch,
+    encoder: &super::cli::session::Encoder,
+    idle: &rusqlite::Connection,
+) -> crate::error::Result<bool> {
+    // 1. The head, on a read-only connection: no store lock, so an empty queue costs one indexed
+    //    SELECT and contends with no one.
+    let Some(entry) = crate::store::encode::next(idle)? else {
+        return Ok(false);
+    };
+    // 2. Claim under a short lock — witnessed, so `/health` can say who holds the writer.
+    let claim = {
+        let _held = watch.held("memory_encode");
+        let session = lock(session)?;
+        session.claim_encode(&entry.key)?
+    };
+    let Some(claim) = claim else {
+        return Ok(false);
+    };
+    // 3. The model call, with the store lock held NOWHERE. This is where the 1.2 GB cold load lands:
+    //    on this worker, not on whoever is waiting to write.
+    let vector = if claim.needs_embed() {
+        let doc = claim.doc().to_string();
+        match encoder.with(|e| e.embed_one(&doc)) {
+            Ok(vector) => Some(vector),
+            Err(err) => {
+                // Count the attempt and leave the entry: it is retried until `MAX_ATTEMPTS`, then
+                // skipped and reported, rather than spun on.
+                let session = lock(session)?;
+                session.record_encode_failure(&entry.key, &err)?;
+                return Ok(true);
+            }
+        }
+    } else {
+        None
+    };
+    // 4. Settle under a second short lock.
+    let _held = watch.held("memory_encode_write");
+    let session = lock(session)?;
+    session.settle_encode(&claim, vector.as_deref())?;
+    Ok(true)
+}
+
+/// The encode worker: the queue's one consumer, and the reason a write does not embed.
+///
+/// A plain OS thread rather than a tokio task, deliberately. A pass is blocking SQLite calls with a
+/// model call between them, and the whole point is that the model call holds the store lock nowhere —
+/// which a thread says by dropping a guard, where `spawn_blocking`'s `'static` closures would make it
+/// awkward to keep the connection across the call.
+#[cfg(feature = "encoder")]
+pub struct EncodeWorker {
+    /// Set to ask the thread to finish its pass and exit.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "encoder")]
+impl EncodeWorker {
+    /// Ask the worker to finish its current pass and exit.
+    pub fn stop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(feature = "encoder")]
+impl Drop for EncodeWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "encoder")]
+impl MemoryServer {
+    /// Spawn the one encode worker for this store.
+    ///
+    /// **Exactly one per process**: call it from `serve`, never from a clone — `http_router` clones
+    /// the server per MCP session, so spawning in the constructor would mean one worker per client,
+    /// all fighting for the single writer.
+    pub fn spawn_encode_worker(&self, interval: std::time::Duration) -> EncodeWorker {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let session = Arc::clone(&self.session);
+        let watch = Arc::clone(&self.watch);
+        let encoder = Arc::clone(&self.encoder);
+        let paths = self.paths.clone();
+        let thread = std::thread::Builder::new()
+            .name("encode-worker".into())
+            .spawn(move || {
+                // One read-only connection for the worker's life: the idle check must not take the
+                // store lock, or an idle store would contend with its own readers for nothing.
+                let idle = match crate::db::open_read_only(&paths) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(error = %err, "encode worker: cannot read the store");
+                        return;
+                    }
+                };
+                tracing::info!(
+                    interval_ms = interval.as_millis() as u64,
+                    "encode worker up"
+                );
+                while !flag.load(Ordering::SeqCst) {
+                    match pass(&session, &watch, &encoder, &idle) {
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!(error = %err, "encode worker: pass failed"),
+                    }
+                    std::thread::sleep(interval);
+                }
+            })
+            .map_err(|err| tracing::error!(error = %err, "encode worker: cannot spawn"))
+            .ok();
+        EncodeWorker { stop, thread }
+    }
+}
+
+/// Deliberately **not** gated on the encoder: a store-only build has no worker to leave the work to,
+/// so this is the only way it could index anything — and it should fail with the stub embedder's own
+/// error, not fail to compile.
+impl MemoryServer {
+    /// Embed one queued document now, instead of leaving it to the worker: the `?wait=true` door.
+    ///
+    /// The worker's job, run on the caller's thread and under the caller's lock — which is the whole
+    /// difference, and the reason this exists in exactly one place. See `ENCODE-WORKER.md`.
+    pub async fn encode_now(&self, key: &str) -> std::result::Result<bool, String> {
+        let key = key.to_string();
+        self.with_store("memory_encode_now", move |s| s.encode_document(&key))
+            .await
+    }
+}
+
 /// The `memory_upvote` sweep, implemented ONCE for both doors.
 ///
 /// The MCP tool and `POST /memory/{key}/upvote` share this, so they cannot drift in either the error
@@ -1382,10 +1534,18 @@ pub fn serve(
         Arc::clone(&watch),
         std::time::Instant::now(),
     );
+    // Before `cfg` moves into the session: the interval the worker polls at.
+    let encode_interval = std::time::Duration::from_millis(cfg.encode_interval_ms);
     let server = MemoryServer::with_watch(
         Arc::new(Mutex::new(Session::open(paths, cfg, spec)?)),
         watch,
     );
+    // ONE worker, started here because `serve` builds the one server the whole process shares — see
+    // `spawn_encode_worker`, which must never be called from a clone. A plain thread, so it does not
+    // need the runtime below and a wedged transport cannot take the encoder down with it. Held for the
+    // life of this function and stopped on the way out.
+    #[cfg(feature = "encoder")]
+    let _worker = server.spawn_encode_worker(encode_interval);
     // rmcp is async; the rest of ellmephant is not, so own the runtime here.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {

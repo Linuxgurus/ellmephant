@@ -245,7 +245,10 @@ fn settle(conn: &Connection, key: &str, claimed_hash: &str) -> Result<()> {
 
 /// Note a failed attempt. The entry stays, so a transient failure is simply retried — until
 /// [`MAX_ATTEMPTS`] gives up on it and [`failed`] reports it instead of looping forever.
-fn record_failure(conn: &Connection, key: &str, err: &Error) -> Result<()> {
+///
+/// Public because the worker drives the retry itself: it holds the store lock in two short pieces,
+/// so it cannot use [`drain`] and needs to record the failure between them.
+pub fn record_failure(conn: &Connection, key: &str, err: &Error) -> Result<()> {
     conn.execute(
         "UPDATE encode_queue SET attempts = attempts + 1, last_error = ?2 WHERE key = ?1",
         params![key, err.to_string()],

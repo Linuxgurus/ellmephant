@@ -18,7 +18,7 @@ use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, links, maintain, project};
+use crate::store::{self, Memory, encode, links, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -264,6 +264,45 @@ impl Session {
     pub fn reembed(&self) -> Result<maintain::Report> {
         self.encoder
             .with(|e| maintain::reembed(&self.conn, e, &self.cfg.instruction))
+    }
+
+    /// The head of the encode queue, or `None` when nothing is waiting to be embedded.
+    pub fn next_encode(&self) -> Result<Option<encode::Entry>> {
+        encode::next(&self.conn)
+    }
+
+    /// Take one queued document **without embedding anything**: the read half of a job.
+    ///
+    /// Split from [`settle_encode`](Self::settle_encode) on purpose — the worker drops the store lock
+    /// between the two, so the model call runs holding nothing at all. `ENCODE-WORKER.md` is the why.
+    pub fn claim_encode(&self, key: &str) -> Result<Option<encode::Claim>> {
+        encode::claim(&self.conn, &self.vec_spec(), key)
+    }
+
+    /// Store a claim's vector and settle its queue entry: the write half of a job.
+    pub fn settle_encode(&self, claim: &encode::Claim, vector: Option<&[f32]>) -> Result<()> {
+        encode::settle_encoded(&self.conn, claim, vector)
+    }
+
+    /// Count a failed embed attempt. The entry stays and is retried until `encode::MAX_ATTEMPTS`,
+    /// after which it is skipped and reported rather than retried in a hot loop forever.
+    pub fn record_encode_failure(&self, key: &str, err: &Error) -> Result<()> {
+        encode::record_failure(&self.conn, key, err)
+    }
+
+    /// Documents still waiting for a vector — the encoder's backlog.
+    pub fn encode_pending(&self) -> Result<i64> {
+        encode::pending(&self.conn)
+    }
+
+    /// Embed one queued document **now**, instead of leaving it to the worker: the `?wait=true` door.
+    ///
+    /// Deliberately the exception. It holds the store lock across the model call, which is precisely
+    /// the coupling the queue exists to remove — so it is opt-in, and for a caller that genuinely
+    /// cannot proceed until the row is searchable.
+    pub fn encode_document(&self, key: &str) -> Result<bool> {
+        self.encoder
+            .with(|e| encode::encode_one(&self.conn, e, &self.vec_spec(), key))
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.

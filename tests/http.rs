@@ -1202,3 +1202,33 @@ async fn a_merge_that_would_drop_prose_is_refused() {
         "the source retires once the fold is in"
     );
 }
+
+/// `?wait=true` settles the document before answering, so the row is searchable the moment the write
+/// returns — the one path that deliberately holds the store lock across the model call.
+#[tokio::test]
+async fn wait_true_indexes_before_it_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let front = "Key: waited\nTitle: Waited\n---\na body with words worth finding\n";
+
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?wait=true&format=json",
+        Some("tok"),
+        Some("text/plain"),
+        front,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("\"indexed\":true"),
+        "the write should report it indexed: {body}"
+    );
+
+    // Deliberately NO `settle(dir.path())` here: the request drained the queue itself, and that is the
+    // whole promise of `?wait=true`.
+    let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("waited"), "{body}");
+}

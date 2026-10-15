@@ -269,6 +269,13 @@ One pass:
 SELECT every second is free. A `Notify` can be added later as a pure optimisation, changing no
 semantics.
 
+**A plain OS thread, not a tokio task** — which is what releasing the lock costs. A pass is blocking
+SQLite calls with a model call between them, and a thread says "hold nothing across step 3" by
+dropping a guard; `spawn_blocking`'s `'static` closures make keeping the connection across the call
+awkward, and the whole point of the split is that the reference must be droppable. Being a thread also
+makes the singleton structural: it is started from `serve`, never from a clone (`http_router` clones
+the server per MCP session), and a wedged transport cannot take the encoder down with it.
+
 **One worker, one process, one replica** — so there is no claim/lease/visibility-timeout machinery,
 because there is exactly one consumer. A crash mid-embed leaves the row queued for the next boot,
 which is the correct recovery and needs no code.

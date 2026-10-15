@@ -12,3 +12,8 @@ instruction = "Given a question, retrieve relevant memories"  # query side only
 default_k = 5                          # search result count
 default_max_distance = 0.6             # cosine-distance ceiling when a search omits it; null = off
 port = 8888                            # MCP HTTP port (`mcp --stdio` ignores it)
+
+# How long the encode worker sleeps between jobs, in milliseconds. It is also the worker's idle poll
+# interval, so it bounds how long a freshly written memory stays invisible to a *semantic* search
+# (a write queues its document; the worker indexes it). See ENCODE-WORKER.md.
+encode_interval_ms = 1000

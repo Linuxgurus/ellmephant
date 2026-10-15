@@ -122,6 +122,11 @@ pub struct Config {
     pub default_max_distance: Option<f32>,
     /// TCP port for the MCP server (SPEC §11); `ellmephant mcp` listens here by default.
     pub port: u16,
+    /// How long the encode worker sleeps between jobs, in milliseconds (`ENCODE-WORKER.md`). This is
+    /// also its idle poll interval, so it bounds how long a freshly written memory stays invisible to
+    /// a *semantic* search — one number, because a separate "between jobs" and "idle" interval would
+    /// be a knob nobody can set correctly.
+    pub encode_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -138,6 +143,7 @@ impl Default for Config {
             default_k: 5,
             default_max_distance: Some(DEFAULT_MAX_DISTANCE),
             port: DEFAULT_PORT,
+            encode_interval_ms: 1_000,
         }
     }
 }

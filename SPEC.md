@@ -516,8 +516,11 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   so candidates are judged (`memory_get` both) before merging. No bodies.
 - `memory_merge` retires one memory into another: it rewrites every `[[from]]` token in every body,
   repoints the edges in lockstep (dropping any self-link the rewrite would create), repoints any
-  project `preload` naming `from`, and deletes `from`. **The prose fold is the caller's** — write the
-  merged facts into `into` first, then retire `from`; this never edits `into`'s body. `[[prj:from]]`
+  project `preload` naming `from`, and deletes `from`. **The prose fold is the caller's** — fold the
+  source's lines into `into` first, then retire `from`; this never edits `into`'s body. Every
+  non-blank line of `from` must survive in `into` (whitespace-insensitive, order free), or the merge
+  is refused and quotes the line it would have lost: a fold may reorder and dedupe, never drop.
+  `[[prj:from]]`
   is not rewritten (that names a project). This is the actor that makes hygiene safe: without it a
   merge leaves dangling references, so merging never happened (`store::links::merge_into`).
 

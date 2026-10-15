@@ -187,10 +187,13 @@ the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen �
 const MERGE_DESCRIPTION: &str = "\
 Retire one memory into another: repoint every `[[from]]` reference at `into` — bodies, the `[[…]]` \
 graph, and any project `preload` naming it — then delete `from`. This is how to merge WITHOUT \
-leaving dangling links. The PROSE fold is yours: write the merged facts into `into` first \
+leaving dangling links. The PROSE fold is yours: fold `from`'s lines into `into` first \
 (`memory_upsert`, or a patch that keeps the rest), then retire `from` here; this never edits \
-`into`'s body. `[[prj:from]]` is not rewritten (that names a project). Both keys must exist — a \
-merge into a typo would destroy the source. Reports what moved.";
+`into`'s body. EVERY non-blank line of `from` must survive in `into` (whitespace-insensitive, order \
+free) or the merge is REFUSED and quotes the line it would have lost — folding prose is the point, \
+losing it is not. To discard prose on purpose, `memory_delete`. `[[prj:from]]` is not rewritten \
+(that names a project). Both keys must exist — a merge into a typo would destroy the source. Reports \
+what moved.";
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
@@ -460,7 +463,7 @@ pub struct MergeParams {
     pub from: String,
     /// The key that survives.
     #[schemars(
-        description = "The key that survives. Must already exist; its body is NOT edited (write the merged facts into it first)."
+        description = "The key that survives. Must already exist; its body is NOT edited here (fold the source's lines into it first — every line must survive, or the merge is refused)."
     )]
     pub into: String,
 }

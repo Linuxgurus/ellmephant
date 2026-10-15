@@ -222,16 +222,20 @@ pub struct MergeInto {
     pub preloads: usize,
 }
 
-/// Refuse a merge whose target does not already carry the source's prose.
+/// Refuse a merge that would LOSE one of the source's lines.
 ///
 /// [`merge_into`] repoints links and retires `from`; it never edits `into`'s body, because the prose
 /// fold is the caller's job. Which makes a merge a legal way to *destroy* prose: retire a memory
-/// carrying a fact the target lacks and the fact is simply gone, with a `200` that reports link
-/// counts and says nothing about the words. This turns the fold from a hope into a precondition.
+/// carrying a line the target lacks and the line is simply gone, with a `200` that reports link
+/// counts and says nothing about the words. So the fold is a precondition, not a hope.
 ///
-/// The check is a whitespace-insensitive substring — the fold is a model's job, and anything
-/// stricter would refuse honest folds. Discarding prose on purpose has its own verb: a DELETE says
-/// "gone", a merge says "folded in", and this keeps the two from meaning the same thing.
+/// The check is **per line, whitespace-insensitive**: every line of `from` must appear SOMEWHERE in
+/// `into`. A fold is an editorial act — it interleaves the source's lines among the target's, drops
+/// the lines the target already carried, and may lay the result out anew — so a whole-body substring
+/// would demand a verbatim paste and refuse every honest fold (the fold the write policy asks for,
+/// "fold both bodies", is exactly the one a contiguous-body check forbids). What no fold may do is
+/// drop a line, and this catches that; the refusal NAMES the first line that did not survive.
+/// Discarding prose on purpose has its own verb: a DELETE says "gone", a merge says "folded in".
 fn ensure_prose_folded(
     conn: &Connection,
     from_id: i64,
@@ -245,22 +249,31 @@ fn ensure_prose_folded(
         })
         .map_err(Into::into)
     };
-    if prose_is_folded(&body(from_id)?, &body(into_id)?) {
-        return Ok(());
+    let into_body = body(into_id)?;
+    if let Some(lost) = unfolded_line(&body(from_id)?, &into_body) {
+        return Err(Error::Invalid(format!(
+            "refusing to merge `{from}` into `{into}`: `{into}`'s body does not carry this line of \
+             `{from}` — \"{lost}\" — and a merge folds prose, it does not lose it. Fold that line \
+             into `{into}` (an ordinary upsert) and merge again, or DELETE `{from}` to discard it on \
+             purpose: a merge folds, a delete discards."
+        )));
     }
-    Err(Error::Invalid(format!(
-        "refusing to merge `{from}` into `{into}`: `{into}`'s body does not carry the facts in \
-         `{from}`'s, and a merge never edits the target's body — write the merged facts into `{into}` \
-         first (an ordinary upsert), then merge. To discard them on purpose, DELETE `{from}` instead: \
-         a merge folds, a delete discards."
-    )))
+    Ok(())
 }
 
-/// Whether `into` already carries `from`'s prose, ignoring how it is laid out on the line.
-fn prose_is_folded(from: &str, into: &str) -> bool {
-    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let from = squash(from);
-    from.is_empty() || squash(into).contains(&from)
+/// Squash every run of whitespace to a single space, so a check can ignore how prose is laid out.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The first non-blank line of `from` that `into` does not carry anywhere, or `None` when every line
+/// survived. Blank lines carry nothing, so they never fail a fold.
+fn unfolded_line<'a>(from: &'a str, into: &str) -> Option<&'a str> {
+    let into = squash(into);
+    from.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| !into.contains(&squash(line)))
 }
 
 /// Retire `from` into `into`: repoint every reference, then delete `from` (PLAN §3).
@@ -275,7 +288,7 @@ fn prose_is_folded(from: &str, into: &str) -> bool {
 ///   collapsed;
 /// - `from` is deleted (row, vector, edges).
 ///
-/// **The prose is the caller's.** This never touches `into`'s body: write the merged facts into
+/// **The prose is the caller's.** This never touches `into`'s body: fold `from`'s lines into
 /// `into` first (an ordinary upsert/patch), then retire `from` here — the store keeps facts
 /// straight, a model writes the words. `[[prj:from]]` is *not* rewritten: that names a project.
 pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto> {

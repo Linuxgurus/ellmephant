@@ -104,7 +104,7 @@ that earned its keep in one call; under-voting starves the store's own rankings.
 /// The firing cue that rides the `memory_get` *result* payload, not just its static description.
 /// The model's attention is on the body it just consumed — a trigger fires where attention sits at
 /// the moment of use (cf. the telemetry lesson).
-const GET_NUDGE: &str = "Shaped your task? memory_upvote this key.";
+pub(crate) const GET_NUDGE: &str = "Shaped your task? memory_upvote this key.";
 
 /// `memory_dupes` description. A finder for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
@@ -113,7 +113,7 @@ Find duplicate *candidates*: memory pairs whose documents sit closer than a tigh
 merging. The finder for the merge rule.";
 
 /// Cap on returned dupe pairs for a bare `memory_dupes` call.
-const DUPES_LIMIT: usize = 50;
+pub(crate) const DUPES_LIMIT: usize = 50;
 
 /// `memory_coherent` description. The split-review law rides here, in its owning tool only.
 const COHERENT_DESCRIPTION: &str = "\
@@ -617,7 +617,11 @@ impl MemoryServer {
     /// `tool` labels the call in logs: a success is a `debug!` with its latency, a store
     /// error a `warn!`, and a panic/join failure an `error!`. That is the one place every
     /// tool failure surfaces, so `docker logs` never loses it to a client-side error string.
-    async fn with_store<T, F>(&self, tool: &'static str, f: F) -> std::result::Result<T, String>
+    pub(crate) async fn with_store<T, F>(
+        &self,
+        tool: &'static str,
+        f: F,
+    ) -> std::result::Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&mut Session) -> crate::error::Result<T> + Send + 'static,
@@ -661,7 +665,7 @@ impl MemoryServer {
 }
 
 /// One JSON object as the tool's text result.
-fn json_ok(value: serde_json::Value) -> String {
+pub(crate) fn json_ok(value: serde_json::Value) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -815,6 +819,12 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
+        self.run_search(p).await
+    }
+
+    /// Run a search and render its wire JSON. Shared by the MCP tool and `GET /search`, so the two
+    /// doors emit byte-identical bodies (HTTP.md § "the wire grammar").
+    pub(crate) async fn run_search(&self, p: SearchParams) -> std::result::Result<String, String> {
         let query = p.query;
         let pattern = p.pattern;
         let mode = p.mode.map(MatchModeParam::to_mode).unwrap_or_default();
@@ -1282,10 +1292,28 @@ pub fn http_router(
     const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
     let mut sessions = LocalSessionManager::default();
     sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
+    let service_server = server.clone();
     let service: StreamableHttpService<MemoryServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), sessions.into(), config);
+    // The plain-HTTP reads reuse this very session, so the two doors cannot drift.
+    let state = state.with_server(service_server);
+    use crate::http_surface as surface;
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
+        .route("/bootstrap", axum::routing::get(surface::bootstrap))
+        .route("/stats", axum::routing::get(surface::stats))
+        .route("/memory/{key}", axum::routing::get(surface::memory_get))
+        .route(
+            "/memory/{key}/backlinks",
+            axum::routing::get(surface::backlinks),
+        )
+        .route("/search", axum::routing::get(surface::search))
+        .route("/dupes", axum::routing::get(surface::dupes))
+        .route("/projects", axum::routing::get(surface::projects))
+        .route("/project/{key}", axum::routing::get(surface::project_get))
+        // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.
+        .fallback(surface::not_found)
+        .method_not_allowed_fallback(surface::method_not_allowed)
         .nest_service("/mcp", service)
         .with_state(state)
 }

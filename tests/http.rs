@@ -153,3 +153,21 @@ async fn health_witnesses_the_writer() {
     let (_, body, _) = get(&app, "/health").await;
     assert!(body.contains("writer      free"), "{body}");
 }
+
+/// Parity is enforced, not asserted by hand: every MCP tool has exactly one route (HTTP.md slice 2).
+#[test]
+fn every_tool_has_a_route() {
+    use ellmephant::http_surface::ROUTES;
+    use ellmephant::mcp::TOOLS;
+    assert_eq!(
+        ROUTES.len(),
+        TOOLS.len(),
+        "the route table must have one entry per tool"
+    );
+    for tool in TOOLS {
+        assert!(
+            ROUTES.iter().any(|route| route.tool == *tool),
+            "no HTTP route maps to `{tool}`"
+        );
+    }
+}

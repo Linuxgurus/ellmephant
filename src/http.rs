@@ -59,7 +59,7 @@ impl LockWatch {
     }
 
     /// The one-line writer witness (`free`, or `busy 41.2s (memory_reembed)`).
-    fn witness(&self) -> String {
+    pub(crate) fn witness(&self) -> String {
         match self.busy_ms() {
             Some(ms) => match self.holder() {
                 Some(tool) => format!("busy {:.1}s ({tool})", ms as f64 / 1000.0),
@@ -86,8 +86,8 @@ impl Drop for LockGuard {
     }
 }
 
-/// Everything `/health` needs, without a `Session`: the store path, the writer witness and the
-/// process start time.
+/// Everything the plain-HTTP surface needs: the store path, the writer witness, the process start
+/// time, the write credential and (for the reads that reuse it) the shared MCP session.
 #[derive(Clone)]
 pub struct HttpState {
     /// The store this surface reads.
@@ -98,37 +98,69 @@ pub struct HttpState {
     pub watch: Arc<LockWatch>,
     /// When the process came up, for the uptime line.
     pub started: Instant,
+    /// The bearer that may write, or `None` for "no writes". Resolved to a scope per request.
+    write_token: Option<String>,
+    /// The session behind `/mcp`, reached through the same `with_store` path so a read over HTTP
+    /// and one over MCP are literally the same call.
+    server: Option<crate::mcp::MemoryServer>,
 }
 
 impl HttpState {
-    /// Assemble the surface state.
+    /// Assemble the surface state. The write credential comes from `ELLMEPHANT_WRITE_TOKEN`.
     pub fn new(paths: Paths, cfg: Config, watch: Arc<LockWatch>, started: Instant) -> Self {
         Self {
             paths,
             cfg,
             watch,
             started,
+            write_token: std::env::var("ELLMEPHANT_WRITE_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
+            server: None,
         }
+    }
+
+    /// Set the write bearer (tests, or a future config source). `None` refuses every write.
+    pub fn with_write_token(mut self, token: Option<String>) -> Self {
+        self.write_token = token;
+        self
+    }
+
+    /// Share the MCP session with the plain-HTTP reads. `/health` and `/bootstrap` never use it.
+    pub fn with_server(mut self, server: crate::mcp::MemoryServer) -> Self {
+        self.server = Some(server);
+        self
+    }
+
+    /// The configured write bearer.
+    pub fn write_token(&self) -> Option<&str> {
+        self.write_token.as_deref()
+    }
+
+    /// The session shared with `/mcp`. `None` only before [`with_server`](Self::with_server).
+    pub(crate) fn server(&self) -> Option<&crate::mcp::MemoryServer> {
+        self.server.as_ref()
     }
 }
 
-/// The health of the store, rendered either as the prose kubectl reads or as JSON.
-struct HealthReport {
-    version: &'static str,
-    uptime_s: u64,
-    schema: i32,
-    latest: i32,
-    memories: i64,
-    vectors: i64,
-    projection: String,
-    links: i64,
-    links_dangling: usize,
-    tags: usize,
-    projects: i64,
-    projects_dangling: usize,
-    writer: String,
-    ready: bool,
-    reason: Option<String>,
+/// The health of the store, rendered either as the prose kubectl reads or as JSON. `/bootstrap`
+/// reads the same facts, so the fields are crate-visible.
+pub(crate) struct HealthReport {
+    pub(crate) version: &'static str,
+    pub(crate) uptime_s: u64,
+    pub(crate) schema: i32,
+    pub(crate) latest: i32,
+    pub(crate) memories: i64,
+    pub(crate) vectors: i64,
+    pub(crate) projection: String,
+    pub(crate) links: i64,
+    pub(crate) links_dangling: usize,
+    pub(crate) tags: usize,
+    pub(crate) projects: i64,
+    pub(crate) projects_dangling: usize,
+    pub(crate) writer: String,
+    pub(crate) ready: bool,
+    pub(crate) reason: Option<String>,
 }
 
 impl HealthReport {
@@ -208,7 +240,7 @@ impl HealthReport {
 
 /// Read-only readiness for a probe: schema, projection, vectors, the derived counts and the
 /// writer witness. Never migrates, never takes the store lock.
-fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> HealthReport {
+pub(crate) fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> HealthReport {
     let latest = db::migrate::latest();
     let mut report = HealthReport {
         version: crate::VERSION,

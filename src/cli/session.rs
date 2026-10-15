@@ -97,9 +97,9 @@ impl Session {
         store::merge(&self.conn, embedder, patch)
     }
 
-    /// Fetch one memory by key without counting a visit. Private on purpose: `fetch` is the read
-    /// path, and "read without counting" is not something a tool should be able to reach.
-    fn show(&self, key: &str) -> Result<Memory> {
+    /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path,
+    /// and "read without counting" reaches no tool — only the plain-HTTP read, which is pure by law.
+    pub(crate) fn show(&self, key: &str) -> Result<Memory> {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
@@ -123,6 +123,12 @@ impl Session {
     /// existed and the keys that did not, both in input order — a missing key is not an error.
     pub fn record_useful_many(&self, keys: &[String]) -> Result<store::UsefulSweep> {
         store::record_useful_many(&self.conn, keys)
+    }
+
+    /// Bump `visits` for `key` and return the new total — the write `GET /memory/{key}` refuses to
+    /// be, split out so counting is never a read (HTTP.md invariant 1).
+    pub fn record_visit(&self, key: &str) -> Result<i64> {
+        store::record_visit(&self.conn, key)
     }
 
     /// Set the split-review verdict for `key` (`Some(true)` coherent, `Some(false)` a

@@ -759,7 +759,7 @@ fn a_project_link_is_not_a_memory_backlink() {
     assert!(links::backlinks(&conn, "sessions").unwrap().is_empty());
 
     // ...and renaming that memory must not drag the project's edge along.
-    links::rename(&conn, "sessions", "session-notes").expect("rename");
+    links::rename(&conn, &embedder, "sessions", "session-notes").expect("rename");
     let typed: Vec<(String, String)> = conn
         .prepare("SELECT to_key, to_type FROM memory_link")
         .unwrap()

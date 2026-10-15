@@ -342,6 +342,9 @@ CREATE TABLE project_memory (      -- RETIRED in 0007; see "Membership is a TAG"
   a backlink of a memory that happens to share its name.
 - **Rename:** keys are near-immutable; `rename` deliberately rewrites `[[oldkey]]` across
   bodies **and** repoints edges — memory edges only, so a project's incoming links are untouched.
+  The renamed row is **re-embedded**: `key` is in the embed projection (§6), so its document moved.
+  The rows whose bodies had `[[oldkey]]` rewritten are *not* re-embedded — links are stripped from
+  the projection, so their document is unchanged by the token swap.
   **No interface exposes it today**: the CLI verb was its only caller and went with the REPL, so
   `store::links::rename` is reachable only from tests. A `memory_rename` tool is the obvious way back;
   the decision is open.

@@ -37,7 +37,7 @@ fn rename_rewrites_bodies_and_repoints_edges() {
     seed(&conn, &embedder, "a", "see [[target]] first");
     seed(&conn, &embedder, "b", "also [[target]] here");
 
-    let outcome = links::rename(&conn, "target", "renamed").expect("rename");
+    let outcome = links::rename(&conn, &embedder, "target", "renamed").expect("rename");
     assert_eq!(outcome.key, "renamed");
     assert_eq!(outcome.bodies, 2, "both bodies carried the token");
     assert_eq!(outcome.edges, 2, "both edges repointed");
@@ -75,8 +75,11 @@ fn rename_refuses_missing_and_colliding_keys() {
     seed(&conn, &embedder, "one", "first");
     seed(&conn, &embedder, "two", "second");
 
-    assert!(links::rename(&conn, "ghost", "new").is_err(), "missing old");
-    let err = links::rename(&conn, "one", "two").unwrap_err();
+    assert!(
+        links::rename(&conn, &embedder, "ghost", "new").is_err(),
+        "missing old"
+    );
+    let err = links::rename(&conn, &embedder, "one", "two").unwrap_err();
     assert!(format!("{err}").contains("already exists"), "{err}");
     assert!(store::get(&conn, "one").unwrap().is_some(), "unchanged");
 }
@@ -88,9 +91,46 @@ fn rename_to_the_same_key_is_a_noop() {
     let embedder = HashEmbedder::new(DIM);
     seed(&conn, &embedder, "one", "body");
 
-    let outcome = links::rename(&conn, "one", "one").expect("rename");
+    let outcome = links::rename(&conn, &embedder, "one", "one").expect("rename");
     assert_eq!((outcome.bodies, outcome.edges), (0, 0));
     assert!(store::get(&conn, "one").unwrap().is_some());
+}
+
+#[test]
+fn rename_re_embeds_the_row_it_moves() {
+    // `key` IS in the embed projection, so a rename moves the row's *document*. Its stored
+    // `doc_hash` (and vector) must describe the NEW key; otherwise the vector drifts until
+    // something else happens to write the row.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    // `memory()` uses the key as the title too, so the title stays put across the rename.
+    seed(&conn, &embedder, "old-name", "the body");
+
+    links::rename(&conn, &embedder, "old-name", "new-name").expect("rename");
+
+    let stored: String = conn
+        .query_row(
+            "SELECT doc_hash FROM memory WHERE key = 'new-name'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("row moved");
+    let fresh = store::row_hash(
+        &embedder,
+        &ellmephant::embed::projection::embed_document("new-name", &[], "old-name", "the body"),
+    );
+    assert_eq!(
+        stored, fresh,
+        "the row was re-embedded under its new key, not left describing the old one"
+    );
+
+    // The pre-fix hash (documented under the OLD key) must NOT match — that drift is the bug.
+    let stale = store::row_hash(
+        &embedder,
+        &ellmephant::embed::projection::embed_document("old-name", &[], "old-name", "the body"),
+    );
+    assert_ne!(stored, stale, "the stale, old-key hash was replaced");
 }
 
 #[test]
@@ -131,7 +171,7 @@ fn renaming_clears_a_dangling_edge() {
 
     // Renaming an unrelated memory into `later` resolves it (no edge repoint needed).
     seed(&conn, &embedder, "stub", "placeholder");
-    links::rename(&conn, "stub", "later").expect("rename");
+    links::rename(&conn, &embedder, "stub", "later").expect("rename");
     assert!(links::dangling(&conn).unwrap().is_empty());
 }
 

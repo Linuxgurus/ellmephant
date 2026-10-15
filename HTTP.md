@@ -198,10 +198,21 @@ actually fails. A project patch is *structured* (owner list, preload list, tags)
 honest shape. So both are accepted, and the caller picks by `Content-Type`. `?format=` governs the
 *response* only.
 
-### Auth: open until a token is set, over a seam that is already the right shape
+### Auth: **no key today.** The seam is there; the gate is not.
 
-One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the deployment). A **wrong**
-token → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a one-line text body.
+**Reads and writes are equally open, with no credential of any kind — exactly as MCP is.** That is a
+decision, not an oversight: the point of this surface is to be the *easy* door, and a key we have no way
+to issue yet would make it the harder one. Nothing in the tree sets `ELLMEPHANT_WRITE_TOKEN` (not the
+chart, not the workflows, not the Dockerfile), so no route can demand one by accident.
+
+The seam is kept, dormant, because auth comes back soon and re-adding it should be a config flip rather
+than a code change. One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the
+deployment). A **wrong** token → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a
+one-line text body.
+
+**Set the variable and the gate returns; unset it and there is none.** So the open state must never be
+described as "deny by default with a hole in it" — it is simply no gate, and the tests still prove the
+gate *works* for the day it matters (`a_configured_token_closes_the_door_again`).
 
 **Open until the token is set — deliberately, and with an expiry date.** An earlier draft denied by
 default, so that a deployment which forgot the env var got a read-only surface rather than an open one.

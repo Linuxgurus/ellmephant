@@ -12,6 +12,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use ellmephant::mcp::MemoryServer;
 use ellmephant::model::Spec;
 use ellmephant::store::Patch;
 
-/// The fake embedder's width, and what the config has to echo (see the test's `Config`).
+/// The fake embedder's width, and what the config has to echo (see the tests' `Config`).
 const DIM: usize = 8;
 const MODEL: &str = "gate";
 
@@ -34,9 +35,29 @@ const MODEL: &str = "gate";
 ///
 /// A sleeping fake would only make the assertion probable; a gate makes it certain, because the test
 /// does not proceed until the embed is demonstrably underway.
+///
+/// Two details are load-bearing:
+///
+/// - only the first `parks` calls park, so the rest of a test runs at full speed; and
+/// - the wait is a **`recv_timeout`, never a blocking `recv`**. If a regression puts the model call
+///   back under the store lock, the write the test is timing will block — and with a blocking receive
+///   the test would never reach the statement that releases the gate, so the whole suite would hang.
+///   Bounding it means the write bounds out too, and the test **fails on its assertion** instead.
 struct Gate {
     started: mpsc::Sender<()>,
-    release: Arc<Mutex<mpsc::Receiver<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
+    /// How many calls still park. The worker is single-threaded, so a load/store pair is enough.
+    parks: AtomicUsize,
+}
+
+impl Gate {
+    fn new(started: mpsc::Sender<()>, release: mpsc::Receiver<()>, parks: usize) -> Self {
+        Self {
+            started,
+            release: Mutex::new(release),
+            parks: AtomicUsize::new(parks),
+        }
+    }
 }
 
 impl Embedder for Gate {
@@ -47,9 +68,17 @@ impl Embedder for Gate {
         MODEL
     }
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let _ = self.started.send(());
-        // `Err` once the test has dropped its sender, which is how the second job is let through.
-        let _ = self.release.lock().unwrap().recv();
+        let remaining = self.parks.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.parks.store(remaining - 1, Ordering::SeqCst);
+            let _ = self.started.send(());
+            // Bounded on purpose — see this struct's doc: a regression must fail a test, not hang one.
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3));
+        }
         Ok(vec![vec![0.0; DIM]; texts.len()])
     }
 }
@@ -88,10 +117,7 @@ fn a_write_returns_while_the_model_is_mid_embed() {
     let spec = Spec::from_config(&cfg, &paths);
     let session = Session::open(paths.clone(), cfg, spec)
         .expect("open store")
-        .with_embedder(Box::new(Gate {
-            started: started_tx,
-            release: Arc::new(Mutex::new(release_rx)),
-        }));
+        .with_embedder(Box::new(Gate::new(started_tx, release_rx, 1)));
     let shared = Arc::new(Mutex::new(session));
     let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
     let mut worker = server.spawn_encode_worker(Duration::from_millis(5));
@@ -121,9 +147,8 @@ fn a_write_returns_while_the_model_is_mid_embed() {
         "the write waited {waited:?} for a model call in flight: the encoder is under the store lock again"
     );
 
-    // Let the model finish; then let it finish again. The queue drains itself.
+    // Let the model finish. Every later call runs straight through.
     release_tx.send(()).expect("release the model");
-    drop(release_tx);
 
     let idle = db::open_read_only(&paths).expect("read the store");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -138,6 +163,90 @@ fn a_write_returns_while_the_model_is_mid_embed() {
         ellmephant::store::encode::pending(&idle).expect("queue"),
         0,
         "the worker emptied the queue"
+    );
+    worker.stop();
+}
+
+/// The guard, end to end: a write that lands *while its own key is being embedded* must be kept, not
+/// swallowed.
+///
+/// This is the failure with no symptom. A dequeue that ignored the hash would clear the entry the
+/// worker claimed and take the newer text with it, leaving a vector describing text no longer in the
+/// row — and nothing anywhere would say so. The proof that it did not happen is not an assertion about
+/// a hash: it is that the worker **comes back to the key**.
+#[test]
+fn a_write_landing_mid_embed_is_kept_not_swallowed() {
+    let (_dir, paths) = common::temp_store();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let cfg = Config {
+        model: MODEL.to_string(),
+        dim: DIM,
+        ..Config::default()
+    };
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg, spec)
+        .expect("open store")
+        // TWO parked calls: the first embeds `alpha` while the rewrite lands, and the second is the
+        // worker coming back for `gamma` — the thing this test is actually asserting.
+        .with_embedder(Box::new(Gate::new(started_tx, release_rx, 2)));
+    let shared = Arc::new(Mutex::new(session));
+    let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(5));
+
+    // `a` is claimed and parked inside its embed, holding the text "alpha".
+    shared
+        .lock()
+        .unwrap()
+        .memory_merge(&patch("a", "alpha"))
+        .expect("write alpha");
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first embed started");
+
+    // A rewrite of the SAME key lands mid-embed, superseding the queue entry: the row now says
+    // "gamma", and the entry carries gamma's hash.
+    shared
+        .lock()
+        .unwrap()
+        .memory_merge(&patch("a", "gamma"))
+        .expect("rewrite to gamma");
+
+    // Let the first embed finish. Its dequeue must MISS, and the proof is that the worker returns.
+    release_tx.send(()).expect("release the first embed");
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker did not re-claim the key: the stale settle swallowed the rewrite");
+
+    release_tx.send(()).expect("release the second embed");
+    let idle = db::open_read_only(&paths).expect("read the store");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = ellmephant::store::encode::pending(&idle).expect("queue");
+        if pending == 0 && ellmephant::index::vec::count(&idle).expect("vectors") == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queue did not drain: {pending} left"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // And the vector describes the text actually in the row, which is the whole point.
+    let expected = ellmephant::store::row_hash(
+        &ellmephant::embed::VecSpec::new(MODEL, DIM),
+        &ellmephant::embed::projection::embed_document("a", "a", "gamma"),
+    );
+    let stored: String = idle
+        .query_row("SELECT doc_hash FROM memory WHERE key = 'a'", [], |r| {
+            r.get(0)
+        })
+        .expect("doc_hash");
+    assert_eq!(
+        stored, expected,
+        "the vector describes the CURRENT text, not the one the job first claimed"
     );
     worker.stop();
 }

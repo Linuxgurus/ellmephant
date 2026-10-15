@@ -688,7 +688,7 @@ pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref
 /// Repoint every project `preload` entry naming `from` (a memory key) at `into`, keeping order and
 /// collapsing duplicates to their first position. Returns how many projects changed.
 ///
-/// The graph half of a merge ([`crate::store::links::merge_into`]): a preload still naming a retired
+/// The graph half of a merge ([`crate::store::links::merge_into`]): a preload still naming a deleted
 /// key would be rot ([`dangling`]) that no amount of editing the memory could fix, because the
 /// reference lives on the *project* row.
 pub fn repoint_preload(conn: &Connection, from: &str, into: &str) -> Result<usize> {

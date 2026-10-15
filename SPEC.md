@@ -525,7 +525,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   self-link the rewrite would create), repoints any project `preload` naming `from`, and deletes
   `from`. A caller may fold the prose itself first — the write policy asks for that when the
   survivor should read as one thing — and `integrated` then comes back empty, making the call a pure
-  retire. **Verbatim append rather than a generated rewrite** because the store keeps facts straight
+  delete. **Verbatim append rather than a generated rewrite** because the store keeps facts straight
   and a model writes the words: a fold this store cannot verify is a way to lose a fact with nothing
   to notice it. `[[prj:from]]` is not rewritten (that names a project). This is the actor that makes
   hygiene safe: without it a merge leaves dangling references, so merging never happened. Returns

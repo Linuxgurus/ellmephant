@@ -50,7 +50,7 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     for name in ["memory", "memory_link", "meta", "project"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
-    // 0007 retired the one-home association: membership is a tag now, so the table must be GONE —
+    // 0007 dropped the one-home association: membership is a tag now, so the table must be GONE —
     // and must never creep back.
     assert!(
         !object_exists(&conn, "table", "project_memory"),
@@ -182,7 +182,7 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     drop(conn);
 
     // 0006 interprets the prefix exactly once — while it still means something — and 0007 then
-    // retires the one-home table entirely.
+    // drops the one-home table entirely.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(
         count(&conn, "SELECT count(*) FROM project WHERE key = 'chronos'"),

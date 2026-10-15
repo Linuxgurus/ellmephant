@@ -193,7 +193,7 @@ which of the two is the stronger memory. Lines `into` already carries are not ap
 REMOVES redundancy — that is what it is for, and a merge that only ever appends is the thing this \
 replaces. Fold the prose yourself first (an ordinary upsert) when you want the survivor to read as \
 one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and the \
-call is a pure retire. Returns `integrated` — the lines it appended on your behalf — so the fold it \
+call has nothing to integrate. Returns `integrated` — the lines it appended on your behalf — so the fold it \
 made for you is visible. Both keys must exist: a merge into a typo would destroy the source. To \
 discard prose on purpose use `memory_delete`: a merge integrates, a delete discards. `[[prj:from]]` \
 is not rewritten (that names a project). Reports what moved.";
@@ -459,9 +459,9 @@ pub struct KeyParams {
 /// Parameters for [`MemoryServer::memory_merge`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MergeParams {
-    /// The key to retire.
+    /// The key to delete.
     #[schemars(
-        description = "The key to retire — the weaker memory. Its lines are integrated into `into`, its `[[…]]` references are repointed at `into`, then it is deleted."
+        description = "The key to delete — the weaker memory. Its lines are integrated into `into`, its `[[…]]` references are repointed at `into`, then it is deleted."
     )]
     pub from: String,
     /// The key that survives.

@@ -293,11 +293,11 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     assert!(!extra.is_error.unwrap_or(false), "{}", text(&extra));
     // `memory_merge` integrates one key into another and deletes it, repointing its references (the
-    // safe merge). The survivor already carries the retired body's prose, so there is nothing to
-    // integrate here and the call is a pure retire.
+    // safe merge). The survivor already carries the deleted body's prose, so there is nothing to
+    // integrate here and the call has nothing to integrate.
     for (key, body) in [
-        ("merge-old", "retired"),
-        ("merge-new", "survivor, now carrying: retired"),
+        ("merge-old", "deleted"),
+        ("merge-new", "survivor, now carrying: deleted"),
     ] {
         let r = call(
             &client,
@@ -342,7 +342,7 @@ async fn tools_round_trip_over_the_transport() {
         serde_json::json!({ "key": "merge-old" }),
     )
     .await;
-    assert_eq!(gone.is_error, Some(true), "the source is retired");
+    assert_eq!(gone.is_error, Some(true), "the source is deleted");
     let referrer = call(
         &client,
         "memory_get",

@@ -2,7 +2,7 @@
 //! `oneshot`, with the deterministic `HashEmbedder`, so no weights and no network.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
@@ -1231,4 +1231,149 @@ async fn wait_true_indexes_before_it_answers() {
     let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("waited"), "{body}");
+}
+
+/// `?wait=true` when the encoder **cannot** embed: the write still stands, and the reply says so rather
+/// than claiming a guarantee that was missed. This is the path a vanished weights cache would take.
+#[tokio::test]
+async fn wait_true_reports_a_write_that_could_not_be_indexed() {
+    /// An encoder that always fails.
+    struct Broken;
+
+    impl ellmephant::embed::Embedder for Broken {
+        fn dim(&self) -> usize {
+            64
+        }
+        fn model_id(&self) -> &str {
+            "broken"
+        }
+        fn embed(&self, _texts: &[String]) -> ellmephant::error::Result<Vec<Vec<f32>>> {
+            Err(ellmephant::error::Error::Config("no vector for you".into()))
+        }
+    }
+
+    // Built WITH the failing encoder: `Encoder::inject` sets a `OnceLock`, so it cannot be replaced
+    // after the fact — a test that tried would silently keep the working one.
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let paths = Paths::from_root(dir.path());
+    let cfg = Config::default();
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg.clone(), spec)
+        .expect("open store")
+        .with_embedder(Box::new(Broken));
+    let state = HttpState::new(paths, cfg, Arc::clone(&watch), Instant::now())
+        .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::new(Mutex::new(session)), watch),
+        "127.0.0.1",
+        state,
+    );
+
+    let front = "Key: unindexable\nTitle: Unindexable\n---\na body the encoder will refuse\n";
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?wait=true&format=json",
+        Some("tok"),
+        Some("text/plain"),
+        front,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failed index must not fail the write: {body}"
+    );
+    assert!(body.contains("\"indexed\":false"), "{body}");
+    assert!(
+        body.contains("encode_error"),
+        "and it must say why, not just that it did not: {body}"
+    );
+
+    // The row is there: the queue is derived state, so the write was never at risk.
+    let (status, _, _) = get(&app, "/memory/unindexable?format=json").await;
+    assert_eq!(status, StatusCode::OK, "the row is written regardless");
+}
+
+/// `?wait=true` costs exactly what its docs say it costs — it holds the store lock across the model
+/// call — and **`/health` says so while it does**.
+///
+/// That witness is not decoration: `writer: busy 1239.1s (memory_reembed)` is what made the 45-minute
+/// incident legible in the first place. A writer nobody can see is how a store comes to report `ready`
+/// while it cannot write.
+#[tokio::test]
+async fn wait_true_holds_the_lock_and_health_names_the_holder() {
+    /// Slow enough that a poller cannot miss the window.
+    struct Slow;
+
+    impl ellmephant::embed::Embedder for Slow {
+        fn dim(&self) -> usize {
+            64
+        }
+        fn model_id(&self) -> &str {
+            "slow"
+        }
+        fn embed(&self, texts: &[String]) -> ellmephant::error::Result<Vec<Vec<f32>>> {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Ok(vec![vec![0.0; 64]; texts.len()])
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let paths = Paths::from_root(dir.path());
+    let cfg = Config::default();
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg.clone(), spec)
+        .expect("open store")
+        .with_embedder(Box::new(Slow));
+    let state = HttpState::new(paths, cfg, Arc::clone(&watch), Instant::now())
+        .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::new(Mutex::new(session)), watch),
+        "127.0.0.1",
+        state,
+    );
+
+    // The synchronous write runs in the background; the poller watches the witness in the foreground.
+    let writing = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let front = "Key: witnessed\nTitle: Witnessed\n---\na body embedded slowly\n";
+            request(
+                &app,
+                Method::POST,
+                "/memory?wait=true&format=json",
+                Some("tok"),
+                Some("text/plain"),
+                front,
+            )
+            .await
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        let (_, body, _) = get(&app, "/health?format=json").await;
+        if body.contains("memory_encode_now") {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the witness never named the lock holder: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        seen.contains("\"writer\":\"busy"),
+        "and it should read as busy while held: {seen}"
+    );
+
+    let (status, body, _) = writing.await.expect("the write task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("\"indexed\":true"),
+        "the synchronous door settles it before answering: {body}"
+    );
 }

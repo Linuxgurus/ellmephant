@@ -534,3 +534,50 @@ fn stop_joins_the_worker_and_no_further_work_is_picked_up() {
         "the queue should be stranded with the worker stopped"
     );
 }
+
+/// Deleting a memory takes its queue entry with it, and so does retiring one into another.
+///
+/// A ghost entry is not corruption — the worker drops an entry whose row has gone — but it is a leak
+/// nothing else would notice, and until it is collected a deleted key can still cause an embed.
+#[test]
+fn a_deleted_or_retired_key_leaves_no_queue_entry() {
+    let (_dir, paths) = common::temp_store();
+    let conn = db::open(&paths).expect("open store");
+    let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
+    let queued = |conn: &rusqlite::Connection| -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT key FROM encode_queue ORDER BY key")
+            .expect("prepare");
+        let rows = stmt.query_map([], |r| r.get(0)).expect("query");
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .expect("keys")
+    };
+
+    ellmephant::store::add(&conn, &spec, &memory("gone", "never to be embedded")).expect("write");
+    ellmephant::store::add(&conn, &spec, &memory("kept", "still owed a vector")).expect("write");
+    assert_eq!(queued(&conn), ["gone", "kept"]);
+
+    // Delete: the entry goes in the same transaction as the row.
+    assert!(ellmephant::store::delete(&conn, "gone").expect("delete"));
+    assert_eq!(
+        queued(&conn),
+        ["kept"],
+        "the deleted key's entry went with it"
+    );
+
+    // Retire one key into another. `new` has to carry `old`'s prose already, or the merge is refused.
+    ellmephant::store::add(&conn, &spec, &memory("old", "retired")).expect("write");
+    ellmephant::store::add(
+        &conn,
+        &spec,
+        &memory("new", "survivor, now carrying: retired"),
+    )
+    .expect("write");
+    assert_eq!(queued(&conn), ["kept", "new", "old"]);
+    ellmephant::store::links::merge_into(&conn, "old", "new").expect("merge");
+    assert_eq!(
+        queued(&conn),
+        ["kept", "new"],
+        "the retired key's entry went with it"
+    );
+}

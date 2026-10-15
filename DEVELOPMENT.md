@@ -47,9 +47,21 @@ Everything runs on **Forgejo** (`git.vn.linuxguru.net`) from
 describe - `ci.yml`, `docker-release.yml`, `chart-release.yml` - were deleted in `6b16f5b`, so
 every path and claim that mentioned them was stale.
 
-- **`.forgejo/workflows/publish-dev.yml`** - fires on a push to `dev`, plus manual dispatch. Builds
-  the runtime image (amd64) and pushes it to **private Harbor** as `edge` + `sha-<commit>`. This is
-  the everyday path: every push to `dev` republishes `edge`. See [Publishing](#publishing).
+- **`.forgejo/workflows/publish-dev.yml`** - fires on a push to `dev`, a **pull request**, and manual
+  dispatch. It has two jobs: **`test`** (the gate) and **`publish`**.
+  - **`test`** builds `Dockerfile.test`: `cargo fmt --all --check`, `cargo clippy --all-targets
+    --all-features -- -D warnings`, `cargo test --locked`, `cargo test --locked
+    --no-default-features` - one cargo step at a time. It is a docker **build**, not a run: the
+    runner image (`catthehacker/ubuntu:act-22.04`) carries the docker CLI and **no cargo**, so a
+    container is the only way to get a toolchain, and `docker build` is the path this repository
+    already depends on. It is standalone (`FROM rust:1-bookworm`, no Harbor, no secrets), so it
+    behaves identically on a `dev` push and on a pull request - including one that cannot read the
+    private registry. `target/` is a **cache mount**, not a layer, so the throwaway image stays the
+    size of the toolchain instead of ~3 GB of build artifacts.
+  - **`publish`** builds the runtime image (amd64) and pushes it to **private Harbor** as `edge` +
+    `sha-<commit>`. It **needs `test`** and is **skipped on a pull request**: a PR gets the gate as a
+    status and publishes nothing, and a push to `dev` cannot move `edge` from code that does not
+    pass. Every push to `dev` republishes `edge`. See [Publishing](#publishing).
 - **`.forgejo/workflows/publish.yml`** - fires on a push to `main`, a `v*` tag, or manual dispatch.
   The **release** path: reads the version from `Cargo.toml`, builds the image once and tags it
   `1.1.0` / `1.1` / `1` / `latest` (a pre-release gets only its own tag), pushes all of them to
@@ -63,9 +75,11 @@ every path and claim that mentioned them was stale.
 - **`.forgejo/workflows/smoke.yml`** - manual dispatch only, on `dev`. A diagnostic for the runner
   itself (does a job start, does `actions/checkout` resolve, can a job reach the Docker daemon),
   written when nothing on the instance had yet executed a job. Not a check of the code.
-- **Nothing runs on a pull request.** There is no CI gate on this repository: a PR shows **no
-  statuses at all**, so a green-looking PR means nothing has been verified. The checks are yours to
-  run, and they are the ones that matter:
+- **A pull request gets the `test` gate, and nothing else.** `publish-dev.yml` runs `test` on a PR
+  and skips `publish`, so a PR shows a real status - it used to show none. **Run the gates yourself
+  before you push anyway**: the runner is strictly one job at a time (`capacity = 1`), so a `dev`
+  push queues `test` and then `publish` behind whatever is running, and a red gate means that push
+  published nothing. The same commands the gate runs:
 
   ```sh
   cargo fmt --check
@@ -75,6 +89,10 @@ every path and claim that mentioned them was stale.
   ```
 
   Run the cargo steps one at a time - they contend on the target-dir lock.
+
+  The chart gates are **not** on the runner: helm is deliberately not in the test image (a
+  third-party download in the path that gates publishing is a flakiness trade not worth taking), so
+  `make chart-lint` and `make chart-template` remain a developer step.
 
 What gets published, per event:
 

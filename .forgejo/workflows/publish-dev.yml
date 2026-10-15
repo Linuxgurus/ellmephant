@@ -2,6 +2,11 @@ name: publish-dev
 
 # Publish `dev`: build the runtime image and push it to Harbor as `edge` + `sha-<commit>`.
 #
+# This file is ALSO the CI gate. Two jobs: `test` (the gate) then `publish`. `publish` needs `test`
+# and is skipped on a pull request, so a PR gets a real status and publishes nothing, and a push to
+# `dev` cannot move `edge` from code that does not pass. Before this, a PR showed NO statuses at all
+# and a broken `dev` published freely.
+#
 # Harbor is the PRIVATE registry (LAN-only) and `edge` is the *dev* tag: the newest build of `dev`,
 # which the cluster may track. Releases are a separate workflow (`publish.yml`, on `main`) and go to
 # BOTH registries. `edge` is deliberately NOT mirrored to GHCR: a public tag that stops moving is a
@@ -12,6 +17,8 @@ name: publish-dev
 on:
   push:
     branches: [dev]
+  # A `pull_request` runs `test` only -- the guard is on the `publish` job below.
+  pull_request:
   workflow_dispatch: # manual republish, e.g. after rotating the robot
 
 env:
@@ -21,7 +28,26 @@ env:
   BUILDER_PROFILE: rust-lean
 
 jobs:
+  # The gate: format, lints and the suite, one cargo step at a time, in a throwaway image.
+  #
+  # A docker BUILD rather than a run, because the runner image (`catthehacker/ubuntu:act-22.04`) has
+  # the docker CLI and NO cargo -- a container is the only way to get a toolchain, and `docker build`
+  # is the path this repository already depends on below. `Dockerfile.test` is standalone
+  # (`FROM rust:1-bookworm`, no Harbor, no secrets) so it behaves identically on a `dev` push and on
+  # a pull request, and it does not need the registry login the publish job has. Its `cargo fetch`
+  # needs crates.io egress, which was PROBED on this runner before the gate was made load-bearing.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the test image (fmt, clippy, tests)
+        run: docker build --platform linux/amd64 -f Dockerfile.test -t ellmephant-test .
+
   publish:
+    needs: test
+    # The gate runs on PRs; publishing never does.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

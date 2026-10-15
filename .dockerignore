@@ -2,6 +2,7 @@ target/
 .git/
 .github/
 .gitignore
+.tmp/
 models/
 *.db
 *.db-wal

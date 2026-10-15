@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# The CI gate: format, lints and the test suite, in a throwaway image.
+#
+# Built -- never run -- by the `test` job of `.forgejo/workflows/publish-dev.yml`, and made a
+# `needs` of that file's `publish` job, so a push to `dev` cannot publish `edge` from code that does
+# not pass. The same job runs on a `pull request`, which is the only way a PR gets a status here.
+#
+# Deliberately STANDALONE: `FROM rust:1-bookworm`, no Harbor dependency and no secrets, so it runs
+# identically on a `dev` push and on a pull request, including one from a branch that cannot read
+# the private registry. That costs a fresh dependency compile every run -- the publish build reuses
+# a prebuilt dependency image and this one cannot -- and the trade is on purpose: a gate that always
+# starts beats one that is fast but occasionally cannot. `rust:1-bookworm` carries rustfmt and
+# clippy, which the gates need.
+FROM rust:1-bookworm
+
+WORKDIR /src
+# `.dockerignore` keeps target/, .git/ and the scratch dir out of the context.
+COPY . .
+
+# The official image carries rustup but NOT the `rustfmt`/`clippy` components, and the gates below
+# need both. (Learned the loud way: the first probe died at `cargo fmt` with "'cargo-fmt' is not
+# installed for the toolchain".)
+RUN rustup component add rustfmt clippy
+
+# Fetch the registry up front, in its own layer, so a network problem (a restricted egress policy
+# would do it) is ONE loud early failure rather than a random failure in the middle of a compile.
+RUN cargo fetch --locked
+
+# One cargo step at a time, on purpose: they contend on the target-dir lock (DEVELOPMENT.md), and a
+# separate layer makes a failure name itself instead of scrolling past in one long log.
+#
+# `target/` is a CACHE MOUNT, deliberately not part of the image: without it the gate bakes ~3 GB of
+# build artifacts into a throwaway image that nothing ever RUNs -- slow to export (minutes, measured)
+# and it spends the runner's disk for nothing. Mounted, the artifacts stay in the build cache, the
+# later steps reuse the earlier ones, and the image is only the size of the toolchain. (`fmt` reads
+# the source and writes no artifacts, so it needs no mount.)
+RUN cargo fmt --all --check
+RUN --mount=type=cache,target=/src/target cargo clippy --all-targets --all-features -- -D warnings
+RUN --mount=type=cache,target=/src/target cargo test --locked
+# The store-only build must compile too (the encoder is behind a default-on feature).
+RUN --mount=type=cache,target=/src/target cargo test --locked --no-default-features

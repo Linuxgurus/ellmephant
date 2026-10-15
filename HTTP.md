@@ -1,6 +1,8 @@
 # The plain-HTTP surface — the store without an MCP session
 
-**Status:** slice 1 (`GET /health`) implemented; `/bootstrap` planned.
+**Status:** slices 1 and 2 implemented — the whole MCP surface is served over REST, plus `/health` and
+`/bootstrap`. Remaining: the rules stub (a `cline-home` change) and the deploy (set
+`ELLMEPHANT_WRITE_TOKEN`, or writes stay 401 and MCP remains the write path).
 
 ## Why
 
@@ -163,7 +165,7 @@ Reads — no auth, pure, retryable, `?format=json` accepted everywhere:
 | GET | `/health` | *(new)* | `?format=json` |
 | GET | `/bootstrap` | *(new)* | `?format=json`, `?hydrate=keys\|snippet\|full` |
 | GET | `/stats` | `memory_stats` | `?tags=true` |
-| GET | `/memory/{key}` | `memory_get` | `?visit=false` (no bump by default) |
+| GET | `/memory/{key}` | `memory_get` | *pure* — never counts; count with `POST /memory/{key}/visit` |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
 | GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&coherent=&fields=a,b&tag=x&tag=y` |
 | GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=` |
@@ -180,7 +182,7 @@ Writes — **auth required**, all of them:
 | POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>` |
 | PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null` |
 | DELETE | `/memory/{key}` | `memory_delete` | — |
-| POST | `/project` | `project_upsert` | JSON (structured) or text front-matter |
+| POST | `/project` | `project_upsert` | JSON — a project patch is structured (owner / preload / tags) and front-matter has no grammar for it |
 | POST | `/reembed` | `memory_reembed` | — **last**: heaviest lock holder, and `/health` watches it |
 
 **Body formats, by Content-Type.** A memory body is *prose*, so `text/plain` front-matter wins there —
@@ -194,6 +196,11 @@ honest shape. So both are accepted, and the caller picks by `Content-Type`. `?fo
 One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the deployment). Absent or
 wrong → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a one-line text body.
 
+**Deny by default.** An unset `ELLMEPHANT_WRITE_TOKEN` makes *every* write a 401 — a deployment that
+forgets the env var gets a read-only surface, never an open one. The deploy is therefore part of this
+project: until the Secret is wired, MCP stays the write path, which is exactly why MCP is kept rather
+than removed.
+
 The real design is per-area credentials mapping to a namespace, resolved server-side
 (`ellmephant-namespaces`). That lands *on top* of this seam, so the seam must already have the right
 shape: **resolve a credential → a scope, then hand the scope to the handler**, even while today's scope
@@ -206,6 +213,11 @@ receives a scope will not.
 **Reads default to `text/plain`; `?format=json` returns the object.** JSON responses are **byte-identical
 to what the MCP tool returns** for the same call (`to_wire_json` is reused, not reimplemented) — that is
 how we assert the two doors are one core rather than two implementations that drift.
+
+**One deliberate exception.** `GET /memory/{key}` cannot be byte-identical to `memory_get`, because MCP
+counts a `visits` read and invariant 1 forbids HTTP to write. The surface returns the same object with
+`visits` left alone, and the test asserts that single delta and nothing else. A difference that is
+*chosen* is a contract; a difference that is *discovered* is a bug.
 
 **Writes accept `text/plain` front-matter**, with no escaping anywhere:
 

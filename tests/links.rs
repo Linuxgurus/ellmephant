@@ -314,6 +314,49 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
 }
 
 #[test]
+fn merge_accepts_an_interleaved_fold_but_refuses_a_dropped_line() {
+    // A fold INTERLEAVES the source's lines among the target's and lays the result out anew; the
+    // layout is the caller's. Every line survives, so this must merge — a whole-body substring,
+    // which demanded a verbatim paste, used to refuse exactly this.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    seed(&conn, &embedder, "old", "alpha fact.\nbeta fact.");
+    seed(
+        &conn,
+        &embedder,
+        "new",
+        "survivor line.\nalpha fact.\nan inserted line.\nbeta fact.",
+    );
+    links::merge_into(&conn, "old", "new").expect("an interleaved fold is still a fold");
+    assert!(
+        store::get(&conn, "old").unwrap().is_none(),
+        "source retired"
+    );
+
+    // A fold that DROPS a line is prose destroyed with a `200`. Refused, and the refusal NAMES the
+    // line, so the caller is told what to fold rather than that it "lacks the facts". The first line
+    // survived (per-line, so a carried line never blocks); the second did not, and is quoted.
+    seed(
+        &conn,
+        &embedder,
+        "twin",
+        "alpha fact.\nthe line only the twin carries.",
+    );
+    let err = links::merge_into(&conn, "twin", "new").expect_err("a dropped line must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("the line only the twin carries"),
+        "the refusal names the lost line: {msg}"
+    );
+    assert!(
+        store::get(&conn, "twin").unwrap().is_some(),
+        "a refused merge destroys nothing"
+    );
+}
+
+#[test]
 fn merge_into_refuses_a_missing_target_and_a_self_merge() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");

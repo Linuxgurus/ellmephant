@@ -18,6 +18,17 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
+    // A genesis line, so a pod's log starts with WHAT was started and under which knobs. The
+    // EFFECTIVE device/precision are logged later by the session that resolves them (the flags here
+    // are only the raw request, and `None` means "take the default").
+    tracing::info!(
+        version = ellmephant::VERSION,
+        offline = cli.offline,
+        home = ?cli.home,
+        model_dir = ?cli.model_dir,
+        "ellmephant starting"
+    );
+
     match ellmephant::cli::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

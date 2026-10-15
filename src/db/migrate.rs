@@ -4,6 +4,7 @@
 //! the same transaction so a failed migration leaves the file untouched.
 
 use rusqlite::Connection;
+use tracing::{debug, info};
 
 use crate::error::Result;
 
@@ -53,18 +54,38 @@ pub fn version(conn: &Connection) -> Result<i32> {
 }
 
 /// Apply every migration newer than the file's `user_version`.
+///
+/// Loud when something HAPPENS and quiet otherwise, on purpose: this runs on every store open, so a
+/// no-op must not spam `info` — but a schema change is the single most important thing that can
+/// happen to a store at startup, and it used to happen in total silence.
 pub fn run(conn: &Connection) -> Result<()> {
     let mut current = version(conn)?;
-    for (version, sql, _label) in MIGRATIONS {
+    let latest = latest();
+    if current >= latest {
+        debug!(schema = current, "schema up to date; no migration to apply");
+        return Ok(());
+    }
+    info!(from = current, to = latest, "migrating the store");
+    let mut applied = 0;
+    for (version, sql, label) in MIGRATIONS {
         if *version <= current {
             continue;
         }
+        let started = std::time::Instant::now();
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
         current = *version;
+        applied += 1;
+        info!(
+            schema = version,
+            label = %label,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "migration applied"
+        );
     }
+    info!(schema = current, applied, "migrations complete");
     Ok(())
 }
 

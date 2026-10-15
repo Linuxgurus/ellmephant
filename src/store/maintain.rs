@@ -16,6 +16,7 @@ use crate::embed::{Embedder, projection};
 use crate::error::Result;
 use crate::index;
 use crate::store::{links, row_hash, tags};
+use tracing::info;
 
 /// Rows embedded per `Embedder::embed` batch.
 const BATCH: usize = 16;
@@ -75,8 +76,24 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     let rows_count = rows.len();
     // The batch embed stays inside the tx on purpose: a full rebuild wants one atomic swap
     // of the whole index, and it is a deliberate, rare maintenance command.
+    //
+    // The progress line below is `info` on purpose, and it is the point of instrumenting this at
+    // all. A rebuild is RARE, DELIBERATE and LONG -- the one operation anyone actually waits on --
+    // while `doctor` can only ever report 0/N or N/N, because every row is written inside the single
+    // uncommitted transaction. Without a per-batch line, "slow" and "stuck" look identical from
+    // outside, which is exactly the hole this path used to have: no logging whatsoever.
+    let batches = rows.len().div_ceil(BATCH);
+    info!(
+        rows = rows_count,
+        batch = BATCH,
+        batches,
+        dim,
+        model = embedder.model_id(),
+        "reembed starting"
+    );
+    let started = std::time::Instant::now();
     let tx = conn.unchecked_transaction()?;
-    for chunk in rows.chunks(BATCH) {
+    for (n, chunk) in rows.chunks(BATCH).enumerate() {
         let docs: Vec<String> = chunk
             .iter()
             .map(|(_, key, _tags, title, body)| projection::embed_document(key, title, body))
@@ -89,12 +106,32 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
                 params![id, row_hash(embedder, &docs[i])],
             )?;
         }
+        let done = ((n + 1) * BATCH).min(rows_count);
+        let elapsed = started.elapsed();
+        info!(
+            batch = n + 1,
+            batches,
+            rows_done = done,
+            elapsed_ms = elapsed.as_millis() as u64,
+            rate_rows_s = done as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+            "reembed progress"
+        );
     }
     tx.commit()?;
 
     // The link graph is derived too: re-parse every body, so a parser change — or a body written by
     // an older version — finally reaches the stored edges.
     let linked = links::reparse(conn)?;
+
+    info!(
+        rows = rows_count,
+        linked,
+        rebuilt,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        dim,
+        model = embedder.model_id(),
+        "reembed complete"
+    );
 
     Ok(Report {
         rows: rows_count,

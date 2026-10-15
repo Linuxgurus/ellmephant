@@ -12,6 +12,7 @@
 use std::sync::Once;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use tracing::info;
 
 use crate::db::meta;
 use crate::embed::projection;
@@ -91,14 +92,19 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
             )));
         }
         Some(_) => {}
-        None => meta::set(conn, meta::DIM, &dim.to_string())?,
+        None => {
+            meta::set(conn, meta::DIM, &dim.to_string())?;
+            info!(dim, "created the vector index");
+        }
     }
     // Record the projection recipe the first time the index is touched, so a later change to what
     // `embed_document` emits is *detected* rather than silently leaving every vector describing the
     // old recipe. Only set when absent: a stored fingerprint is the baseline a mismatch is measured
     // against, and a mere open must never overwrite it.
     if meta::get(conn, meta::PROJECTION)?.is_none() {
-        meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
+        let fingerprint = projection::fingerprint();
+        info!(projection = %fingerprint, "recorded the embed projection baseline");
+        meta::set(conn, meta::PROJECTION, &fingerprint)?;
     }
     conn.execute_batch(&create_sql(dim))?;
     Ok(())

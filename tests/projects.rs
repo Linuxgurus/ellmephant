@@ -462,6 +462,10 @@ fn a_project_tag_is_how_memories_join() {
             min_chars: None,
             max_chars: None,
             coherent: None,
+            created_after: None,
+            created_before: None,
+            updated_after: None,
+            updated_before: None,
         };
         ellmephant::search::run(&conn, None, &q)
             .expect("search")

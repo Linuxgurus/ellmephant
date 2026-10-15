@@ -158,9 +158,9 @@ impl Session {
         store::stats::compute(&self.conn)
     }
 
-    /// Recompute every vector and rebuild the derived vector index, handling a model or
-    /// dimension change (P9). Loads the encoder, so it is the heaviest call the server makes —
-    /// it backs the `memory_reembed` tool.
+    /// Recompute every vector and rebuild the derived indexes — the vector index and the `[[link]]`
+    /// graph — handling a model or dimension change (P9). Loads the encoder, so it is the heaviest
+    /// call the server makes; it backs the `memory_reembed` tool.
     pub fn reembed(&mut self) -> Result<maintain::Report> {
         self.ensure_embedder()?;
         let embedder = self.embedder()?;

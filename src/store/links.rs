@@ -183,6 +183,32 @@ pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
     group_dangling(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Rebuild the `memory_link` graph for every memory from its **current** body.
+///
+/// `memory_link` is documented as *derived*, but edges are computed at **write** time ([`write_links`],
+/// which this reuses) — so a parser change, or a body written by an older version, leaves a stored
+/// graph the rows no longer imply. Two stores with identical rows could otherwise hold different
+/// graphs, and a body that documented the link syntax under an old parser keeps an edge it should
+/// not ([`spans`]). This recomputes every row's outgoing edges, so the graph really is *rebuildable*
+/// from its source of truth; the `memory_reembed` tool runs it alongside the vector rebuild.
+///
+/// Returns the number of rows visited.
+pub fn reparse(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, key, body FROM memory ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    for (id, key, body) in &rows {
+        // One home for the edge write: `write_links` deletes the row's edges and re-inserts those
+        // its body implies, so the reparse cannot drift from the write path.
+        crate::store::write_links(&tx, *id, key, body)?;
+    }
+    tx.commit()?;
+    Ok(rows.len())
+}
+
 /// What a [`rename`] changed.
 #[derive(Debug, Clone)]
 pub struct RenameOutcome {

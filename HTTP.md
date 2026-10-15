@@ -145,11 +145,15 @@ file can point at a URL and the agent's whole existence travels over HTTPS.
 
 ### Three invariants, in order of strength
 
-1. **Reads are pure.** No `GET` may write — not a counter, not a `visits` bump, not a migration. A read
-   that writes is not safely retryable, and retryability is half the reason this exists. **Consequence:**
-   in MCP, `memory_get` bumps `visits`; over HTTP it must not, or a probe or a monitor inflates the
-   usefulness signal. Counting moves to `POST /memory/{key}/visit`, where a write belongs. `POST` is
-   still safe to retry blind, because the counter is idempotent per caller-reason rather than per call.
+1. **Reads are pure — telemetry aside.** No `GET` may write *data*: no migration, no content, nothing a
+   caller could be relying on. **A counter is not data.** So a read that counts a visit is still safe to
+   repeat — the worst a retry does is inflate a ranking signal — and MCP's `memory_get` has always counted,
+   because a fetch is evidence that needs no declaration: that is exactly the difference between `visits`
+   and the *declared* `times_useful`. `GET /memory/{key}` therefore counts, and the two doors agree byte
+   for byte. Everything else about a read stays pure; `/health` and `/bootstrap` write nothing at all.
+   `POST /memory/{key}/visit` remains for a body read that did **not** come through that route — a project
+   `preload` hydrate returns bodies too — and it is a plain increment, so retrying it double-counts. That
+   was always true; it is acceptable for a counter, and it is no longer dressed up as idempotent.
 2. **Writes take the store lock; reads do not.** `Session` is one connection behind one mutex, so a read
    that needs it queues behind a writer. `/health` and `/bootstrap` therefore answer from a **second,
    read-only connection** (`SQLITE_OPEN_READ_ONLY`), never from `Session`. Slice 1 proved the pattern.
@@ -161,14 +165,14 @@ file can point at a URL and the agent's whole existence travels over HTTPS.
 
 ### Routes
 
-Reads — no auth, pure, retryable, `?format=json` accepted everywhere:
+Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 
 | method | path | maps to | parameters |
 | --- | --- | --- | --- |
 | GET | `/health` | *(new)* | `?format=json` |
 | GET | `/bootstrap` | *(new)* | `?format=json`, `?hydrate=keys\|snippet\|full` |
 | GET | `/stats` | `memory_stats` | `?tags=true` |
-| GET | `/memory/{key}` | `memory_get` | *pure* — never counts; count with `POST /memory/{key}/visit` |
+| GET | `/memory/{key}` | `memory_get` | counts a `visits` read, exactly as MCP does |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
 | GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&coherent=&fields=a,b&tag=x&tag=y` |
 | GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=` |
@@ -180,7 +184,7 @@ Writes — **auth required**, all of them:
 | method | path | maps to | body / parameters |
 | --- | --- | --- | --- |
 | POST | `/memory` | `memory_upsert` | text front-matter, or JSON if `Content-Type: application/json` |
-| POST | `/memory/{key}/visit` | *(new)* | — (the split-out counter) |
+| POST | `/memory/{key}/visit` | *(new)* | — count a body read that did not come through `GET /memory/{key}` (a `preload` hydrate, say) |
 | POST | `/memory/{key}/upvote` | `memory_upvote` | — |
 | POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>` |
 | PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null` |
@@ -224,10 +228,10 @@ receives a scope will not.
 to what the MCP tool returns** for the same call (`to_wire_json` is reused, not reimplemented) — that is
 how we assert the two doors are one core rather than two implementations that drift.
 
-**One deliberate exception.** `GET /memory/{key}` cannot be byte-identical to `memory_get`, because MCP
-counts a `visits` read and invariant 1 forbids HTTP to write. The surface returns the same object with
-`visits` left alone, and the test asserts that single delta and nothing else. A difference that is
-*chosen* is a contract; a difference that is *discovered* is a bug.
+**No exceptions.** Every read route returns what its MCP tool returns for the same call, `memory_get`
+included: both doors count the `visits` read, so `GET /memory/{key}` and `memory_get` agree field for
+field. A difference that is *chosen* is a contract; a difference that is *discovered* is a bug — and
+there is no longer one to choose.
 
 **Writes accept `text/plain` front-matter**, with no escaping anywhere:
 
@@ -337,7 +341,8 @@ Under `?format=json` every error is `{"error": "...", "status": N}`, so a script
 
 1. **Parity is enforced, not asserted by hand**: every name in `TOOLS` must appear in the route table and
    the table's length must equal `TOOLS.len()`. A tool added without a route fails the suite.
-2. **Read purity**: `GET /memory/{key}` leaves `visits` unchanged (compare before/after).
+2. **Telemetry**: `GET /memory/{key}` advances `visits` by one, exactly as `memory_get` does — the one
+   write a read may make. No other `GET` touches a counter.
 3. **One core**: for each read route the JSON body equals the MCP tool's output for the same call.
 4. **Auth**: every write route → 401 bare, 401 on a wrong token, and `WWW-Authenticate` is exactly
    `Bearer` — **no `resource_metadata`**, because that is the header that starts an OAuth flow.

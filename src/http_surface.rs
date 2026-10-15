@@ -1,11 +1,12 @@
 //! The full plain-HTTP surface (HTTP.md slice 2): every MCP tool as a route over the same
 //! `Session`, plus `/bootstrap`.
 //!
-//! Three laws hold here, in order of strength. **Reads are pure** — no `GET` writes, so `GET
-//! /memory/{key}` does not bump `visits` (`POST /memory/{key}/visit` does). **`/health` and
-//! `/bootstrap` never touch `Session`** — they answer from their own read-only connection, so a
-//! read never queues behind a writer. **Auth before writes** — every `POST`/`PUT`/`DELETE` resolves
-//! a bearer to a scope first, and a rejection carries `WWW-Authenticate: Bearer` and nothing else.
+//! Three laws hold here, in order of strength. **Reads are pure — telemetry aside**: no `GET` writes
+//! *data*, but a counter is not data, so `GET /memory/{key}` counts a `visits` read exactly as
+//! `memory_get` does (HTTP.md invariant 1). **`/health` and `/bootstrap` never touch `Session`** —
+//! they answer from their own read-only connection, so a read never queues behind a writer. **Auth
+//! before writes** — every `POST`/`PUT`/`DELETE` resolves a bearer to a scope first, and a rejection
+//! carries `WWW-Authenticate: Bearer` and nothing else.
 
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, RawQuery, State};
@@ -507,8 +508,8 @@ pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> R
     }
 }
 
-/// `GET /memory/{key}` — one memory whole. **Pure**: it does not bump `visits` (HTTP.md invariant 1);
-/// counting lives at `POST /memory/{key}/visit`.
+/// `GET /memory/{key}` — one memory whole. Counts a `visits` read, exactly as `memory_get` does: the
+/// one write a read may make, because a counter is not data (HTTP.md invariant 1).
 pub async fn memory_get(
     State(state): State<HttpState>,
     Path(key): Path<String>,
@@ -519,7 +520,10 @@ pub async fn memory_get(
         Ok(s) => s,
         Err(r) => return r,
     };
-    match server.with_store("memory_get", move |s| s.show(&key)).await {
+    match server
+        .with_store("memory_get", move |s| s.fetch(&key))
+        .await
+    {
         Ok(mem) => {
             let mut value = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {

@@ -97,8 +97,8 @@ impl Session {
         store::merge(&self.conn, embedder, patch)
     }
 
-    /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path,
-    /// and "read without counting" reaches no tool — only the plain-HTTP read, which is pure by law.
+    /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
+    /// both doors, and the only caller is [`Self::fetch`] itself.
     pub(crate) fn show(&self, key: &str) -> Result<Memory> {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
@@ -112,7 +112,7 @@ impl Session {
     }
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
-    /// point, backing `memory_get`.
+    /// point, backing `memory_get` on **both** doors: MCP's tool and `GET /memory/{key}`.
     pub fn fetch(&self, key: &str) -> Result<Memory> {
         let mut mem = self.show(key)?;
         mem.visits = store::record_visit(&self.conn, key)?;
@@ -125,8 +125,9 @@ impl Session {
         store::record_useful_many(&self.conn, keys)
     }
 
-    /// Bump `visits` for `key` and return the new total — the write `GET /memory/{key}` refuses to
-    /// be, split out so counting is never a read (HTTP.md invariant 1).
+    /// Bump `visits` for `key` and return the new total. For a body read that did **not** come through
+    /// `fetch` — a project `preload` hydrate returns bodies too. A plain increment: retrying it
+    /// double-counts, which is fine for a counter (HTTP.md invariant 1).
     pub fn record_visit(&self, key: &str) -> Result<i64> {
         store::record_visit(&self.conn, key)
     }

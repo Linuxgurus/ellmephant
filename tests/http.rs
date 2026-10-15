@@ -288,26 +288,28 @@ async fn seed(app: &axum::Router, token: &str, key: &str, title: &str, body: &st
     assert_eq!(status, StatusCode::OK, "seed failed: {response}");
 }
 
-/// Read purity: `GET /memory/{key}` never bumps `visits`; the counter is a separate write.
+/// A read counts a visit — on **both** doors. Telemetry is the one write a `GET` may make: a counter
+/// is not data, so counting does not make a read unsafely repeatable, and `memory_get` has always done
+/// it. `POST /memory/{key}/visit` remains for a body read that came another way (a `preload` hydrate).
 #[tokio::test]
-async fn reading_a_memory_does_not_count_a_visit() {
+async fn reading_a_memory_counts_a_visit() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    seed(&app, "tok", "pure", "one sharp line", "the body").await;
+    seed(&app, "tok", "counted", "one sharp line", "the body").await;
 
-    let (_, first, _) = get(&app, "/memory/pure?format=json").await;
+    let (_, first, _) = get(&app, "/memory/counted?format=json").await;
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(first["visits"], 0, "a read must not count");
+    assert_eq!(first["visits"], 1, "the first read counts");
 
-    let (_, second, _) = get(&app, "/memory/pure?format=json").await;
+    let (_, second, _) = get(&app, "/memory/counted?format=json").await;
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-    assert_eq!(second["visits"], 0, "reading twice still counts nothing");
+    assert_eq!(second["visits"], 2, "and the second");
 
-    // The write, where it belongs, is the only thing that moves it.
+    // The explicit counter still moves it, for a read that did not come through that route.
     let (status, body, _) = request(
         &app,
         Method::POST,
-        "/memory/pure/visit?format=json",
+        "/memory/counted/visit?format=json",
         Some("tok"),
         None,
         "",
@@ -315,7 +317,26 @@ async fn reading_a_memory_does_not_count_a_visit() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let counted: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(counted["visits"], 1, "{body}");
+    assert_eq!(counted["visits"], 3, "{body}");
+
+    // And no OTHER read may touch a counter — only the one that returns a body.
+    let total = |body: &str| -> i64 {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["visits_total"]
+            .as_i64()
+            .expect("visits_total")
+    };
+    let (_, before, _) = get(&app, "/stats?format=json").await;
+    for uri in [
+        "/memory/counted/backlinks?format=json",
+        "/search?q=counted&format=json",
+        "/dupes?format=json",
+        "/projects?format=json",
+    ] {
+        let (status, _, _) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+    let (_, after, _) = get(&app, "/stats?format=json").await;
+    assert_eq!(total(&before), total(&after), "no other read counts");
 }
 
 /// Auth before writes: with a token configured, every write route refuses a bare credential and a
@@ -663,18 +684,32 @@ async fn boot_text_renders_arguments_from_the_schema() {
     assert!(doc.contains("tags: boolean (optional)"), "{doc}");
 }
 
-/// `/bootstrap` is read-only: it changes no `visits` and no counts.
+/// `/bootstrap` is read-only: it changes no counter and no count. (It cannot: the document is built
+/// from code and reads no database. The counters are compared through `/stats`, because reading a
+/// memory would itself count — the very thing this asserts.)
 #[tokio::test]
 async fn bootstrap_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
     seed(&app, "tok", "still", "unchanged", "no visits here").await;
 
-    let (_, before, _) = get(&app, "/memory/still?format=json").await;
+    let digest = |body: &str| -> serde_json::Value {
+        let doc: serde_json::Value = serde_json::from_str(body).unwrap();
+        serde_json::json!({
+            "memories": doc["memories"],
+            "visits_total": doc["visits_total"],
+            "useful_total": doc["useful_total"],
+        })
+    };
+    let (_, before, _) = get(&app, "/stats?format=json").await;
     let (status, _, _) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK);
-    let (_, after, _) = get(&app, "/memory/still?format=json").await;
-    assert_eq!(before, after, "/bootstrap changed the store");
+    let (_, after, _) = get(&app, "/stats?format=json").await;
+    assert_eq!(
+        digest(&before),
+        digest(&after),
+        "/bootstrap changed the store"
+    );
 }
 
 /// One core, two doors: for every read route the JSON body is byte-identical to the MCP tool's
@@ -747,16 +782,36 @@ async fn the_two_doors_are_one_core() {
         assert_eq!(http_body, mcp_body, "{uri} diverged from {name}");
     }
 
-    // `memory_get` is the one read that differs, and deliberately: MCP counts the visit, HTTP must
-    // not. Everything else is identical.
-    let (_, http_get, _) = get(&app, "/memory/alpha?format=json").await;
-    let http_get: serde_json::Value = serde_json::from_str(&http_get).unwrap();
-    let mcp_get: serde_json::Value =
-        serde_json::from_str(&tool(service.peer(), "memory_get", json!({ "key": "alpha" })).await)
-            .unwrap();
-    assert_eq!(http_get["visits"], 0, "HTTP stays pure");
-    assert_eq!(mcp_get["visits"], 1, "MCP counts the read");
-    assert_eq!(http_get["key"], mcp_get["key"]);
-    assert_eq!(http_get["body"], mcp_get["body"]);
-    assert_eq!(http_get["title"], mcp_get["title"]);
+    // `memory_get` is the same operation on both doors, telemetry included: each call advances
+    // `visits` by one, and the payloads agree on every field but the counter (two successive reads
+    // must differ there — that is the point of a counter).
+    let (_, http_body, _) = get(&app, "/memory/alpha?format=json").await;
+    let http_get: serde_json::Value = serde_json::from_str(&http_body).unwrap();
+    let mcp_body = tool(service.peer(), "memory_get", json!({ "key": "alpha" })).await;
+    let mcp_get: serde_json::Value = serde_json::from_str(&mcp_body).unwrap();
+
+    let http_visits = http_get["visits"]
+        .as_i64()
+        .expect("visits in the http payload");
+    let mcp_visits = mcp_get["visits"]
+        .as_i64()
+        .expect("visits in the mcp payload");
+    assert_eq!(
+        mcp_visits,
+        http_visits + 1,
+        "both doors count a visit, in turn: {http_body} vs {mcp_body}"
+    );
+
+    let mut http_rest = http_get.clone();
+    let mut mcp_rest = mcp_get.clone();
+    if let Some(obj) = http_rest.as_object_mut() {
+        obj.remove("visits");
+    }
+    if let Some(obj) = mcp_rest.as_object_mut() {
+        obj.remove("visits");
+    }
+    assert_eq!(
+        http_rest, mcp_rest,
+        "every field but the counter must match"
+    );
 }

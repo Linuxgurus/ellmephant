@@ -1,8 +1,9 @@
 # The plain-HTTP surface — the store without an MCP session
 
 **Status:** slices 1 and 2 implemented — the whole MCP surface is served over REST, plus `/health` and
-`/bootstrap`. Remaining: the rules stub (a `cline-home` change) and the deploy (set
-`ELLMEPHANT_WRITE_TOKEN`, or writes stay 401 and MCP remains the write path).
+`/bootstrap`. Writes are **open** while `ELLMEPHANT_WRITE_TOKEN` is unset (deliberate and temporary —
+see "Auth"), so MCP is no longer load-bearing for anything. Remaining: the rules stub (a `cline-home`
+change).
 
 ## Why
 
@@ -34,13 +35,13 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 | route | semantics | state |
 | --- | --- | --- |
 | `GET /health` | read-only readiness + the writer witness | **implemented** |
-| `GET /bootstrap` | the boot payload in one read | planned |
-| `GET /stats`, `GET /dupes`, `GET /projects` | the read surfaces | planned |
-| `GET /memory/{key}`, `GET /memory/{key}/backlinks` | one memory, body included | planned |
-| `GET /search?q=&k=&tags=` | the query surface | planned |
-| `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes — **auth first** | planned |
-| `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes — **auth first** | planned |
-| `POST /reembed` | the heaviest op; last, because it holds the store lock | planned |
+| `GET /bootstrap` | the boot payload in one read | **implemented** |
+| `GET /stats`, `GET /dupes`, `GET /projects` | the read surfaces | **implemented** |
+| `GET /memory/{key}`, `GET /memory/{key}/backlinks` | one memory, body included | **implemented** |
+| `GET /search?q=&k=&tag=` | the query surface | **implemented** |
+| `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes | **implemented** |
+| `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes | **implemented** |
+| `POST /reembed` | the heaviest op; last, because it holds the store lock | **implemented** |
 
 **`/bootstrap` is a view, not a dump.** It carries the resident set a cold agent needs — the `cline-self`
 keys, the boot body, hot, todos, open projects, stats, health, links — and an index of the routes
@@ -152,9 +153,11 @@ file can point at a URL and the agent's whole existence travels over HTTPS.
 2. **Writes take the store lock; reads do not.** `Session` is one connection behind one mutex, so a read
    that needs it queues behind a writer. `/health` and `/bootstrap` therefore answer from a **second,
    read-only connection** (`SQLITE_OPEN_READ_ONLY`), never from `Session`. Slice 1 proved the pattern.
-3. **Auth before writes, never after.** Every mutating route needs a bearer token. The 401 must carry
-   **no OAuth `resource_metadata` challenge** — a client that finds one invents an auth flow, and that
-   invention is exactly the wedge (`404 Session not found` → doomed OAuth) this project removes.
+3. **Auth is a config flip, and today it is open.** Every mutating route resolves a bearer to a scope
+   before it does anything, and a rejection must carry **no OAuth `resource_metadata` challenge** — a
+   client that finds one invents an auth flow, and that invention is exactly the wedge (`404 Session not
+   found` → doomed OAuth) this project removes. With no `ELLMEPHANT_WRITE_TOKEN` configured there is
+   nothing to resolve against, so writes are open. See "Auth".
 
 ### Routes
 
@@ -191,15 +194,22 @@ actually fails. A project patch is *structured* (owner list, preload list, tags)
 honest shape. So both are accepted, and the caller picks by `Content-Type`. `?format=` governs the
 *response* only.
 
-### Auth: build the seam, one value today
+### Auth: open until a token is set, over a seam that is already the right shape
 
-One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the deployment). Absent or
-wrong → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a one-line text body.
+One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the deployment). A **wrong**
+token → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a one-line text body.
 
-**Deny by default.** An unset `ELLMEPHANT_WRITE_TOKEN` makes *every* write a 401 — a deployment that
-forgets the env var gets a read-only surface, never an open one. The deploy is therefore part of this
-project: until the Secret is wired, MCP stays the write path, which is exactly why MCP is kept rather
-than removed.
+**Open until the token is set — deliberately, and with an expiry date.** An earlier draft denied by
+default, so that a deployment which forgot the env var got a read-only surface rather than an open one.
+That was the wrong trade for this moment: requiring a credential before there is any way to issue one
+keeps this door read-only, which is the one state it exists to end — and staying read-only is exactly
+what keeps MCP load-bearing. So an unset `ELLMEPHANT_WRITE_TOKEN` now means **any caller may write**.
+
+This is not the shape the thing should keep. The store is private, behind the gateway, and this is a
+decision with an expiry date rather than a design. It is written down here so that the open state is a
+choice somebody made, not a surprise somebody found. Setting the env var closes the door with no code
+change, so the gate stays a flip rather than a rewrite — and `/bootstrap` **says which state it is in**,
+so a caller never has to assume.
 
 The real design is per-area credentials mapping to a namespace, resolved server-side
 (`ellmephant-namespaces`). That lands *on top* of this seam, so the seam must already have the right
@@ -238,40 +248,74 @@ MCP tool's own object under `?format=json`.
 
 ### `GET /bootstrap` — the document
 
-A view, not a dump. Sections, in this order:
+**The MCP boot, with HTTP verbs.** An MCP client is handed `initialize` (`serverInfo`,
+`capabilities`, `instructions`) and then `tools/list` (the tool cards). This is those two merged into
+one read, with `method` + `path` where MCP carries `name`. **Nothing more, nothing less** — no counts,
+no resident set, no route index. The unit being replicated is the *API surface*; a boot that also
+carries content is a boot you cannot trust to describe the same API.
 
 ```
-BOOT ellmephant 0.19.0  2026-10-15T13:47:32Z
-  ready      yes — projection current, 275/275 vectors, schema v12
-  writer     free | busy 41.2s (memory_reembed)      <- the witness, always visible
-  store      275 memories, 275 vectors, 18 projects, 512 links (1 dangling), 40 tags
+BOOT ellmephant 1.2.0   capabilities: tools
 
-SELF (tag cline-self) — 12 keys; bodies on demand: GET /memory/{key}
-  bootstrap-self   BOOT: read me first — who I am + how to talk to James    [1240 chars]
-  ...
+INSTRUCTIONS
+  ellmephant = Memory storage in smart-caveman style — big words in, small words out; ...
 
-BOOT NOTE — bootstrap-self                       <- the ONE body that must be resident
-  <body verbatim>
+TOOLS — 14; HTTP verbs in place of MCP verbs, arguments and descriptions unchanged
 
-OPEN (tag todo) — 9
-  todo-page-james-silent — the emergency page is silent AT NIGHT
+  GET /memory/{key}/backlinks
+      List memories whose body point at `key` with `[[…]]`.
+      args: key: string (required) — Memory key. Slug.
 
-ACTIVE PROJECTS — 8
-  ellmephant-http — the whole MCP surface over REST, and a /bootstrap my rules can point at
+  PUT /memory/{key}/coherent
+      Record a memory's split-review verdict: `true` = one coherent topic, — ...
+      args: coherent: boolean (optional) — true = one topic; false = a grab-bag; null = unjudged.; key: string (required) — Memory key. Slug.
 
-HOT — recently useful
-  bootstrap-self (visits 38, useful 19)
-  ...
+  DELETE /memory/{key}
+      Kill one memory by `key`. No undo. Gone. — ...
+      args: key: string (required) — Memory key. Slug.
 
-ROUTES
-  GET  /bootstrap  /health  /stats  /search?q=  /memory/{key}  /projects  /dupes
-  POST /memory  /memory/{key}/visit|upvote|merge  /project  /reembed        (auth: bearer)
+  ... (14, alphabetical by tool — the same order `tools/list` uses)
 ```
 
-Three deliberate choices. **`SELF` lists keys, titles and sizes, not bodies** — so the agent chooses what
-to pull, and `?hydrate=full` is there when it wants everything. **Exactly one body is resident**, the boot
-note, because a boot that carries every body is a context fill. And **`writer` is on the first screen**:
-the thing that stalls us should be visible before anything else.
+`?format=json` is the same document in MCP's own shape, so a client moves over by reading
+`method`/`path` where it read `name`:
+
+```json
+{
+  "serverInfo": { "name": "ellmephant", "version": "1.2.0" },
+  "capabilities": { "tools": {} },
+  "instructions": "ellmephant = Memory storage in smart-caveman style — ...",
+  "tools": [
+    {
+      "method": "GET",
+      "path": "/memory/{key}",
+      "description": "Pull one memory whole by `key` — ...",
+      "inputSchema": { "$schema": "...", "properties": { "key": { "type": "string" } }, "required": ["key"], "type": "object" },
+      "annotations": { "title": "Get memory", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+    }
+  ]
+}
+```
+
+The fields are MCP's, verbatim — `inputSchema` and `annotations` included, `$defs` and all. (MCP
+*omits* a `title` it does not have rather than sending `""`, so the cards have no top-level `title`
+either; the human name rides `annotations.title`, where rmcp puts it.)
+
+**`protocolVersion` is the one field an MCP boot has that this drops.** It names a *transport* version,
+and over HTTP there is no MCP protocol to negotiate. Omitted rather than faked.
+
+**Where the content went.** The resident set this document used to carry — the `cline-self` keys, the
+boot note, todos, active projects, hot — is reachable with the commands above, exactly as it is over
+MCP: `GET /memory/bootstrap-self`, `GET /search?tag=cline-self`, `GET /search?tag=todo`,
+`GET /projects?status=active`, `GET /stats`. Readiness is `/health`'s job, and `/health` is the only
+surface that reports it. **A boot is not a status page.**
+
+**It needs no store.** The document is built from code — `mcp::instructions` and `mcp::tool_catalog`
+joined to the `ROUTES` table — so it reads no database and takes no lock. A boot still describes the
+API when the store is missing, stalled, or behind a writer, which is exactly when a caller needs to
+know what it may ask for. That is also why it cannot drift: the cards come from the same router
+`tools/list` uses, and a tool the router carries but no route reaches is dropped from the boot and
+**fails `every_tool_has_a_route`**.
 
 **Boot counting is deliberately absent.** A counter would make `/bootstrap` a writer, which breaks
 invariant 1. Boot observability already exists — the gateway's access log records every `GET /bootstrap`

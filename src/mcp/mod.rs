@@ -57,6 +57,55 @@ pub const TOOLS: &[&str] = &[
     "project_list",
 ];
 
+/// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
+/// `initialize` cannot disagree about who is answering.
+pub(crate) const SERVER_NAME: &str = "ellmephant";
+
+/// One tool exactly as `tools/list` presents it, for a surface that is not MCP.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCard {
+    /// Tool name.
+    pub name: String,
+    /// The law: what it does, when to use it, what it returns.
+    pub description: String,
+    /// The JSON Schema the model is handed as `inputSchema`.
+    pub input_schema: serde_json::Value,
+    /// The tool's annotation hints, as `tools/list` serializes them. The human-readable title lives
+    /// in here (`annotations.title`), not at the top level — which is why a card has no `title`.
+    pub annotations: serde_json::Value,
+}
+
+/// The server-level instruction — the same text an MCP `initialize` carries.
+pub(crate) fn instructions() -> &'static str {
+    INSTRUCTIONS
+}
+
+/// The tool surface as `tools/list` presents it.
+///
+/// Read from the router the `#[tool]` attributes build, so a door that is not MCP describes the
+/// same toolkit from the same source instead of a hand-kept copy: a tool added below appears
+/// here for free. `TOOLS` is the name contract; this is the content.
+pub(crate) fn tool_catalog() -> Vec<ToolCard> {
+    MemoryServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|tool| ToolCard {
+            name: tool.name.to_string(),
+            description: tool
+                .description
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+            annotations: tool
+                .annotations
+                .as_ref()
+                .and_then(|a| serde_json::to_value(a).ok())
+                .unwrap_or(serde_json::Value::Null),
+        })
+        .collect()
+}
+
 /// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
 /// every tool (curation), defined once here. Every other law lives in the tool descriptions — each
 /// states its own, so nothing is written twice (SPEC §9).
@@ -740,7 +789,7 @@ impl MemoryServer {
     /// Delete one memory by key.
     #[tool(
         name = "memory_delete",
-        description = "Kill one memory by `key`. No undo. Gone.",
+        description = "Kill one memory by `key`. No undo. Gone. Use `memory_merge` when another memory should absorb it: a bare delete leaves every `[[key]]` pointing at it dangling, and `memory_stats` will report the store as damaged. Unsure rather than wrong? Reword it instead.",
         annotations(
             title = "Delete memory",
             read_only_hint = false,
@@ -1198,7 +1247,7 @@ impl MemoryServer {
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("ellmephant", crate::VERSION))
+            .with_server_info(Implementation::new(SERVER_NAME, crate::VERSION))
             .with_instructions(INSTRUCTIONS)
     }
 }

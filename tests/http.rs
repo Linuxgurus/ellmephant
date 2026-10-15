@@ -188,6 +188,19 @@ fn app_with_token(dir: &std::path::Path, token: &str) -> axum::Router {
     http_router(server, "127.0.0.1", state)
 }
 
+/// A router with NO write token configured, so the write routes are open (see `resolve`).
+fn app_open(dir: &std::path::Path) -> axum::Router {
+    let watch = Arc::new(LockWatch::new());
+    let state = HttpState::new(
+        Paths::from_root(dir),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    );
+    let server = MemoryServer::with_watch(Arc::new(Mutex::new(session(dir))), watch);
+    http_router(server, "127.0.0.1", state)
+}
+
 /// Read a response into `(status, body, content-type)`.
 async fn read(response: axum::response::Response) -> (StatusCode, String, Option<String>) {
     let status = response.status();
@@ -305,7 +318,8 @@ async fn reading_a_memory_does_not_count_a_visit() {
     assert_eq!(counted["visits"], 1, "{body}");
 }
 
-/// Auth before writes: every write route refuses a bare token and a wrong one, with a bare challenge.
+/// Auth before writes: with a token configured, every write route refuses a bare credential and a
+/// wrong one, and the challenge is a bare `Bearer`.
 #[tokio::test]
 async fn every_write_route_is_gated() {
     use ellmephant::http_surface::ROUTES;
@@ -354,6 +368,75 @@ async fn every_write_route_is_gated() {
         checked += 1;
     }
     assert!(checked >= 7, "expected every write route, saw {checked}");
+}
+
+/// The other half of the gate: with NO token configured the write routes are **open**, and
+/// `/bootstrap` says so rather than implying a gate that is not there. Deliberate and temporary —
+/// see `resolve`.
+#[tokio::test]
+async fn writes_are_open_when_no_token_is_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_open(dir.path());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/memory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"key":"open-note","title":"open","body":"written with no token"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+        "an open door must not hand out a challenge to invent an auth flow from"
+    );
+
+    // A boot is built from code, so it may not vary with the door's state or the store's contents:
+    // the same document, whether writes are open or gated.
+    let gated = app_with_token(dir.path(), "tok");
+    let (_, boot_open, _) = get(&app, "/bootstrap").await;
+    let (_, boot_gated, _) = get(&gated, "/bootstrap").await;
+    assert_eq!(
+        boot_open, boot_gated,
+        "a boot must not depend on the auth config"
+    );
+}
+
+/// The same code with a token configured is a gate — so auth stays a config flip, not a rewrite.
+#[tokio::test]
+async fn a_configured_token_closes_the_door_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let body = r#"{"key":"x","title":"t","body":"b"}"#;
+
+    let (status, response, _) = request(
+        &app,
+        Method::POST,
+        "/memory",
+        None,
+        Some("application/json"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{response}");
+
+    let (status, response, _) = request(
+        &app,
+        Method::POST,
+        "/memory",
+        Some("tok"),
+        Some("application/json"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
 }
 
 /// The text round trip — the reason the format exists: a body with quotes, colons, braces and a
@@ -416,49 +499,168 @@ async fn failures_are_ours_not_the_gateways() {
     );
 }
 
-/// `/bootstrap` shape: exactly one BOOT NOTE body, a non-resident memory shows its title and not
-/// its body, and both `writer` and `ROUTES` are on the first screen.
+/// `/bootstrap` is the MCP boot and **nothing more**: the server identity, the instruction text, and
+/// every tool with an HTTP verb in place of its MCP verb. No resident set, no counts, no route
+/// index — a boot is the *API surface*, not a view of the store's contents.
 #[tokio::test]
-async fn bootstrap_is_a_view_not_a_dump() {
+async fn bootstrap_is_the_mcp_boot_and_nothing_more() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    let note_body = "BOOT: read me first, then go";
-    let (status, body, _) = request(
+    // Seed exactly the content the OLD boot inlined, to prove the boot no longer reads the store.
+    seed(
         &app,
-        Method::POST,
-        "/memory",
-        Some("tok"),
-        Some("text/plain"),
-        &format!("Key: bootstrap-self\nTitle: boot me\nTags: cline-self\n---\n{note_body}\n"),
+        "tok",
+        "bootstrap-self",
+        "boot me",
+        "BOOT: read me first, then go",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
     let secret = "this body must not be resident";
-    let (status, body, _) = request(
-        &app,
-        Method::POST,
-        "/memory",
-        Some("tok"),
-        Some("text/plain"),
-        &format!(
-            "Key: other-self\nTitle: another cline-self key\nTags: cline-self\n---\n{secret}\n"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    seed(&app, "tok", "other-self", "another cline-self key", secret).await;
 
     let (status, doc, content_type) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
     assert!(content_type.unwrap().starts_with("text/plain"));
-    assert_eq!(doc.matches("BOOT NOTE").count(), 1, "one body resident");
-    assert!(doc.contains(note_body), "the boot note body is resident");
-    assert!(doc.contains("writer"), "{doc}");
-    assert!(doc.contains("ROUTES"), "{doc}");
+
+    // The handshake, and only the handshake.
     assert!(
-        doc.contains("another cline-self key"),
-        "the non-resident key shows its title"
+        doc.contains("INSTRUCTIONS"),
+        "the standing law rides the boot"
     );
-    assert!(!doc.contains(secret), "and not its body");
+    assert!(doc.contains("smart-caveman"), "and it is the MCP text");
+    assert!(
+        doc.contains(&format!("TOOLS — {}", ellmephant::mcp::TOOLS.len())),
+        "the tool list is complete: {doc}"
+    );
+
+    // Every tool, named by the HTTP verb that reaches it rather than by its MCP tool name.
+    for route in ellmephant::http_surface::ROUTES {
+        assert!(
+            doc.contains(&format!("{} {}", route.method, route.path)),
+            "`{} {}` is missing from the boot",
+            route.method,
+            route.path
+        );
+    }
+
+    // NOTHING MORE. Every section the boot used to compose is gone.
+    for gone in [
+        "SELF (tag",
+        "BOOT NOTE",
+        "OPEN (tag",
+        "ACTIVE PROJECTS",
+        "HOT —",
+        "ROUTES",
+    ] {
+        assert!(
+            !doc.contains(gone),
+            "`{gone}` is not part of an MCP boot: {doc}"
+        );
+    }
+    assert!(
+        !doc.contains("bootstrap-self") && !doc.contains(secret),
+        "a boot is built from code, not read from the store: {doc}"
+    );
+}
+
+/// `/bootstrap?format=json` is the MCP handshake in MCP's own shape: `initialize`'s fields plus
+/// `tools/list`'s, with `method`/`path` where MCP carries `name` and every other field untouched.
+#[tokio::test]
+async fn bootstrap_json_is_the_mcp_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+
+    let (status, body, _) = get(&app, "/bootstrap?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Exactly the handshake's fields, and no others — this is the "nothing more" assertion.
+    let mut keys: Vec<&String> = doc.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["capabilities", "instructions", "serverInfo", "tools"],
+        "{doc}"
+    );
+    assert_eq!(doc["serverInfo"]["name"], serde_json::json!("ellmephant"));
+    assert_eq!(
+        doc["serverInfo"]["version"],
+        serde_json::json!(ellmephant::VERSION)
+    );
+    assert_eq!(doc["capabilities"], serde_json::json!({ "tools": {} }));
+    assert!(
+        doc["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("smart-caveman")
+    );
+
+    let tools = doc["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), ellmephant::mcp::TOOLS.len());
+
+    // Each card is the MCP card with the verb swapped in: same title, description, schema, hints.
+    for route in ellmephant::http_surface::ROUTES {
+        let card = tools
+            .iter()
+            .find(|card| card["path"] == route.path && card["method"] == route.method)
+            .unwrap_or_else(|| panic!("no card for {} {}", route.method, route.path));
+        assert!(
+            card.get("name").is_none(),
+            "the MCP verb is replaced, not carried alongside: {card}"
+        );
+        assert!(
+            card.get("title").is_none(),
+            "MCP omits an absent title rather than sending \"\": {card}"
+        );
+        assert!(card["description"].as_str().unwrap().len() > 40, "{card}");
+        assert!(card["inputSchema"].is_object(), "{card}");
+        assert!(card["annotations"].is_object(), "{card}");
+    }
+
+    // The schema is MCP's, verbatim.
+    let search = tools.iter().find(|c| c["path"] == "/search").unwrap();
+    assert!(search["inputSchema"]["properties"]["query"].is_object());
+    assert_eq!(
+        search["annotations"]["readOnlyHint"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        search["annotations"]["title"],
+        serde_json::json!("Search memory"),
+        "the human title rides `annotations`, as it does over MCP"
+    );
+}
+
+/// The text form renders each argument from the tool's own schema, so a caller can construct the
+/// call from the boot alone: a nullable property reports the type it carries, an enum reports its
+/// values, and a required argument says so.
+#[tokio::test]
+async fn boot_text_renders_arguments_from_the_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let (status, doc, _) = get(&app, "/bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+
+    // `k` is `["integer", "null"]` — an optional integer, not "any".
+    assert!(doc.contains("k: integer (optional)"), "{doc}");
+    // A `$ref` to a string enum shows the values a caller may send.
+    assert!(
+        doc.contains("mode: \"literal\"|\"regex\" (optional)"),
+        "{doc}"
+    );
+    // A six-valued filter enum, spelled out.
+    assert!(
+        doc.contains("coherent: \"true\"|\"false\"|\"null\"|\"!true\"|\"!false\"|\"!null\""),
+        "{doc}"
+    );
+    // An array of an enum is parenthesised, so the `[]` cannot be misread.
+    assert!(
+        doc.contains("(\"key\"|\"title\"|\"tags\"|\"coherent\"|\"chars\"|\"distance\")[]"),
+        "{doc}"
+    );
+    // A required argument says so; a plain boolean resolves without a ref.
+    assert!(doc.contains("key: string (required)"), "{doc}");
+    assert!(doc.contains("tags: boolean (optional)"), "{doc}");
 }
 
 /// `/bootstrap` is read-only: it changes no `visits` and no counts.

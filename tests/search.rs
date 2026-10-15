@@ -81,11 +81,14 @@ fn semantic_ranks_the_closest_document_first() {
 }
 
 #[test]
-fn tags_and_key_are_embedded() {
+fn a_tag_is_reached_by_the_filter_not_by_semantics() {
+    // This replaces `tags_and_key_are_embedded`, which pinned the OLD projection (tags folded into
+    // the document). Tags left the projection (§6/§9): a tag is *filing*, answered exactly by the
+    // `tags` filter, and a tag-only write now re-embeds nothing. What the vector carries is the
+    // document's own text — `key`, title, body (see `embed::projection`'s unit tests).
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    // The body says nothing about "postgres"; the tag and the key do.
     seed(
         &conn,
         &embedder,
@@ -101,10 +104,13 @@ fn tags_and_key_are_embedded() {
         &[],
     );
 
-    let hits = search::run(&conn, Some(&embedder), &query(Some("postgres")))
-        .expect("search")
-        .hits;
-    assert_eq!(hits[0].key, "db-backup", "a tag token must be retrievable");
+    let mut q = query(None);
+    q.tags = vec!["postgres".into()];
+    assert_eq!(
+        hit_keys(&conn, &q),
+        ["db-backup"],
+        "the tag finder is the exact filter, not a semantic hook"
+    );
 }
 
 #[test]

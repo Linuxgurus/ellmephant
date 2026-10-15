@@ -435,9 +435,9 @@ fn within(after: &Option<String>, before: &Option<String>, value: &str) -> bool 
     after.as_deref().is_none_or(|lo| value >= lo) && before.as_deref().is_none_or(|hi| value <= hi)
 }
 
-/// Length (chars) of the document a row embeds: `key` + tags + `title` + `body`, links stripped.
+/// Length (chars) of the document a row embeds: `key` + `title` + `body`, links stripped.
 fn embedded_len(mem: &Memory) -> usize {
-    projection::embed_document(&mem.key, &mem.tags, &mem.title, &mem.body)
+    projection::embed_document(&mem.key, &mem.title, &mem.body)
         .chars()
         .count()
 }

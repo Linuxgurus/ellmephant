@@ -23,7 +23,7 @@ use crate::index;
 /// write path fills in (`id`/`doc_hash`/timestamps are derived on insert).
 ///
 /// `title`, `body` and `tags` are stored literally; `doc_hash` is the re-embed trigger for the
-/// single document embedding (`key` + tags + `title` + `body`).
+/// single document embedding (`key` + `title` + `body` — tags are *filing*, not meaning).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Memory {
     /// Rowid; `None` before insert and omitted from serialized output (local/derived).
@@ -202,7 +202,7 @@ pub struct MergeOutcome {
 /// A key with no row is created, and then `title` and `body` are both required — there is nothing
 /// to keep.
 ///
-/// Re-embeds only when the embedded document (`key` + tags + title + body) actually changes, and
+/// Re-embeds only when the embedded document (`key` + title + body) actually changes, and
 /// clears `coherent` only when the title or the body changes: a tag or a source is *filing*, not
 /// *meaning*, so it must not re-open the split review (SPEC §9).
 pub fn merge(conn: &Connection, embedder: &dyn Embedder, patch: &Patch) -> Result<MergeOutcome> {
@@ -305,7 +305,7 @@ pub(crate) fn prepare(
     mem: &Memory,
 ) -> Result<Prepared> {
     let key = resolve_key(conn, mem)?;
-    let doc_text = projection::embed_document(&key, &mem.tags, &mem.title, &mem.body);
+    let doc_text = projection::embed_document(&key, &mem.title, &mem.body);
     let doc_hash = row_hash(embedder, &doc_text);
     let existing: Option<(i64, String)> = conn
         .query_row(

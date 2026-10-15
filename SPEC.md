@@ -72,7 +72,7 @@ mcp-memory-service → typed edges + tag AND/OR).
 | 9 | Root `~/.ellmephant`; DB `memory.db`; `config.toml`; models in `models/` | Single dotdir, matches tooling conventions |
 | 10 | **Tags** name aspects of a subject (e.g. `storage`, `gotchas`); no `scope`, no `type` | Tags are a facet and part of the embedded document, so a tag token is retrievable; a bucket/type taxonomy adds vocabulary without adding recall |
 | 11 | `key` = **global-unique slug**, optional to supply | Identity (upsert target) and link target; auto-slugged from the title when omitted |
-| 12 | **Smart-caveman** writing; **one** document embedding over `key` + tags + `title` + `body` | Terse text embeds sharply, and one vector per row is simpler to build and rebuild; terseness keeps the body from swamping the title |
+| 12 | **Smart-caveman** writing; **one** document embedding over `key` + `title` + `body` | Terse text embeds sharply, and one vector per row is simpler to build and rebuild; terseness keeps the body from swamping the title |
 
 ## 5. Architecture
 
@@ -101,8 +101,10 @@ mcp-memory-service → typed edges + tag AND/OR).
 - **Query instruction:** `Instruct: <task>\nQuery: <q>` on the query side; documents bare
   (+1–5%). Task string stored in `meta`.
 - **store ≠ embed:** the *row* keeps the full literal text; one **document** is embedded — the
-  `key`, the tags, the title and the link-stripped body (`[[links]]` removed), one non-empty
-  part per line. One vector per row.
+  `key`, the title and the link-stripped body (`[[links]]` removed), one non-empty part per line.
+  **Tags are not embedded** (§9): a tag is how a memory is *filed*, answered exactly by the `tags`
+  filter, so leaving it out keeps the vector describing what the memory *means* — and lets a tag-only
+  write re-embed nothing. One vector per row.
 
 ### 6.1 Weights are data: the model cache
 
@@ -480,11 +482,12 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   `status`), so an empty `status` cannot quietly read as `todo`. A create (a key with no row) still
   needs its minimum: a `title` and a `body` for a memory, a `title` for a project.
 - The write law is **per-field invalidation**, and it separates two questions. *Re-embed?* follows
-  the document (`key` + tags + title + body): `title`/`body`/`tags` re-embed, `source` does not, and
+  the document (`key` + title + body): `title`/`body` re-embed, `tags`/`source` do not, and
   a project never does. *Re-judge?* follows **meaning**: `coherent` clears only when the title or the
   body actually changed, because a tag or a source is *filing*, not *meaning*. So a patch that
   changes nothing re-embeds nothing and un-judges nothing — and, unlike a whole-row write, a tags or
-  source edit no longer re-opens the §9 split review. Membership in a project is a `tags` write
+  source edit no longer re-opens the §9 split review, nor moves the vector. Membership in a project
+  is a `tags` write
   (`prj:<key>`); `project_upsert`'s `status` still follows the §7.1 date rules.
 - `memory_upvote` takes one or more `keys` (`{keys:[…]}`) and bumps `times_useful` for each that
   exists — a feedback sweep in one call. It returns `{status, upvoted:[{key,times_useful}], missing?}`;
@@ -500,8 +503,8 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 - `memory_dupes` is the **finder for the §9 merge rule**: a read-only audit returning memory
   *pairs* whose document embeddings sit within a tight cosine ceiling (default `0.05`), nearest
   first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
-  A **finder, not a judge**: because `key`+tags are folded into the document, merely-related
-  memories cluster too, so candidates are judged (`memory_get` both) before merging. No bodies.
+  A **finder, not a judge**: same-topic memories still cluster (the documents are tersely worded),
+  so candidates are judged (`memory_get` both) before merging. No bodies.
 
 **CLI** — the shipped verbs, and nothing else:
 

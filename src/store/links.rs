@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::embed::{Embedder, projection};
 use crate::error::{Error, Result};
 use crate::index;
-use crate::store::{slug, tags};
+use crate::store::slug;
 
 /// Capture a `[[key]]` or `[[prj:key]]` target. Key charset `[a-z0-9-]+`; the `prj:` marker is the
 /// only thing allowed before it.
@@ -249,16 +249,16 @@ pub fn rename(
         });
     }
 
-    // Read the row before moving it: the new document needs its title and tags, and the vector
-    // needs its rowid. `source` is not read — it is not part of the embed projection.
-    let row: Option<(i64, String, String, String)> = conn
+    // Read the row before moving it: the new document needs its title and body, and the vector
+    // needs its rowid. Tags are not read — they are not part of the embed projection.
+    let row: Option<(i64, String, String)> = conn
         .query_row(
-            "SELECT id, title, body, tags FROM memory WHERE key = ?1",
+            "SELECT id, title, body FROM memory WHERE key = ?1",
             params![old],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((id, title, body, tags_raw)) = row else {
+    let Some((id, title, body)) = row else {
         return Err(Error::NotFound(old));
     };
     let taken: Option<i64> = conn
@@ -272,7 +272,7 @@ pub fn rename(
 
     // The document under the NEW key, hashed and embedded before the write lock — inference is
     // slow and must not hold the lock (SPEC §13). The vec table is created outside the tx too.
-    let doc_text = projection::embed_document(&new, &tags::decode(&tags_raw), &title, &body);
+    let doc_text = projection::embed_document(&new, &title, &body);
     let doc_hash = crate::store::row_hash(embedder, &doc_text);
     index::vec::ensure(conn, embedder.dim())?;
     let vector = embedder.embed_one(&doc_text)?;

@@ -261,6 +261,58 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert!(!extra.is_error.unwrap_or(false), "{}", text(&extra));
+    // `memory_merge` retires one key into another, repointing its references (the safe merge).
+    for (key, body) in [("merge-old", "retired"), ("merge-new", "survivor")] {
+        let r = call(
+            &client,
+            "memory_upsert",
+            serde_json::json!({ "key": key, "title": key, "body": body }),
+        )
+        .await;
+        assert!(!r.is_error.unwrap_or(false), "{}", text(&r));
+    }
+    let r = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "merge-ref", "title": "ref", "body": "see [[merge-old]]" }),
+    )
+    .await;
+    assert!(!r.is_error.unwrap_or(false), "{}", text(&r));
+
+    let merged = call(
+        &client,
+        "memory_merge",
+        serde_json::json!({ "from": "merge-old", "into": "merge-new" }),
+    )
+    .await;
+    assert!(!merged.is_error.unwrap_or(false), "{}", text(&merged));
+    let out: serde_json::Value = serde_json::from_str(&text(&merged)).expect("merge json");
+    assert_eq!(out["from"], serde_json::json!("merge-old"));
+    assert_eq!(out["into"], serde_json::json!("merge-new"));
+    assert_eq!(
+        out["bodies"],
+        serde_json::json!(1),
+        "the referrer was rewritten"
+    );
+
+    let gone = call(
+        &client,
+        "memory_get",
+        serde_json::json!({ "key": "merge-old" }),
+    )
+    .await;
+    assert_eq!(gone.is_error, Some(true), "the source is retired");
+    let referrer = call(
+        &client,
+        "memory_get",
+        serde_json::json!({ "key": "merge-ref" }),
+    )
+    .await;
+    assert!(
+        text(&referrer).contains("[[merge-new]]"),
+        "the reference followed the merge: {}",
+        text(&referrer)
+    );
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");

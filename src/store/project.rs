@@ -685,6 +685,42 @@ pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref
         .collect())
 }
 
+/// Repoint every project `preload` entry naming `from` (a memory key) at `into`, keeping order and
+/// collapsing duplicates to their first position. Returns how many projects changed.
+///
+/// The graph half of a merge ([`crate::store::links::merge_into`]): a preload still naming a retired
+/// key would be rot ([`dangling`]) that no amount of editing the memory could fix, because the
+/// reference lives on the *project* row.
+pub fn repoint_preload(conn: &Connection, from: &str, into: &str) -> Result<usize> {
+    let from = slug::slugify(from);
+    let into = slug::slugify(into);
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT key, mem_preload FROM project")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut changed = 0;
+    for (key, raw) in rows {
+        let keys = decode_preload(&raw);
+        if !keys.iter().any(|k| k == &from) {
+            continue;
+        }
+        let mut repointed: Vec<String> = Vec::new();
+        for k in keys {
+            let k = if k == from { into.clone() } else { k };
+            if !repointed.contains(&k) {
+                repointed.push(k);
+            }
+        }
+        conn.execute(
+            "UPDATE project SET mem_preload = ?2, updated = datetime('now') WHERE key = ?1",
+            params![key, encode_preload(&repointed)?],
+        )?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 /// The project plus its preload — the `project_get` read ("stand inside it"). `hydrate` decides how
 /// much of each preload memory's body to carry ([`Hydrate::None`] keeps it a reading list).
 pub fn view(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Option<View>> {

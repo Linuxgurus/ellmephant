@@ -103,6 +103,14 @@ impl Session {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
+    /// Retire one memory into another: repoint every reference, then delete the source. The prose
+    /// fold is the caller's — this never touches `into`'s body. No encoder: the graph is not
+    /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch
+    /// behind `memory_upsert`.)
+    pub fn merge_into(&self, from: &str, into: &str) -> Result<links::MergeInto> {
+        links::merge_into(&self.conn, from, into)
+    }
+
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
     /// point, backing `memory_get`.
     pub fn fetch(&self, key: &str) -> Result<Memory> {

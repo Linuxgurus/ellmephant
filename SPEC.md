@@ -443,7 +443,8 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 ## 11. Interfaces
 
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
-`memory_delete`, `memory_search`,
+`memory_delete`, `memory_merge`,
+`memory_search`,
 `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
 `memory_dupes`, `memory_reembed`, `project_upsert`, `project_get`, `project_list`.
 
@@ -505,6 +506,12 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
   A **finder, not a judge**: same-topic memories still cluster (the documents are tersely worded),
   so candidates are judged (`memory_get` both) before merging. No bodies.
+- `memory_merge` retires one memory into another: it rewrites every `[[from]]` token in every body,
+  repoints the edges in lockstep (dropping any self-link the rewrite would create), repoints any
+  project `preload` naming `from`, and deletes `from`. **The prose fold is the caller's** — write the
+  merged facts into `into` first, then retire `from`; this never edits `into`'s body. `[[prj:from]]`
+  is not rewritten (that names a project). This is the actor that makes hygiene safe: without it a
+  merge leaves dangling references, so merging never happened (`store::links::merge_into`).
 
 **CLI** — the shipped verbs, and nothing else:
 

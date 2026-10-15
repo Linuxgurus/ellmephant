@@ -55,6 +55,11 @@ pub struct Stats {
     pub singleton_tags: i64,
     /// The busiest tags, count-desc then name — at most [`TOP_TAGS`] of them.
     pub top_tags: Vec<(String, i64)>,
+    /// The full tag vocabulary, count-desc then name — empty unless asked for (see
+    /// [`vocabulary`]). Tags are a primary filter, so the *whole* set is what stops a caller
+    /// inventing a synonym; `top_tags` is only its head, and the sprawl lives in its tail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all_tags: Vec<(String, i64)>,
     /// `memory_link` edges.
     pub edges: i64,
     /// Memories touching at least one link (incoming or outgoing).
@@ -118,6 +123,18 @@ impl Stats {
 /// `a / b`, guarding the empty store (`0.0` rather than a NaN).
 fn ratio(a: i64, b: i64) -> f64 {
     if b <= 0 { 0.0 } else { a as f64 / b as f64 }
+}
+
+/// The full tag vocabulary with reference counts, count-desc then name. The store keeps no tag
+/// table (SPEC §5/§7 — nothing to keep in sync), so this is derived on demand from the one column
+/// that holds them; it is the *readable* half of tag hygiene, and a rename/merge is the write half.
+///
+/// [`compute`] leaves [`Stats::all_tags`] empty (the digest stays lean); a caller that wants the
+/// whole vocabulary fills it from here.
+pub fn vocabulary(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut counts = tags::list(conn)?; // (tag, count), name-ascending
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(counts)
 }
 
 /// Compute the digest. `db_bytes` is read from the connection's store file ([`disk_bytes`]), so it
@@ -227,6 +244,7 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         untagged: memories - tagged,
         singleton_tags,
         top_tags: counts,
+        all_tags: Vec::new(),
         edges,
         linked: memories - orphans,
         orphans,
@@ -333,6 +351,7 @@ mod tests {
             untagged: 0,
             singleton_tags: 0,
             top_tags: Vec::new(),
+            all_tags: Vec::new(),
             edges: 0,
             linked: 0,
             orphans: 0,

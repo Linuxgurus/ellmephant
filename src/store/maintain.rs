@@ -79,7 +79,7 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     for chunk in rows.chunks(BATCH) {
         let docs: Vec<String> = chunk
             .iter()
-            .map(|(_, key, tags, title, body)| projection::embed_document(key, tags, title, body))
+            .map(|(_, key, _tags, title, body)| projection::embed_document(key, title, body))
             .collect();
         let vectors = embedder.embed(&docs)?;
         for (i, (id, _, _, _, _)) in chunk.iter().enumerate() {

@@ -99,9 +99,10 @@ fn a_title_write_re_embeds_and_re_opens_the_review() {
 }
 
 #[test]
-fn a_tags_write_re_embeds_without_re_opening_the_review() {
-    // The two questions, separated: tags are part of the DOCUMENT but not of the MEANING. So a tag
-    // write re-embeds (the vector moved) and does NOT un-judge (the topic did not).
+fn a_tags_write_re_embeds_nothing_and_re_opens_nothing() {
+    // Tags are FILING, not MEANING — and not part of the document either. So a tag write moves
+    // neither the vector nor the split-review verdict: retro-tagging a memory is cheap and the
+    // vector keeps describing what the memory *means*.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -119,10 +120,10 @@ fn a_tags_write_re_embeds_without_re_opening_the_review() {
     )
     .expect("merge tags");
 
-    assert!(out.reembedded, "tags are in the document");
+    assert!(!out.reembedded, "tags are not in the document");
     assert!(!out.coherent_reset, "filing is not meaning");
     let after = store::get(&conn, &key).unwrap().unwrap();
-    assert_ne!(after.doc_hash, hash_before);
+    assert_eq!(after.doc_hash, hash_before, "the vector did not move");
     assert_eq!(
         after.tags,
         vec!["prj:seaweedfs".to_string(), "storage".to_string()],

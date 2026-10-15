@@ -23,8 +23,9 @@ The decisions the code obeys:
   close facts one per line; distinct facts split. Drop filler, articles and glue words. A
   coherent topic embeds sharply and edits surgically; grab-bag summaries smear the vector and
   rot. Derived views are computed at query time, not stored.
-- **`store ≠ embed`.** The row keeps the full, literal text; one **document** (`key` + tags +
-  title + link-stripped body) is embedded. The embedding strategy can change without losing what
+- **`store ≠ embed`.** The row keeps the full, literal text; one **document** (`key` + title +
+  link-stripped body — tags are *filing*, not meaning, and never enter the vector) is embedded.
+  The embedding strategy can change without losing what
   was written.
 - **A memory is one body of closely related facts**, embedded as one document and matched by
   meaning — which is what makes voting, ranking and the coherence verdict meaningful.

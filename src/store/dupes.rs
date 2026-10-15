@@ -1,9 +1,9 @@
 //! Duplicate-candidate audit: pairs of memories whose document embeddings sit unusually close
 //! (the finder for the §9 "merge redundant memories" rule).
 //!
-//! A *finder*, not a judge. The embedded document is `key` + tags + title + body, so
-//! merely-related memories cluster here too — the ceiling is tight on purpose, and the caller
-//! decides (fetch both, judge, then merge). This module never merges.
+//! A *finder*, not a judge. The embedded document is `key` + title + body, so merely-related
+//! memories cluster here too — the ceiling is tight on purpose, and the caller decides (fetch
+//! both, judge, then merge). This module never merges.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,8 +13,8 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::index::vec::{self, Knn};
 
-/// Default cosine-distance ceiling. Tight on purpose: with key/tags folded into the document,
-/// a loose ceiling returns same-topic neighbours, not duplicates.
+/// Default cosine-distance ceiling. Tight on purpose: a loose ceiling returns same-topic
+/// neighbours, not duplicates.
 pub const DEFAULT_MAX_DISTANCE: f32 = 0.05;
 
 /// Nearest neighbours examined per memory (self excluded). A duplicate is the *nearest* row,

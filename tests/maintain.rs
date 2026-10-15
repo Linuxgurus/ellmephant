@@ -80,7 +80,7 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
             doc_hash,
             store::row_hash(
                 &wide,
-                &projection::embed_document(&mem.key, &mem.tags, &mem.title, &mem.body)
+                &projection::embed_document(&mem.key, &mem.title, &mem.body)
             )
         );
     }

@@ -5,7 +5,7 @@
 //! `sqlite3_auto_extension` — no `.dylib`, no `load_extension`.
 //!
 //! One vec0 table, `memory_vec`, holds one vector per memory: the embedding of the whole
-//! document (`key` + tags + `title` + `body`, SPEC §6/§8). It is a *derived, rebuildable*
+//! document (`key` + `title` + `body`, SPEC §6/§8). It is a *derived, rebuildable*
 //! index: its dimension is a runtime property of the embedder, so it is created by
 //! [`ensure`] rather than by a SQL migration.
 
@@ -107,12 +107,31 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
 /// Whether the stored vectors were built with a DIFFERENT projection than the code now emits —
 /// i.e. a re-embed is needed ([`crate::store::maintain::reembed`] rewrites the fingerprint).
 ///
-/// `false` when nothing is recorded: an older store, or one with no vectors, has no baseline to
-/// compare against, and [`ensure`] records one the next time the index is touched. `doctor`
-/// surfaces the stale case so the drift is loud instead of silent.
+/// Two ways to be stale:
+///
+/// - a fingerprint is recorded and it no longer matches the code, or
+/// - **no** fingerprint is recorded but vectors already exist. That means the store was written
+///   before projections were fingerprinted, so its vectors cannot be *proven* to match the current
+///   recipe. (A store's first write records the fingerprint via [`ensure`] *before* it inserts a
+///   vector, so a fresh store never lands here.) This is what makes a projection change safe to
+///   ship to an old store: the drift is flagged, not assumed away.
+///
+/// `false` for an empty store, or one with no vectors — there is nothing to be wrong about.
 pub fn projection_stale(conn: &Connection) -> Result<bool> {
-    Ok(matches!(meta::get(conn, meta::PROJECTION)?, Some(stored)
-            if stored != projection::fingerprint()))
+    match meta::get(conn, meta::PROJECTION)? {
+        Some(stored) => Ok(stored != projection::fingerprint()),
+        None => Ok(vec_table_exists(conn)? && count(conn)? > 0),
+    }
+}
+
+/// Whether the `vec0` table has been created yet (it appears on the first write, not on a migration).
+fn vec_table_exists(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![TABLE],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Drop and recreate the table for a *new* dimension, recording it in `meta`.
@@ -334,6 +353,26 @@ mod tests {
         .unwrap();
         assert_eq!(hits[0].0, 1, "exact match should rank first");
         assert!(hits[0].1 <= hits[1].1);
+    }
+
+    #[test]
+    fn a_vector_without_a_fingerprint_is_stale() {
+        // An empty store has nothing to be wrong about.
+        let empty = conn();
+        ensure(&empty, 2).unwrap();
+        empty
+            .execute("DELETE FROM meta WHERE k = ?1", params![meta::PROJECTION])
+            .unwrap();
+        assert!(!projection_stale(&empty).unwrap());
+
+        // A store written before projections were fingerprinted: vectors exist, nothing recorded —
+        // so they cannot be proven to match the current projection. Flagged, not assumed away.
+        let conn = conn();
+        ensure(&conn, 2).unwrap();
+        upsert(&conn, 1, &[1.0, 0.0]).unwrap();
+        conn.execute("DELETE FROM meta WHERE k = ?1", params![meta::PROJECTION])
+            .unwrap();
+        assert!(projection_stale(&conn).unwrap());
     }
 
     #[test]

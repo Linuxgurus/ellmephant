@@ -118,7 +118,7 @@ fn rename_re_embeds_the_row_it_moves() {
         .expect("row moved");
     let fresh = store::row_hash(
         &embedder,
-        &ellmephant::embed::projection::embed_document("new-name", &[], "old-name", "the body"),
+        &ellmephant::embed::projection::embed_document("new-name", "old-name", "the body"),
     );
     assert_eq!(
         stored, fresh,
@@ -128,7 +128,7 @@ fn rename_re_embeds_the_row_it_moves() {
     // The pre-fix hash (documented under the OLD key) must NOT match — that drift is the bug.
     let stale = store::row_hash(
         &embedder,
-        &ellmephant::embed::projection::embed_document("old-name", &[], "old-name", "the body"),
+        &ellmephant::embed::projection::embed_document("old-name", "old-name", "the body"),
     );
     assert_ne!(stored, stale, "the stale, old-key hash was replaced");
 }

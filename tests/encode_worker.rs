@@ -565,7 +565,8 @@ fn a_deleted_or_retired_key_leaves_no_queue_entry() {
         "the deleted key's entry went with it"
     );
 
-    // Retire one key into another. `new` has to carry `old`'s prose already, or the merge is refused.
+    // Retire one key into another. `new` already carries `old`'s prose, so nothing is integrated and
+    // the only queue movement is the retired key's entry going with its row.
     ellmephant::store::add(&conn, &spec, &memory("old", "retired")).expect("write");
     ellmephant::store::add(
         &conn,
@@ -574,7 +575,7 @@ fn a_deleted_or_retired_key_leaves_no_queue_entry() {
     )
     .expect("write");
     assert_eq!(queued(&conn), ["kept", "new", "old"]);
-    ellmephant::store::links::merge_into(&conn, "old", "new").expect("merge");
+    ellmephant::store::links::merge_into(&conn, &spec, "old", "new").expect("merge");
     assert_eq!(
         queued(&conn),
         ["kept", "new"],

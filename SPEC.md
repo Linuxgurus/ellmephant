@@ -514,15 +514,22 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
   A **finder, not a judge**: same-topic memories still cluster (the documents are tersely worded),
   so candidates are judged (`memory_get` both) before merging. No bodies.
-- `memory_merge` retires one memory into another: it rewrites every `[[from]]` token in every body,
-  repoints the edges in lockstep (dropping any self-link the rewrite would create), repoints any
-  project `preload` naming `from`, and deletes `from`. **The prose fold is the caller's** — fold the
-  source's lines into `into` first, then retire `from`; this never edits `into`'s body. Every
-  non-blank line of `from` must survive in `into` (whitespace-insensitive, order free), or the merge
-  is refused and quotes the line it would have lost: a fold may reorder and dedupe, never drop.
-  `[[prj:from]]`
-  is not rewritten (that names a project). This is the actor that makes hygiene safe: without it a
-  merge leaves dangling references, so merging never happened (`store::links::merge_into`).
+- `memory_merge` **integrates one memory into another and deletes it**: every line of `from`'s body
+  that `into` does not already carry is appended to `into` **verbatim** (`store::links::missing_lines`),
+  so nothing is lost and nothing is paraphrased — the invariant "every line of `from` survives in
+  `into`" holds by construction rather than by refusal. Lines `into` already carries are not
+  appended, so a merge **removes redundancy**, which is what it exists for. `into` is the survivor,
+  and naming it is the caller's judgement of which memory is stronger: the store has no quality
+  signal, and the read telemetry (`visits`, `times_useful`) measures readers, not truth. Then it
+  rewrites every `[[from]]` token in every body, repoints the edges in lockstep (dropping any
+  self-link the rewrite would create), repoints any project `preload` naming `from`, and deletes
+  `from`. A caller may fold the prose itself first — the write policy asks for that when the
+  survivor should read as one thing — and `integrated` then comes back empty, making the call a pure
+  retire. **Verbatim append rather than a generated rewrite** because the store keeps facts straight
+  and a model writes the words: a fold this store cannot verify is a way to lose a fact with nothing
+  to notice it. `[[prj:from]]` is not rewritten (that names a project). This is the actor that makes
+  hygiene safe: without it a merge leaves dangling references, so merging never happened. Returns
+  `integrated` — the lines it appended on the caller's behalf (`store::links::merge_into`).
 
 **CLI** — the shipped verbs, and nothing else:
 

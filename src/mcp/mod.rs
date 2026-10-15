@@ -185,15 +185,18 @@ the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen �
 
 /// `memory_merge` description.
 const MERGE_DESCRIPTION: &str = "\
-Retire one memory into another: repoint every `[[from]]` reference at `into` — bodies, the `[[…]]` \
-graph, and any project `preload` naming it — then delete `from`. This is how to merge WITHOUT \
-leaving dangling links. The PROSE fold is yours: fold `from`'s lines into `into` first \
-(`memory_upsert`, or a patch that keeps the rest), then retire `from` here; this never edits \
-`into`'s body. EVERY non-blank line of `from` must survive in `into` (whitespace-insensitive, order \
-free) or the merge is REFUSED and quotes the line it would have lost — folding prose is the point, \
-losing it is not. To discard prose on purpose, `memory_delete`. `[[prj:from]]` is not rewritten \
-(that names a project). Both keys must exist — a merge into a typo would destroy the source. Reports \
-what moved.";
+Integrate one memory into another and delete it: every line of `from`'s body that `into` does not \
+already carry is appended to `into` VERBATIM — nothing is lost, nothing is paraphrased — then every \
+`[[from]]` reference is repointed at `into` (bodies, the `[[…]]` graph, and any project `preload` \
+naming it) and `from` is deleted. `into` SURVIVES: name the keeper as `into`, because you are judging \
+which of the two is the stronger memory. Lines `into` already carries are not appended, so a merge \
+REMOVES redundancy — that is what it is for, and a merge that only ever appends is the thing this \
+replaces. Fold the prose yourself first (an ordinary upsert) when you want the survivor to read as \
+one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and the \
+call is a pure retire. Returns `integrated` — the lines it appended on your behalf — so the fold it \
+made for you is visible. Both keys must exist: a merge into a typo would destroy the source. To \
+discard prose on purpose use `memory_delete`: a merge integrates, a delete discards. `[[prj:from]]` \
+is not rewritten (that names a project). Reports what moved.";
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
@@ -458,12 +461,12 @@ pub struct KeyParams {
 pub struct MergeParams {
     /// The key to retire.
     #[schemars(
-        description = "The key to retire — its `[[…]]` references are repointed at `into`, then it is deleted."
+        description = "The key to retire — the weaker memory. Its lines are integrated into `into`, its `[[…]]` references are repointed at `into`, then it is deleted."
     )]
     pub from: String,
     /// The key that survives.
     #[schemars(
-        description = "The key that survives. Must already exist; its body is NOT edited here (fold the source's lines into it first — every line must survive, or the merge is refused)."
+        description = "The key that survives — the stronger memory. You are judging which is which by naming it here. Any line of `from` this does not already carry is appended to it verbatim, so its information is in it when the call returns."
     )]
     pub into: String,
 }
@@ -1126,7 +1129,7 @@ impl MemoryServer {
         }
     }
 
-    /// Retire one memory into another, repointing the graph — the safe way to merge.
+    /// Integrate one memory into another and delete it — the safe way to merge.
     #[tool(
         name = "memory_merge",
         description = MERGE_DESCRIPTION,

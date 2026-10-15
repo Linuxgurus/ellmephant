@@ -225,9 +225,10 @@ fn merge_into_repoints_every_reference_and_retires_the_source() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "old", "the retired facts");
-    // The fold comes FIRST: a merge refuses to drop prose the target does not already carry.
+    // The caller folded it FIRST, so nothing is missing and this is a pure retire.
     seed(
         &conn,
         &embedder,
@@ -238,8 +239,12 @@ fn merge_into_repoints_every_reference_and_retires_the_source() {
     seed(&conn, &embedder, "b", "also [[old]] here");
     let target_body = store::get(&conn, "new").unwrap().unwrap().body;
 
-    let out = links::merge_into(&conn, "old", "new").expect("merge");
+    let out = links::merge_into(&conn, &spec, "old", "new").expect("merge");
     assert_eq!(out.bodies, 2, "both referrers were rewritten");
+    assert!(
+        out.integrated.is_empty(),
+        "a caller that folded first leaves nothing to integrate"
+    );
     assert!(store::get(&conn, "old").unwrap().is_none(), "source gone");
     assert_eq!(
         store::get(&conn, "new").unwrap().unwrap().body,
@@ -271,13 +276,14 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "old", "retired");
     seed(&conn, &embedder, "new", "survivor, now carrying: retired");
     project::upsert(&conn, &project_fixture("p"), Some(&["old".to_string()])).expect("project");
     // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
     seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
 
-    let out = links::merge_into(&conn, "old", "new").expect("merge");
+    let out = links::merge_into(&conn, &spec, "old", "new").expect("merge");
     assert_eq!(out.preloads, 1, "the project preload was repointed");
     let refs = project::preload(&conn, "p", project::Hydrate::None).unwrap();
     assert_eq!(refs.len(), 1);
@@ -301,11 +307,12 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "old", "retired");
-    // `new` must already carry `old`'s prose, or the merge refuses.
+    // `new` already carries `old`'s prose, so there is nothing to integrate.
     seed(&conn, &embedder, "new", "see [[old]] — and retired");
 
-    links::merge_into(&conn, "old", "new").expect("merge");
+    links::merge_into(&conn, &spec, "old", "new").expect("merge");
     let edges: i64 = conn
         .query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))
         .unwrap();
@@ -314,13 +321,14 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
 }
 
 #[test]
-fn merge_accepts_an_interleaved_fold_but_refuses_a_dropped_line() {
-    // A fold INTERLEAVES the source's lines among the target's and lays the result out anew; the
-    // layout is the caller's. Every line survives, so this must merge — a whole-body substring,
-    // which demanded a verbatim paste, used to refuse exactly this.
+fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
+    // The integration: a merge APPENDS what the survivor lacks, verbatim. Layout is the caller's, so
+    // an interleaved or re-ordered fold has nothing missing — and a line only the source carries is
+    // folded in rather than refused, which is the case that used to be prose destroyed behind a 200.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "old", "alpha fact.\nbeta fact.");
     seed(
@@ -329,30 +337,48 @@ fn merge_accepts_an_interleaved_fold_but_refuses_a_dropped_line() {
         "new",
         "survivor line.\nalpha fact.\nan inserted line.\nbeta fact.",
     );
-    links::merge_into(&conn, "old", "new").expect("an interleaved fold is still a fold");
+    let out = links::merge_into(&conn, &spec, "old", "new").expect("an interleaved fold is a fold");
+    assert!(out.integrated.is_empty(), "every line was already carried");
     assert!(
         store::get(&conn, "old").unwrap().is_none(),
         "source retired"
     );
+    let body = store::get(&conn, "new").unwrap().unwrap().body;
+    assert!(
+        body.contains("an inserted line."),
+        "a caller that folded by hand keeps its layout: {body}"
+    );
 
-    // A fold that DROPS a line is prose destroyed with a `200`. Refused, and the refusal NAMES the
-    // line, so the caller is told what to fold rather than that it "lacks the facts". The first line
-    // survived (per-line, so a carried line never blocks); the second did not, and is quoted.
+    // `twin` carries a line the survivor lacks. It is INTEGRATED — appended verbatim, nothing lost,
+    // nothing paraphrased — while the line the survivor already carried is not duplicated. That is
+    // the redundancy a merge exists to remove.
     seed(
         &conn,
         &embedder,
         "twin",
         "alpha fact.\nthe line only the twin carries.",
     );
-    let err = links::merge_into(&conn, "twin", "new").expect_err("a dropped line must refuse");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("the line only the twin carries"),
-        "the refusal names the lost line: {msg}"
+    let before = store::get(&conn, "new").unwrap().unwrap().body;
+    let out = links::merge_into(&conn, &spec, "twin", "new")
+        .expect("a missing line is integrated, not refused");
+    assert_eq!(
+        out.integrated,
+        vec!["the line only the twin carries.".to_string()],
+        "only the missing line is appended — a carried line is never duplicated"
+    );
+    let after = store::get(&conn, "new").unwrap().unwrap().body;
+    assert_eq!(
+        after,
+        format!("{before}\nthe line only the twin carries."),
+        "appended verbatim"
     );
     assert!(
-        store::get(&conn, "twin").unwrap().is_some(),
-        "a refused merge destroys nothing"
+        store::get(&conn, "twin").unwrap().is_none(),
+        "the weaker memory is gone"
+    );
+    assert!(
+        links::dangling(&conn).unwrap().is_empty(),
+        "nothing left dangling"
     );
 }
 
@@ -361,18 +387,22 @@ fn merge_into_refuses_a_missing_target_and_a_self_merge() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "a", "x");
     seed(&conn, &embedder, "b", "y");
 
     assert!(
-        links::merge_into(&conn, "ghost", "a").is_err(),
+        links::merge_into(&conn, &spec, "ghost", "a").is_err(),
         "source must exist"
     );
     assert!(
-        links::merge_into(&conn, "a", "ghost").is_err(),
+        links::merge_into(&conn, &spec, "a", "ghost").is_err(),
         "a merge into a typo must not destroy the source"
     );
-    assert!(links::merge_into(&conn, "a", "a").is_err(), "self-merge");
+    assert!(
+        links::merge_into(&conn, &spec, "a", "a").is_err(),
+        "self-merge"
+    );
 
     // A refused merge destroyed nothing.
     assert!(store::get(&conn, "a").unwrap().is_some());

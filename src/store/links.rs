@@ -220,78 +220,67 @@ pub struct MergeInto {
     pub bodies: usize,
     /// `project` preloads whose `from` entry was repointed.
     pub preloads: usize,
+    /// Lines of `from`'s body the survivor did not already carry, appended to it verbatim.
+    ///
+    /// Empty when the caller had already folded the prose — then the merge was a pure retire.
+    pub integrated: Vec<String>,
 }
 
-/// Refuse a merge that would LOSE one of the source's lines.
+/// Every line of `from`'s body that the survivor does not already carry, in order, deduped.
 ///
-/// [`merge_into`] repoints links and retires `from`; it never edits `into`'s body, because the prose
-/// fold is the caller's job. Which makes a merge a legal way to *destroy* prose: retire a memory
-/// carrying a line the target lacks and the line is simply gone, with a `200` that reports link
-/// counts and says nothing about the words. So the fold is a precondition, not a hope.
+/// This is the *integration* — and the reason nothing here refuses. [`merge_into`] repoints links and
+/// retires `from`, so without this a merge would be a legal way to **destroy** prose: retire a memory
+/// carrying a line the target lacks and the line is simply gone, behind a `200` that reports link
+/// counts and says nothing about the words. So the missing lines are folded in rather than demanded
+/// of the caller, and "every line of `from` survives in `into`" holds **by construction** instead of
+/// by refusal.
 ///
-/// The check is **per line, whitespace-insensitive**: every line of `from` must appear SOMEWHERE in
-/// `into`. A fold is an editorial act — it interleaves the source's lines among the target's, drops
-/// the lines the target already carried, and may lay the result out anew — so a whole-body substring
-/// would demand a verbatim paste and refuse every honest fold (the fold the write policy asks for,
-/// "fold both bodies", is exactly the one a contiguous-body check forbids). What no fold may do is
-/// drop a line, and this catches that; the refusal NAMES the first line that did not survive.
-/// Discarding prose on purpose has its own verb: a DELETE says "gone", a merge says "folded in".
-fn ensure_prose_folded(
-    conn: &Connection,
-    from_id: i64,
-    into_id: i64,
-    from: &str,
-    into: &str,
-) -> Result<()> {
-    let body = |id: i64| -> Result<String> {
-        conn.query_row("SELECT body FROM memory WHERE id = ?1", params![id], |r| {
-            r.get(0)
-        })
-        .map_err(Into::into)
-    };
-    let into_body = body(into_id)?;
-    if let Some(lost) = unfolded_line(&body(from_id)?, &into_body) {
-        return Err(Error::Invalid(format!(
-            "refusing to merge `{from}` into `{into}`: `{into}`'s body does not carry this line of \
-             `{from}` — \"{lost}\" — and a merge folds prose, it does not lose it. Fold that line \
-             into `{into}` (an ordinary upsert) and merge again, or DELETE `{from}` to discard it on \
-             purpose: a merge folds, a delete discards."
-        )));
+/// **Per line, whitespace-insensitive**: layout is the caller's, so interleaving, reordering and
+/// relaying-out all count as survived, and a whole-body substring would demand a verbatim paste and
+/// refuse every honest fold. Lines the survivor already carries are not missing — which is exactly
+/// how a merge removes the redundancy it exists to remove.
+///
+/// **Verbatim**: the store keeps facts straight and a model writes the words. Appending is lossless;
+/// a rewrite this store could not verify would be a way to lose a fact with nothing to notice it.
+/// Discarding prose on purpose has its own verb — a DELETE says "gone", a merge says "integrated".
+fn missing_lines(from: &str, into: &str) -> Vec<String> {
+    let into = squash(into);
+    let mut out: Vec<String> = Vec::new();
+    for line in from.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let line = squash(line);
+        if !line.is_empty() && !into.contains(&line) && !out.contains(&line) {
+            out.push(line);
+        }
     }
-    Ok(())
+    out
 }
 
-/// Squash every run of whitespace to a single space, so a check can ignore how prose is laid out.
+/// Squash every run of whitespace to a single space, so these checks ignore how prose is laid out.
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The first non-blank line of `from` that `into` does not carry anywhere, or `None` when every line
-/// survived. Blank lines carry nothing, so they never fail a fold.
-fn unfolded_line<'a>(from: &'a str, into: &str) -> Option<&'a str> {
-    let into = squash(into);
-    from.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find(|line| !into.contains(&squash(line)))
-}
-
-/// Retire `from` into `into`: repoint every reference, then delete `from` (PLAN §3).
+/// Integrate `from` into `into`, then retire `from` (PLAN §3).
 ///
-/// Merging used to be a hand-fold plus `memory_delete`, which **breaks the graph** — every `[[from]]`
-/// left behind dangles — so hygiene never happened. This does the repointing, so it is safe:
+/// **`into` is the survivor — the caller judges which memory is the stronger one.** Then, in one
+/// transaction:
 ///
+/// - every line of `from`'s body that `into` does not already carry is appended to it verbatim
+///   ([`missing_lines`]), so the source's information is IN the survivor by construction;
 /// - every `[[from]]` token in every memory body becomes `[[into]]`;
 /// - the edge set is repointed in lockstep, and any self-edge the rewrite creates is dropped (the
 ///   same rule the write path applies);
 /// - every project `preload` naming `from` is repointed at `into`, order kept and duplicates
 ///   collapsed;
-/// - `from` is deleted (row, vector, edges).
+/// - `from` is deleted (row, vector, edge set, queue entry).
 ///
-/// **The prose is the caller's.** This never touches `into`'s body: fold `from`'s lines into
-/// `into` first (an ordinary upsert/patch), then retire `from` here — the store keeps facts
-/// straight, a model writes the words. `[[prj:from]]` is *not* rewritten: that names a project.
-pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto> {
+/// Merging used to be a hand-fold plus `memory_delete`, which **breaks the graph** — every `[[from]]`
+/// left behind dangles — so hygiene never happened. This does the repointing, so it is safe.
+///
+/// A caller may still fold the prose itself FIRST, and should when it wants the survivor to read as
+/// one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and
+/// the call is a pure retire. `[[prj:from]]` is *not* rewritten: that names a project.
+pub fn merge_into(conn: &Connection, spec: &VecSpec, from: &str, into: &str) -> Result<MergeInto> {
     let from = slug::slugify(from);
     let into = slug::slugify(into);
     if from == into {
@@ -308,9 +297,34 @@ pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto
     };
     let from_id = rowid(&from)?;
     let into_id = rowid(&into)?; // must exist: a merge into a typo would silently destroy the source
-    ensure_prose_folded(conn, from_id, into_id, &from, &into)?;
+    let from_body: String = conn.query_row(
+        "SELECT body FROM memory WHERE id = ?1",
+        params![from_id],
+        |r| r.get(0),
+    )?;
+    let (into_title, into_body): (String, String) = conn.query_row(
+        "SELECT title, body FROM memory WHERE id = ?1",
+        params![into_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let integrated = missing_lines(&from_body, &into_body);
 
     let tx = conn.unchecked_transaction()?;
+    // INTEGRATE FIRST, and before the token rewrite below: `from`'s own lines can carry `[[from]]`,
+    // and appending them afterwards would leave a token aimed at a key that no longer exists.
+    if !integrated.is_empty() {
+        let body = format!("{}\n{}", into_body.trim_end(), integrated.join("\n"));
+        tx.execute(
+            "UPDATE memory SET body = ?2, updated = datetime('now') WHERE id = ?1",
+            params![into_id, body],
+        )?;
+        // The survivor's body moved, so its outgoing edges moved with it — `write_links` is the one
+        // home for that write — and a moved document is queued for a new vector like any other write.
+        crate::store::write_links(&tx, into_id, &into, &body)?;
+        let doc = projection::embed_document(&into, &into_title, &body);
+        let hash = crate::store::row_hash(spec, &doc);
+        crate::store::encode::enqueue(&tx, &into, &hash, crate::store::encode::INTERACTIVE)?;
+    }
     // The tokens. A bare `[[from]]` is a memory; `[[prj:from]]` names the other table and must not
     // move — which is why the kind rides on the edge, not the name.
     let bodies = tx.execute(
@@ -350,6 +364,7 @@ pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto
         into,
         bodies,
         preloads,
+        integrated,
     })
 }
 

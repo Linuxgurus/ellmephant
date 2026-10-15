@@ -188,6 +188,19 @@ fn app_with_token(dir: &std::path::Path, token: &str) -> axum::Router {
     http_router(server, "127.0.0.1", state)
 }
 
+/// A router with NO write token configured, so the write routes are open (see `resolve`).
+fn app_open(dir: &std::path::Path) -> axum::Router {
+    let watch = Arc::new(LockWatch::new());
+    let state = HttpState::new(
+        Paths::from_root(dir),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    );
+    let server = MemoryServer::with_watch(Arc::new(Mutex::new(session(dir))), watch);
+    http_router(server, "127.0.0.1", state)
+}
+
 /// Read a response into `(status, body, content-type)`.
 async fn read(response: axum::response::Response) -> (StatusCode, String, Option<String>) {
     let status = response.status();
@@ -275,37 +288,63 @@ async fn seed(app: &axum::Router, token: &str, key: &str, title: &str, body: &st
     assert_eq!(status, StatusCode::OK, "seed failed: {response}");
 }
 
-/// Read purity: `GET /memory/{key}` never bumps `visits`; the counter is a separate write.
+/// A read counts a visit — on **both** doors. Telemetry is the one write a `GET` may make: a counter
+/// is not data, so counting does not make a read unsafely repeatable, and `memory_get` has always done
+/// it. There is no separate counter route to call: MCP has no such tool, and `project_get` counts
+/// nothing on either door.
 #[tokio::test]
-async fn reading_a_memory_does_not_count_a_visit() {
+async fn reading_a_memory_counts_a_visit() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    seed(&app, "tok", "pure", "one sharp line", "the body").await;
+    seed(&app, "tok", "counted", "one sharp line", "the body").await;
 
-    let (_, first, _) = get(&app, "/memory/pure?format=json").await;
+    let (_, first, _) = get(&app, "/memory/counted?format=json").await;
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(first["visits"], 0, "a read must not count");
+    assert_eq!(first["visits"], 1, "the first read counts");
 
-    let (_, second, _) = get(&app, "/memory/pure?format=json").await;
+    let (_, second, _) = get(&app, "/memory/counted?format=json").await;
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-    assert_eq!(second["visits"], 0, "reading twice still counts nothing");
+    assert_eq!(second["visits"], 2, "and the second");
 
-    // The write, where it belongs, is the only thing that moves it.
-    let (status, body, _) = request(
+    // There is no explicit counter to call. A route with no counterpart in the MCP boot would be one
+    // an agent could never discover, and `project_get` does not count hydrated bodies on either door.
+    let (status, _, _) = request(
         &app,
         Method::POST,
-        "/memory/pure/visit?format=json",
+        "/memory/counted/visit?format=json",
         Some("tok"),
         None,
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let counted: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(counted["visits"], 1, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the split-out counter is gone"
+    );
+
+    // And no OTHER read may touch a counter — only the one that returns a body.
+    let total = |body: &str| -> i64 {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["visits_total"]
+            .as_i64()
+            .expect("visits_total")
+    };
+    let (_, before, _) = get(&app, "/stats?format=json").await;
+    for uri in [
+        "/memory/counted/backlinks?format=json",
+        "/search?q=counted&format=json",
+        "/dupes?format=json",
+        "/projects?format=json",
+    ] {
+        let (status, _, _) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+    let (_, after, _) = get(&app, "/stats?format=json").await;
+    assert_eq!(total(&before), total(&after), "no other read counts");
 }
 
-/// Auth before writes: every write route refuses a bare token and a wrong one, with a bare challenge.
+/// Auth before writes: with a token configured, every write route refuses a bare credential and a
+/// wrong one, and the challenge is a bare `Bearer`.
 #[tokio::test]
 async fn every_write_route_is_gated() {
     use ellmephant::http_surface::ROUTES;
@@ -354,6 +393,75 @@ async fn every_write_route_is_gated() {
         checked += 1;
     }
     assert!(checked >= 7, "expected every write route, saw {checked}");
+}
+
+/// The other half of the gate: with NO token configured the write routes are **open**, and
+/// `/bootstrap` says so rather than implying a gate that is not there. Deliberate and temporary —
+/// see `resolve`.
+#[tokio::test]
+async fn writes_are_open_when_no_token_is_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_open(dir.path());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/memory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"key":"open-note","title":"open","body":"written with no token"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+        "an open door must not hand out a challenge to invent an auth flow from"
+    );
+
+    // A boot is built from code, so it may not vary with the door's state or the store's contents:
+    // the same document, whether writes are open or gated.
+    let gated = app_with_token(dir.path(), "tok");
+    let (_, boot_open, _) = get(&app, "/bootstrap").await;
+    let (_, boot_gated, _) = get(&gated, "/bootstrap").await;
+    assert_eq!(
+        boot_open, boot_gated,
+        "a boot must not depend on the auth config"
+    );
+}
+
+/// The same code with a token configured is a gate — so auth stays a config flip, not a rewrite.
+#[tokio::test]
+async fn a_configured_token_closes_the_door_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let body = r#"{"key":"x","title":"t","body":"b"}"#;
+
+    let (status, response, _) = request(
+        &app,
+        Method::POST,
+        "/memory",
+        None,
+        Some("application/json"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{response}");
+
+    let (status, response, _) = request(
+        &app,
+        Method::POST,
+        "/memory",
+        Some("tok"),
+        Some("application/json"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
 }
 
 /// The text round trip — the reason the format exists: a body with quotes, colons, braces and a
@@ -416,63 +524,196 @@ async fn failures_are_ours_not_the_gateways() {
     );
 }
 
-/// `/bootstrap` shape: exactly one BOOT NOTE body, a non-resident memory shows its title and not
-/// its body, and both `writer` and `ROUTES` are on the first screen.
+/// `/bootstrap` is the MCP boot and **nothing more**: the server identity, the instruction text, and
+/// every tool with an HTTP verb in place of its MCP verb. No resident set, no counts, no route
+/// index — a boot is the *API surface*, not a view of the store's contents.
 #[tokio::test]
-async fn bootstrap_is_a_view_not_a_dump() {
+async fn bootstrap_is_the_mcp_boot_and_nothing_more() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    let note_body = "BOOT: read me first, then go";
-    let (status, body, _) = request(
+    // Seed exactly the content the OLD boot inlined, to prove the boot no longer reads the store.
+    seed(
         &app,
-        Method::POST,
-        "/memory",
-        Some("tok"),
-        Some("text/plain"),
-        &format!("Key: bootstrap-self\nTitle: boot me\nTags: cline-self\n---\n{note_body}\n"),
+        "tok",
+        "bootstrap-self",
+        "boot me",
+        "BOOT: read me first, then go",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
     let secret = "this body must not be resident";
-    let (status, body, _) = request(
-        &app,
-        Method::POST,
-        "/memory",
-        Some("tok"),
-        Some("text/plain"),
-        &format!(
-            "Key: other-self\nTitle: another cline-self key\nTags: cline-self\n---\n{secret}\n"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    seed(&app, "tok", "other-self", "another cline-self key", secret).await;
 
     let (status, doc, content_type) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
     assert!(content_type.unwrap().starts_with("text/plain"));
-    assert_eq!(doc.matches("BOOT NOTE").count(), 1, "one body resident");
-    assert!(doc.contains(note_body), "the boot note body is resident");
-    assert!(doc.contains("writer"), "{doc}");
-    assert!(doc.contains("ROUTES"), "{doc}");
+
+    // The handshake, and only the handshake.
     assert!(
-        doc.contains("another cline-self key"),
-        "the non-resident key shows its title"
+        doc.contains("INSTRUCTIONS"),
+        "the standing law rides the boot"
     );
-    assert!(!doc.contains(secret), "and not its body");
+    assert!(doc.contains("smart-caveman"), "and it is the MCP text");
+    assert!(
+        doc.contains(&format!("TOOLS — {}", ellmephant::mcp::TOOLS.len())),
+        "the tool list is complete: {doc}"
+    );
+
+    // Every tool, named by the HTTP verb that reaches it rather than by its MCP tool name.
+    for route in ellmephant::http_surface::ROUTES {
+        assert!(
+            doc.contains(&format!("{} {}", route.method, route.path)),
+            "`{} {}` is missing from the boot",
+            route.method,
+            route.path
+        );
+    }
+
+    // NOTHING MORE. Every section the boot used to compose is gone.
+    for gone in [
+        "SELF (tag",
+        "BOOT NOTE",
+        "OPEN (tag",
+        "ACTIVE PROJECTS",
+        "HOT —",
+        "ROUTES",
+    ] {
+        assert!(
+            !doc.contains(gone),
+            "`{gone}` is not part of an MCP boot: {doc}"
+        );
+    }
+    assert!(
+        !doc.contains("bootstrap-self") && !doc.contains(secret),
+        "a boot is built from code, not read from the store: {doc}"
+    );
 }
 
-/// `/bootstrap` is read-only: it changes no `visits` and no counts.
+/// `/bootstrap?format=json` is the MCP handshake in MCP's own shape: `initialize`'s fields plus
+/// `tools/list`'s, with `method`/`path` where MCP carries `name` and every other field untouched.
+#[tokio::test]
+async fn bootstrap_json_is_the_mcp_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+
+    let (status, body, _) = get(&app, "/bootstrap?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Exactly the handshake's fields, and no others — this is the "nothing more" assertion.
+    let mut keys: Vec<&String> = doc.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["capabilities", "instructions", "serverInfo", "tools"],
+        "{doc}"
+    );
+    assert_eq!(doc["serverInfo"]["name"], serde_json::json!("ellmephant"));
+    assert_eq!(
+        doc["serverInfo"]["version"],
+        serde_json::json!(ellmephant::VERSION)
+    );
+    assert_eq!(doc["capabilities"], serde_json::json!({ "tools": {} }));
+    assert!(
+        doc["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("smart-caveman")
+    );
+
+    let tools = doc["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), ellmephant::mcp::TOOLS.len());
+
+    // Each card is the MCP card with the verb swapped in: same title, description, schema, hints.
+    for route in ellmephant::http_surface::ROUTES {
+        let card = tools
+            .iter()
+            .find(|card| card["path"] == route.path && card["method"] == route.method)
+            .unwrap_or_else(|| panic!("no card for {} {}", route.method, route.path));
+        assert!(
+            card.get("name").is_none(),
+            "the MCP verb is replaced, not carried alongside: {card}"
+        );
+        assert!(
+            card.get("title").is_none(),
+            "MCP omits an absent title rather than sending \"\": {card}"
+        );
+        assert!(card["description"].as_str().unwrap().len() > 40, "{card}");
+        assert!(card["inputSchema"].is_object(), "{card}");
+        assert!(card["annotations"].is_object(), "{card}");
+    }
+
+    // The schema is MCP's, verbatim.
+    let search = tools.iter().find(|c| c["path"] == "/search").unwrap();
+    assert!(search["inputSchema"]["properties"]["query"].is_object());
+    assert_eq!(
+        search["annotations"]["readOnlyHint"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        search["annotations"]["title"],
+        serde_json::json!("Search memory"),
+        "the human title rides `annotations`, as it does over MCP"
+    );
+}
+
+/// The text form renders each argument from the tool's own schema, so a caller can construct the
+/// call from the boot alone: a nullable property reports the type it carries, an enum reports its
+/// values, and a required argument says so.
+#[tokio::test]
+async fn boot_text_renders_arguments_from_the_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let (status, doc, _) = get(&app, "/bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+
+    // `k` is `["integer", "null"]` — an optional integer, not "any".
+    assert!(doc.contains("k: integer (optional)"), "{doc}");
+    // A `$ref` to a string enum shows the values a caller may send.
+    assert!(
+        doc.contains("mode: \"literal\"|\"regex\" (optional)"),
+        "{doc}"
+    );
+    // A six-valued filter enum, spelled out.
+    assert!(
+        doc.contains("coherent: \"true\"|\"false\"|\"null\"|\"!true\"|\"!false\"|\"!null\""),
+        "{doc}"
+    );
+    // An array of an enum is parenthesised, so the `[]` cannot be misread.
+    assert!(
+        doc.contains("(\"key\"|\"title\"|\"tags\"|\"coherent\"|\"chars\"|\"distance\")[]"),
+        "{doc}"
+    );
+    // A required argument says so; a plain boolean resolves without a ref.
+    assert!(doc.contains("key: string (required)"), "{doc}");
+    assert!(doc.contains("tags: boolean (optional)"), "{doc}");
+}
+
+/// `/bootstrap` is read-only: it changes no counter and no count. (It cannot: the document is built
+/// from code and reads no database. The counters are compared through `/stats`, because reading a
+/// memory would itself count — the very thing this asserts.)
 #[tokio::test]
 async fn bootstrap_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
     seed(&app, "tok", "still", "unchanged", "no visits here").await;
 
-    let (_, before, _) = get(&app, "/memory/still?format=json").await;
+    let digest = |body: &str| -> serde_json::Value {
+        let doc: serde_json::Value = serde_json::from_str(body).unwrap();
+        serde_json::json!({
+            "memories": doc["memories"],
+            "visits_total": doc["visits_total"],
+            "useful_total": doc["useful_total"],
+        })
+    };
+    let (_, before, _) = get(&app, "/stats?format=json").await;
     let (status, _, _) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK);
-    let (_, after, _) = get(&app, "/memory/still?format=json").await;
-    assert_eq!(before, after, "/bootstrap changed the store");
+    let (_, after, _) = get(&app, "/stats?format=json").await;
+    assert_eq!(
+        digest(&before),
+        digest(&after),
+        "/bootstrap changed the store"
+    );
 }
 
 /// One core, two doors: for every read route the JSON body is byte-identical to the MCP tool's
@@ -545,16 +786,386 @@ async fn the_two_doors_are_one_core() {
         assert_eq!(http_body, mcp_body, "{uri} diverged from {name}");
     }
 
-    // `memory_get` is the one read that differs, and deliberately: MCP counts the visit, HTTP must
-    // not. Everything else is identical.
-    let (_, http_get, _) = get(&app, "/memory/alpha?format=json").await;
-    let http_get: serde_json::Value = serde_json::from_str(&http_get).unwrap();
-    let mcp_get: serde_json::Value =
-        serde_json::from_str(&tool(service.peer(), "memory_get", json!({ "key": "alpha" })).await)
-            .unwrap();
-    assert_eq!(http_get["visits"], 0, "HTTP stays pure");
-    assert_eq!(mcp_get["visits"], 1, "MCP counts the read");
-    assert_eq!(http_get["key"], mcp_get["key"]);
-    assert_eq!(http_get["body"], mcp_get["body"]);
-    assert_eq!(http_get["title"], mcp_get["title"]);
+    // `memory_get` is the same operation on both doors, telemetry included: each call advances
+    // `visits` by one, and the payloads agree on every field but the counter (two successive reads
+    // must differ there — that is the point of a counter).
+    let (_, http_body, _) = get(&app, "/memory/alpha?format=json").await;
+    let http_get: serde_json::Value = serde_json::from_str(&http_body).unwrap();
+    let mcp_body = tool(service.peer(), "memory_get", json!({ "key": "alpha" })).await;
+    let mcp_get: serde_json::Value = serde_json::from_str(&mcp_body).unwrap();
+
+    let http_visits = http_get["visits"]
+        .as_i64()
+        .expect("visits in the http payload");
+    let mcp_visits = mcp_get["visits"]
+        .as_i64()
+        .expect("visits in the mcp payload");
+    assert_eq!(
+        mcp_visits,
+        http_visits + 1,
+        "both doors count a visit, in turn: {http_body} vs {mcp_body}"
+    );
+
+    let mut http_rest = http_get.clone();
+    let mut mcp_rest = mcp_get.clone();
+    if let Some(obj) = http_rest.as_object_mut() {
+        obj.remove("visits");
+    }
+    if let Some(obj) = mcp_rest.as_object_mut() {
+        obj.remove("visits");
+    }
+    assert_eq!(
+        http_rest, mcp_rest,
+        "every field but the counter must match"
+    );
+}
+
+/// The MCP tool's OWN arguments, sent as a request body, must work on the write routes that take an
+/// argument: a caller that knows `memory_coherent` and `memory_merge` should not have to learn a
+/// second spelling for the same thing. The query forms stay, for a caller that only has a URL.
+#[tokio::test]
+async fn write_routes_accept_the_mcp_arguments_as_a_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "mb", "a body", "text").await;
+
+    let coherent_of = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["coherent"].clone()
+    };
+
+    // `memory_coherent` takes {key, coherent}; an absent field is `null` (unjudged), which is what
+    // the tool's optional field means.
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb/coherent?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"key":"mb","coherent":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got, _) = get(&app, "/memory/mb?format=json").await;
+    assert_eq!(coherent_of(&got), serde_json::json!(true), "{got}");
+
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb/coherent?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"key":"mb"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got, _) = get(&app, "/memory/mb?format=json").await;
+    assert_eq!(coherent_of(&got), serde_json::Value::Null, "{got}");
+
+    // A body `key` that disagrees with the path is refused, not silently preferred.
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb/coherent?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"key":"other","coherent":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // `memory_merge` takes {from, into} — and a merge refuses to silently drop prose, so the target
+    // must already carry the source's. That is the documented order: write the facts into `into`
+    // first, then retire `from`.
+    seed(
+        &app,
+        "tok",
+        "mb-into",
+        "target",
+        "the target's own body, now carrying: text",
+    )
+    .await;
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/mb/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"mb","into":"mb-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, _) = get(&app, "/memory/mb?format=json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the source is retired");
+
+    // ...and a `from` that disagrees with the path, likewise.
+    seed(&app, "tok", "mb2", "another", "x").await;
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/mb2/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"mb","into":"mb-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Both ways in, one meaning: the query spellings still work.
+    seed(&app, "tok", "mb3", "third", "y").await;
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb3/coherent?value=false&format=json",
+        Some("tok"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got, _) = get(&app, "/memory/mb3?format=json").await;
+    assert_eq!(coherent_of(&got), serde_json::json!(false), "{got}");
+}
+
+/// `memory_upvote` takes `{"keys": [...]}` — a BATCH — so the route must honour that body rather than
+/// silently upvoting the key in its own path, which is what it used to do. And the reply is the tool's
+/// reply, because both doors call one `upvote_sweep`.
+#[tokio::test]
+async fn upvote_route_honours_the_mcp_batch_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "uv-a", "a", "a").await;
+    seed(&app, "tok", "uv-b", "b", "b").await;
+
+    let times_useful = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["times_useful"].clone()
+    };
+
+    // A body naming OTHER keys: the path key must be left alone.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":["uv-b"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["upvoted"][0]["key"], "uv-b", "the body wins: {body}");
+    let (_, a, _) = get(&app, "/memory/uv-a?format=json").await;
+    assert_eq!(
+        times_useful(&a),
+        serde_json::json!(0),
+        "the path key is untouched"
+    );
+    let (_, b, _) = get(&app, "/memory/uv-b?format=json").await;
+    assert_eq!(times_useful(&b), serde_json::json!(1), "{b}");
+
+    // A batch reports the keys it could NOT find, exactly as the tool does.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":["uv-a","nope"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["upvoted"][0]["key"], "uv-a", "{body}");
+    assert_eq!(doc["missing"][0], "nope", "{body}");
+
+    // No body: the path key is the one-key shorthand (unchanged behaviour).
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-b/upvote?format=json",
+        Some("tok"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A sweep that hits nothing is a 404, as on the tool.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":["nope"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// A store with rows but no vectors must SAY so rather than answer an empty list: a caller reads
+/// `hits: []` as "nothing matched" and stops asking, and that is the one answer that is a lie. This
+/// is the state an interrupted `reembed` leaves behind.
+#[tokio::test]
+async fn search_says_so_when_the_index_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(
+        &app,
+        "tok",
+        "idx-a",
+        "a memory",
+        "a body with words worth finding",
+    )
+    .await;
+
+    // The truth first: with vectors, the phrase finds it.
+    let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("idx-a"), "{body}");
+
+    // Now strip every vector, as a killed rebuild would.
+    {
+        ellmephant::index::vec::register_extension();
+        let conn = rusqlite::Connection::open(Paths::from_root(dir.path()).db()).unwrap();
+        ellmephant::index::vec::clear(&conn).unwrap();
+    }
+
+    let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("index unavailable"), "{body}");
+
+    // A store with no rows at all is empty, not broken: that search is still a plain 200.
+    let empty = tempfile::tempdir().unwrap();
+    let app = app_with_token(empty.path(), "tok");
+    let (status, body, _) = get(&app, "/search?q=anything&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `backlinks` on a key with no row is a 404, not an empty list: *no backlinks* and *no such memory*
+/// are different answers, and it is the second that decides whether a delete is safe.
+#[tokio::test]
+async fn backlinks_of_a_missing_memory_is_a_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let (status, body, _) = get(&app, "/memory/no-such-memory/backlinks?format=json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    seed(&app, "tok", "bl-target", "a target", "a body").await;
+    let (status, body, _) = get(&app, "/memory/bl-target/backlinks?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A body past the store's cap is refused with 413, rather than accepted and then ground through the
+/// encoder for minutes while the whole session waits behind it.
+#[tokio::test]
+async fn a_body_past_the_cap_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let cap = ellmephant::store::MAX_BODY_CHARS;
+
+    let too_big =
+        serde_json::json!({"key": "too-big", "title": "too big", "body": "x".repeat(cap + 1)})
+            .to_string();
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?format=json",
+        Some("tok"),
+        Some("application/json"),
+        &too_big,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("body too long"), "{body}");
+    let (status, _, _) = get(&app, "/memory/too-big?format=json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was stored");
+
+    // Exactly at the cap is allowed: a limit, not an off-by-one.
+    let at_cap = serde_json::json!({"key": "at-cap", "title": "at cap", "body": "y".repeat(cap)})
+        .to_string();
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?format=json",
+        Some("tok"),
+        Some("application/json"),
+        &at_cap,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A merge that would silently drop prose is refused. `into`'s body is never edited, so retiring a
+/// memory carrying a fact the target lacks deletes the fact and reports only link counts — which
+/// made the one operation called "tidying up" the one that could quietly lose the detail.
+#[tokio::test]
+async fn a_merge_that_would_drop_prose_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(
+        &app,
+        "tok",
+        "dup-into",
+        "the survivor",
+        "only the survivor's words",
+    )
+    .await;
+    seed(
+        &app,
+        "tok",
+        "dup-from",
+        "the duplicate",
+        "a fact only the duplicate carries",
+    )
+    .await;
+
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/dup-from/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"dup-from","into":"dup-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("refusing to merge"), "{body}");
+    assert!(
+        body.contains("DELETE"),
+        "it says how to discard on purpose: {body}"
+    );
+
+    // A refused merge retires nothing.
+    let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a refused merge must not delete the source"
+    );
+
+    // Fold the fact in first, and the same merge goes through.
+    seed(
+        &app,
+        "tok",
+        "dup-into",
+        "the survivor",
+        "only the survivor's words\na fact only the duplicate carries",
+    )
+    .await;
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/dup-from/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"dup-from","into":"dup-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the source retires once the fold is in"
+    );
 }

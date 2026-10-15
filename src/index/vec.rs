@@ -186,8 +186,12 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Read a stored vector back (used by tests and `doctor`).
+/// Read a stored vector back (used by tests and `doctor`). `None` when the store has never been
+/// written — no table means no vector, the same answer as an empty table.
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Vec<f32>>> {
+    if !table_exists(conn)? {
+        return Ok(None);
+    }
     let blob: Option<Vec<u8>> = conn
         .query_row(
             &format!("SELECT embedding FROM {TABLE} WHERE memory_id = ?1"),
@@ -198,15 +202,33 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Vec<f32>>> {
     Ok(blob.map(|b| from_blob(&b)))
 }
 
-/// Number of indexed vectors.
+/// Number of indexed vectors. Zero for a store that has never been written: the vec0 table only
+/// exists once [`ensure`] has run, and "no table" and "an empty table" mean the same thing to any
+/// caller — nothing is indexed. (Without this a text search on a brand-new store answered
+/// `database error: no such table: memory_vec` instead of an empty result.)
 pub fn count(conn: &Connection) -> Result<i64> {
+    if !table_exists(conn)? {
+        return Ok(0);
+    }
     Ok(conn.query_row(&format!("SELECT count(*) FROM {TABLE}"), [], |r| r.get(0))?)
+}
+
+/// Whether the vec0 table has been created yet.
+fn table_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+        params![TABLE],
+        |r| r.get(0),
+    )?)
 }
 
 /// KNN over the table, nearest first: `(memory_id, cosine distance)`.
 pub fn knn(conn: &Connection, query: &[f32], hint: &Knn) -> Result<Vec<(i64, f32)>> {
     if query.is_empty() {
         return Err(Error::Config("empty query vector".into()));
+    }
+    if !table_exists(conn)? {
+        return Ok(Vec::new()); // nothing indexed: nothing can be near
     }
     let k = i64::try_from(hint.k).map_err(|_| Error::Config("k too large".into()))?;
     let sql = format!(

@@ -1,8 +1,9 @@
 # The plain-HTTP surface — the store without an MCP session
 
 **Status:** slices 1 and 2 implemented — the whole MCP surface is served over REST, plus `/health` and
-`/bootstrap`. Remaining: the rules stub (a `cline-home` change) and the deploy (set
-`ELLMEPHANT_WRITE_TOKEN`, or writes stay 401 and MCP remains the write path).
+`/bootstrap`. Writes are **open** while `ELLMEPHANT_WRITE_TOKEN` is unset (deliberate and temporary —
+see "Auth"), so MCP is no longer load-bearing for anything. Remaining: the rules stub (a `cline-home`
+change).
 
 ## Why
 
@@ -34,13 +35,13 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 | route | semantics | state |
 | --- | --- | --- |
 | `GET /health` | read-only readiness + the writer witness | **implemented** |
-| `GET /bootstrap` | the boot payload in one read | planned |
-| `GET /stats`, `GET /dupes`, `GET /projects` | the read surfaces | planned |
-| `GET /memory/{key}`, `GET /memory/{key}/backlinks` | one memory, body included | planned |
-| `GET /search?q=&k=&tags=` | the query surface | planned |
-| `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes — **auth first** | planned |
-| `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes — **auth first** | planned |
-| `POST /reembed` | the heaviest op; last, because it holds the store lock | planned |
+| `GET /bootstrap` | the boot payload in one read | **implemented** |
+| `GET /stats`, `GET /dupes`, `GET /projects` | the read surfaces | **implemented** |
+| `GET /memory/{key}`, `GET /memory/{key}/backlinks` | one memory, body included | **implemented** |
+| `GET /search?q=&k=&tag=` | the query surface | **implemented** |
+| `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes | **implemented** |
+| `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes | **implemented** |
+| `POST /reembed` | the heaviest op; last, because it holds the store lock | **implemented** |
 
 **`/bootstrap` is a view, not a dump.** It carries the resident set a cold agent needs — the `cline-self`
 keys, the boot body, hot, todos, open projects, stats, health, links — and an index of the routes
@@ -144,28 +145,35 @@ file can point at a URL and the agent's whole existence travels over HTTPS.
 
 ### Three invariants, in order of strength
 
-1. **Reads are pure.** No `GET` may write — not a counter, not a `visits` bump, not a migration. A read
-   that writes is not safely retryable, and retryability is half the reason this exists. **Consequence:**
-   in MCP, `memory_get` bumps `visits`; over HTTP it must not, or a probe or a monitor inflates the
-   usefulness signal. Counting moves to `POST /memory/{key}/visit`, where a write belongs. `POST` is
-   still safe to retry blind, because the counter is idempotent per caller-reason rather than per call.
+1. **Reads are pure — telemetry aside.** No `GET` may write *data*: no migration, no content, nothing a
+   caller could be relying on. **A counter is not data.** So a read that counts a visit is still safe to
+   repeat — the worst a retry does is inflate a ranking signal — and MCP's `memory_get` has always counted,
+   because a fetch is evidence that needs no declaration: that is exactly the difference between `visits`
+   and the *declared* `times_useful`. `GET /memory/{key}` therefore counts, and the two doors agree byte
+   for byte. Everything else about a read stays pure; `/health` and `/bootstrap` write nothing at all.
+   And MCP's `project_get` does **not** count the bodies it hydrates, so nothing here does either: no
+   route counts a read MCP would not. There is no `POST /memory/{key}/visit` — it existed only to work
+   around the old rule, and once the rule went it would have been the one reachable route with no
+   counterpart on the other door.
 2. **Writes take the store lock; reads do not.** `Session` is one connection behind one mutex, so a read
    that needs it queues behind a writer. `/health` and `/bootstrap` therefore answer from a **second,
    read-only connection** (`SQLITE_OPEN_READ_ONLY`), never from `Session`. Slice 1 proved the pattern.
-3. **Auth before writes, never after.** Every mutating route needs a bearer token. The 401 must carry
-   **no OAuth `resource_metadata` challenge** — a client that finds one invents an auth flow, and that
-   invention is exactly the wedge (`404 Session not found` → doomed OAuth) this project removes.
+3. **Auth is a config flip, and today it is open.** Every mutating route resolves a bearer to a scope
+   before it does anything, and a rejection must carry **no OAuth `resource_metadata` challenge** — a
+   client that finds one invents an auth flow, and that invention is exactly the wedge (`404 Session not
+   found` → doomed OAuth) this project removes. With no `ELLMEPHANT_WRITE_TOKEN` configured there is
+   nothing to resolve against, so writes are open. See "Auth".
 
 ### Routes
 
-Reads — no auth, pure, retryable, `?format=json` accepted everywhere:
+Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 
 | method | path | maps to | parameters |
 | --- | --- | --- | --- |
 | GET | `/health` | *(new)* | `?format=json` |
 | GET | `/bootstrap` | *(new)* | `?format=json`, `?hydrate=keys\|snippet\|full` |
 | GET | `/stats` | `memory_stats` | `?tags=true` |
-| GET | `/memory/{key}` | `memory_get` | *pure* — never counts; count with `POST /memory/{key}/visit` |
+| GET | `/memory/{key}` | `memory_get` | counts a `visits` read, exactly as MCP does |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
 | GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&coherent=&fields=a,b&tag=x&tag=y` |
 | GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=` |
@@ -177,10 +185,9 @@ Writes — **auth required**, all of them:
 | method | path | maps to | body / parameters |
 | --- | --- | --- | --- |
 | POST | `/memory` | `memory_upsert` | text front-matter, or JSON if `Content-Type: application/json` |
-| POST | `/memory/{key}/visit` | *(new)* | — (the split-out counter) |
 | POST | `/memory/{key}/upvote` | `memory_upvote` | — |
-| POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>` |
-| PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null` |
+| POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>`, or a JSON body `{"from","into"}` |
+| PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null`, or a JSON body `{"coherent": …}` |
 | DELETE | `/memory/{key}` | `memory_delete` | — |
 | POST | `/project` | `project_upsert` | JSON — a project patch is structured (owner / preload / tags) and front-matter has no grammar for it |
 | POST | `/reembed` | `memory_reembed` | — **last**: heaviest lock holder, and `/health` watches it |
@@ -191,15 +198,42 @@ actually fails. A project patch is *structured* (owner list, preload list, tags)
 honest shape. So both are accepted, and the caller picks by `Content-Type`. `?format=` governs the
 *response* only.
 
-### Auth: build the seam, one value today
+**And every route that takes an argument takes the MCP tool's own arguments as the body**, with its
+query form as shorthand: `POST /memory/{key}/merge` accepts `{"from","into"}` as well as `?into=`, and
+`PUT /memory/{key}/coherent` accepts `{"coherent": …}` as well as `?value=`. A caller that knows the
+tool should not have to learn a second spelling for the same thing — that is what parity means here.
+`POST /memory` and `POST /project` already took the tool's object, so these two were the whole gap. A
+body field that disagrees with the path (`{"from":"a"}` on `/memory/b/merge`) is a `400` that names
+both, never a silent winner, and an omitted `coherent`/`value` is `null` — the same "unjudged" the
+tool's optional field means.
 
-One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the deployment). Absent or
-wrong → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a one-line text body.
+### Auth: **no key today.** The seam is there; the gate is not.
 
-**Deny by default.** An unset `ELLMEPHANT_WRITE_TOKEN` makes *every* write a 401 — a deployment that
-forgets the env var gets a read-only surface, never an open one. The deploy is therefore part of this
-project: until the Secret is wired, MCP stays the write path, which is exactly why MCP is kept rather
-than removed.
+**Reads and writes are equally open, with no credential of any kind — exactly as MCP is.** That is a
+decision, not an oversight: the point of this surface is to be the *easy* door, and a key we have no way
+to issue yet would make it the harder one. Nothing in the tree sets `ELLMEPHANT_WRITE_TOKEN` (not the
+chart, not the workflows, not the Dockerfile), so no route can demand one by accident.
+
+The seam is kept, dormant, because auth comes back soon and re-adding it should be a config flip rather
+than a code change. One bearer token, read from `ELLMEPHANT_WRITE_TOKEN` (env; a k8s Secret in the
+deployment). A **wrong** token → `401` with `WWW-Authenticate: Bearer`, **no** `resource_metadata`, and a
+one-line text body.
+
+**Set the variable and the gate returns; unset it and there is none.** So the open state must never be
+described as "deny by default with a hole in it" — it is simply no gate, and the tests still prove the
+gate *works* for the day it matters (`a_configured_token_closes_the_door_again`).
+
+**Open until the token is set — deliberately, and with an expiry date.** An earlier draft denied by
+default, so that a deployment which forgot the env var got a read-only surface rather than an open one.
+That was the wrong trade for this moment: requiring a credential before there is any way to issue one
+keeps this door read-only, which is the one state it exists to end — and staying read-only is exactly
+what keeps MCP load-bearing. So an unset `ELLMEPHANT_WRITE_TOKEN` now means **any caller may write**.
+
+This is not the shape the thing should keep. The store is private, behind the gateway, and this is a
+decision with an expiry date rather than a design. It is written down here so that the open state is a
+choice somebody made, not a surprise somebody found. Setting the env var closes the door with no code
+change, so the gate stays a flip rather than a rewrite — and `/bootstrap` **says which state it is in**,
+so a caller never has to assume.
 
 The real design is per-area credentials mapping to a namespace, resolved server-side
 (`ellmephant-namespaces`). That lands *on top* of this seam, so the seam must already have the right
@@ -214,10 +248,10 @@ receives a scope will not.
 to what the MCP tool returns** for the same call (`to_wire_json` is reused, not reimplemented) — that is
 how we assert the two doors are one core rather than two implementations that drift.
 
-**One deliberate exception.** `GET /memory/{key}` cannot be byte-identical to `memory_get`, because MCP
-counts a `visits` read and invariant 1 forbids HTTP to write. The surface returns the same object with
-`visits` left alone, and the test asserts that single delta and nothing else. A difference that is
-*chosen* is a contract; a difference that is *discovered* is a bug.
+**No exceptions.** Every read route returns what its MCP tool returns for the same call, `memory_get`
+included: both doors count the `visits` read, so `GET /memory/{key}` and `memory_get` agree field for
+field. A difference that is *chosen* is a contract; a difference that is *discovered* is a bug — and
+there is no longer one to choose.
 
 **Writes accept `text/plain` front-matter**, with no escaping anywhere:
 
@@ -238,40 +272,74 @@ MCP tool's own object under `?format=json`.
 
 ### `GET /bootstrap` — the document
 
-A view, not a dump. Sections, in this order:
+**The MCP boot, with HTTP verbs.** An MCP client is handed `initialize` (`serverInfo`,
+`capabilities`, `instructions`) and then `tools/list` (the tool cards). This is those two merged into
+one read, with `method` + `path` where MCP carries `name`. **Nothing more, nothing less** — no counts,
+no resident set, no route index. The unit being replicated is the *API surface*; a boot that also
+carries content is a boot you cannot trust to describe the same API.
 
 ```
-BOOT ellmephant 0.19.0  2026-10-15T13:47:32Z
-  ready      yes — projection current, 275/275 vectors, schema v12
-  writer     free | busy 41.2s (memory_reembed)      <- the witness, always visible
-  store      275 memories, 275 vectors, 18 projects, 512 links (1 dangling), 40 tags
+BOOT ellmephant 1.2.0   capabilities: tools
 
-SELF (tag cline-self) — 12 keys; bodies on demand: GET /memory/{key}
-  bootstrap-self   BOOT: read me first — who I am + how to talk to James    [1240 chars]
-  ...
+INSTRUCTIONS
+  ellmephant = Memory storage in smart-caveman style — big words in, small words out; ...
 
-BOOT NOTE — bootstrap-self                       <- the ONE body that must be resident
-  <body verbatim>
+TOOLS — 14; HTTP verbs in place of MCP verbs, arguments and descriptions unchanged
 
-OPEN (tag todo) — 9
-  todo-page-james-silent — the emergency page is silent AT NIGHT
+  GET /memory/{key}/backlinks
+      List memories whose body point at `key` with `[[…]]`.
+      args: key: string (required) — Memory key. Slug.
 
-ACTIVE PROJECTS — 8
-  ellmephant-http — the whole MCP surface over REST, and a /bootstrap my rules can point at
+  PUT /memory/{key}/coherent
+      Record a memory's split-review verdict: `true` = one coherent topic, — ...
+      args: coherent: boolean (optional) — true = one topic; false = a grab-bag; null = unjudged.; key: string (required) — Memory key. Slug.
 
-HOT — recently useful
-  bootstrap-self (visits 38, useful 19)
-  ...
+  DELETE /memory/{key}
+      Kill one memory by `key`. No undo. Gone. — ...
+      args: key: string (required) — Memory key. Slug.
 
-ROUTES
-  GET  /bootstrap  /health  /stats  /search?q=  /memory/{key}  /projects  /dupes
-  POST /memory  /memory/{key}/visit|upvote|merge  /project  /reembed        (auth: bearer)
+  ... (14, alphabetical by tool — the same order `tools/list` uses)
 ```
 
-Three deliberate choices. **`SELF` lists keys, titles and sizes, not bodies** — so the agent chooses what
-to pull, and `?hydrate=full` is there when it wants everything. **Exactly one body is resident**, the boot
-note, because a boot that carries every body is a context fill. And **`writer` is on the first screen**:
-the thing that stalls us should be visible before anything else.
+`?format=json` is the same document in MCP's own shape, so a client moves over by reading
+`method`/`path` where it read `name`:
+
+```json
+{
+  "serverInfo": { "name": "ellmephant", "version": "1.2.0" },
+  "capabilities": { "tools": {} },
+  "instructions": "ellmephant = Memory storage in smart-caveman style — ...",
+  "tools": [
+    {
+      "method": "GET",
+      "path": "/memory/{key}",
+      "description": "Pull one memory whole by `key` — ...",
+      "inputSchema": { "$schema": "...", "properties": { "key": { "type": "string" } }, "required": ["key"], "type": "object" },
+      "annotations": { "title": "Get memory", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+    }
+  ]
+}
+```
+
+The fields are MCP's, verbatim — `inputSchema` and `annotations` included, `$defs` and all. (MCP
+*omits* a `title` it does not have rather than sending `""`, so the cards have no top-level `title`
+either; the human name rides `annotations.title`, where rmcp puts it.)
+
+**`protocolVersion` is the one field an MCP boot has that this drops.** It names a *transport* version,
+and over HTTP there is no MCP protocol to negotiate. Omitted rather than faked.
+
+**Where the content went.** The resident set this document used to carry — the `cline-self` keys, the
+boot note, todos, active projects, hot — is reachable with the commands above, exactly as it is over
+MCP: `GET /memory/bootstrap-self`, `GET /search?tag=cline-self`, `GET /search?tag=todo`,
+`GET /projects?status=active`, `GET /stats`. Readiness is `/health`'s job, and `/health` is the only
+surface that reports it. **A boot is not a status page.**
+
+**It needs no store.** The document is built from code — `mcp::instructions` and `mcp::tool_catalog`
+joined to the `ROUTES` table — so it reads no database and takes no lock. A boot still describes the
+API when the store is missing, stalled, or behind a writer, which is exactly when a caller needs to
+know what it may ask for. That is also why it cannot drift: the cards come from the same router
+`tools/list` uses, and a tool the router carries but no route reaches is dropped from the boot and
+**fails `every_tool_has_a_route`**.
 
 **Boot counting is deliberately absent.** A counter would make `/bootstrap` a writer, which breaks
 invariant 1. Boot observability already exists — the gateway's access log records every `GET /bootstrap`
@@ -293,7 +361,8 @@ Under `?format=json` every error is `{"error": "...", "status": N}`, so a script
 
 1. **Parity is enforced, not asserted by hand**: every name in `TOOLS` must appear in the route table and
    the table's length must equal `TOOLS.len()`. A tool added without a route fails the suite.
-2. **Read purity**: `GET /memory/{key}` leaves `visits` unchanged (compare before/after).
+2. **Telemetry**: `GET /memory/{key}` advances `visits` by one, exactly as `memory_get` does — the one
+   write a read may make. No other `GET` touches a counter.
 3. **One core**: for each read route the JSON body equals the MCP tool's output for the same call.
 4. **Auth**: every write route → 401 bare, 401 on a wrong token, and `WWW-Authenticate` is exactly
    `Bearer` — **no `resource_metadata`**, because that is the header that starts an OAuth flow.

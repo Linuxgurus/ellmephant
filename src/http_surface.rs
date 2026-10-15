@@ -1,22 +1,22 @@
 //! The full plain-HTTP surface (HTTP.md slice 2): every MCP tool as a route over the same
 //! `Session`, plus `/bootstrap`.
 //!
-//! Three laws hold here, in order of strength. **Reads are pure** — no `GET` writes, so `GET
-//! /memory/{key}` does not bump `visits` (`POST /memory/{key}/visit` does). **`/health` and
-//! `/bootstrap` never touch `Session`** — they answer from their own read-only connection, so a
-//! read never queues behind a writer. **Auth before writes** — every `POST`/`PUT`/`DELETE` resolves
-//! a bearer to a scope first, and a rejection carries `WWW-Authenticate: Bearer` and nothing else.
+//! Three laws hold here, in order of strength. **Reads are pure — telemetry aside**: no `GET` writes
+//! *data*, but a counter is not data, so `GET /memory/{key}` counts a `visits` read exactly as
+//! `memory_get` does (HTTP.md invariant 1). **`/health` and `/bootstrap` never touch `Session`** —
+//! they answer from their own read-only connection, so a read never queues behind a writer. **Auth
+//! before writes** — every `POST`/`PUT`/`DELETE` resolves a bearer to a scope first, and a rejection
+//! carries `WWW-Authenticate: Bearer` and nothing else.
 
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use rusqlite::{Connection, OpenFlags};
 
-use crate::http::{HttpState, probe};
+use crate::http::HttpState;
 use crate::mcp::{
-    CoherentFilter, DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SearchParams,
-    json_ok,
+    CoherentFilter, DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SERVER_NAME,
+    SearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
 use crate::store::{self, links::backlinks_to_wire_json, project};
@@ -127,8 +127,15 @@ const STORE_SCOPE: Scope = Scope {
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
 /// Resolve a credential → a scope, or `None`. The seam: handlers receive the scope, never the token.
+///
+/// **An unset server token means the write routes are OPEN.** That is deliberate and temporary:
+/// requiring a bearer before there is any way to issue one would leave this surface read-only,
+/// which is the one state it exists to end. Setting `ELLMEPHANT_WRITE_TOKEN` closes the door
+/// again with no code change, so the gate stays a config flip rather than a rewrite. Read this
+/// as a decision with an expiry date, not as the shape of the thing.
 fn resolve(provided: Option<&str>, expected: Option<&str>) -> Option<Scope> {
     match (provided, expected) {
+        (_, None) => Some(STORE_SCOPE),
         (Some(p), Some(e)) if p == e => Some(STORE_SCOPE),
         _ => None,
     }
@@ -143,6 +150,9 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Authorize a write: resolve the bearer, or hand back the bare 401 (no `resource_metadata`).
+///
+/// With no `ELLMEPHANT_WRITE_TOKEN` configured there is nothing to check and nothing to hand a
+/// caller, so the door is open — see [`resolve`]. Configure the token and this becomes a gate.
 #[allow(clippy::result_large_err)] // the Err is a ready-to-return response, not a value to carry
 fn authorize(state: &HttpState, headers: &HeaderMap, json: bool) -> Result<Scope, Response> {
     resolve(bearer(headers), state.write_token()).ok_or_else(|| unauthorized(json))
@@ -187,10 +197,17 @@ fn error(json: bool, status: StatusCode, message: impl AsRef<str>) -> Response {
     }
 }
 
-/// 404 for a store error that names a missing row; 400 otherwise (a malformed request).
+/// 404 for a store error that names a missing row; 413 for a body past the store's cap; 503 for a
+/// derived index that is not there; 400 otherwise (a malformed request).
 fn error_status(message: &str) -> StatusCode {
     if message.starts_with("no such memory:") || message.starts_with("no such project:") {
         StatusCode::NOT_FOUND
+    } else if message.starts_with("body too long:") {
+        // The request is well formed and the caller is welcome; it is simply too big to hold.
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else if message.starts_with("index unavailable:") {
+        // Not the caller's fault and not permanent: the derived index needs rebuilding.
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_REQUEST
     }
@@ -475,6 +492,24 @@ async fn body_bytes(body: Body) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("bad body: {e}"))
 }
 
+/// The request's JSON body, when it sent one — `None` for an empty body or a non-JSON content type.
+///
+/// This is what lets a route take its arguments **the way the MCP tool does** (`{"into": ...}`,
+/// `{"coherent": ...}`) *and* its own query parameters, so a caller that knows the tool can post the
+/// tool's own arguments unchanged. Parity is the point of this door; guessing at the shape is not.
+async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json::Value>, String> {
+    if !is_json_content(headers) {
+        return Ok(None);
+    }
+    let bytes = body_bytes(body).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("bad json body: {e}"))
+}
+
 /// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
     let params = Params::parse(raw.as_deref());
@@ -498,8 +533,8 @@ pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> R
     }
 }
 
-/// `GET /memory/{key}` — one memory whole. **Pure**: it does not bump `visits` (HTTP.md invariant 1);
-/// counting lives at `POST /memory/{key}/visit`.
+/// `GET /memory/{key}` — one memory whole. Counts a `visits` read, exactly as `memory_get` does: the
+/// one write a read may make, because a counter is not data (HTTP.md invariant 1).
 pub async fn memory_get(
     State(state): State<HttpState>,
     Path(key): Path<String>,
@@ -510,8 +545,17 @@ pub async fn memory_get(
         Ok(s) => s,
         Err(r) => return r,
     };
-    match server.with_store("memory_get", move |s| s.show(&key)).await {
-        Ok(mem) => {
+    let lookup = key.clone();
+    match server
+        .with_read("memory_get", move |s| s.show(&lookup))
+        .await
+    {
+        Ok(mut mem) => {
+            // Count the read best-effort (see `MemoryServer::bump_visit`): telemetry never makes a
+            // reader wait, so a write in flight means this visit goes uncounted.
+            if let Some(seen) = server.bump_visit(&key) {
+                mem.visits = seen;
+            }
             let mut value = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
@@ -760,82 +804,68 @@ pub async fn memory_delete(
     }
 }
 
-/// `POST /memory/{key}/visit` — the split-out counter: the write `GET` refused to be.
-pub async fn visit(
-    State(state): State<HttpState>,
-    Path(key): Path<String>,
-    RawQuery(raw): RawQuery,
-    headers: HeaderMap,
-) -> Response {
-    let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let lookup = key.clone();
-    match server
-        .with_store("memory_visit", move |s| s.record_visit(&lookup))
-        .await
-    {
-        Ok(visits) => {
-            tracing::info!(area = scope.area, key = %key, visits, "visit counted over http");
-            render(
-                StatusCode::OK,
-                json,
-                json_ok(serde_json::json!({ "status": "visited", "key": key, "visits": visits })),
-                format!("visited {key} (visits {visits})"),
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
-    }
-}
-
 /// `POST /memory/{key}/upvote` — mark one memory useful (`memory_upvote`).
 pub async fn upvote(
     State(state): State<HttpState>,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     let scope = match authorize(&state, &headers, json) {
         Ok(s) => s,
         Err(r) => return r,
     };
+    // MCP's `memory_upvote` takes `{"keys": [...]}` — a BATCH, and that is what a caller who knows the
+    // tool will send. Accept it; the path key is the one-key shorthand. A body that names other keys
+    // must never be ignored, and this route used to upvote the PATH key and silently drop the body.
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let keys = match body.as_ref().and_then(|b| b.get("keys")) {
+        Some(serde_json::Value::Array(items)) => {
+            let mut keys = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(k) => keys.push(k.to_string()),
+                    None => {
+                        return error(
+                            json,
+                            StatusCode::BAD_REQUEST,
+                            format!("bad `keys` entry: {item} (a string expected)"),
+                        );
+                    }
+                }
+            }
+            keys
+        }
+        Some(other) => {
+            return error(
+                json,
+                StatusCode::BAD_REQUEST,
+                format!("bad `keys`: {other} (an array of keys expected)"),
+            );
+        }
+        None => vec![key.clone()],
+    };
+    let named = keys.join(", ");
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let sweep = vec![key.clone()];
-    let lookup = key.clone();
-    match server
-        .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
-        .await
-    {
-        Ok((upvoted, _missing)) => match upvoted.into_iter().next() {
-            Some((_, times_useful)) => {
-                tracing::info!(area = scope.area, key = %key, "upvoted over http");
-                render(
-                    StatusCode::OK,
-                    json,
-                    json_ok(serde_json::json!({
-                        "status": "useful",
-                        "upvoted": [{ "key": key, "times_useful": times_useful }],
-                    })),
-                    format!("upvoted {key} (useful {times_useful})"),
-                )
-            }
-            None => error(
-                json,
-                StatusCode::NOT_FOUND,
-                format!("no such memory: {lookup}"),
-            ),
-        },
-        Err(e) => error(json, error_status(&e), e),
+    // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
+    // errors nor the JSON can drift apart.
+    match crate::mcp::upvote_sweep(server, keys).await {
+        Ok(payload) => {
+            tracing::info!(area = scope.area, keys = %named, "upvoted over http");
+            render(StatusCode::OK, json, payload, format!("upvoted {named}"))
+        }
+        Err(message) => {
+            let status = error_status(&message);
+            error(json, status, message)
+        }
     }
 }
 
@@ -845,6 +875,7 @@ pub async fn merge(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -852,8 +883,41 @@ pub async fn merge(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let Some(into) = params.maybe("into").map(str::to_string) else {
-        return error(json, StatusCode::BAD_REQUEST, "missing `into` parameter");
+    // The MCP tool takes `{"from", "into"}`; accept it, so a caller can send the tool's own arguments
+    // unchanged. The path names `from` here, so a body `from` must AGREE with it rather than quietly
+    // win. `?into=` stays for a caller that only has a URL.
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    if let Some(given) = body
+        .as_ref()
+        .and_then(|b| b.get("from"))
+        .and_then(|f| f.as_str())
+        && given != key
+    {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            format!("body `from` is `{given}` but the path names `{key}`"),
+        );
+    }
+    let into = match body
+        .as_ref()
+        .and_then(|b| b.get("into"))
+        .and_then(|i| i.as_str())
+    {
+        Some(into) => into.to_string(),
+        None => match params.maybe("into") {
+            Some(into) => into.to_string(),
+            None => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    "missing `into`: send `?into=<key>`, or a JSON body {\"into\": \"<key>\"}",
+                );
+            }
+        },
     };
     let server = match session(&state) {
         Ok(s) => s,
@@ -884,6 +948,7 @@ pub async fn coherent(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -891,18 +956,56 @@ pub async fn coherent(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let value = match params.get("value") {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        Some("null") => None,
+    // Two ways in, one meaning. The MCP tool takes `{"key", "coherent"}` — accept exactly that as the
+    // body, so a caller can send the tool's own arguments unchanged; a body field that is absent is
+    // `null` (unjudged), which is what an optional field means on the tool. `?value=` stays for a
+    // caller that only has a URL.
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    if let Some(given) = body
+        .as_ref()
+        .and_then(|b| b.get("key"))
+        .and_then(|k| k.as_str())
+        && given != key
+    {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            format!("body `key` is `{given}` but the path names `{key}`"),
+        );
+    }
+    let value = match body.as_ref().and_then(|b| b.get("coherent")) {
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::Null) => None,
         Some(other) => {
             return error(
                 json,
                 StatusCode::BAD_REQUEST,
-                format!("bad `value`: {other} (one of: true, false, null)"),
+                format!("bad `coherent`: {other} (true, false or null)"),
             );
         }
-        None => return error(json, StatusCode::BAD_REQUEST, "missing `value` parameter"),
+        None if body.is_some() => None,
+        None => match params.get("value") {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some("null") => None,
+            Some(other) => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    format!("bad `value`: {other} (one of: true, false, null)"),
+                );
+            }
+            None => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    "missing the verdict: send `?value=true|false|null`, or a JSON body {\"coherent\": …}",
+                );
+            }
+        },
     };
     let server = match session(&state) {
         Ok(s) => s,
@@ -1228,329 +1331,236 @@ fn memory_text(mem: &store::Memory) -> String {
     out
 }
 
-/// How much of each `SELF` body `/bootstrap` carries: the doc's `?hydrate=keys|snippet|full`.
-#[derive(Clone, Copy)]
-enum BootHydrate {
-    /// Keys, titles and sizes — the resident set is *this*, not the bodies.
-    Keys,
-    /// A one-line glance at each body.
-    Snippet,
-    /// Every body.
-    Full,
+/// One tool as the boot presents it: the MCP card with an HTTP verb and path where the MCP tool
+/// name was. Every other field is the MCP field unchanged — same description, same schema, same
+/// annotations — because the requirement is that changing transport changes the verbs and nothing
+/// else.
+struct BootTool {
+    /// The HTTP verb that reaches this tool.
+    method: &'static str,
+    /// The path template; `{key}` is the placeholder.
+    path: &'static str,
+    /// The law, verbatim from the tool.
+    description: String,
+    /// The argument schema, verbatim from the tool.
+    input_schema: serde_json::Value,
+    /// The annotation hints, as `tools/list` serializes them.
+    annotations: serde_json::Value,
 }
 
-impl BootHydrate {
-    /// Parse the wire spelling; unknown values fall back to `keys` (never a 400 on a read).
-    fn parse(raw: Option<&str>) -> Self {
-        match raw.map(str::trim) {
-            Some("snippet") => Self::Snippet,
-            Some("full") => Self::Full,
-            _ => Self::Keys,
-        }
-    }
-}
-
-/// One row of the `SELF` list.
-struct BootKey {
-    key: String,
-    title: String,
-    chars: usize,
-    body: String,
-}
-
-/// The `/bootstrap` view, gathered once from a read-only connection and the writer witness.
-struct BootData {
-    report: crate::http::HealthReport,
-    stamp: String,
-    self_keys: Vec<BootKey>,
-    boot_note: Option<BootKey>,
-    open: Vec<(String, String)>,
-    active: Vec<(String, String)>,
-    hot: Vec<(String, i64, i64)>,
-}
-
-/// Gather the `/bootstrap` view from a **read-only connection** (never `Session`, so it cannot
-/// queue behind a writer) plus the writer witness.
-fn boot_data(state: &HttpState) -> BootData {
-    let mut data = BootData {
-        report: probe(&state.paths, &state.watch, state.started),
-        stamp: String::new(),
-        self_keys: Vec::new(),
-        boot_note: None,
-        open: Vec::new(),
-        active: Vec::new(),
-        hot: Vec::new(),
-    };
-    if !state.paths.db().exists() {
-        return data;
-    }
-    let Ok(conn) = Connection::open_with_flags(state.paths.db(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return data;
-    };
-    data.stamp = utc_stamp(&conn).unwrap_or_default();
-    if let Ok(rows) = memories_with_tag(&conn, "cline-self") {
-        data.self_keys = rows
-            .into_iter()
-            .map(|(key, title, body)| BootKey {
-                key,
-                title,
-                chars: body.chars().count(),
-                body,
+/// The tool surface, each MCP tool paired with the route that reaches it.
+///
+/// The cards come from the MCP server's own router and the verbs from [`ROUTES`], so the boot
+/// cannot describe a toolkit the doors do not have: a tool the router carries but no route reaches
+/// is dropped here, and `every_tool_has_a_route` fails the suite for it.
+fn boot_tools() -> Vec<BootTool> {
+    tool_catalog()
+        .into_iter()
+        .filter_map(|card| {
+            let route = ROUTES.iter().find(|route| route.tool == card.name)?;
+            Some(BootTool {
+                method: route.method,
+                path: route.path,
+                description: card.description,
+                input_schema: card.input_schema,
+                annotations: card.annotations,
             })
-            .collect();
-    }
-    data.boot_note = data
-        .self_keys
-        .iter()
-        .find(|k| k.key == "bootstrap-self")
-        .map(|k| BootKey {
-            key: k.key.clone(),
-            title: k.title.clone(),
-            chars: k.chars,
-            body: k.body.clone(),
-        });
-    if let Ok(rows) = memories_with_tag(&conn, "todo") {
-        data.open = rows.into_iter().map(|(k, t, _)| (k, t)).collect();
-    }
-    if let Ok(mut stmt) = conn.prepare("SELECT key, title FROM project WHERE status = 'active'") {
-        data.active = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .and_then(Iterator::collect)
-            .unwrap_or_default();
-    }
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT key, visits, times_useful FROM memory WHERE times_useful > 0
-         ORDER BY times_useful DESC, key LIMIT 10",
-    ) {
-        data.hot = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .and_then(Iterator::collect)
-            .unwrap_or_default();
-    }
-    data
+        })
+        .collect()
 }
 
-/// `now` as the doc's ISO stamp (`YYYY-MM-DDTHH:MM:SSZ`), from the store's own clock.
-fn utc_stamp(conn: &Connection) -> rusqlite::Result<String> {
-    let raw: String = conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?;
-    Ok(format!("{}Z", raw.replace(' ', "T")))
+/// `GET /bootstrap` — the boot document: exactly what an MCP client is handed at `initialize` and
+/// `tools/list`, with HTTP verbs in place of MCP verbs, and nothing else.
+///
+/// **Nothing else is the requirement, not a limitation.** This is the store's *API surface*, not a
+/// view of its contents: the resident set (self, todos, active projects, hot) is one of the
+/// commands below, exactly as it is over MCP, and `/health` answers readiness.
+///
+/// Because the document is built from code rather than from the store, it needs no database and
+/// takes no lock — so a boot still describes the API when the store is missing or stalled, which is
+/// exactly when a caller needs to know what it can ask for.
+pub async fn bootstrap(RawQuery(raw): RawQuery) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let tools = boot_tools();
+    render(
+        StatusCode::OK,
+        json,
+        boot_json(&tools).to_string(),
+        boot_text(&tools),
+    )
 }
 
-/// Every memory carrying `tag`, as `(key, title, body)`, key order. Tags are a comma-joined
-/// column, so the filter is applied in Rust over the decoded set.
-fn memories_with_tag(
-    conn: &Connection,
-    tag: &str,
-) -> rusqlite::Result<Vec<(String, String, String)>> {
-    let mut stmt = conn.prepare("SELECT key, title, body, tags FROM memory ORDER BY key")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (key, title, body, tags) = row?;
-        if store::tags::decode(&tags).iter().any(|t| t == tag) {
-            out.push((key, title, body));
+/// The boot document in the store's text form: the same information as [`boot_json`], rendered for
+/// a model to read rather than a machine to parse.
+fn boot_text(tools: &[BootTool]) -> String {
+    let mut out = format!(
+        "BOOT {SERVER_NAME} {}   capabilities: tools\n",
+        crate::VERSION
+    );
+    out.push_str(&format!(
+        "\nINSTRUCTIONS\n{}\n",
+        indent_block(instructions(), "  ")
+    ));
+    out.push_str(&format!(
+        "\nTOOLS — {}; HTTP verbs in place of MCP verbs, arguments and descriptions unchanged\n",
+        tools.len()
+    ));
+    for tool in tools {
+        out.push_str(&format!("\n  {} {}\n", tool.method, tool.path));
+        out.push_str(&format!("      {}\n", tool.description.replace('\n', " ")));
+        if let Some(args) = args_text(&tool.input_schema) {
+            out.push_str(&format!("      args: {args}\n"));
         }
     }
-    Ok(out)
-}
-
-/// `GET /bootstrap` — the boot payload in one read: health, the writer witness, the resident
-/// `SELF` set, exactly one body (`bootstrap-self`), todos, active projects, hot, and the routes.
-pub async fn bootstrap(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
-    let params = Params::parse(raw.as_deref());
-    let json = params.json();
-    let hydrate = BootHydrate::parse(params.get("hydrate"));
-    let probe_state = state.clone();
-    let data = tokio::task::spawn_blocking(move || boot_data(&probe_state)).await;
-    match data {
-        Ok(data) if json => render(
-            StatusCode::OK,
-            true,
-            boot_json(&data).to_string(),
-            String::new(),
-        ),
-        Ok(data) => render(
-            StatusCode::OK,
-            false,
-            String::new(),
-            boot_text(&data, hydrate),
-        ),
-        Err(_) => error(
-            json,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "bootstrap task failed",
-        ),
-    }
-}
-
-/// The `/bootstrap` document (HTTP.md § "GET /bootstrap — the document").
-fn boot_text(data: &BootData, hydrate: BootHydrate) -> String {
-    let r = &data.report;
-    let mut out = format!("BOOT ellmephant {}  {}\n", r.version, data.stamp);
-    let ready = if r.ready {
-        format!(
-            "yes — projection {}, {}/{} vectors, schema v{}",
-            r.projection, r.vectors, r.memories, r.schema
-        )
-    } else {
-        format!("NO — {}", r.reason.as_deref().unwrap_or("unready"))
-    };
-    out.push_str(&format!("  {:<10}{ready}\n", "ready"));
-    out.push_str(&format!("  {:<10}{}\n", "writer", r.writer));
-    out.push_str(&format!(
-        "  {:<10}{} memories, {} vectors, {} projects, {} links ({} dangling), {} tags\n",
-        "store", r.memories, r.vectors, r.projects, r.links, r.links_dangling, r.tags
-    ));
-
-    out.push_str(&format!(
-        "\nSELF (tag cline-self) — {} keys; bodies on demand: GET /memory/{{key}}\n",
-        data.self_keys.len()
-    ));
-    for key in &data.self_keys {
-        out.push_str(&format!(
-            "  {:<18}{}    [{} chars]\n",
-            key.key, key.title, key.chars
-        ));
-        match hydrate {
-            BootHydrate::Keys => {}
-            BootHydrate::Snippet => {
-                out.push_str(&format!(
-                    "    {}\n",
-                    crate::search::snippet(&key.body, crate::search::SNIPPET_CHARS)
-                ));
-            }
-            BootHydrate::Full => {
-                for line in key.body.lines() {
-                    out.push_str(&format!("    {line}\n"));
-                }
-            }
-        }
-    }
-
-    out.push_str(&format!(
-        "\nBOOT NOTE — {}\n",
-        data.boot_note
-            .as_ref()
-            .map(|k| k.key.as_str())
-            .unwrap_or("(none)")
-    ));
-    if let Some(note) = &data.boot_note {
-        for line in note.body.lines() {
-            out.push_str(&format!("  {line}\n"));
-        }
-    }
-
-    out.push_str(&format!("\nOPEN (tag todo) — {}\n", data.open.len()));
-    for (key, title) in &data.open {
-        out.push_str(&format!("  {key} — {title}\n"));
-    }
-
-    out.push_str(&format!("\nACTIVE PROJECTS — {}\n", data.active.len()));
-    for (key, title) in &data.active {
-        out.push_str(&format!("  {key} — {title}\n"));
-    }
-
-    out.push_str("\nHOT — recently useful\n");
-    for (key, visits, useful) in &data.hot {
-        out.push_str(&format!("  {key} (visits {visits}, useful {useful})\n"));
-    }
-
-    out.push('\n');
-    out.push_str(&routes_text());
     out
 }
 
-/// The `ROUTES` index, built from [`ROUTES`] so it cannot drift from the router.
-fn routes_text() -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for method in ["GET", "POST", "PUT", "DELETE"] {
-        let mut paths: Vec<&str> = Vec::new();
-        if method == "GET" {
-            paths.push("/bootstrap");
-            paths.push("/health");
-        }
-        for route in ROUTES {
-            if route.method == method {
-                paths.push(route.path);
-            }
-        }
-        if paths.is_empty() {
-            continue;
-        }
-        let auth = if method == "GET" {
-            ""
-        } else {
-            "  (auth: bearer)"
-        };
-        lines.push(format!("  {method:<8}{}{auth}", paths.join("  ")));
+/// A tool's arguments, one line, read from the tool's own schema — so the text form cannot drift
+/// from the schema the MCP door hands a model.
+fn args_text(schema: &serde_json::Value) -> Option<String> {
+    let props = schema.get("properties")?.as_object()?;
+    if props.is_empty() {
+        return None;
     }
-    format!("ROUTES\n{}\n", lines.join("\n"))
-}
-
-/// The `/bootstrap` view as JSON (`?format=json`) — the same sections as [`boot_text`], minus the
-/// deliberately-absent bodies except the one resident note.
-fn boot_json(data: &BootData) -> serde_json::Value {
-    let r = &data.report;
-    let self_keys: Vec<serde_json::Value> = data
-        .self_keys
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let parts: Vec<String> = props
         .iter()
-        .map(|k| serde_json::json!({ "key": k.key, "title": k.title, "chars": k.chars }))
-        .collect();
-    let boot_note = data
-        .boot_note
-        .as_ref()
-        .map(|k| serde_json::json!({ "key": k.key, "body": k.body }));
-    let rows = |items: &[(String, String)]| -> Vec<serde_json::Value> {
-        items
-            .iter()
-            .map(|(key, title)| serde_json::json!({ "key": key, "title": title }))
-            .collect()
-    };
-    let hot: Vec<serde_json::Value> = data
-        .hot
-        .iter()
-        .map(|(key, visits, useful)| {
-            serde_json::json!({ "key": key, "visits": visits, "times_useful": useful })
+        .map(|(name, spec)| {
+            let need = if required.contains(&name.as_str()) {
+                "required"
+            } else {
+                "optional"
+            };
+            let kind = schema_type(spec, schema);
+            match spec.get("description").and_then(|d| d.as_str()) {
+                Some(description) if !description.is_empty() => {
+                    format!("{name}: {kind} ({need}) — {description}")
+                }
+                _ => format!("{name}: {kind} ({need})"),
+            }
         })
         .collect();
-    let mut routes: Vec<serde_json::Value> = vec![
-        serde_json::json!({ "method": "GET", "path": "/health", "tool": null }),
-        serde_json::json!({ "method": "GET", "path": "/bootstrap", "tool": null }),
-    ];
-    for route in ROUTES {
-        routes.push(serde_json::json!({
-            "method": route.method,
-            "path": route.path,
-            "tool": route.tool,
-        }));
+    Some(parts.join("; "))
+}
+
+/// A property's type as a reader wants it: scalars, arrays of them, and `enum` value sets.
+///
+/// A nullable property is reported by the type it actually carries — `k` is an integer you may
+/// omit, not "any" — and a `$ref` is resolved against the tool's own `$defs`, so an enum shows the
+/// values a caller may actually send.
+fn schema_type(spec: &serde_json::Value, root: &serde_json::Value) -> String {
+    let resolved = deref(spec, root);
+    if let Some(real) = resolved
+        .get("anyOf")
+        .and_then(|b| b.as_array())
+        .and_then(|branches| {
+            branches
+                .iter()
+                .find(|b| b.get("type").and_then(|t| t.as_str()) != Some("null"))
+        })
+    {
+        return schema_type(real, root);
     }
+    if let Some(values) = resolved.get("enum").and_then(|e| e.as_array()) {
+        return values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    // A unit-only enum is spelled `oneOf` of `const`s (`literal` | `regex`), one entry per variant.
+    if let Some(branches) = resolved.get("oneOf").and_then(|o| o.as_array()) {
+        let consts: Vec<String> = branches
+            .iter()
+            .filter_map(|branch| branch.get("const"))
+            .map(ToString::to_string)
+            .collect();
+        if !consts.is_empty() && consts.len() == branches.len() {
+            return consts.join("|");
+        }
+        if let Some(first) = branches.first() {
+            return schema_type(first, root);
+        }
+    }
+    match non_null_type(resolved).as_deref() {
+        Some("array") => {
+            let inner = resolved
+                .get("items")
+                .map_or_else(|| "any".to_string(), |item| schema_type(item, root));
+            // `"a"|"b"[]` would read as if only the last value were the array.
+            if inner.contains('|') {
+                format!("({inner})[]")
+            } else {
+                format!("{inner}[]")
+            }
+        }
+        Some(other) => other.to_string(),
+        None => "any".to_string(),
+    }
+}
+
+/// Follow a `$ref` one hop against the schema's own `$defs`. A ref that does not resolve is left
+/// alone rather than guessed at.
+fn deref<'a>(spec: &'a serde_json::Value, root: &'a serde_json::Value) -> &'a serde_json::Value {
+    let name = spec
+        .get("$ref")
+        .and_then(|r| r.as_str())
+        .and_then(|r| r.strip_prefix("#/$defs/"));
+    name.and_then(|name| root.get("$defs").and_then(|defs| defs.get(name)))
+        .unwrap_or(spec)
+}
+
+/// The type a property actually carries: a `type` may be a name, or an array of them when the
+/// property is nullable (`["integer", "null"]` is an optional integer).
+fn non_null_type(spec: &serde_json::Value) -> Option<String> {
+    match spec.get("type")? {
+        serde_json::Value::String(name) => (name != "null").then(|| name.clone()),
+        serde_json::Value::Array(names) => names
+            .iter()
+            .filter_map(|n| n.as_str())
+            .find(|n| *n != "null")
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+/// Prefix every line of `text` with `pad`, so a block reads as one section.
+fn indent_block(text: &str, pad: &str) -> String {
+    text.lines()
+        .map(|line| format!("{pad}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The boot document as `?format=json` — the MCP handshake's own shape.
+///
+/// The fields are `initialize`'s (`serverInfo`, `capabilities`, `instructions`) plus `tools/list`'s
+/// (`tools`), and each tool carries `method`/`path` **where MCP carried `name`**. Everything else on
+/// a card — `title`, `description`, `inputSchema`, `annotations` — is the MCP field untouched.
+///
+/// `protocolVersion` is the one field an MCP boot has that this does not: it names a *transport*
+/// version, and over HTTP there is no MCP protocol to negotiate. Left out rather than faked.
+fn boot_json(tools: &[BootTool]) -> serde_json::Value {
+    let tools: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "method": tool.method,
+                "path": tool.path,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+                "annotations": tool.annotations,
+            })
+        })
+        .collect();
     serde_json::json!({
-        "version": r.version,
-        "stamp": data.stamp,
-        "ready": r.ready,
-        "reason": r.reason,
-        "writer": r.writer,
-        "store": {
-            "memories": r.memories,
-            "vectors": r.vectors,
-            "projects": r.projects,
-            "links": r.links,
-            "links_dangling": r.links_dangling,
-            "tags": r.tags,
-        },
-        "self": self_keys,
-        "boot_note": boot_note,
-        "open": rows(&data.open),
-        "active_projects": rows(&data.active),
-        "hot": hot,
-        "routes": routes,
+        "serverInfo": { "name": SERVER_NAME, "version": crate::VERSION },
+        "capabilities": { "tools": {} },
+        "instructions": instructions(),
+        "tools": tools,
     })
 }

@@ -57,6 +57,55 @@ pub const TOOLS: &[&str] = &[
     "project_list",
 ];
 
+/// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
+/// `initialize` cannot disagree about who is answering.
+pub(crate) const SERVER_NAME: &str = "ellmephant";
+
+/// One tool exactly as `tools/list` presents it, for a surface that is not MCP.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCard {
+    /// Tool name.
+    pub name: String,
+    /// The law: what it does, when to use it, what it returns.
+    pub description: String,
+    /// The JSON Schema the model is handed as `inputSchema`.
+    pub input_schema: serde_json::Value,
+    /// The tool's annotation hints, as `tools/list` serializes them. The human-readable title lives
+    /// in here (`annotations.title`), not at the top level — which is why a card has no `title`.
+    pub annotations: serde_json::Value,
+}
+
+/// The server-level instruction — the same text an MCP `initialize` carries.
+pub(crate) fn instructions() -> &'static str {
+    INSTRUCTIONS
+}
+
+/// The tool surface as `tools/list` presents it.
+///
+/// Read from the router the `#[tool]` attributes build, so a door that is not MCP describes the
+/// same toolkit from the same source instead of a hand-kept copy: a tool added below appears
+/// here for free. `TOOLS` is the name contract; this is the content.
+pub(crate) fn tool_catalog() -> Vec<ToolCard> {
+    MemoryServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|tool| ToolCard {
+            name: tool.name.to_string(),
+            description: tool
+                .description
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+            annotations: tool
+                .annotations
+                .as_ref()
+                .and_then(|a| serde_json::to_value(a).ok())
+                .unwrap_or(serde_json::Value::Null),
+        })
+        .collect()
+}
+
 /// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
 /// every tool (curation), defined once here. Every other law lives in the tool descriptions — each
 /// states its own, so nothing is written twice (SPEC §9).
@@ -587,6 +636,12 @@ pub struct ProjectListParams {
 pub struct MemoryServer {
     session: Arc<Mutex<Session>>,
     watch: Arc<crate::http::LockWatch>,
+    /// Read-side handholds, taken once at construction so that a READ never has to touch `session`:
+    /// the writer holds that for the whole of a write, embedding included, and a reader queueing on
+    /// it is precisely the stall this split removes.
+    paths: crate::config::Paths,
+    cfg: crate::config::Config,
+    encoder: Arc<super::cli::session::Encoder>,
 }
 
 impl MemoryServer {
@@ -601,8 +656,20 @@ impl MemoryServer {
     }
 
     /// Build a server sharing a writer witness with the plain-HTTP surface.
+    ///
+    /// The read-side handholds are read out of the session here, once, while nothing else holds it.
     pub fn with_watch(session: Arc<Mutex<Session>>, watch: Arc<crate::http::LockWatch>) -> Self {
-        Self { session, watch }
+        let (paths, cfg, encoder) = {
+            let guard = session.lock().unwrap_or_else(|e| e.into_inner());
+            (guard.paths().clone(), guard.cfg().clone(), guard.encoder())
+        };
+        Self {
+            session,
+            watch,
+            paths,
+            cfg,
+            encoder,
+        }
     }
 
     /// The writer witness this server marks while a tool holds the store lock.
@@ -662,6 +729,65 @@ impl MemoryServer {
             }
         }
     }
+
+    /// Run `f` against the store on a READ-ONLY session of its own: its own SQLite connection, the
+    /// shared encoder, and **no store lock at all**.
+    ///
+    /// This is the difference between a read that waits and a read that answers. A write holds
+    /// `session` for its whole duration — the embedding included, and the embedding is the slow part
+    /// (~1.3-8.5 s per KB of body) — so a reader that queued on that lock waited out the write. In
+    /// WAL mode a reader alongside a writer is exactly what SQLite does well: it sees the last
+    /// committed state, which `/health` has always demonstrated by answering in 0.02s during a 51s
+    /// write, purely because it never touched the session.
+    ///
+    /// The cost is one `open` per read (tens of microseconds), which buys reads that do not care how
+    /// long a write takes.
+    pub(crate) async fn with_read<T, F>(
+        &self,
+        tool: &'static str,
+        f: F,
+    ) -> std::result::Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Session) -> crate::error::Result<T> + Send + 'static,
+    {
+        let paths = self.paths.clone();
+        let cfg = self.cfg.clone();
+        let encoder = Arc::clone(&self.encoder);
+        let started = std::time::Instant::now();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let session = Session::read_only(&paths, cfg, encoder).map_err(|e| e.to_string())?;
+            f(&session).map_err(|e| e.to_string())
+        })
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(Ok(value)) => {
+                tracing::debug!(tool, elapsed_ms, "read ok");
+                Ok(value)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(tool, elapsed_ms, error = %err, "read error");
+                Err(err)
+            }
+            Err(join) => {
+                let err = format!("memory read task failed: {join}");
+                tracing::error!(tool, elapsed_ms, error = %err, "read task failed");
+                Err(err)
+            }
+        }
+    }
+
+    /// Count a read (`visits`) without ever waiting for the store.
+    ///
+    /// `visits` is telemetry, not a fact, and a read must not queue behind a write to bump a counter.
+    /// So this takes the writer only if it is free and gives up otherwise: a missed visit count costs
+    /// nothing, while a read that waits out a rebuild is the whole bug this split exists to remove.
+    /// Returns the new count when it landed, so the caller can report it exactly as before.
+    pub(crate) fn bump_visit(&self, key: &str) -> Option<i64> {
+        let session = self.session.try_lock().ok()?;
+        session.record_visit(key).ok()
+    }
 }
 
 /// One JSON object as the tool's text result.
@@ -697,6 +823,44 @@ fn log_search(
             "  hit"
         );
     }
+}
+
+/// The `memory_upvote` sweep, implemented ONCE for both doors.
+///
+/// The MCP tool and `POST /memory/{key}/upvote` share this, so they cannot drift in either the error
+/// they raise or the JSON they return. That is the whole point of a second door: not a second
+/// implementation, a second *way in*.
+pub(crate) async fn upvote_sweep(
+    server: &MemoryServer,
+    keys: Vec<String>,
+) -> std::result::Result<String, String> {
+    if keys.is_empty() {
+        return Err("memory_upvote needs at least one key".to_string());
+    }
+    let sweep = keys.clone();
+    let (upvoted, missing) = server
+        .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
+        .await
+        .map_err(|e| e.to_string())?;
+    // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
+    if upvoted.is_empty() {
+        return Err(Error::NotFound(keys.join(", ")).to_string());
+    }
+    tracing::info!(
+        tool = "memory_upvote",
+        upvoted = upvoted.len(),
+        missing = missing.len(),
+        "marked useful"
+    );
+    let upvoted: Vec<serde_json::Value> = upvoted
+        .into_iter()
+        .map(|(key, times_useful)| serde_json::json!({ "key": key, "times_useful": times_useful }))
+        .collect();
+    let mut result = serde_json::json!({ "status": "useful", "upvoted": upvoted });
+    if !missing.is_empty() {
+        result["missing"] = serde_json::json!(missing);
+    }
+    Ok(json_ok(result))
 }
 
 #[tool_router]
@@ -740,7 +904,7 @@ impl MemoryServer {
     /// Delete one memory by key.
     #[tool(
         name = "memory_delete",
-        description = "Kill one memory by `key`. No undo. Gone.",
+        description = "Kill one memory by `key`. No undo. Gone. Use `memory_merge` when another memory should absorb it: a bare delete leaves every `[[key]]` pointing at it dangling, and `memory_stats` will report the store as damaged. Unsure rather than wrong? Reword it instead.",
         annotations(
             title = "Delete memory",
             read_only_hint = false,
@@ -845,7 +1009,7 @@ impl MemoryServer {
         let log_query = query.clone();
         let started = std::time::Instant::now();
         let bundle = self
-            .with_store("memory_search", move |s| {
+            .with_read("memory_search", move |s| {
                 let q = Query {
                     text: query,
                     pattern,
@@ -895,9 +1059,15 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let key = p.key;
         let lookup = key.clone();
-        let mem = self
-            .with_store("memory_get", move |s| s.fetch(&lookup))
+        let mut mem = self
+            .with_read("memory_get", move |s| s.show(&lookup))
             .await?;
+        // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
+        // write holds the store this visit simply goes uncounted — which is nothing, next to a read
+        // that queued behind the entire write.
+        if let Some(seen) = self.bump_visit(&key) {
+            mem.visits = seen;
+        }
         tracing::debug!(tool = "memory_get", key = %key, "memory fetched");
         // Carry the firing cue in the payload, not only the static description: the model reads
         // the returned body here, so this is where the upvote ask must live.
@@ -924,33 +1094,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        let keys = p.keys;
-        if keys.is_empty() {
-            return Err("memory_upvote needs at least one key".to_string());
-        }
-        let sweep = keys.clone();
-        let (upvoted, missing) = self
-            .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
-            .await?;
-        // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
-        if upvoted.is_empty() {
-            return Err(Error::NotFound(keys.join(", ")).to_string());
-        }
-        tracing::info!(
-            tool = "memory_upvote",
-            upvoted = upvoted.len(),
-            missing = missing.len(),
-            "marked useful"
-        );
-        let upvoted: Vec<serde_json::Value> = upvoted
-            .into_iter()
-            .map(|(key, times_useful)| serde_json::json!({ "key": key, "times_useful": times_useful }))
-            .collect();
-        let mut result = serde_json::json!({ "status": "useful", "upvoted": upvoted });
-        if !missing.is_empty() {
-            result["missing"] = serde_json::json!(missing);
-        }
-        Ok(json_ok(result))
+        upvote_sweep(self, p.keys).await
     }
 
     /// List the memories whose bodies link to `key`.
@@ -972,7 +1116,7 @@ impl MemoryServer {
         let key = p.key;
         let lookup = key.clone();
         let links = self
-            .with_store("memory_backlinks", move |s| s.backlinks(&lookup))
+            .with_read("memory_backlinks", move |s| s.backlinks(&lookup))
             .await?;
         tracing::debug!(tool = "memory_backlinks", key = %key, count = links.len(), "backlinks");
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
@@ -1025,7 +1169,7 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let with_tags = p.tags.unwrap_or(false);
         let stats = self
-            .with_store("memory_stats", move |s| s.stats(with_tags))
+            .with_read("memory_stats", move |s| s.stats(with_tags))
             .await?;
         tracing::info!(tool = "memory_stats", memories = stats.memories, "stats");
         serde_json::to_string(&stats).map_err(|e| e.to_string())
@@ -1050,7 +1194,7 @@ impl MemoryServer {
         let max_distance = p.max_distance.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE);
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
         let pairs = self
-            .with_store("memory_dupes", move |s| s.dupes(max_distance, limit))
+            .with_read("memory_dupes", move |s| s.dupes(max_distance, limit))
             .await?;
         tracing::info!(
             tool = "memory_dupes",
@@ -1152,7 +1296,7 @@ impl MemoryServer {
             .map_err(|e| e.to_string())?;
         let lookup = key.clone();
         let view = self
-            .with_store("project_get", move |s| s.project_view(&lookup, hydrate))
+            .with_read("project_get", move |s| s.project_view(&lookup, hydrate))
             .await?;
         tracing::debug!(
             tool = "project_get",
@@ -1187,7 +1331,7 @@ impl MemoryServer {
             mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
         };
         let rows = self
-            .with_store("project_list", move |s| s.project_list(&filter))
+            .with_read("project_list", move |s| s.project_list(&filter))
             .await?;
         tracing::info!(tool = "project_list", projects = rows.len(), "projects");
         project::list_to_wire_json(&rows).map_err(|e| e.to_string())
@@ -1198,7 +1342,7 @@ impl MemoryServer {
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("ellmephant", crate::VERSION))
+            .with_server_info(Implementation::new(SERVER_NAME, crate::VERSION))
             .with_instructions(INSTRUCTIONS)
     }
 }
@@ -1310,7 +1454,6 @@ pub fn http_router(
             "/memory/{key}/backlinks",
             axum::routing::get(surface::backlinks),
         )
-        .route("/memory/{key}/visit", axum::routing::post(surface::visit))
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
         .route(

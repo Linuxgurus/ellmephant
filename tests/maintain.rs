@@ -9,7 +9,7 @@ use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::{Embedder, HashEmbedder, projection};
 use ellmephant::index::vec;
-use ellmephant::store::{self, Memory, maintain};
+use ellmephant::store::{self, Memory, links, maintain};
 use rusqlite::{Connection, params};
 
 fn memory(key: &str, body: &str, tags_: &[&str]) -> Memory {
@@ -33,6 +33,11 @@ fn meta(conn: &Connection, key: &str) -> Option<String> {
         r.get(0)
     })
     .ok()
+}
+
+fn edge_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))
+        .expect("count edges")
 }
 
 #[test]
@@ -126,4 +131,60 @@ fn reembed_records_the_projection_fingerprint() {
         "reembed writes the current projection fingerprint"
     );
     assert!(!vec::projection_stale(&conn).unwrap());
+}
+
+#[test]
+fn reembed_rebuilds_the_link_graph_from_the_bodies() {
+    // Edges are computed at WRITE time, so a parser change does not reach an existing body on its
+    // own — the stored graph can disagree with the rows. The full rebuild re-parses every body.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let a = add(&conn, &embedder, "a", "points at [[b]]", &[]);
+    add(&conn, &embedder, "b", "the target", &[]);
+    assert_eq!(edge_count(&conn), 1);
+
+    // Simulate a stale edge an older parser would have left: one the current body does not imply.
+    conn.execute(
+        "INSERT INTO memory_link (from_id, to_key, to_type, rel) VALUES (?1, 'ghost', 'memory', 'see')",
+        params![a],
+    )
+    .expect("stale edge");
+    assert_eq!(edge_count(&conn), 2, "[[b]] plus the stale [[ghost]]");
+
+    let report = maintain::reembed(&conn, &embedder, "").expect("reembed");
+    assert_eq!(report.linked, 2, "both rows were re-parsed");
+    assert_eq!(
+        edge_count(&conn),
+        1,
+        "the stale edge is gone; [[b]] remains"
+    );
+    assert!(links::dangling(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn reparse_applies_the_code_span_rule_to_an_existing_body() {
+    // The backtick escape is a parser change; a full rebuild is how a body written before it
+    // catches up (the edge it wrongly created is not removed by rewriting the row alone).
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    // A body that only *documents* the syntax creates no edge under the current parser...
+    let a = add(&conn, &embedder, "doc", "write `[[key]]` to link", &[]);
+    assert_eq!(edge_count(&conn), 0);
+
+    // ...but one left by the old parser did. Rebuild and it is gone.
+    conn.execute(
+        "INSERT INTO memory_link (from_id, to_key, to_type, rel) VALUES (?1, 'key', 'memory', 'see')",
+        params![a],
+    )
+    .expect("legacy edge");
+    assert_eq!(edge_count(&conn), 1);
+
+    maintain::reembed(&conn, &embedder, "").expect("reembed");
+    assert_eq!(
+        edge_count(&conn),
+        0,
+        "the code-span token is no longer an edge"
+    );
 }

@@ -1,9 +1,13 @@
-//! Rebuild the derived vector index from `memory` (PLAN §6 P9).
+//! Rebuild the derived indexes from `memory` (PLAN §6 P9): the vector index and the `[[link]]`
+//! graph.
 //!
 //! The relational rows are the source of truth, so changing the encoder (or its dimension)
 //! is a *re-embed*, never a migration: walk `memory`, recompute the document projection,
-//! rewrite each row's `doc_hash`, and repopulate `memory_vec`. `meta` records what the
-//! vectors now correspond to so `doctor` can tell a swapped model from a corrupt one.
+//! rewrite each row's `doc_hash`, and repopulate `memory_vec`. The `[[link]]` graph is derived
+//! too — its edges are computed at *write* time — so the same pass re-parses every body
+//! ([`links::reparse`]), making "derived and rebuildable" true rather than aspirational. `meta`
+//! records what the vectors now correspond to so `doctor` can tell a swapped model from a corrupt
+//! one.
 
 use rusqlite::{Connection, params};
 
@@ -11,7 +15,7 @@ use crate::db::meta;
 use crate::embed::{Embedder, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::{row_hash, tags};
+use crate::store::{links, row_hash, tags};
 
 /// Rows embedded per `Embedder::embed` batch.
 const BATCH: usize = 16;
@@ -27,11 +31,16 @@ pub struct Report {
     pub rebuilt: bool,
     /// The model id the vectors now correspond to.
     pub model: String,
+    /// Memories whose `[[link]]` graph was re-parsed from its body.
+    pub linked: usize,
 }
 
 /// Recompute every vector and rebuild the vec0 table (PLAN §6 P9). Handles a dimension
 /// change by dropping and recreating the table (the one path [`index::vec::ensure`]
 /// refuses), and records `dim`/`model`/`instruction` in `meta`.
+///
+/// Also re-parses every body into `memory_link` ([`links::reparse`]): that graph is derived from
+/// the rows too, so a full rebuild is where a parser change (or an older body) catches up.
 pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) -> Result<Report> {
     let dim = embedder.dim();
     let rebuilt = index::vec::stored_dim(conn)? != Some(dim);
@@ -83,10 +92,15 @@ pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) ->
     }
     tx.commit()?;
 
+    // The link graph is derived too: re-parse every body, so a parser change — or a body written by
+    // an older version — finally reaches the stored edges.
+    let linked = links::reparse(conn)?;
+
     Ok(Report {
         rows: rows_count,
         dim,
         rebuilt,
         model: embedder.model_id().to_string(),
+        linked,
     })
 }

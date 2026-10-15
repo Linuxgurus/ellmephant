@@ -1201,9 +1201,8 @@ async fn write_routes_accept_the_mcp_arguments_as_a_body() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-    // `memory_merge` takes {from, into} — and a merge refuses to silently drop prose, so the target
-    // must already carry the source's. That is the documented order: write the facts into `into`
-    // first, then retire `from`.
+    // `memory_merge` takes {from, into}. The target already carries the source's prose here, so there
+    // is nothing to integrate; had it not, the merge would append it rather than refuse.
     seed(
         &app,
         "tok",
@@ -1424,11 +1423,11 @@ async fn a_body_past_the_cap_is_refused() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// A merge that would silently drop prose is refused. `into`'s body is never edited, so retiring a
-/// memory carrying a fact the target lacks deletes the fact and reports only link counts — which
-/// made the one operation called "tidying up" the one that could quietly lose the detail.
+/// A merge no longer needs the caller to fold first: retiring a memory whose fact the target lacks
+/// APPENDS that fact, verbatim, and the target keeps it. The old gate made the one operation called
+/// "tidying up" the one that could quietly lose the detail — or refuse and stall the workflow.
 #[tokio::test]
-async fn a_merge_that_would_drop_prose_is_refused() {
+async fn a_merge_integrates_the_fact_instead_of_losing_or_refusing_it() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
     seed(
@@ -1457,45 +1456,24 @@ async fn a_merge_that_would_drop_prose_is_refused() {
         r#"{"from":"dup-from","into":"dup-into"}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("refusing to merge"), "{body}");
-    assert!(
-        body.contains("DELETE"),
-        "it says how to discard on purpose: {body}"
-    );
-
-    // A refused merge retires nothing.
-    let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a refused merge must not delete the source"
-    );
-
-    // Fold the fact in first, and the same merge goes through.
-    seed(
-        &app,
-        "tok",
-        "dup-into",
-        "the survivor",
-        "only the survivor's words\na fact only the duplicate carries",
-    )
-    .await;
-    let (status, body, _) = request(
-        &app,
-        Method::POST,
-        "/memory/dup-from/merge?format=json",
-        Some("tok"),
-        Some("application/json"),
-        r#"{"from":"dup-from","into":"dup-into"}"#,
-    )
-    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("a fact only the duplicate carries"),
+        "the integrated line is reported, not just a link count: {body}"
+    );
+
+    // The source retires, and its fact SURVIVED in the target: not lost, not paraphrased.
     let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "the source retires once the fold is in"
+    assert_eq!(status, StatusCode::NOT_FOUND, "the source retires");
+    let (status, body, _) = get(&app, "/memory/dup-into?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("a fact only the duplicate carries"),
+        "the fact was carried into the survivor: {body}"
+    );
+    assert!(
+        body.contains("only the survivor's words"),
+        "and the survivor's own words are untouched: {body}"
     );
 }
 

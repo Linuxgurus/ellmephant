@@ -960,7 +960,11 @@ pub async fn merge(
                 StatusCode::OK,
                 json,
                 serde_json::to_string(&out).unwrap_or_default(),
-                format!("merged {key} -> {into} ({} refs repointed)", out.bodies),
+                format!(
+                    "merged {key} -> {into} ({} line(s) integrated, {} refs repointed)",
+                    out.integrated.len(),
+                    out.bodies
+                ),
             )
         }
         Err(e) => error(json, error_status(&e), e),

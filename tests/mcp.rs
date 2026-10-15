@@ -292,8 +292,9 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert!(!extra.is_error.unwrap_or(false), "{}", text(&extra));
-    // `memory_merge` retires one key into another, repointing its references (the safe merge). The
-    // survivor carries the retired body's prose first: a merge that would drop facts is refused.
+    // `memory_merge` integrates one key into another and deletes it, repointing its references (the
+    // safe merge). The survivor already carries the retired body's prose, so there is nothing to
+    // integrate here and the call is a pure retire.
     for (key, body) in [
         ("merge-old", "retired"),
         ("merge-new", "survivor, now carrying: retired"),
@@ -328,6 +329,11 @@ async fn tools_round_trip_over_the_transport() {
         out["bodies"],
         serde_json::json!(1),
         "the referrer was rewritten"
+    );
+    assert_eq!(
+        out["integrated"],
+        serde_json::json!([]),
+        "the caller folded first, so nothing was left to integrate"
     );
 
     let gone = call(

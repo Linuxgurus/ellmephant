@@ -186,7 +186,7 @@ impl Session {
     /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch
     /// behind `memory_upsert`.)
     pub fn merge_into(&self, from: &str, into: &str) -> Result<links::MergeInto> {
-        links::merge_into(&self.conn, from, into)
+        links::merge_into(&self.conn, &self.vec_spec(), from, into)
     }
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry

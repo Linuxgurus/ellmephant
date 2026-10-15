@@ -52,11 +52,18 @@ answers, so the row is searchable the moment it returns. It holds the store lock
 — exactly the coupling the queue exists to remove — so it is opt-in and for callers that genuinely
 cannot proceed otherwise.
 
-**`/bootstrap` is a view, not a dump.** It carries the resident set a cold agent needs — the `cline-self`
-keys, the boot body, hot, todos, open projects, stats, health, links — and an index of the routes
-below, so everything else is one call away. It does **not** carry every body (there are hundreds): that
-is not a boot, it is a context fill. If a fact is not meant to be resident, `/bootstrap` must not
-smuggle it in.
+**`/bootstrap` is the door, and what is behind it.** One fetch must be enough to *boot*: what this is,
+how to get a memory, who you are, what is open, where the rest is. It carries the resident set — the
+`bootstrap-self` body **in full**, the `cline-self` keys with their titles, the open projects, and a
+state line — plus the four calls that reach everything else. It does **not** carry every body (there
+are hundreds): that is not a boot, it is a context fill. If a fact is not meant to be resident,
+`/bootstrap` must not smuggle it in.
+
+**And it stays small, because a boot that arrives truncated is worse than no boot.** A fetching client
+handed the old document — a verbatim `initialize` + `tools/list` dump, 14.8 KB — delivered it with
+7 KB punched out of the middle, and the reader has no way to know. So the default view is budgeted
+(`BOOT_BUDGET_BYTES`, asserted by the suite) and the tool catalogue is `?tools=true`: the one part
+that cannot be made small, which the caller should choose to spend tokens on.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 
@@ -194,7 +201,7 @@ Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 | method | path | maps to | parameters |
 | --- | --- | --- | --- |
 | GET | `/health` | *(new)* | `?format=json` |
-| GET | `/bootstrap` | *(new)* | `?format=json`, `?hydrate=keys\|snippet\|full` |
+| GET | `/bootstrap` | *(new)* | `?format=json`; `?tools=true` adds the tool catalogue |
 | GET | `/stats` | `memory_stats` | `?tags=true` |
 | GET | `/memory/{key}` | `memory_get` | counts a `visits` read, exactly as MCP does |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
@@ -295,74 +302,80 @@ MCP tool's own object under `?format=json`.
 
 ### `GET /bootstrap` — the document
 
-**The MCP boot, with HTTP verbs.** An MCP client is handed `initialize` (`serverInfo`,
-`capabilities`, `instructions`) and then `tools/list` (the tool cards). This is those two merged into
-one read, with `method` + `path` where MCP carries `name`. **Nothing more, nothing less** — no counts,
-no resident set, no route index. The unit being replicated is the *API surface*; a boot that also
-carries content is a boot you cannot trust to describe the same API.
+**The door, in one read.** Its reader is a client that has just been handed a URL and knows nothing:
+not that this is a memory store, not that it can fetch from it, not that one of the memories is its own
+notes. So the document answers, in order:
+
+1. **what this is** — one line: a memory store over plain HTTP, and the state (`ready — 302 memories,
+   schema v8, encode 0 pending / 0 failed`).
+2. **how to get at it** — the four calls that reach everything: `/stats`, `/memory/{key}`,
+   `/search?q=`, `POST /memory`. With the two facts a caller needs to use them: every GET takes
+   `?format=json`, and a write may 401 because it wants a bearer.
+3. **you, resident** — the `bootstrap-self` body, in full. The one body a cold agent needs before it
+   can decide anything else.
+4. **the rest of you** — the `cline-self` tag as an index: key + clipped title per line, bodies one
+   call away.
+5. **open work** — every project that is not done: status, key, clipped goal.
+6. **style** — how to write here, compressed to three lines.
+7. **the catalogue** — with `?tools=true`, all 14 tools with every argument; without it, a pointer
+   that names the size it would cost (measured, not hardcoded).
 
 ```
-BOOT ellmephant 1.2.0   capabilities: tools
+# ellmephant — your memory, over plain HTTP
+# ready — 302 memories, 15 projects, schema v8, encode 0 pending, 0 failed (detail: /health)
 
-INSTRUCTIONS
-  ellmephant = Memory storage in smart-caveman style — big words in, small words out; ...
+HOW TO GET AT IT — this endpoint is the door, not a handshake. Four calls reach everything:
+  GET /stats?format=json                 the whole store in one object (counts, tags, queue, top)
+  GET /memory/{key}?format=json          one memory whole, by key
+  GET /search?q=…&format=json            hunt by meaning; &tags=todo for what I meant to do next
+  POST /memory                          write: a JSON body of `memory_upsert`'s args (see ?tools=true)
+  Every GET takes ?format=json. Reads are open. If a write 401s, it wants a bearer — ask me.
 
-TOOLS — 14; HTTP verbs in place of MCP verbs, arguments and descriptions unchanged
+## 1. YOU — resident, in full (memory `bootstrap-self`)
+  BOOT: read FIRST. Lean by design — only what a cold me needs RESIDENT …
+  - I am Cline = the LINE (continuity), not the chassis. …
+  …
 
-  GET /memory/{key}/backlinks
-      List memories whose body point at `key` with `[[…]]`.
-      args: key: string (required) — Memory key. Slug.
+## 2. THE REST OF YOU — tag `cline-self`, 22 keys; a body is GET /memory/{key}
+  agent-drive                        Agent drives: what makes work interesting, …
+  …
 
-  PUT /memory/{key}/coherent
-      Record a memory's split-review verdict: `true` = one coherent topic, — ...
-      args: coherent: boolean (optional) — true = one topic; false = a grab-bag; null = unjudged.; key: string (required) — Memory key. Slug.
-
-  DELETE /memory/{key}
-      Kill one memory by `key`. No undo. Gone. — ...
-      args: key: string (required) — Memory key. Slug.
-
-  ... (14, alphabetical by tool — the same order `tools/list` uses)
+## 3. OPEN WORK — 13 projects still running; state, goal and `preload`: GET /project/{key}
+  active  ellmephant           Own and grow the memory MCP: storage, search, projects, …
+  …
 ```
 
-`?format=json` is the same document in MCP's own shape, so a client moves over by reading
-`method`/`path` where it read `name`:
+**`?format=json` carries the same document, in MCP's field names where MCP has one** —
+`serverInfo`, `capabilities`, `instructions` — plus `howToUse` (the calls, as structured entries, not
+prose), `state`, `youResident`, `selfSet`, `openProjects`. `tools` appears only with `?tools=true`,
+and each card is MCP's with `method`/`path` where MCP had `name`:
 
 ```json
 {
   "serverInfo": { "name": "ellmephant", "version": "1.2.0" },
   "capabilities": { "tools": {} },
   "instructions": "ellmephant = Memory storage in smart-caveman style — ...",
-  "tools": [
-    {
-      "method": "GET",
-      "path": "/memory/{key}",
-      "description": "Pull one memory whole by `key` — ...",
-      "inputSchema": { "$schema": "...", "properties": { "key": { "type": "string" } }, "required": ["key"], "type": "object" },
-      "annotations": { "title": "Get memory", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
-    }
-  ]
+  "howToUse": { "what": "...", "calls": [ { "call": "GET /search?q=…&format=json", "for": "hunt by meaning" } ], "notes": [ "..." ] },
+  "state": "ready — 302 memories, 15 projects, schema v8, encode 0 pending, 0 failed (detail: /health)",
+  "youResident": { "key": "bootstrap-self", "title": "...", "body": "..." },
+  "selfSet": { "tag": "cline-self", "keys": [ { "key": "...", "title": "..." } ] },
+  "openProjects": [ { "key": "...", "status": "active", "goal": "...", "call": "GET /project/{key}?hydrate=full" } ],
+  "tools": [ { "method": "GET", "path": "/memory/{key}", "description": "...", "inputSchema": { }, "annotations": { } } ]
 }
 ```
-
-The fields are MCP's, verbatim — `inputSchema` and `annotations` included, `$defs` and all. (MCP
-*omits* a `title` it does not have rather than sending `""`, so the cards have no top-level `title`
-either; the human name rides `annotations.title`, where rmcp puts it.)
 
 **`protocolVersion` is the one field an MCP boot has that this drops.** It names a *transport* version,
 and over HTTP there is no MCP protocol to negotiate. Omitted rather than faked.
 
-**Where the content went.** The resident set this document used to carry — the `cline-self` keys, the
-boot note, todos, active projects, hot — is reachable with the commands above, exactly as it is over
-MCP: `GET /memory/bootstrap-self`, `GET /search?tag=cline-self`, `GET /search?tag=todo`,
-`GET /projects?status=active`, `GET /stats`. Readiness is `/health`'s job, and `/health` is the only
-surface that reports it. **A boot is not a status page.**
+**It degrades instead of failing.** The document is read on its own read-only connection, so it needs
+no lock and never queues behind a writer — and when the store cannot be read at all, the header says
+`STORE UNREADABLE (reason)` and the API part (how to get at it, the catalogue) is still served. The
+missing content is *named*, never quietly omitted: silence would read as "there is nothing in here",
+which is the one thing a boot must not say when it does not know.
 
-**It needs no store.** The document is built from code — `mcp::instructions` and `mcp::tool_catalog`
-joined to the `ROUTES` table — so it reads no database and takes no lock. A boot still describes the
-API when the store is missing, stalled, or behind a writer, which is exactly when a caller needs to
-know what it may ask for. That is also why it cannot drift: the cards come from the same router
-`tools/list` uses, and a tool the router carries but no route reaches is dropped from the boot and
-**fails `every_tool_has_a_route`**.
+**The catalogue cannot drift from the doors.** The cards come from the same router `tools/list` uses,
+joined to the `ROUTES` table, so a tool the router carries but no route reaches is dropped from the
+catalogue — and **fails `every_tool_has_a_route`**.
 
 **Boot counting is deliberately absent.** A counter would make `/bootstrap` a writer, which breaks
 invariant 1. Boot observability already exists — the gateway's access log records every `GET /bootstrap`
@@ -392,10 +405,15 @@ Under `?format=json` every error is `{"error": "...", "status": N}`, so a script
 5. **The text round-trip** (the reason the format exists): a body containing `"quotes"`, `: colons`, `{}`
    and a line of `---` is stored and read back **byte-identical**.
 6. **Front-matter strictness**: an unknown field is a 400 that names it, and nothing is written.
-7. **`/bootstrap` shape**: exactly one BOOT NOTE body; a non-resident memory shows its title and not its
-   body; `writer` and `ROUTES` present.
-8. **`/bootstrap` is read-only**: it changes no `visits` and no counts.
-9. **Failures**: 404 unknown key, 405 wrong method, unknown path hits our fallback with a text body.
+7. **`/bootstrap` is the door**: it says what it is, states the calls, and inlines the resident note's
+   **body** while every other self-set memory contributes only key + title; the tool catalogue is absent
+   by default and present with `?tools=true`.
+8. **`/bootstrap` stays inside its budget**: the default view is under `BOOT_BUDGET_BYTES`, on a store
+   shaped like the live one — the guardrail against a boot that a fetching client would truncate.
+9. **`/bootstrap` is read-only**: it changes no `visits` and no counts, and it will not create a store.
+10. **`/bootstrap` degrades**: with no readable store, it still 200s with the API part and names what it
+    could not read.
+11. **Failures**: 404 unknown key, 405 wrong method, unknown path hits our fallback with a text body.
 
 ### The rules stub (criterion 2) — a different repo, so a separate change
 

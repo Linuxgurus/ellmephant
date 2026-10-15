@@ -13,13 +13,16 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 
+use crate::config::Paths;
+use crate::db;
 use crate::http::HttpState;
 use crate::mcp::{
     CoherentFilter, DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SERVER_NAME,
     SearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
-use crate::store::{self, links::backlinks_to_wire_json, project};
+use crate::store::{self, encode, links::backlinks_to_wire_json, project, tags};
+use rusqlite::OptionalExtension;
 
 /// One MCP tool reachable over HTTP — the parity table. A route the table does not name is a tool
 /// a wedged MCP session would strand; the parity test keeps it exactly as long as `TOOLS`.
@@ -1404,42 +1407,239 @@ fn boot_tools() -> Vec<BootTool> {
         .collect()
 }
 
-/// `GET /bootstrap` — the boot document: exactly what an MCP client is handed at `initialize` and
-/// `tools/list`, with HTTP verbs in place of MCP verbs, and nothing else.
+/// How much of an index entry's title the boot keeps. The index exists so a cold client knows what it
+/// HAS, not what it says — the body is one call away — and the whole document must survive being
+/// fetched by a client that truncates on size (see [`BOOT_BUDGET_BYTES`]).
+const INDEX_TITLE_CHARS: usize = 40;
+
+/// How much of a project's goal the boot keeps, for the same reason.
+const PROJECT_GOAL_CHARS: usize = 56;
+
+/// The ceiling the default boot is held under, in bytes — public because the suite asserts it
+/// (`tests/http.rs`), and a budget nothing checks is a comment.
 ///
-/// **Nothing else is the requirement, not a limitation.** This is the store's *API surface*, not a
-/// view of its contents: the resident set (self, todos, active projects, hot) is one of the
-/// commands below, exactly as it is over MCP, and `/health` answers readiness.
+/// Not a style preference: a fetching client truncates a large response, and a boot truncated
+/// mid-way is worse than no boot — the reader gets a document it believes is complete. The default
+/// view is the resident set plus the calls that reach everything else, so it stays small; the 14-tool
+/// catalogue (every argument schema) is `?tools=true` and says so, because it is the one part that
+/// cannot be made small and must never be silently cut in half.
+pub const BOOT_BUDGET_BYTES: usize = 8_192;
+
+/// What `/bootstrap` found when it looked. Every field is `None`/empty when the store could not be
+/// read — the boot still says what it is and what it can be asked for, and names the missing facts
+/// rather than omitting them, because silence reads as "nothing to report".
+#[derive(Default)]
+struct BootView {
+    /// The resident note: `(key, title, body)`.
+    note: Option<(String, String, String)>,
+    /// The self set as `(key, title)`, key-ascending.
+    self_set: Vec<(String, String)>,
+    /// Open projects as `(key, status, goal)`.
+    projects: Vec<(String, String, String)>,
+    /// The one-line state, or `None` when there was nothing to read.
+    state: Option<String>,
+    /// Why there is no content, when there is none.
+    unreadable: Option<String>,
+}
+
+impl BootView {
+    /// Read the boot from the store on a read-only connection of our own.
+    fn read(paths: &Paths) -> Self {
+        let conn = match db::open_read_only(paths) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return BootView {
+                    unreadable: Some(err.to_string()),
+                    ..BootView::default()
+                };
+            }
+        };
+        match Self::fill(&conn) {
+            Ok(view) => view,
+            Err(err) => BootView {
+                unreadable: Some(err.to_string()),
+                ..BootView::default()
+            },
+        }
+    }
+
+    fn fill(conn: &rusqlite::Connection) -> crate::error::Result<Self> {
+        let note = conn
+            .query_row(
+                "SELECT key, title, body FROM memory WHERE key = ?1",
+                rusqlite::params![BOOT_NOTE],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(BootView {
+            note,
+            self_set: tags::keys_with(conn, BOOT_TAG)?,
+            projects: project::open(conn)?,
+            state: Some(state_line(conn)?),
+            unreadable: None,
+        })
+    }
+}
+
+/// The state line: the facts a caller needs before trusting anything else, all from the boot's own
+/// read-only connection. A *view* of the same facts `/health` reports — no readiness predicate is
+/// reimplemented here (readiness is `/health`'s job), and the encode queue is the metric it is there.
+fn state_line(conn: &rusqlite::Connection) -> crate::error::Result<String> {
+    let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+    let projects = project::count(conn)?;
+    let schema = db::migrate::version(conn)?;
+    let latest = db::migrate::latest();
+    let queue = encode::counts(conn)?;
+    let status = if schema == latest {
+        "ready"
+    } else {
+        "NOT READY"
+    };
+    let queue = match queue.oldest_s {
+        Some(age) => format!(
+            "{} pending (oldest {age}s), {} failed",
+            queue.pending, queue.failed
+        ),
+        None => format!("{} pending, {} failed", queue.pending, queue.failed),
+    };
+    Ok(format!(
+        "{status} — {memories} memories, {projects} projects, schema v{schema}, encode {queue} (detail: /health)"
+    ))
+}
+
+/// The self set's tag: the keys a cold client is made of, indexed at boot and loaded on demand.
+const BOOT_TAG: &str = "cline-self";
+
+/// The resident note, inlined at boot. One key, because one body is what a cold agent needs before it
+/// can decide anything else; the rest of the self set is an index it can walk.
+const BOOT_NOTE: &str = "bootstrap-self";
+
+/// `GET /bootstrap` — **the door, and what is behind it**: everything a cold client needs in one
+/// read, in the order it needs it, small enough to arrive intact.
 ///
-/// Because the document is built from code rather than from the store, it needs no database and
-/// takes no lock — so a boot still describes the API when the store is missing or stalled, which is
-/// exactly when a caller needs to know what it can ask for.
-pub async fn bootstrap(RawQuery(raw): RawQuery) -> Response {
-    let json = Params::parse(raw.as_deref()).json();
-    let tools = boot_tools();
+/// This is the view HTTP.md promised and the code never delivered. What it used to be was a verbatim
+/// dump of `initialize` + all 14 tool cards — 14.8 KB, which a fetching client middle-truncated
+/// (7 KB punched out of the tool list), and which contains no memory at all. A client that read it
+/// learned the *shape of the API* and nothing about the store: not that there are 302 memories, not
+/// that one of them is its own boot note, not that eight projects are open and waiting. So it did
+/// not think of this endpoint as how you get memories — and it was right, because it was not.
+///
+/// So the boot leads with what is here and how to fetch it: the four calls that reach the store, the
+/// resident note in full, an index of the self set, the work still open, and the style. The tool
+/// catalogue is `?tools=true` — the one part that cannot be small, which the caller should choose to
+/// spend tokens on rather than receive by default.
+pub async fn bootstrap(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let with_tools = params.flag("tools");
+    // The boot reads the store on its OWN read-only connection: no lock, so a boot never queues
+    // behind a writer, and a boot during an outage still describes a store it cannot read.
+    let view = tokio::task::spawn_blocking({
+        let paths = state.paths.clone();
+        move || BootView::read(&paths)
+    })
+    .await
+    .unwrap_or_default();
+    let tools = with_tools.then(boot_tools);
     render(
         StatusCode::OK,
         json,
-        boot_json(&tools).to_string(),
-        boot_text(&tools),
+        boot_json(&view, tools.as_deref()).to_string(),
+        boot_text(&view, tools.as_deref()),
     )
 }
 
-/// The boot document in the store's text form: the same information as [`boot_json`], rendered for
-/// a model to read rather than a machine to parse.
-fn boot_text(tools: &[BootTool]) -> String {
-    let mut out = format!(
-        "BOOT {SERVER_NAME} {}   capabilities: tools\n",
-        crate::VERSION
+/// The boot document in the store's text form: for a client to read, in the order it should read it.
+///
+/// The order is the point. A client arriving cold asks, in sequence: *what is this*, *what is in it*,
+/// *how do I fetch it*, *what is mine*, *what is open*, *how does this person want me to write*,
+/// *where is the rest*. The document answers in that order, and every line that names a memory or a
+/// project is a call the reader can make.
+fn boot_text(view: &BootView, tools: Option<&[BootTool]>) -> String {
+    let mut out = String::from("# ellmephant — your memory, over plain HTTP\n");
+    match &view.state {
+        Some(state) => out.push_str(&format!("# {state}\n")),
+        // A boot with no store still says what it is and what it can be asked for; the missing facts
+        // are NAMED, because silence would read as "there is nothing in here".
+        None => out.push_str(&format!(
+            "# STORE UNREADABLE, API ONLY — {}\n",
+            view.unreadable.as_deref().unwrap_or("unknown error")
+        )),
+    }
+
+    out.push_str(
+        "\nHOW TO GET AT IT — this endpoint is the door, not a handshake. Four calls reach everything:\n\
+         \x20 GET /stats?format=json                 the whole store in one object (counts, tags, queue, top)\n\
+         \x20 GET /memory/{key}?format=json          one memory whole, by key\n\
+         \x20 GET /search?q=…&format=json            hunt by meaning; &tags=todo for what I meant to do next\n\
+         \x20 POST /memory                          write: a JSON body of `memory_upsert`'s args (see ?tools=true)\n\
+         \x20 Every GET takes ?format=json. Reads are open. If a write 401s, it wants a bearer — ask me.\n",
     );
+
     out.push_str(&format!(
-        "\nINSTRUCTIONS\n{}\n",
-        indent_block(instructions(), "  ")
+        "\n## 1. YOU — resident, in full (memory `{BOOT_NOTE}`)\n"
     ));
+    match &view.note {
+        Some((_, _, body)) => out.push_str(&format!("{}\n", indent_block(body, "  "))),
+        None => out.push_str("  (no resident note in this store)\n"),
+    }
+
     out.push_str(&format!(
-        "\nTOOLS — {}; HTTP verbs in place of MCP verbs, arguments and descriptions unchanged\n",
-        tools.len()
+        "\n## 2. THE REST OF YOU — tag `{BOOT_TAG}`, {} keys; a body is GET /memory/{{key}}\n",
+        view.self_set.len()
     ));
+    for (key, title) in &view.self_set {
+        out.push_str(&format!("  {key:<34} {}\n", clip(title, INDEX_TITLE_CHARS)));
+    }
+
+    out.push_str(&format!(
+        "\n## 3. OPEN WORK — {} projects still running; state, goal and `preload`: GET /project/{{key}}\n",
+        view.projects.len()
+    ));
+    for (key, status, goal) in &view.projects {
+        out.push_str(&format!(
+            "  {status:<7} {key:<20} {}\n",
+            clip(goal, PROJECT_GOAL_CHARS)
+        ));
+    }
+
+    out.push_str(
+        "\n## 4. STYLE — how to work here (the full standing text rides ?tools=true)\n\
+         \x20 smart-caveman: big words in, small words out. Upvote any memory that shaped your task.\n\
+         \x20 A project is an activity over time; a memory JOINS one by carrying the `prj:<key>` tag and\n\
+         \x20 POINTS at one with `[[prj:key]]`. Keys are plain names, and the tool descriptions are the spec.\n",
+    );
+
+    match tools {
+        Some(tools) => {
+            out.push_str(&format!(
+                "\n## 5. TOOLS — {}; HTTP verbs in place of MCP verbs, arguments and descriptions unchanged\n",
+                tools.len()
+            ));
+            out.push_str(&catalogue_text(tools));
+        }
+        None => {
+            // The size is MEASURED, not stated: it is the one number a caller deciding whether to
+            // spend the tokens needs, and a hardcoded size drifts the first time a tool description
+            // grows. Rendering it here costs nothing (the catalogue is code, not a database read).
+            let catalogue = catalogue_text(&boot_tools());
+            out.push_str(&format!(
+                "\n## 5. THE FULL CATALOGUE — all {} tools with every argument: GET /bootstrap?tools=true\n\
+                 \x20 That document is {} KB of schemas — several times this one — and some fetching clients\n\
+                 \x20 truncate a response that size, so it is opt-in. Everything above is the common case;\n\
+                 \x20 that is the reference. Nothing in it is needed to fetch a memory.\n",
+                boot_tools().len(),
+                catalogue.len() / 1024
+            ));
+        }
+    }
+    out
+}
+
+/// The catalogue half of the boot: every tool, its verb, and its arguments. Split out so the default
+/// view can measure it without including it.
+fn catalogue_text(tools: &[BootTool]) -> String {
+    let mut out = String::new();
     for tool in tools {
         out.push_str(&format!("\n  {} {}\n", tool.method, tool.path));
         out.push_str(&format!("      {}\n", tool.description.replace('\n', " ")));
@@ -1571,6 +1771,22 @@ fn indent_block(text: &str, pad: &str) -> String {
         .join("\n")
 }
 
+/// Cut `text` to at most `max` characters on a word boundary, marking the cut — an index entry says
+/// what a memory is ABOUT, and a hard cut mid-word reads as corruption where a marked cut reads as a
+/// limit. Every index line in the boot goes through this.
+fn clip(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max).collect();
+    let cut = head
+        .rfind(' ')
+        .map(|i| head[..i].to_string())
+        .unwrap_or(head);
+    format!("{cut} …")
+}
+
 /// The boot document as `?format=json` — the MCP handshake's own shape.
 ///
 /// The fields are `initialize`'s (`serverInfo`, `capabilities`, `instructions`) plus `tools/list`'s
@@ -1579,23 +1795,63 @@ fn indent_block(text: &str, pad: &str) -> String {
 ///
 /// `protocolVersion` is the one field an MCP boot has that this does not: it names a *transport*
 /// version, and over HTTP there is no MCP protocol to negotiate. Left out rather than faked.
-fn boot_json(tools: &[BootTool]) -> serde_json::Value {
-    let tools: Vec<serde_json::Value> = tools
-        .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "method": tool.method,
-                "path": tool.path,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-                "annotations": tool.annotations,
-            })
-        })
-        .collect();
-    serde_json::json!({
+/// The boot document as `?format=json` — the same facts, shaped for a machine.
+///
+/// `serverInfo`/`capabilities`/`instructions` stay in MCP's own names so a client moving over from
+/// MCP can read what it already knows how to read; `tools` appears only with `?tools=true`, and the
+/// content sections carry the same cuts as the text form so the two cannot diverge in size or shape.
+fn boot_json(view: &BootView, tools: Option<&[BootTool]>) -> serde_json::Value {
+    let mut doc = serde_json::json!({
         "serverInfo": { "name": SERVER_NAME, "version": crate::VERSION },
         "capabilities": { "tools": {} },
         "instructions": instructions(),
-        "tools": tools,
-    })
+        "howToUse": {
+            "what": "This is a memory store reachable over plain HTTP. It is the door, not a handshake.",
+            "calls": [
+                { "call": "GET /stats?format=json", "for": "the whole store in one object (counts, tags, encode queue, top tags/useful)" },
+                { "call": "GET /memory/{key}?format=json", "for": "one memory whole, by key" },
+                { "call": "GET /search?q=…&format=json", "for": "hunt by meaning; &tags=todo for what I meant to do next" },
+                { "call": "GET /search?format=json&tags=cline-self", "for": "every key of the resident self set" },
+                { "call": "GET /projects?format=json", "for": "all projects; ?status=active to narrow" },
+                { "call": "POST /memory", "for": "write: a JSON body of `memory_upsert`'s args" },
+                { "call": "GET /bootstrap?tools=true", "for": "the full tool catalogue with every argument (≈15KB)" }
+            ],
+            "notes": [
+                "Every GET takes ?format=json; reads are open.",
+                "A write may 401: that means it wants a bearer token.",
+                "A write returns before its vector exists (the store embeds it a moment later)."
+            ]
+        },
+        "state": view.state,
+        "unreadable": view.unreadable,
+        "youResident": view.note.as_ref().map(|(key, title, body)| serde_json::json!({
+            "key": key, "title": title, "body": body,
+        })),
+        "selfSet": {
+            "tag": BOOT_TAG,
+            "keys": view.self_set.iter().map(|(key, title)| serde_json::json!({
+                "key": key, "title": clip(title, INDEX_TITLE_CHARS),
+            })).collect::<Vec<_>>(),
+        },
+        "openProjects": view.projects.iter().map(|(key, status, goal)| serde_json::json!({
+            "key": key, "status": status, "goal": clip(goal, PROJECT_GOAL_CHARS),
+            "call": format!("GET /project/{key}?hydrate=full"),
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(tools) = tools {
+        let tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "method": tool.method,
+                    "path": tool.path,
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                    "annotations": tool.annotations,
+                })
+            })
+            .collect();
+        doc["tools"] = serde_json::Value::Array(tools);
+    }
+    doc
 }

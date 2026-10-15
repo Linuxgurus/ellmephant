@@ -155,8 +155,13 @@ ON CONFLICT(key) DO UPDATE SET
 and it runs **iff `prepared.needs_embed()`**. That one condition keeps the whole "filing, not
 meaning" class free — a tag-only edit, a `source` change, `mark_coherent`, `record_visit`,
 `record_useful`, a project merge — because none of them move the document, so none of them queue an
-embed. `index::vec::ensure(conn, spec.dim)` stays on the write path (cheap DDL guard);
-`embedder.embed_one` is deleted from it.
+embed.
+
+**`add_impl` also stops creating the vec table**, which `index::vec::ensure` used to do here. That
+table's width is a runtime property of the **embedder**, and a write no longer holds one (§ P0) — so
+the only code that can honestly create it is the code holding a vector, `settle_encoded`. Deriving the
+width from config would pin the store to whatever `config.toml` said rather than to what the encoder
+actually emits, and those two are allowed to differ (a test does exactly that).
 
 ### `doc_hash` keeps its exact meaning — the part to get right
 
@@ -354,9 +359,15 @@ The suite is the point of the design, so it is specified with it.
   so the refactor cannot silently re-embed every row in the store).
 
 **Integration (`tests/`, the existing suite)**
-- Every `store::add` call gains a `drain(&conn, &embedder, &spec, n)` before it asserts on search
-  hits — ~20 call sites in `tests/store.rs`, `tests/links.rs`, `tests/maintain.rs`. Mechanical, and
-  it is better than a sync shim: the tests then exercise the real path.
+- The suite drives the queue synchronously: `tests/common` gains `settle` / `add_now` /
+  `merge_now`, and `tests/http.rs` + `tests/mcp.rs` gain a local `settle(dir)` that opens its own
+  connection to the store file (the one-writer rule is the *service's*, not the file's).
+- **The fixture has to describe the embedder.** `tests/http.rs` and `tests/mcp.rs` used to pair
+  `Config::default()` (`Qwen…`, dim 1024) with a 64-dim `HashEmbedder` — invisible while the write
+  path ignored config for both the vector width and the hash. Under the queue the config *is* the
+  write path's view of the vector space, so a mismatch makes every later write look like a document
+  change and the queue never converges. Both fixtures now echo the fake (`model = "fake-hash-v1"`,
+  `dim = 64`).
 - **The regression test for this whole document**: a slow fake embedder (a sleeping `Embedder`,
   as `the_encoder_does_not_serialize_its_callers` already uses) plus a running worker, then a
   `memory_upsert` must return in the **milliseconds** it takes to write a row while the worker is

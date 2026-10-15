@@ -11,7 +11,7 @@ use common::temp_store;
 use ellmephant::bench;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
-use ellmephant::store::{self, Memory};
+use ellmephant::store::Memory;
 
 const DIM: usize = 512;
 
@@ -41,7 +41,7 @@ fn golden_eval_clears_the_recall_gate() {
     let corpus = read_corpus(&golden("memories.jsonl"));
     assert!(corpus.len() >= 20, "the corpus should be a real set");
     for memory in &corpus {
-        store::add(&conn, &embedder, memory).expect("seed");
+        common::add_now(&conn, &embedder, memory).expect("seed");
     }
 
     let cases = bench::load_cases(&golden("queries.jsonl")).expect("golden queries");
@@ -69,7 +69,7 @@ fn sweep_walks_every_k_and_names_a_winner() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     for memory in read_corpus(&golden("memories.jsonl")) {
-        store::add(&conn, &embedder, &memory).expect("seed");
+        common::add_now(&conn, &embedder, &memory).expect("seed");
     }
     let cases = bench::load_cases(&golden("queries.jsonl")).expect("golden queries");
 

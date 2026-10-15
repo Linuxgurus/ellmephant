@@ -69,7 +69,7 @@ fn add_writes_row_one_vector_tags_and_links() {
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
 
-    let (id, _) = store::add(
+    let (id, _) = common::add_now(
         &conn,
         &embedder,
         &memory(
@@ -117,11 +117,11 @@ fn identical_readd_does_not_re_embed() {
     let embedder = CountingEmbedder::new();
 
     let m = memory("note", "Note", "same words here", &["k8s"]);
-    let (first, _) = store::add(&conn, &embedder, &m).expect("add");
+    let (first, _) = common::add_now(&conn, &embedder, &m).expect("add");
     assert_eq!(embedder.calls(), 1, "first add embeds the document");
     let vector_before = vec::get(&conn, first).unwrap();
 
-    let (again, _) = store::add(&conn, &embedder, &m).expect("re-add");
+    let (again, _) = common::add_now(&conn, &embedder, &m).expect("re-add");
     assert_eq!(again, first, "same key => same row");
     assert_eq!(embedder.calls(), 1, "unchanged row must not re-embed");
     assert_eq!(vec::get(&conn, first).unwrap(), vector_before);
@@ -135,12 +135,12 @@ fn changed_body_reembeds_the_document() {
     let embedder = CountingEmbedder::new();
 
     let (first, _) =
-        store::add(&conn, &embedder, &memory("note", "Note", "alpha", &[])).expect("add");
+        common::add_now(&conn, &embedder, &memory("note", "Note", "alpha", &[])).expect("add");
     let vector_before = vec::get(&conn, first).unwrap().unwrap();
     assert_eq!(embedder.calls(), 1);
 
-    let (second, _) =
-        store::add(&conn, &embedder, &memory("note", "Note", "beta gamma", &[])).expect("update");
+    let (second, _) = common::add_now(&conn, &embedder, &memory("note", "Note", "beta gamma", &[]))
+        .expect("update");
     assert_eq!(second, first, "upsert keeps the row id");
     assert_eq!(embedder.calls(), 2, "a changed document re-embeds");
     assert_ne!(vec::get(&conn, first).unwrap().unwrap(), vector_before);
@@ -153,7 +153,7 @@ fn delete_removes_row_and_every_derived_index() {
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
 
-    store::add(
+    common::add_now(
         &conn,
         &embedder,
         &memory("anchor", "Anchor", "lonely word [[ghost]]", &["k8s"]),
@@ -180,8 +180,8 @@ fn auto_key_gets_a_collision_suffix() {
     let mut auto = memory("", "", "", &[]);
     auto.title = "GitOps registry".into();
 
-    store::add(&conn, &embedder, &auto).unwrap();
-    store::add(&conn, &embedder, &auto).unwrap();
+    common::add_now(&conn, &embedder, &auto).unwrap();
+    common::add_now(&conn, &embedder, &auto).unwrap();
 
     let keys: Vec<String> = conn
         .prepare("SELECT key FROM memory ORDER BY key")
@@ -198,8 +198,8 @@ fn summaries_carry_key_title_and_tags_without_bodies() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
-    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
-    store::add(&conn, &embedder, &memory("b", "B", "body b", &["db"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("b", "B", "body b", &["db"])).unwrap();
 
     let all = store::summaries(&conn).unwrap();
     assert_eq!(all.len(), 2);
@@ -225,7 +225,7 @@ fn visit_and_useful_counters_bump_by_key() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
-    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
 
     // A fresh row starts at zero.
     let got = store::get(&conn, "a").unwrap().unwrap();
@@ -250,8 +250,8 @@ fn record_useful_many_sweeps_known_keys_and_reports_the_rest() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
-    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
-    store::add(&conn, &embedder, &memory("b", "B", "body b", &["k8s"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("b", "B", "body b", &["k8s"])).unwrap();
 
     let keys = vec!["a".to_string(), "ghost".to_string(), "b".to_string()];
     let (upvoted, missing) = store::record_useful_many(&conn, &keys).unwrap();
@@ -272,12 +272,12 @@ fn upsert_preserves_counters() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
-    store::add(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
     store::record_visit(&conn, "a").unwrap();
     store::record_useful(&conn, "a").unwrap();
 
     // Re-writing the same key must not reset its telemetry.
-    store::add(&conn, &embedder, &memory("a", "A2", "body a2", &["k8s"])).unwrap();
+    common::add_now(&conn, &embedder, &memory("a", "A2", "body a2", &["k8s"])).unwrap();
     let got = store::get(&conn, "a").unwrap().unwrap();
     assert_eq!(got.title, "A2");
     assert_eq!((got.visits, got.times_useful), (1, 1));
@@ -288,7 +288,7 @@ fn upsert_resets_the_coherence_verdict() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = CountingEmbedder::new();
-    store::add(&conn, &embedder, &memory("a", "A", "body", &[])).expect("add");
+    common::add_now(&conn, &embedder, &memory("a", "A", "body", &[])).expect("add");
 
     // A fresh row is unjudged.
     assert_eq!(store::get(&conn, "a").unwrap().unwrap().coherent, None);
@@ -303,7 +303,7 @@ fn upsert_resets_the_coherence_verdict() {
     assert!(!store::set_coherent(&conn, "ghost", Some(false)).unwrap());
 
     // An upsert resets the verdict (even a byte-identical rewrite re-opens review).
-    store::add(&conn, &embedder, &memory("a", "A", "body", &[])).expect("re-add");
+    common::add_now(&conn, &embedder, &memory("a", "A", "body", &[])).expect("re-add");
     assert_eq!(store::get(&conn, "a").unwrap().unwrap().coherent, None);
 
     // Setting it again does not re-embed (coherent is not part of the document).

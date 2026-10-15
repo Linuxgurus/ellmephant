@@ -20,11 +20,19 @@ use tower::ServiceExt as _;
 fn session(dir: &std::path::Path) -> Session {
     let paths = Paths::from_root(dir);
     paths.ensure().expect("create store root");
-    let cfg = Config::default();
+    // The config is the WRITE path's view of the vector space — a write has no embedder to ask — so it
+    // has to agree with the fake injected below. Disagree, and `doc_hash` describes a different space
+    // than the stored vectors do, which makes every later write look like a document change.
+    let cfg = Config {
+        model: HASH_MODEL.to_string(),
+        dim: DIM,
+        ..Config::default()
+    };
+    cfg.validate().expect("valid config");
     let spec = Spec::from_config(&cfg, &paths);
     Session::open(paths, cfg, spec)
         .expect("open store")
-        .with_embedder(Box::new(HashEmbedder::new(64)))
+        .with_embedder(Box::new(HashEmbedder::new(DIM)))
 }
 
 /// A router over a server and a health state that share one witness.
@@ -273,6 +281,25 @@ async fn tool(peer: &Peer<RoleClient>, name: &'static str, args: serde_json::Val
         .unwrap_or_default()
 }
 
+/// The embedder every app in this file is built with (`app_with_token`).
+const DIM: usize = 64;
+/// Its model id, which the config has to echo (see `session`).
+const HASH_MODEL: &str = "fake-hash-v1";
+
+/// Settle every queued document, the way the worker would.
+///
+/// A write only *queues* its embed now (`ENCODE-WORKER.md`) and a test process has no worker, so
+/// anything that asserts on search results or vector counts has to settle first. The store is one
+/// file, so a second connection to it is how a test drives the queue — the one-writer rule is the
+/// *service's*, not the file's.
+fn settle(dir: &std::path::Path) {
+    ellmephant::index::vec::register_extension();
+    let conn = ellmephant::db::open(&Paths::from_root(dir)).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let spec = ellmephant::embed::VecSpec::of(&embedder);
+    while ellmephant::store::encode::drain(&conn, &embedder, &spec, 64).expect("drain") > 0 {}
+}
+
 /// Seed one memory over HTTP.
 async fn seed(app: &axum::Router, token: &str, key: &str, title: &str, body: &str) {
     let front = format!("Key: {key}\nTitle: {title}\n---\n{body}\n");
@@ -297,6 +324,7 @@ async fn reading_a_memory_counts_a_visit() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
     seed(&app, "tok", "counted", "one sharp line", "the body").await;
+    settle(dir.path());
 
     let (_, first, _) = get(&app, "/memory/counted?format=json").await;
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
@@ -759,6 +787,10 @@ async fn the_two_doors_are_one_core() {
     )
     .await;
 
+    // The two writes queued their embeds; settle them so the semantic read below has an index to
+    // read, and the MCP and HTTP answers are comparable.
+    settle(dir.path());
+
     let cases: [(&str, &str, serde_json::Value); 6] = [
         ("/stats?format=json", "memory_stats", json!({})),
         (
@@ -1017,6 +1049,7 @@ async fn search_says_so_when_the_index_is_empty() {
         "a body with words worth finding",
     )
     .await;
+    settle(dir.path());
 
     // The truth first: with vectors, the phrase finds it.
     let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;

@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::embed::{Embedder, VecSpec, projection};
+use crate::embed::{VecSpec, projection};
 use crate::error::{Error, Result};
 use crate::index;
 
@@ -78,7 +78,7 @@ pub struct Summary {
 
 /// `sha256(model|dim|text)` — the per-field re-embed trigger (SPEC §15 #7).
 ///
-/// Takes a [`VecSpec`] rather than a loaded [`Embedder`]: both inputs are *config*, so fingerprinting
+/// Takes a [`VecSpec`] rather than a loaded embedder: both inputs are *config*, so fingerprinting
 /// a document must never be a reason to load 1.2 GB of weights. The bytes hashed are unchanged —
 /// this is a signature change only, so no stored `doc_hash` moves (pinned by
 /// `row_hash_output_is_pinned`).
@@ -130,8 +130,9 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
     Ok(())
 }
 
-/// Upsert a memory by `key`, keeping the row, its tags, its links and its vector in one
-/// transaction (SPEC §7, PLAN §6 P4). Re-embeds the document only when its hash changes.
+/// Upsert a memory by `key`, keeping the row, its tags, its links and its **queue entry** in one
+/// transaction (SPEC §7, PLAN §6 P4). The document is *scheduled*, not embedded: no encoder is
+/// touched here, and the vector is written later by the encode worker (`ENCODE-WORKER.md`).
 ///
 /// Returns the rowid and the resolved key (the slug may differ from `mem.key` when it was
 /// derived from the title), so the caller never has to re-read the row.
@@ -141,8 +142,8 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 ///
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
-pub fn add(conn: &Connection, embedder: &dyn Embedder, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _) = add_impl(conn, embedder, &VecSpec::of(embedder), mem, true)?;
+pub fn add(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String)> {
+    let (id, key, _) = add_impl(conn, spec, mem, true)?;
     Ok((id, key))
 }
 
@@ -169,30 +170,31 @@ fn check_body(body: &str) -> Result<()> {
 
 /// [`add`] with the split-review verdict's fate made explicit. `reset_coherent` is `true` for a
 /// whole-row write — the row's shape may have changed, so re-judge it — and `false` for a merge that
-/// left the title and the body alone. Returns whether the document actually changed (and so whether
-/// the vector was recomputed).
+/// left the title and the body alone. Returns whether the document actually moved (and so whether a
+/// job was queued).
+///
+/// **The embed that used to live here is gone**, and with it the encoder: an inference under the
+/// session lock is what made one slow write a store-wide stall. The row and its queue entry are
+/// written in one transaction instead, so the work cannot be lost.
+///
+/// **It also does not create the vec table**, which it used to. That table's width is a runtime
+/// property of the *embedder*, and a write no longer holds one — so the only code that can honestly
+/// create it is the code holding a vector ([`crate::store::encode::settle_encoded`], via
+/// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
+/// config said rather than what the encoder actually emits.
 fn add_impl(
     conn: &Connection,
-    embedder: &dyn Embedder,
     spec: &VecSpec,
     mem: &Memory,
     reset_coherent: bool,
 ) -> Result<(i64, String, bool)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, spec, mem)?;
-    let reembedded = prepared.needs_embed();
-    // Create the vec table before the tx so its DDL is not inside it.
-    index::vec::ensure(conn, embedder.dim())?;
-    // Embed before the tx: inference is slow (SPEC §13) and must not hold the write lock.
-    let vector = if reembedded {
-        Some(embedder.embed_one(&prepared.doc_text)?)
-    } else {
-        None
-    };
+    let queued = prepared.needs_embed();
     let tx = conn.unchecked_transaction()?;
-    let id = apply(&tx, mem, &prepared, vector.as_deref(), reset_coherent)?;
+    let id = apply(&tx, mem, &prepared, reset_coherent)?;
     tx.commit()?;
-    Ok((id, prepared.key, reembedded))
+    Ok((id, prepared.key, queued))
 }
 
 /// A **partial** write to one memory: every field is optional and `None` means *leave it alone*.
@@ -221,8 +223,9 @@ pub struct MergeOutcome {
     pub key: String,
     /// True when the key did not exist and a row was inserted.
     pub created: bool,
-    /// True when the embedded document changed, so the vector was recomputed.
-    pub reembedded: bool,
+    /// True when the embedded document changed, so an embed was **queued** (not performed — see
+    /// `ENCODE-WORKER.md`). Named for what the store did, which is all it can honestly promise now.
+    pub queued: bool,
     /// True when the split-review verdict was cleared (the title or the body moved).
     pub coherent_reset: bool,
 }
@@ -231,10 +234,10 @@ pub struct MergeOutcome {
 /// A key with no row is created, and then `title` and `body` are both required — there is nothing
 /// to keep.
 ///
-/// Re-embeds only when the embedded document (`key` + title + body) actually changes, and
+/// Queues an embed only when the embedded document (`key` + title + body) actually changes, and
 /// clears `coherent` only when the title or the body changes: a tag or a source is *filing*, not
 /// *meaning*, so it must not re-open the split review (SPEC §9).
-pub fn merge(conn: &Connection, embedder: &dyn Embedder, patch: &Patch) -> Result<MergeOutcome> {
+pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOutcome> {
     let probe = Memory {
         key: patch.key.clone().unwrap_or_default(),
         title: patch.title.clone().unwrap_or_default(),
@@ -300,21 +303,20 @@ pub fn merge(conn: &Connection, embedder: &dyn Embedder, patch: &Patch) -> Resul
         }
     };
 
-    let (_id, key, reembedded) =
-        add_impl(conn, embedder, &VecSpec::of(embedder), &mem, reset_coherent)?;
+    let (_id, key, queued) = add_impl(conn, spec, &mem, reset_coherent)?;
     Ok(MergeOutcome {
         key,
         created,
-        reembedded,
+        queued,
         coherent_reset: reset_coherent,
     })
 }
 
-/// A write resolved *outside* the transaction: the key, the embedded document, its hash, and
-/// the existing row it will upsert. Lets the caller embed before taking the write lock.
+/// A write resolved *outside* the transaction: the key, the document's hash, and the existing row it
+/// will upsert. Resolving the key and the hash without a model call is what keeps the write path
+/// encoder-free.
 pub(crate) struct Prepared {
     pub(crate) key: String,
-    pub(crate) doc_text: String,
     doc_hash: String,
     existing: Option<(i64, String)>,
 }
@@ -342,31 +344,33 @@ pub(crate) fn prepare(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result
         .optional()?;
     Ok(Prepared {
         key,
-        doc_text,
         doc_hash,
         existing,
     })
 }
 
-/// Apply a prepared write inside the caller's transaction. `vector` must be present exactly
-/// when `needs_embed` is true.
+/// Apply a prepared write inside the caller's transaction.
+///
+/// It does **not** write the vector, and — the part that is easy to get wrong — it does **not**
+/// advance `doc_hash`. That column means "the text whose vector is stored", so it moves with the
+/// vector, in [`crate::store::encode::settle_encoded`]. Moving it here would make a pending row look
+/// indexed, and `needs_embed` would then never fire again.
 pub(crate) fn apply(
     tx: &Connection,
     mem: &Memory,
     prepared: &Prepared,
-    vector: Option<&[f32]>,
     reset_coherent: bool,
 ) -> Result<i64> {
     let id = match prepared.existing {
         Some((id, _)) => {
-            update_row(tx, id, mem, &prepared.doc_hash, reset_coherent)?;
+            update_row(tx, id, mem, reset_coherent)?;
             id
         }
-        None => insert_row(tx, &prepared.key, mem, &prepared.doc_hash)?,
+        None => insert_row(tx, &prepared.key, mem)?,
     };
     write_links(tx, id, &prepared.key, &mem.body)?;
-    if let Some(vector) = vector {
-        index::vec::upsert(tx, id, vector)?;
+    if prepared.needs_embed() {
+        encode::enqueue(tx, &prepared.key, &prepared.doc_hash, encode::INTERACTIVE)?;
     }
     Ok(id)
 }
@@ -374,18 +378,12 @@ pub(crate) fn apply(
 /// The `UPDATE` half of [`add`]: the key already exists. `reset_coherent` clears the split-review
 /// verdict — right for a whole-row write (the row's shape may have changed), wrong for a merge that
 /// only touched a tag or a source.
-fn update_row(
-    tx: &Connection,
-    id: i64,
-    mem: &Memory,
-    doc_hash: &str,
-    reset_coherent: bool,
-) -> Result<()> {
+fn update_row(tx: &Connection, id: i64, mem: &Memory, reset_coherent: bool) -> Result<()> {
     tx.execute(
         "UPDATE memory
-            SET title = ?2, body = ?3, tags = ?4, source = ?5, doc_hash = ?6,
-                coherent = CASE WHEN ?8 THEN NULL ELSE coherent END,
-                updated = COALESCE(NULLIF(?7, ''), datetime('now'))
+            SET title = ?2, body = ?3, tags = ?4, source = ?5,
+                coherent = CASE WHEN ?7 THEN NULL ELSE coherent END,
+                updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
             id,
@@ -393,7 +391,6 @@ fn update_row(
             mem.body,
             tags::encode(&mem.tags),
             mem.source,
-            doc_hash,
             mem.updated,
             reset_coherent
         ],
@@ -402,19 +399,21 @@ fn update_row(
 }
 
 /// The `INSERT` half of [`add`]: a new key; returns its rowid.
-fn insert_row(tx: &Connection, key: &str, mem: &Memory, doc_hash: &str) -> Result<i64> {
+///
+/// `doc_hash` starts **empty**, which is "no vector yet" — the row is queued, and the worker fills it
+/// in with the vector it writes.
+fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
         "INSERT INTO memory (key, title, body, tags, source, doc_hash, created, updated)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
-                 COALESCE(NULLIF(?7, ''), datetime('now')),
-                 COALESCE(NULLIF(?8, ''), datetime('now')))",
+         VALUES (?1, ?2, ?3, ?4, ?5, '',
+                 COALESCE(NULLIF(?6, ''), datetime('now')),
+                 COALESCE(NULLIF(?7, ''), datetime('now')))",
         params![
             key,
             mem.title,
             mem.body,
             tags::encode(&mem.tags),
             mem.source,
-            doc_hash,
             mem.created,
             mem.updated
         ],
@@ -422,22 +421,25 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory, doc_hash: &str) -> Resul
     Ok(tx.last_insert_rowid())
 }
 
-/// Delete a memory by key. `memory_link` follows via FK cascade; the vector is removed
-/// explicitly. Returns whether a row was removed.
+/// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
+/// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
+    // is a document that can never be embedded, so leaving one behind is a leak the worker can only
+    // rediscover. Both halves ride in one transaction, so neither undoes the other.
+    encode::forget(&tx, key)?;
     let id: Option<i64> = tx
         .query_row("SELECT id FROM memory WHERE key = ?1", params![key], |r| {
             r.get(0)
         })
         .optional()?;
-    let Some(id) = id else {
-        return Ok(false); // tx rolls back on drop
-    };
-    tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
-    index::vec::delete(&tx, id)?;
+    if let Some(id) = id {
+        tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
+        index::vec::delete(&tx, id)?;
+    }
     tx.commit()?;
-    Ok(true)
+    Ok(id.is_some())
 }
 
 /// The outcome of a feedback sweep (see [`record_useful_many`]): `(key, new_total)` for every key

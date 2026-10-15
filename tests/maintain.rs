@@ -23,7 +23,7 @@ fn memory(key: &str, body: &str, tags_: &[&str]) -> Memory {
 }
 
 fn add(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str, tags_: &[&str]) -> i64 {
-    store::add(conn, embedder, &memory(key, body, tags_))
+    common::add_now(conn, embedder, &memory(key, body, tags_))
         .expect("add")
         .0
 }

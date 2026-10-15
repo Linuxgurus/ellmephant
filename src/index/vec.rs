@@ -179,6 +179,12 @@ pub fn upsert(conn: &Connection, id: i64, vector: &[f32]) -> Result<()> {
 
 /// Remove the vector for `id` (a virtual table cannot be a FK target, so this is explicit).
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    if !table_exists(conn)? {
+        // No table means no vector to delete — the same answer as an empty table (see `get`). This is
+        // reachable now: the table appears on the first *embed*, not the first write, so deleting a
+        // memory from a store that has not encoded anything yet lands here.
+        return Ok(());
+    }
     conn.execute(
         &format!("DELETE FROM {TABLE} WHERE memory_id = ?1"),
         params![id],

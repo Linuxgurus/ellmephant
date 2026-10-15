@@ -14,7 +14,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, Paths};
 use crate::db;
-use crate::embed::Embedder;
+use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
@@ -146,6 +146,15 @@ impl Session {
         &self.cfg
     }
 
+    /// The vector space this store is configured for.
+    ///
+    /// The write path needs exactly two things from the embedder — the model id and the dimension, to
+    /// fingerprint a document — and both are config. That is what lets a write run without loading
+    /// 1.2 GB of weights (`ENCODE-WORKER.md`).
+    pub fn vec_spec(&self) -> VecSpec {
+        VecSpec::new(self.cfg.model.clone(), self.cfg.dim)
+    }
+
     /// Default result count for searches with no explicit `-k` (SPEC §12 config).
     pub fn default_k(&self) -> usize {
         self.cfg.default_k
@@ -158,10 +167,12 @@ impl Session {
     }
 
     /// Upsert a memory from a partial patch (SPEC §7): `None` fields keep their stored value, so one
-    /// field can change without resending the row. The document may have moved, so this borrows the
-    /// encoder — but only to embed, and the encoder has its own lock ([`Encoder`]).
+    /// field can change without resending the row.
+    ///
+    /// **No encoder.** The document is queued, not embedded (`ENCODE-WORKER.md`), so a write holds
+    /// nothing slower than a row insert — that coupling is what this whole design removes.
     pub fn memory_merge(&self, patch: &store::Patch) -> Result<store::MergeOutcome> {
-        self.encoder.with(|e| store::merge(&self.conn, e, patch))
+        store::merge(&self.conn, &self.vec_spec(), patch)
     }
 
     /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on

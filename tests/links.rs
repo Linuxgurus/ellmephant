@@ -8,7 +8,7 @@ mod common;
 
 use common::temp_store;
 use ellmephant::db;
-use ellmephant::embed::HashEmbedder;
+use ellmephant::embed::{HashEmbedder, VecSpec};
 use ellmephant::store::{self, Memory, links, project};
 use rusqlite::Connection;
 
@@ -24,7 +24,7 @@ fn memory(key: &str, body: &str) -> Memory {
 }
 
 fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str) {
-    store::add(conn, embedder, &memory(key, body)).expect("add");
+    common::add_now(conn, embedder, &memory(key, body)).expect("add");
 }
 
 fn project_fixture(key: &str) -> project::Project {
@@ -40,12 +40,13 @@ fn rename_rewrites_bodies_and_repoints_edges() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "target", "the target itself");
     seed(&conn, &embedder, "a", "see [[target]] first");
     seed(&conn, &embedder, "b", "also [[target]] here");
 
-    let outcome = links::rename(&conn, &embedder, "target", "renamed").expect("rename");
+    let outcome = links::rename(&conn, &spec, "target", "renamed").expect("rename");
     assert_eq!(outcome.key, "renamed");
     assert_eq!(outcome.bodies, 2, "both bodies carried the token");
     assert_eq!(outcome.edges, 2, "both edges repointed");
@@ -80,14 +81,15 @@ fn rename_refuses_missing_and_colliding_keys() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "one", "first");
     seed(&conn, &embedder, "two", "second");
 
     assert!(
-        links::rename(&conn, &embedder, "ghost", "new").is_err(),
+        links::rename(&conn, &spec, "ghost", "new").is_err(),
         "missing old"
     );
-    let err = links::rename(&conn, &embedder, "one", "two").unwrap_err();
+    let err = links::rename(&conn, &spec, "one", "two").unwrap_err();
     assert!(format!("{err}").contains("already exists"), "{err}");
     assert!(store::get(&conn, "one").unwrap().is_some(), "unchanged");
 }
@@ -97,25 +99,28 @@ fn rename_to_the_same_key_is_a_noop() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "one", "body");
 
-    let outcome = links::rename(&conn, &embedder, "one", "one").expect("rename");
+    let outcome = links::rename(&conn, &spec, "one", "one").expect("rename");
     assert_eq!((outcome.bodies, outcome.edges), (0, 0));
     assert!(store::get(&conn, "one").unwrap().is_some());
 }
 
 #[test]
-fn rename_re_embeds_the_row_it_moves() {
-    // `key` IS in the embed projection, so a rename moves the row's *document*. Its stored
-    // `doc_hash` (and vector) must describe the NEW key; otherwise the vector drifts until
-    // something else happens to write the row.
+fn rename_queues_a_new_vector_for_the_row_it_moves() {
+    // `key` IS in the embed projection, so a rename moves the row's *document* — which is why the row
+    // is QUEUED for a new vector, exactly as a write queues it. Once settled, `doc_hash` (and the
+    // vector) describe the NEW key; otherwise the vector drifts until something else writes the row.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
     // `memory()` uses the key as the title too, so the title stays put across the rename.
     seed(&conn, &embedder, "old-name", "the body");
 
-    links::rename(&conn, &embedder, "old-name", "new-name").expect("rename");
+    links::rename(&conn, &spec, "old-name", "new-name").expect("rename");
+    common::settle(&conn, &embedder);
 
     let stored: String = conn
         .query_row(
@@ -172,6 +177,7 @@ fn renaming_clears_a_dangling_edge() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    let spec = VecSpec::of(&embedder);
 
     // `a` references a key that does not exist yet — a forward reference.
     seed(&conn, &embedder, "a", "forward [[later]]");
@@ -179,7 +185,7 @@ fn renaming_clears_a_dangling_edge() {
 
     // Renaming an unrelated memory into `later` resolves it (no edge repoint needed).
     seed(&conn, &embedder, "stub", "placeholder");
-    links::rename(&conn, &embedder, "stub", "later").expect("rename");
+    links::rename(&conn, &spec, "stub", "later").expect("rename");
     assert!(links::dangling(&conn).unwrap().is_empty());
 }
 

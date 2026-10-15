@@ -24,7 +24,7 @@ fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str) -> (i
         tags: vec!["alpha".to_string()],
         ..Default::default()
     };
-    store::add(conn, embedder, &mem).expect("add memory")
+    common::add_now(conn, embedder, &mem).expect("add memory")
 }
 
 /// A patch that names `key` and touches nothing else.
@@ -46,7 +46,7 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
     let before = store::get(&conn, &key).unwrap().unwrap();
     let vector_before = vec::get(&conn, id).unwrap();
 
-    let out = store::merge(
+    let out = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -56,7 +56,7 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
     )
     .expect("merge source");
 
-    assert!(!out.reembedded, "provenance is not part of the document");
+    assert!(!out.queued, "provenance is not part of the document");
     assert!(!out.coherent_reset, "and it is not meaning either");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.source.as_deref(), Some("cmd: prove /repo"));
@@ -81,7 +81,7 @@ fn a_title_write_re_embeds_and_re_opens_the_review() {
     let (_id, key) = seed(&conn, &embedder, "probe", "the facts");
     store::set_coherent(&conn, &key, Some(false)).expect("mark grab-bag");
 
-    let out = store::merge(
+    let out = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -91,7 +91,7 @@ fn a_title_write_re_embeds_and_re_opens_the_review() {
     )
     .expect("merge title");
 
-    assert!(out.reembedded, "the title is in the document");
+    assert!(out.queued, "the title is in the document");
     assert!(out.coherent_reset, "the shape moved, so re-judge it");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.title, "a sharper line");
@@ -110,7 +110,7 @@ fn a_tags_write_re_embeds_nothing_and_re_opens_nothing() {
     store::set_coherent(&conn, &key, Some(true)).expect("mark coherent");
     let hash_before = store::get(&conn, &key).unwrap().unwrap().doc_hash;
 
-    let out = store::merge(
+    let out = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -120,7 +120,7 @@ fn a_tags_write_re_embeds_nothing_and_re_opens_nothing() {
     )
     .expect("merge tags");
 
-    assert!(!out.reembedded, "tags are not in the document");
+    assert!(!out.queued, "tags are not in the document");
     assert!(!out.coherent_reset, "filing is not meaning");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.doc_hash, hash_before, "the vector did not move");
@@ -139,7 +139,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (_id, key) = seed(&conn, &embedder, "probe", "the facts");
-    store::merge(
+    common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -150,7 +150,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
     .expect("set source");
 
     // Empty IS an instruction where empty is a fact.
-    store::merge(
+    common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -161,7 +161,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
     .expect("clear source");
     assert_eq!(store::get(&conn, &key).unwrap().unwrap().source, None);
 
-    store::merge(
+    common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -189,7 +189,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
             },
         ),
     ] {
-        let err = store::merge(&conn, &embedder, &patch).unwrap_err();
+        let err = common::merge_now(&conn, &embedder, &patch).unwrap_err();
         assert!(
             format!("{err}").contains("cannot be empty"),
             "{field}: {err}"
@@ -208,7 +208,7 @@ fn a_body_write_moves_the_link_graph() {
     let (_id, key) = seed(&conn, &embedder, "probe", "jane facts");
     seed(&conn, &embedder, "target", "a target");
 
-    store::merge(
+    common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -231,7 +231,7 @@ fn a_new_key_needs_a_title_and_a_body() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    let err = store::merge(
+    let err = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -250,7 +250,7 @@ fn a_new_key_needs_a_title_and_a_body() {
         "a refused create writes nothing"
     );
 
-    let out = store::merge(
+    let out = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -276,7 +276,7 @@ fn key_is_an_address_not_a_field() {
     let (id, key) = seed(&conn, &embedder, "anchor", "the facts");
 
     // Rewrite every writable field at once: the key must not move with them.
-    store::merge(
+    common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -295,7 +295,7 @@ fn key_is_an_address_not_a_field() {
     assert_eq!(stored, "anchor", "the key survived a whole-row rewrite");
 
     // Naming a DIFFERENT key does not rename: it addresses another row, so it creates one.
-    let out = store::merge(
+    let out = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -327,7 +327,7 @@ fn a_patch_that_changes_nothing_re_embeds_nothing_and_un_judges_nothing() {
     let before = store::get(&conn, &key).unwrap().unwrap();
     let vector_before = vec::get(&conn, id).unwrap();
 
-    let out = store::merge(
+    let out = common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
@@ -339,7 +339,7 @@ fn a_patch_that_changes_nothing_re_embeds_nothing_and_un_judges_nothing() {
     )
     .expect("redundant merge");
 
-    assert!(!out.reembedded, "the document did not move");
+    assert!(!out.queued, "the document did not move");
     assert!(!out.coherent_reset, "and neither did the shape");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.coherent, Some(true), "the verdict survives a save");

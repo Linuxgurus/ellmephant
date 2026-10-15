@@ -311,14 +311,12 @@ mod tests {
         row_hash(spec, &projection::embed_document(key, key, body))
     }
 
-    /// A stored row that OWES a vector: written normally, then stripped back to "never embedded",
-    /// which is precisely the state the queue exists to serve.
+    /// A stored row that OWES a vector. Under the queue that is simply what a write leaves behind:
+    /// `add` schedules the document, embeds nothing, and starts `doc_hash` empty. So this is a real
+    /// write, not a fixture that fakes the pending state.
     fn owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) -> VecSpec {
         let spec = VecSpec::of(embedder);
-        let (id, _) = crate::store::add(conn, embedder, &mem(key, body)).expect("add");
-        index::vec::delete(conn, id).expect("unindex");
-        conn.execute("UPDATE memory SET doc_hash = '' WHERE id = ?1", params![id])
-            .expect("clear doc_hash");
+        crate::store::add(conn, &spec, &mem(key, body)).expect("add");
         spec
     }
 
@@ -383,7 +381,6 @@ mod tests {
         let embedder = HashEmbedder::new(8);
         let spec = owed(&conn, &embedder, "a", "alpha");
         let id = id_of(&conn, "a");
-        enqueue(&conn, "a", &doc("a", "alpha", &spec), INTERACTIVE).unwrap();
         assert!(
             index::vec::get(&conn, id).unwrap().is_none(),
             "precondition"
@@ -408,7 +405,6 @@ mod tests {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
         let spec = owed(&conn, &embedder, "a", "alpha");
-        enqueue(&conn, "a", &doc("a", "alpha", &spec), INTERACTIVE).unwrap();
 
         assert!(encode_one(&conn, &embedder, &spec, "a").unwrap());
         assert!(
@@ -461,10 +457,10 @@ mod tests {
         owed(&conn, &embedder, "b", "beta");
         owed(&conn, &embedder, "c", "gamma");
         let rows = [("a", "alpha"), ("b", "beta"), ("c", "gamma")];
-        for (key, body) in rows {
-            enqueue(&conn, key, &doc(key, body, &spec), INTERACTIVE).unwrap();
-        }
 
+        // Each write queued its own document, which is what makes the three below real work rather
+        // than a fixture.
+        assert_eq!(pending(&conn).unwrap(), 3);
         assert_eq!(drain(&conn, &embedder, &spec, 10).unwrap(), 3);
         assert_eq!(pending(&conn).unwrap(), 0);
         assert_eq!(failed(&conn).unwrap(), 0);
@@ -487,7 +483,6 @@ mod tests {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
         let spec = owed(&conn, &embedder, "a", "alpha");
-        enqueue(&conn, "a", &doc("a", "alpha", &spec), INTERACTIVE).unwrap();
 
         let claimed = claim(&conn, &spec, "a").unwrap().expect("a claim");
         assert!(claimed.needs_embed(), "the row owes a vector");
@@ -542,7 +537,6 @@ mod tests {
         let (_d, conn) = store();
         let real = HashEmbedder::new(8);
         let spec = owed(&conn, &real, "a", "alpha");
-        enqueue(&conn, "a", &doc("a", "alpha", &spec), INTERACTIVE).unwrap();
 
         for attempt in 1..=MAX_ATTEMPTS {
             // One entry per pass, which is the retry shape the worker has: one attempt per pass, and
@@ -578,5 +572,59 @@ mod tests {
             0,
             "a re-enqueue resets the attempts"
         );
+    }
+
+    /// The P2 contract in one place: a **write queues the document and writes no vector**, and the
+    /// row's `doc_hash` stays empty — "no vector yet" — because that column means "the text whose
+    /// vector is stored", and storing it is the worker's job, not the write's.
+    #[test]
+    fn a_write_queues_the_document_and_writes_no_vector() {
+        let (_d, conn) = store();
+        let embedder = HashEmbedder::new(8);
+        let spec = VecSpec::of(&embedder);
+
+        crate::store::add(&conn, &spec, &mem("a", "alpha")).unwrap();
+
+        assert_eq!(pending(&conn).unwrap(), 1, "the write queued a document");
+        assert!(
+            index::vec::get(&conn, id_of(&conn, "a")).unwrap().is_none(),
+            "nothing has been embedded yet"
+        );
+        assert_eq!(stored_hash(&conn, "a"), "", "no vector, so no doc_hash");
+        assert_eq!(
+            next(&conn).unwrap().unwrap().doc_hash,
+            doc("a", "alpha", &spec),
+            "and the entry is for exactly this text"
+        );
+
+        // Honestly embedded now, so a tag-only edit can be judged at all: a tag is FILING, not
+        // meaning, so it moves no document and therefore queues nothing (SPEC §6/§9).
+        drain(&conn, &embedder, &spec, 10).unwrap();
+        let tagged = crate::store::merge(
+            &conn,
+            &spec,
+            &crate::store::Patch {
+                key: Some("a".into()),
+                tags: Some(vec!["k8s".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!tagged.queued, "a tag is filing, not meaning");
+        assert_eq!(pending(&conn).unwrap(), 0);
+
+        // The body IS the document, so that one queues.
+        let edited = crate::store::merge(
+            &conn,
+            &spec,
+            &crate::store::Patch {
+                key: Some("a".into()),
+                body: Some("changed".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(edited.queued, "the body is the document");
+        assert_eq!(pending(&conn).unwrap(), 1);
     }
 }

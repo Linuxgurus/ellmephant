@@ -32,14 +32,14 @@ fn digest_counts_spread_tags_and_links() {
 
     // a: two tags, links to b (resolved) and `missing` (dangling). b: one tag, no links.
     // c: no tags, no links -> the one orphan.
-    store::add(
+    common::add_now(
         &conn,
         &embedder,
         &memory("a", "links to [[b]] and [[missing]]", &["k8s", "infra"]),
     )
     .expect("add a");
-    store::add(&conn, &embedder, &memory("b", "plain body", &["k8s"])).expect("add b");
-    store::add(&conn, &embedder, &memory("c", "orphan body", &[])).expect("add c");
+    common::add_now(&conn, &embedder, &memory("b", "plain body", &["k8s"])).expect("add b");
+    common::add_now(&conn, &embedder, &memory("c", "orphan body", &[])).expect("add c");
 
     let s = stats::compute(&conn).expect("stats");
 
@@ -109,8 +109,8 @@ fn telemetry_totals_and_top_useful() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    store::add(&conn, &embedder, &memory("a", "body a", &["k8s"])).expect("add a");
-    store::add(&conn, &embedder, &memory("b", "body b", &["k8s"])).expect("add b");
+    common::add_now(&conn, &embedder, &memory("a", "body a", &["k8s"])).expect("add a");
+    common::add_now(&conn, &embedder, &memory("b", "body b", &["k8s"])).expect("add b");
 
     store::record_visit(&conn, "a").unwrap();
     store::record_visit(&conn, "a").unwrap();
@@ -132,9 +132,9 @@ fn unvoted_hot_surfaces_read_but_never_marked_useful() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    store::add(&conn, &embedder, &memory("hot", "hot body", &["k8s"])).expect("add hot");
-    store::add(&conn, &embedder, &memory("cold", "cold body", &["k8s"])).expect("add cold");
-    store::add(&conn, &embedder, &memory("voted", "voted body", &["k8s"])).expect("add voted");
+    common::add_now(&conn, &embedder, &memory("hot", "hot body", &["k8s"])).expect("add hot");
+    common::add_now(&conn, &embedder, &memory("cold", "cold body", &["k8s"])).expect("add cold");
+    common::add_now(&conn, &embedder, &memory("voted", "voted body", &["k8s"])).expect("add voted");
 
     // `hot`: read three times, never upvoted -- the store's blind spot.
     for _ in 0..3 {
@@ -160,9 +160,9 @@ fn vocabulary_is_the_whole_tag_set_count_desc_then_name() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    store::add(&conn, &embedder, &memory("a", "x", &["k8s", "infra"])).expect("a");
-    store::add(&conn, &embedder, &memory("b", "y", &["k8s"])).expect("b");
-    store::add(&conn, &embedder, &memory("c", "z", &["gotcha"])).expect("c");
+    common::add_now(&conn, &embedder, &memory("a", "x", &["k8s", "infra"])).expect("a");
+    common::add_now(&conn, &embedder, &memory("b", "y", &["k8s"])).expect("b");
+    common::add_now(&conn, &embedder, &memory("c", "z", &["gotcha"])).expect("c");
 
     let vocab = stats::vocabulary(&conn).expect("vocabulary");
     assert_eq!(

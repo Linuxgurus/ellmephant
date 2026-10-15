@@ -755,10 +755,10 @@ pub async fn upsert(
                 json_ok(serde_json::json!({
                     "status": if out.created { "created" } else { "updated" },
                     "key": out.key,
-                    "reembedded": out.reembedded,
+                    "reembedded": out.queued,
                     "coherent_reset": out.coherent_reset,
                 })),
-                format!("stored {} (reembedded={})", out.key, out.reembedded),
+                format!("stored {} (queued={})", out.key, out.queued),
             )
         }
         Err(e) => error(json, error_status(&e), e),

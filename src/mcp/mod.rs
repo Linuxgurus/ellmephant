@@ -889,14 +889,14 @@ impl MemoryServer {
             tool = "memory_upsert",
             key = %outcome.key,
             created = outcome.created,
-            reembedded = outcome.reembedded,
+            queued = outcome.queued,
             coherent_reset = outcome.coherent_reset,
             "memory stored"
         );
         Ok(json_ok(serde_json::json!({
             "status": if outcome.created { "created" } else { "updated" },
             "key": outcome.key,
-            "reembedded": outcome.reembedded,
+            "queued": outcome.queued,
             "coherent_reset": outcome.coherent_reset,
         })))
     }

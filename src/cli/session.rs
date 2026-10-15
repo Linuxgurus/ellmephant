@@ -1,8 +1,12 @@
-//! One live store session shared by the one-shot commands and the REPL (PLAN §6 P6).
+//! One live store session: the store handle the server and the CLI share (PLAN §6 P6).
 //!
-//! It owns a single writer connection (SPEC §15 #10) and loads the Qwen3 encoder lazily:
-//! `show`/`rm` and the link/tag maintenance commands never pay for 1.2 GB of weights, while
-//! the REPL keeps the model warm across commands (the reason v1 has no daemon — PLAN §2 #4).
+//! It owns a single writer connection (SPEC §15 #10) and loads the Qwen3 encoder lazily, so a
+//! command that never embeds (say `doctor`) never pays for 1.2 GB of weights while a running server
+//! keeps the model warm across calls (the reason v1 has no daemon — PLAN §2 #4).
+//!
+//! The surface is deliberately kept to what `mcp` and `doctor` actually reach for. A wrapper with
+//! no caller reads like a load-bearing one, and this file collected several: `paths`, `rename`,
+//! `dangling`, `tags` and `keys` all sat here, unused, for as long as they did.
 
 use rusqlite::Connection;
 
@@ -12,11 +16,10 @@ use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, links, maintain, project, tags};
+use crate::store::{self, Memory, links, maintain, project};
 
 /// A store handle plus its (lazily loaded) encoder.
 pub struct Session {
-    paths: Paths,
     cfg: Config,
     spec: model::Spec,
     conn: Connection,
@@ -28,7 +31,6 @@ impl Session {
     pub fn open(paths: Paths, cfg: Config, spec: model::Spec) -> Result<Self> {
         let conn = db::open(&paths)?;
         Ok(Self {
-            paths,
             cfg,
             spec,
             conn,
@@ -41,11 +43,6 @@ impl Session {
     pub fn with_embedder(mut self, embedder: Box<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
         self
-    }
-
-    /// The resolved store paths.
-    pub fn paths(&self) -> &Paths {
-        &self.paths
     }
 
     /// Default result count for searches with no explicit `-k` (SPEC §12 config).
@@ -100,22 +97,18 @@ impl Session {
         store::merge(&self.conn, embedder, patch)
     }
 
-    /// Fetch one memory by key, or [`Error::NotFound`].
-    pub fn show(&self, key: &str) -> Result<Memory> {
+    /// Fetch one memory by key without counting a visit. Private on purpose: `fetch` is the read
+    /// path, and "read without counting" is not something a tool should be able to reach.
+    fn show(&self, key: &str) -> Result<Memory> {
         store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
     }
 
-    /// Fetch one memory and count the read (the `visits` telemetry). The read path uses this;
-    /// the write path's existence check uses [`show`](Self::show), which must not count.
+    /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
+    /// point, backing `memory_get`.
     pub fn fetch(&self, key: &str) -> Result<Memory> {
         let mut mem = self.show(key)?;
         mem.visits = store::record_visit(&self.conn, key)?;
         Ok(mem)
-    }
-
-    /// Bump the `times_useful` counter for `key` (explicit agent feedback); returns the new total.
-    pub fn record_useful(&self, key: &str) -> Result<i64> {
-        store::record_useful(&self.conn, key)
     }
 
     /// Bump `times_useful` for many keys at once. Returns `(key, new_total)` for the keys that
@@ -159,11 +152,6 @@ impl Session {
         search::run(&self.conn, None, q)
     }
 
-    /// Every row as an index [`Summary`](store::Summary) — no bodies.
-    pub fn summaries(&self) -> Result<Vec<store::Summary>> {
-        store::summaries(&self.conn)
-    }
-
     /// A read-only digest of the store (`stats`); `db_bytes` is filled from the store file.
     pub fn stats(&self) -> Result<store::stats::Stats> {
         store::stats::compute(&self.conn)
@@ -178,24 +166,9 @@ impl Session {
         maintain::reembed(&self.conn, embedder, &self.cfg.instruction)
     }
 
-    /// Rename a key: rewrite `[[old]]` in bodies and repoint links (P9).
-    pub fn rename(&self, old: &str, new: &str) -> Result<links::RenameOutcome> {
-        links::rename(&self.conn, old, new)
-    }
-
-    /// `[[key]]` targets with no matching row, grouped by target (P9 audit).
-    pub fn dangling(&self) -> Result<Vec<links::Dangling>> {
-        links::dangling(&self.conn)
-    }
-
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.
     pub fn backlinks(&self, key: &str) -> Result<Vec<links::Backlink>> {
         links::backlinks(&self.conn, key)
-    }
-
-    /// Every tag with its reference count, alphabetical.
-    pub fn tags(&self) -> Result<Vec<(String, i64)>> {
-        tags::list(&self.conn)
     }
 
     /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a
@@ -212,15 +185,5 @@ impl Session {
     /// Projects matching `filter`, key order.
     pub fn project_list(&self, filter: &project::Filter) -> Result<Vec<project::Project>> {
         project::list(&self.conn, filter)
-    }
-
-    /// Project-side rot: `preload` keys that resolve to no memory (`doctor`).
-    pub fn project_dangling(&self) -> Result<Vec<links::Dangling>> {
-        project::dangling(&self.conn)
-    }
-
-    /// Every key in the store, alphabetical — the REPL's tab-completion vocabulary.
-    pub fn keys(&self) -> Result<Vec<String>> {
-        store::keys(&self.conn)
     }
 }

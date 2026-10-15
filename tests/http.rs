@@ -109,6 +109,9 @@ async fn health_json_carries_the_fields() {
         "links",
         "projects",
         "writer",
+        "encode_pending",
+        "encode_failed",
+        "encode_oldest_s",
     ] {
         assert!(value.get(key).is_some(), "missing {key}: {body}");
     }
@@ -162,6 +165,121 @@ async fn health_witnesses_the_writer() {
 
     let (_, body, _) = get(&app, "/health").await;
     assert!(body.contains("writer      free"), "{body}");
+}
+
+/// **The regression this test exists for.** A write schedules its document and returns, so between the
+/// write and the worker's pass the store holds N memories and N-1 vectors — the *normal* state of a
+/// healthy store. Gating readiness on "every row has a vector" made that a `NOT READY` 503 saying
+/// "run `reembed`", i.e. reporting load as a fault, and flapping on every single write.
+#[tokio::test]
+async fn a_queued_document_is_load_and_not_a_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    // No worker runs here, so nothing drains it: the queue is pinned at one.
+    seed(
+        &app,
+        "tok",
+        "zz-queued",
+        "queued",
+        "this body was scheduled for embedding, not embedded",
+    )
+    .await;
+
+    let (status, body, _) = get(&app, "/health?format=json").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a pending document must not 503: {body}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["ready"], serde_json::Value::Bool(true), "{body}");
+    assert_eq!(value["encode_pending"], 1, "{body}");
+    assert_eq!(value["encode_failed"], 0, "{body}");
+    assert!(
+        value["encode_oldest_s"].is_i64(),
+        "a waiting document has an age: {body}"
+    );
+
+    let (_, text, _) = get(&app, "/health").await;
+    assert!(text.contains("1 pending"), "{text}");
+    assert!(text.contains("0 failed"), "{text}");
+    assert!(
+        !text.contains("without a vector"),
+        "the old fault wording is gone, because a queue is not one: {text}"
+    );
+}
+
+/// And once the worker has caught up, the queue reads empty — with `null` for the age, so "nothing
+/// queued" is not confused with "nothing reported". The drain here stands in for the worker; the
+/// worker itself is `encode_worker.rs` and `serve_wiring.rs`.
+#[tokio::test]
+async fn a_drained_queue_reports_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(
+        &app,
+        "tok",
+        "zz-drained",
+        "drained",
+        "the worker will come for this",
+    )
+    .await;
+
+    let stand_in = session(dir.path());
+    assert!(
+        stand_in.encode_document("zz-drained").expect("embed"),
+        "there was a job to do"
+    );
+    drop(stand_in);
+
+    let (status, body, _) = get(&app, "/health?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["encode_pending"], 0, "{body}");
+    assert_eq!(
+        value["encode_oldest_s"],
+        serde_json::Value::Null,
+        "an empty queue has no oldest wait: {body}"
+    );
+    assert_eq!(value["vectors"], value["memories"], "{body}");
+}
+
+/// The other half of readiness: a writer that will not come back. The line is 2 s, so this holds the
+/// lock past it and asks. Everything else about the store is perfect — which is exactly the state the
+/// incident reported as `ready: true` beside `writer: busy 1239.1s`.
+#[tokio::test]
+async fn a_wedged_writer_is_not_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    );
+    let server = MemoryServer::with_watch(
+        Arc::new(Mutex::new(session(dir.path()))),
+        Arc::clone(&watch),
+    );
+    let app = router(server, state);
+
+    let guard = watch.held("memory_reembed");
+    std::thread::sleep(Duration::from_millis(2_100));
+    let (status, body, _) = get(&app, "/health").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("writer held too long"), "{body}");
+    assert!(
+        body.contains("memory_reembed"),
+        "and it names the holder: {body}"
+    );
+
+    drop(guard);
+    let (status, body, _) = get(&app, "/health").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "and it recovers with no help: {body}"
+    );
 }
 
 /// Parity is enforced, not asserted by hand: every MCP tool has exactly one route (HTTP.md slice 2).

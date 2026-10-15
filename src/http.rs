@@ -12,7 +12,7 @@ use axum::response::Response;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::config::{Config, Paths};
-use crate::store::{links, project, tags};
+use crate::store::{encode, links, project, tags};
 use crate::{db, index};
 
 /// Epoch milliseconds; 0 on a clock that has run backwards.
@@ -159,9 +159,23 @@ pub(crate) struct HealthReport {
     pub(crate) projects: i64,
     pub(crate) projects_dangling: usize,
     pub(crate) writer: String,
+    /// Documents still owing the vector index. A metric, never a gate: a write schedules its document
+    /// and returns, so a non-empty backlog is the *normal* state of a healthy store (`ENCODE-WORKER.md`).
+    pub(crate) encode_pending: i64,
+    /// Queue entries the encoder has given up on after `encode::MAX_ATTEMPTS` — the one queue number
+    /// that is a defect rather than a load, because the document is now silently unsearchable.
+    pub(crate) encode_failed: i64,
+    /// Age of the oldest pending document in seconds, `None` when the queue is empty.
+    pub(crate) encode_oldest_s: Option<i64>,
     pub(crate) ready: bool,
     pub(crate) reason: Option<String>,
 }
+
+/// How long the writer may be held before `/health` stops calling the store writable. Every write is
+/// milliseconds now that embedding left the write path, so this is not a latency budget — it is the
+/// line between "busy" and "wedged", and the reason it exists at all is an incident where the store
+/// reported `ready: true` beside `writer: busy 1239.1s`.
+const WRITER_GRACE_MS: u64 = 2_000;
 
 impl HealthReport {
     /// The report for when the probe task itself could not run.
@@ -180,6 +194,9 @@ impl HealthReport {
             projects: 0,
             projects_dangling: 0,
             writer: "free".to_string(),
+            encode_pending: 0,
+            encode_failed: 0,
+            encode_oldest_s: None,
             ready: false,
             reason: Some(reason.to_string()),
         }
@@ -210,6 +227,19 @@ impl HealthReport {
             "projects", self.projects, self.projects_dangling
         ));
         out.push_str(&format!("  {:<12}{}\n", "writer", self.writer));
+        // The queue: what the encoder owes, and whether any of it has given up. Never part of the
+        // status line — a backlog is a load, not a fault.
+        let queue = match self.encode_oldest_s {
+            Some(age) => format!(
+                "{} pending (oldest {}s), {} failed",
+                self.encode_pending, age, self.encode_failed
+            ),
+            None => format!(
+                "{} pending, {} failed",
+                self.encode_pending, self.encode_failed
+            ),
+        };
+        out.push_str(&format!("  {:<12}{queue}\n", "encode"));
         if let Some(reason) = &self.reason {
             out.push_str(&format!("  {:<12}false: {reason}\n", "ready"));
         }
@@ -234,6 +264,11 @@ impl HealthReport {
             "projects": self.projects,
             "projects_dangling": self.projects_dangling,
             "writer": self.writer,
+            // Reported, never gated on — see the field docs. `encode_oldest_s` is null when the
+            // queue is empty, which is how a caller tells "empty" from "nothing reported".
+            "encode_pending": self.encode_pending,
+            "encode_failed": self.encode_failed,
+            "encode_oldest_s": self.encode_oldest_s,
         })
     }
 }
@@ -256,6 +291,9 @@ pub(crate) fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> Healt
         projects: 0,
         projects_dangling: 0,
         writer: watch.witness(),
+        encode_pending: 0,
+        encode_failed: 0,
+        encode_oldest_s: None,
         ready: false,
         reason: None,
     };
@@ -271,7 +309,11 @@ pub(crate) fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> Healt
             return report;
         }
     };
-    report.ready = report.schema == latest && !stale && report.vectors >= report.memories;
+    // Ready means READABLE **and** WRITABLE, and nothing else. A non-empty encode queue is the normal
+    // state of a healthy store — a write schedules its document and returns — so it is reported above
+    // and never gated on here; nor is "every row has a vector", for the same reason.
+    let wedged = watch.busy_ms().is_some_and(|ms| ms > WRITER_GRACE_MS);
+    report.ready = report.schema == latest && !stale && !wedged;
     if !report.ready {
         report.reason = Some(if report.schema != latest {
             format!("schema v{} behind binary v{latest}", report.schema)
@@ -279,8 +321,8 @@ pub(crate) fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> Healt
             "projection STALE — run `reembed`".to_string()
         } else {
             format!(
-                "{} memory row(s) without a vector — run `reembed`",
-                report.memories - report.vectors
+                "writer held too long (`{}`) — a write would queue behind it",
+                report.writer
             )
         });
     }
@@ -311,6 +353,14 @@ fn read_store(paths: &Paths, report: &mut HealthReport) -> crate::error::Result<
     report.tags = tags::list(&conn)?.len();
     report.projects = project::count(&conn)?;
     report.projects_dangling = project::dangling(&conn)?.len();
+    // The queue table only exists from v8 on, and the probe's job is to explain a store it does not
+    // recognise — so an older schema reports no queue rather than failing the whole probe on it.
+    if report.schema >= encode::SCHEMA {
+        let queue = encode::counts(&conn)?;
+        report.encode_pending = queue.pending;
+        report.encode_failed = queue.failed;
+        report.encode_oldest_s = queue.oldest_s;
+    }
     Ok(stale)
 }
 

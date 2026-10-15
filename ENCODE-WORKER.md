@@ -1,8 +1,9 @@
 # The encode worker — the write path stops embedding
 
-**Status:** designed, not implemented. Supersedes the inline embed in `store::add_impl`.
-Depends on `feat/http-surface`. Phase 0 changes no behaviour; the phases below are independent
-commits so the suite stays green at each step.
+**Status:** implemented and live (P0–P5, PR #20 — `dev` on `edge`, 2026-10-15). Supersedes the inline
+embed in `store::add_impl`. P6 (the `/health` side of the same decision) has since landed too: the
+readiness predicate no longer counts vectors, and the queue is reported as a metric. Phase 0 changed no
+behaviour; the phases were independent commits so the suite stayed green at each step.
 
 ## Why
 
@@ -300,8 +301,9 @@ hazard.
 
 **Failures.** An `embed_one` error increments `attempts`, stores `last_error`, and does **not**
 delete the row; the loop moves on to the next key rather than wedging on one bad document. After
-`ENCODE_MAX_ATTEMPTS` (say 5) the entry is left in place and skipped — visible as
-`encode_failed` in `/health` rather than retried forever in a hot loop.
+`MAX_ATTEMPTS` (5) the entry is left in place and skipped — counted by `encode_failed` in `/health`,
+`/stats` and `memory_stats`, and announced once, at the moment it gives up, by an `ERROR` from the
+worker. It is not retried forever in a hot loop, and it is not silent either.
 
 ## What visibly changes — the breaking part
 
@@ -335,8 +337,7 @@ Stated once, so it is not mistaken for a cure:
   enqueues anything.
 - **A wedged store is still a wedged store.** Disk full, read-only remount, OOM, an SQLite lock —
   the worker does not paper over any of those, and should not.
-- **It does not, by itself, make `/health` honest.** That is Phase 4 and it is a decision already
-  taken: `/health` 503s until ready for reads **and** writes, with the worker as its precondition.
+- **It does not, by itself, make `/health` honest.** That was P6, and it has landed — see below.
 
 ## Config
 
@@ -411,8 +412,28 @@ diff that can be reviewed on its own.
 | **P4** | `reembed` becomes a producer (`index::vec::recreate` if the dim changed, then enqueue every stale key at p1); `memory_reembed` / `POST /reembed` reply `{queued:N}` | `reembed` stops blocking | The outage actually ends here, and only after P3 exists to consume what it enqueues. |
 | **P5** | docs ride with their commits: `SPEC.md` §7, `HTTP.md` route table, `ENGINEERING.md` "Maintenance". A `PLAN.md` row for the phase history | none | The tool strings in `mcp/mod.rs` are a client's only spec, so they change in P2/P4, not here. |
 
-P6 is the health gate (Phase 4 in the decision already recorded) and is deliberately **not** in this
-document — it is a different decision that merely depends on P3 landing first.
+P6 was the health gate (Phase 4 in the decision already recorded) and it has since **landed**, as its
+own change on top of P0–P5:
+
+- the readiness predicate **dropped `vectors >= memories`**. With a queue that clause is not a safety
+  net, it is a lie that flips on every write: a write leaves N memories and N−1 vectors for as long as
+  the worker takes, so `/health` answered `NOT READY — run \`reembed\`` for the store's normal state.
+- `ready` is now `schema == latest && !projection_stale && writer not held past 2 s` — readiness for
+  reads **and** writes, with nothing derived-but-lagging in it.
+- the queue is **reported, never gated on**: `encode_pending`, `encode_failed`, `encode_oldest_s` in
+  `/health` (both formats), `/stats` and `memory_stats`. The last one is the number that distinguishes
+  a slow worker from an absent one, and the reason a stalled queue is now visible without a DB copy.
+- the worker logs each job (`encode worker: encoded`, with `pending`/`failed` after the settle) and an
+  `ERROR` when it gives up on a document. A worker that only logged failures was indistinguishable
+  from one that was not running.
+
+**One term of the original predicate was not implemented as written.** The decision included
+`encoder_warm`, on the grounds that a cold encoder stalled the first *write*. The worker removes that
+coupling — the 1.2 GB load lands on the worker holding nothing — so a gate on it would 503 a healthy
+store for the ~7 s after a restart, and again whenever nobody has asked for an embedding yet. It is
+not a readiness fact any more; warming the weights at startup (so the *first search* does not pay it)
+remains open, and so does wiring the k8s readiness probe to `/health` — one replica behind a Service
+means a 503 leaves zero endpoints, which is its own decision and not this one.
 
 ## How we will know it worked
 
@@ -422,7 +443,7 @@ Not a feeling, three facts:
    worker is mid-embed, where today it waits out the embed;
 2. `POST /reembed` on the live store returns in **seconds** with `{queued: 291}`, where today it
    holds for ~45 minutes and every write during it is a 60 s timeout;
-3. `/health` shows `pending_encode` draining to 0 after a write burst, with `writer` never
+3. `/health` shows `encode_pending` draining to 0 after a write burst, with `writer` never
    `busy` for more than a job.
 
 ## Open — your call, not mine
@@ -435,6 +456,8 @@ Not a feeling, three facts:
    to a duplicate scan. Warn-and-proceed, or have `dupes` drain first (making a read take a write)?
    I would warn: a dupe scan is a curation aid, and stalling a read to answer it is the coupling
    again.
-3. **A permanently-failing document.** Skip after `ENCODE_MAX_ATTEMPTS` and surface it in
-   `/health` (my proposal), or fail the write loudly? The former is honest and non-blocking; the
-   latter is louder and blocks a store on one bad string.
+3. **A permanently-failing document.** Skip after `MAX_ATTEMPTS` and surface it in `/health` (my
+   proposal), or fail the write loudly? **Taken: the first.** Implemented — the entry is skipped,
+   counted as `encode_failed` in `/health`, `/stats` and `memory_stats`, and announced once by an
+   `ERROR` from the worker. The former is honest and non-blocking; the latter would block a store on
+   one bad string.

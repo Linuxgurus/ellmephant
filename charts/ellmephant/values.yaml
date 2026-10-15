@@ -184,9 +184,11 @@ env: []
 # Extra env sources (secretRef / configMapRef).
 envFrom: []
 
-# TCP probes on the MCP port. There is no health HTTP route — the only path is /mcp, an MCP
-# handshake — so a port check is the honest signal (and matches the image's own HEALTHCHECK
-# philosophy of never writing to the store from a probe).
+# TCP probes on the MCP port. `/health` exists (a read-only readiness route) but it 503s until the
+# store is writable, and with a single replica behind one Service that would leave ZERO endpoints —
+# so readiness is not wired to it here: that is its own decision, not a probe-type edit. A TCP check
+# is the honest signal for the transport, and matches the image's own HEALTHCHECK philosophy of never
+# writing to the store from a probe.
 probes:
   liveness:
     tcpSocket:

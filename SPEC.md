@@ -329,6 +329,9 @@ CREATE TABLE project_memory (      -- RETIRED in 0007; see "Membership is a TAG"
   into the structures half: links live in memory bodies, so a bare token is a *memory* and only the
   other kind needs saying. `:` cannot occur in a slug (`[a-z0-9-]+`), so no name can squat on the
   marker — and `[[prj-foo]]` is a memory *called* `prj-foo`, not a project.
+  A token inside a **backtick code span** is literal text, not a reference: a body *about* links
+  writes `` the marker is `[[prj:x]]` `` and becomes no edge (the escape the parser used to lack).
+  An unclosed backtick makes the remainder of the body code.
 - **Index:** parse to `memory_link(from_id, to_key, to_type, rel)` at write time — a *derived* index.
   The **type rides on the edge**, never on the key, because one name may exist in both tables
   (`sessions` the project, `sessions` the memories about it).
@@ -348,7 +351,8 @@ CREATE TABLE project_memory (      -- RETIRED in 0007; see "Membership is a TAG"
   **No interface exposes it today**: the CLI verb was its only caller and went with the REPL, so
   `store::links::rename` is reachable only from tests. A `memory_rename` tool is the obvious way back;
   the decision is open.
-- **Embedding:** `[[...]]` stripped from the embed projection.
+- **Embedding:** `[[...]]` stripped from the embed projection; a token inside a backtick code span
+  is **kept** — there it is literal text, not a reference.
 - Key charset `[a-z0-9-]+`; the link regex is `\[\[((?:prj:)?[a-z0-9-]+)\]\]`.
 
 ## 9. Memory philosophy (how memories are "tuned")

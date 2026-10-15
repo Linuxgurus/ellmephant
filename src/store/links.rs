@@ -18,6 +18,28 @@ use crate::store::{slug, tags};
 static LINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[\[((?:prj:)?[a-z0-9-]+)\]\]").expect("link regex is valid"));
 
+/// Walk `s`, splitting it into alternating `(is_code, segment)` runs at each backtick. The backtick
+/// delimiters are not part of any segment, so joining the segments with `` ` `` rebuilds `s`
+/// verbatim; that is how [`strip_links`] re-emits them.
+///
+/// A backtick toggles: text between an odd backtick and the next is a **code span**, where a
+/// `[[token]]` is documentation, not a reference. This is the escape the parser used to lack — a
+/// body about links writes `` the marker is `[[prj:x]]` ``, and that no longer becomes an edge.
+fn spans(s: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        if ch == '`' {
+            out.push((in_code, &s[start..i]));
+            in_code = !in_code;
+            start = i + 1;
+        }
+    }
+    out.push((in_code, &s[start..]));
+    out
+}
+
 /// Which table a key names.
 ///
 /// A key is a plain name — two tables may each hold a `sessions` — so the type travels with the
@@ -68,21 +90,39 @@ pub fn parse_target(token: &str) -> (Kind, String) {
     }
 }
 
-/// Extract link targets in first-seen order, de-duplicated.
+/// Extract link targets in first-seen order, de-duplicated. A token inside a backtick code span is
+/// literal text, not a reference (see [`spans`]).
 pub fn extract_links(body: &str) -> Vec<(Kind, String)> {
     let mut seen = Vec::new();
-    for cap in LINK_RE.captures_iter(body) {
-        let target = parse_target(&cap[1]);
-        if !seen.contains(&target) {
-            seen.push(target);
+    for (is_code, segment) in spans(body) {
+        if is_code {
+            continue;
+        }
+        for cap in LINK_RE.captures_iter(segment) {
+            let target = parse_target(&cap[1]);
+            if !seen.contains(&target) {
+                seen.push(target);
+            }
         }
     }
     seen
 }
 
-/// Remove every `[[key]]` token from `s` (the embed projection needs this; SPEC §8).
+/// Remove every `[[key]]` token from `s` (the embed projection needs this; SPEC §8). A token inside
+/// a backtick code span is left alone — it is literal text the projection should keep, not a link to
+/// strip (see [`spans`]).
 pub fn strip_links(s: &str) -> String {
-    LINK_RE.replace_all(s, "").to_string()
+    spans(s)
+        .into_iter()
+        .map(|(is_code, segment)| {
+            if is_code {
+                segment.to_string()
+            } else {
+                LINK_RE.replace_all(segment, "").into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("`")
 }
 
 /// A `[[key]]` that resolves to no row — an allowed forward/renamed reference that the
@@ -334,6 +374,28 @@ mod tests {
             extract_links("[[mem:x]]"),
             Vec::new(),
             "only `prj:` is a marker; `mem:` is not a token at all"
+        );
+    }
+
+    #[test]
+    fn a_backtick_code_span_escapes_a_token() {
+        // Documenting the syntax must not itself be a write to the graph.
+        assert_eq!(
+            extract_links("write `[[key]]` to link, like [[real]]"),
+            vec![(Kind::Memory, "real".to_string())],
+            "only the prose token is a reference"
+        );
+        // An unclosed backtick makes the rest of the body code: nothing after it links.
+        assert!(extract_links("oops `[[a]]").is_empty());
+    }
+
+    #[test]
+    fn strip_links_keeps_code_spans_verbatim() {
+        assert_eq!(strip_links("a `b` c"), "a `b` c", "backticks re-emitted");
+        assert_eq!(
+            strip_links("see [[x]] and `[[y]]`"),
+            "see  and `[[y]]`",
+            "the prose token is stripped, the code token kept"
         );
     }
 

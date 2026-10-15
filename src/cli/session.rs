@@ -162,8 +162,13 @@ impl Session {
 
     /// A read-only digest of the store (`stats`); `db_bytes` comes from the store file, so the
     /// MCP surface reports the real size rather than a zero the caller was expected to fill.
-    pub fn stats(&self) -> Result<store::stats::Stats> {
-        store::stats::compute(&self.conn)
+    /// `with_tags` additionally fills the full tag vocabulary — the digest stays lean without it.
+    pub fn stats(&self, with_tags: bool) -> Result<store::stats::Stats> {
+        let mut stats = store::stats::compute(&self.conn)?;
+        if with_tags {
+            stats.all_tags = store::stats::vocabulary(&self.conn)?;
+        }
+        Ok(stats)
     }
 
     /// Recompute every vector and rebuild the derived indexes — the vector index and the `[[link]]`

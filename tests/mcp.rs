@@ -661,6 +661,25 @@ async fn projects_round_trip_over_the_transport() {
     .await;
     assert!(!tagged.is_error.unwrap_or(false), "{}", text(&tagged));
 
+    // The tag vocabulary is opt-in (`tags: true`) so the digest stays lean — and a memory now
+    // carries tags (`chronos-design` just above), so the full set is real here.
+    let lean = call(&client, "memory_stats", serde_json::json!({})).await;
+    assert!(
+        !text(&lean).contains("all_tags"),
+        "the default digest carries no vocabulary: {}",
+        text(&lean)
+    );
+    let vocab = call(&client, "memory_stats", serde_json::json!({ "tags": true })).await;
+    let v: serde_json::Value = serde_json::from_str(&text(&vocab)).expect("json");
+    let all = v["all_tags"]
+        .as_array()
+        .expect("`tags: true` adds all_tags");
+    assert!(
+        all.iter().any(|t| t[0] == serde_json::json!("design")),
+        "the vocabulary lists the tags in use: {}",
+        text(&vocab)
+    );
+
     let members = call(
         &client,
         "memory_search",

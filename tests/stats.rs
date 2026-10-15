@@ -59,6 +59,10 @@ fn digest_counts_spread_tags_and_links() {
     assert_eq!(s.tag_assignments, 3);
     assert_eq!(s.singleton_tags, 1, "infra is used once");
     assert_eq!(s.top_tags.first(), Some(&("k8s".to_string(), 2)));
+    assert!(
+        s.all_tags.is_empty(),
+        "the digest stays lean: the full vocabulary is asked for, not assumed"
+    );
     assert!((s.avg_tags_per_memory() - 1.0).abs() < 1e-9);
     assert!((s.avg_memories_per_tag() - 1.5).abs() < 1e-9);
 
@@ -147,4 +151,27 @@ fn unvoted_hot_surfaces_read_but_never_marked_useful() {
     assert_eq!(s.unvoted_hot, vec![("hot".to_string(), 3)]);
     // It is a candidate list, not a vote total: the useful row still counts.
     assert_eq!(s.useful_total, 1);
+}
+
+#[test]
+fn vocabulary_is_the_whole_tag_set_count_desc_then_name() {
+    // The readable half of tag hygiene: the WHOLE set, so a caller stops inventing a synonym for a
+    // tag that already exists. (The write half — renaming/merging one — is separate work.)
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    store::add(&conn, &embedder, &memory("a", "x", &["k8s", "infra"])).expect("a");
+    store::add(&conn, &embedder, &memory("b", "y", &["k8s"])).expect("b");
+    store::add(&conn, &embedder, &memory("c", "z", &["gotcha"])).expect("c");
+
+    let vocab = stats::vocabulary(&conn).expect("vocabulary");
+    assert_eq!(
+        vocab,
+        vec![
+            ("k8s".to_string(), 2),
+            ("gotcha".to_string(), 1),
+            ("infra".to_string(), 1),
+        ],
+        "count-desc then name: the head is bloated, the tail is the sprawl"
+    );
 }

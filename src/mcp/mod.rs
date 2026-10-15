@@ -421,7 +421,18 @@ pub struct KeysParams {
     pub keys: Vec<String>,
 }
 
-/// Parameters for a no-argument tool (`memory_stats`).
+/// Parameters for [`MemoryServer::memory_stats`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatsParams {
+    /// Include the full tag vocabulary.
+    #[serde(default)]
+    #[schemars(
+        description = "Also return `all_tags` — the FULL tag vocabulary with counts (count-desc, then name). Off by default so the digest stays lean; on, it is how you see the whole tag set (and its sprawl) instead of inventing a synonym."
+    )]
+    pub tags: Option<bool>,
+}
+
+/// Parameters for a no-argument tool (e.g. `memory_reembed`).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {}
 
@@ -975,7 +986,7 @@ impl MemoryServer {
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
     #[tool(
         name = "memory_stats",
-        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age. One keyed JSON object. The lay of the land; glance before a big hunt.",
+        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age. One keyed JSON object. The lay of the land; glance before a big hunt. Pass `tags: true` to add `all_tags` — the full tag vocabulary.",
         annotations(
             title = "Store stats",
             read_only_hint = true,
@@ -986,9 +997,12 @@ impl MemoryServer {
     )]
     async fn memory_stats(
         &self,
-        Parameters(_): Parameters<ListParams>,
+        Parameters(p): Parameters<StatsParams>,
     ) -> std::result::Result<String, String> {
-        let stats = self.with_store("memory_stats", move |s| s.stats()).await?;
+        let with_tags = p.tags.unwrap_or(false);
+        let stats = self
+            .with_store("memory_stats", move |s| s.stats(with_tags))
+            .await?;
         tracing::info!(tool = "memory_stats", memories = stats.memories, "stats");
         serde_json::to_string(&stats).map_err(|e| e.to_string())
     }

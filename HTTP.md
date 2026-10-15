@@ -186,8 +186,8 @@ Writes — **auth required**, all of them:
 | --- | --- | --- | --- |
 | POST | `/memory` | `memory_upsert` | text front-matter, or JSON if `Content-Type: application/json` |
 | POST | `/memory/{key}/upvote` | `memory_upvote` | — |
-| POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>` |
-| PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null` |
+| POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>`, or a JSON body `{"from","into"}` |
+| PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null`, or a JSON body `{"coherent": …}` |
 | DELETE | `/memory/{key}` | `memory_delete` | — |
 | POST | `/project` | `project_upsert` | JSON — a project patch is structured (owner / preload / tags) and front-matter has no grammar for it |
 | POST | `/reembed` | `memory_reembed` | — **last**: heaviest lock holder, and `/health` watches it |
@@ -197,6 +197,15 @@ that is the format that removes JSON-escaping of multi-line bodies, which is whe
 actually fails. A project patch is *structured* (owner list, preload list, tags), where JSON is the
 honest shape. So both are accepted, and the caller picks by `Content-Type`. `?format=` governs the
 *response* only.
+
+**And every route that takes an argument takes the MCP tool's own arguments as the body**, with its
+query form as shorthand: `POST /memory/{key}/merge` accepts `{"from","into"}` as well as `?into=`, and
+`PUT /memory/{key}/coherent` accepts `{"coherent": …}` as well as `?value=`. A caller that knows the
+tool should not have to learn a second spelling for the same thing — that is what parity means here.
+`POST /memory` and `POST /project` already took the tool's object, so these two were the whole gap. A
+body field that disagrees with the path (`{"from":"a"}` on `/memory/b/merge`) is a `400` that names
+both, never a silent winner, and an omitted `coherent`/`value` is `null` — the same "unjudged" the
+tool's optional field means.
 
 ### Auth: **no key today.** The seam is there; the gate is not.
 

@@ -485,6 +485,24 @@ async fn body_bytes(body: Body) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("bad body: {e}"))
 }
 
+/// The request's JSON body, when it sent one — `None` for an empty body or a non-JSON content type.
+///
+/// This is what lets a route take its arguments **the way the MCP tool does** (`{"into": ...}`,
+/// `{"coherent": ...}`) *and* its own query parameters, so a caller that knows the tool can post the
+/// tool's own arguments unchanged. Parity is the point of this door; guessing at the shape is not.
+async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json::Value>, String> {
+    if !is_json_content(headers) {
+        return Ok(None);
+    }
+    let bytes = body_bytes(body).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("bad json body: {e}"))
+}
+
 /// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
     let params = Params::parse(raw.as_deref());
@@ -824,6 +842,7 @@ pub async fn merge(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -831,8 +850,41 @@ pub async fn merge(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let Some(into) = params.maybe("into").map(str::to_string) else {
-        return error(json, StatusCode::BAD_REQUEST, "missing `into` parameter");
+    // The MCP tool takes `{"from", "into"}`; accept it, so a caller can send the tool's own arguments
+    // unchanged. The path names `from` here, so a body `from` must AGREE with it rather than quietly
+    // win. `?into=` stays for a caller that only has a URL.
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    if let Some(given) = body
+        .as_ref()
+        .and_then(|b| b.get("from"))
+        .and_then(|f| f.as_str())
+        && given != key
+    {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            format!("body `from` is `{given}` but the path names `{key}`"),
+        );
+    }
+    let into = match body
+        .as_ref()
+        .and_then(|b| b.get("into"))
+        .and_then(|i| i.as_str())
+    {
+        Some(into) => into.to_string(),
+        None => match params.maybe("into") {
+            Some(into) => into.to_string(),
+            None => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    "missing `into`: send `?into=<key>`, or a JSON body {\"into\": \"<key>\"}",
+                );
+            }
+        },
     };
     let server = match session(&state) {
         Ok(s) => s,
@@ -863,6 +915,7 @@ pub async fn coherent(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -870,18 +923,56 @@ pub async fn coherent(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let value = match params.get("value") {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        Some("null") => None,
+    // Two ways in, one meaning. The MCP tool takes `{"key", "coherent"}` — accept exactly that as the
+    // body, so a caller can send the tool's own arguments unchanged; a body field that is absent is
+    // `null` (unjudged), which is what an optional field means on the tool. `?value=` stays for a
+    // caller that only has a URL.
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    if let Some(given) = body
+        .as_ref()
+        .and_then(|b| b.get("key"))
+        .and_then(|k| k.as_str())
+        && given != key
+    {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            format!("body `key` is `{given}` but the path names `{key}`"),
+        );
+    }
+    let value = match body.as_ref().and_then(|b| b.get("coherent")) {
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::Null) => None,
         Some(other) => {
             return error(
                 json,
                 StatusCode::BAD_REQUEST,
-                format!("bad `value`: {other} (one of: true, false, null)"),
+                format!("bad `coherent`: {other} (true, false or null)"),
             );
         }
-        None => return error(json, StatusCode::BAD_REQUEST, "missing `value` parameter"),
+        None if body.is_some() => None,
+        None => match params.get("value") {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some("null") => None,
+            Some(other) => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    format!("bad `value`: {other} (one of: true, false, null)"),
+                );
+            }
+            None => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    "missing the verdict: send `?value=true|false|null`, or a JSON body {\"coherent\": …}",
+                );
+            }
+        },
     };
     let server = match session(&state) {
         Ok(s) => s,

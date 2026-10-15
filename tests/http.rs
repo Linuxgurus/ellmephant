@@ -819,3 +819,100 @@ async fn the_two_doors_are_one_core() {
         "every field but the counter must match"
     );
 }
+
+/// The MCP tool's OWN arguments, sent as a request body, must work on the write routes that take an
+/// argument: a caller that knows `memory_coherent` and `memory_merge` should not have to learn a
+/// second spelling for the same thing. The query forms stay, for a caller that only has a URL.
+#[tokio::test]
+async fn write_routes_accept_the_mcp_arguments_as_a_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "mb", "a body", "text").await;
+
+    let coherent_of = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["coherent"].clone()
+    };
+
+    // `memory_coherent` takes {key, coherent}; an absent field is `null` (unjudged), which is what
+    // the tool's optional field means.
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb/coherent?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"key":"mb","coherent":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got, _) = get(&app, "/memory/mb?format=json").await;
+    assert_eq!(coherent_of(&got), serde_json::json!(true), "{got}");
+
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb/coherent?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"key":"mb"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got, _) = get(&app, "/memory/mb?format=json").await;
+    assert_eq!(coherent_of(&got), serde_json::Value::Null, "{got}");
+
+    // A body `key` that disagrees with the path is refused, not silently preferred.
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb/coherent?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"key":"other","coherent":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // `memory_merge` takes {from, into}.
+    seed(&app, "tok", "mb-into", "target", "t").await;
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/mb/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"mb","into":"mb-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, _) = get(&app, "/memory/mb?format=json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the source is retired");
+
+    // ...and a `from` that disagrees with the path, likewise.
+    seed(&app, "tok", "mb2", "another", "x").await;
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/mb2/merge?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"from":"mb","into":"mb-into"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Both ways in, one meaning: the query spellings still work.
+    seed(&app, "tok", "mb3", "third", "y").await;
+    let (status, body, _) = request(
+        &app,
+        Method::PUT,
+        "/memory/mb3/coherent?value=false&format=json",
+        Some("tok"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got, _) = get(&app, "/memory/mb3?format=json").await;
+    assert_eq!(coherent_of(&got), serde_json::json!(false), "{got}");
+}

@@ -209,6 +209,92 @@ pub fn reparse(conn: &Connection) -> Result<usize> {
     Ok(rows.len())
 }
 
+/// What a [`merge_into`] did.
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeInto {
+    /// The key that was retired (deleted).
+    pub from: String,
+    /// The key it was folded into.
+    pub into: String,
+    /// Memory bodies whose `[[from]]` token was rewritten to `[[into]]`.
+    pub bodies: usize,
+    /// `project` preloads whose `from` entry was repointed.
+    pub preloads: usize,
+}
+
+/// Retire `from` into `into`: repoint every reference, then delete `from` (PLAN §3).
+///
+/// Merging used to be a hand-fold plus `memory_delete`, which **breaks the graph** — every `[[from]]`
+/// left behind dangles — so hygiene never happened. This does the repointing, so it is safe:
+///
+/// - every `[[from]]` token in every memory body becomes `[[into]]`;
+/// - the edge set is repointed in lockstep, and any self-edge the rewrite creates is dropped (the
+///   same rule the write path applies);
+/// - every project `preload` naming `from` is repointed at `into`, order kept and duplicates
+///   collapsed;
+/// - `from` is deleted (row, vector, edges).
+///
+/// **The prose is the caller's.** This never touches `into`'s body: write the merged facts into
+/// `into` first (an ordinary upsert/patch), then retire `from` here — the store keeps facts
+/// straight, a model writes the words. `[[prj:from]]` is *not* rewritten: that names a project.
+pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto> {
+    let from = slug::slugify(from);
+    let into = slug::slugify(into);
+    if from == into {
+        return Err(Error::Config(
+            "a memory cannot be merged into itself".into(),
+        ));
+    }
+    let rowid = |key: &str| -> Result<i64> {
+        conn.query_row("SELECT id FROM memory WHERE key = ?1", params![key], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| Error::NotFound(key.to_string()))
+    };
+    let from_id = rowid(&from)?;
+    rowid(&into)?; // the target must exist: a merge into a typo would silently destroy the source
+
+    let tx = conn.unchecked_transaction()?;
+    // The tokens. A bare `[[from]]` is a memory; `[[prj:from]]` names the other table and must not
+    // move — which is why the kind rides on the edge, not the name.
+    let bodies = tx.execute(
+        "UPDATE memory SET body = replace(body, ?1, ?2), updated = datetime('now')
+          WHERE body LIKE ?3",
+        params![
+            format!("[[{from}]]"),
+            format!("[[{into}]]"),
+            format!("%[[{from}]]%")
+        ],
+    )?;
+    // Repoint the edges with the bodies. `OR REPLACE` clears the PK collision when a source already
+    // links to `into`. Memory edges only, like `rename`.
+    tx.execute(
+        "UPDATE OR REPLACE memory_link SET to_key = ?2
+          WHERE to_key = ?1 AND to_type = 'memory'",
+        params![from, into],
+    )?;
+    // The rewrite can turn a `[[from]]` inside `into`'s own body into a self-link, which the write
+    // path never creates. Drop it, so the graph keeps that invariant.
+    tx.execute(
+        "DELETE FROM memory_link
+          WHERE to_type = 'memory'
+            AND to_key = (SELECT key FROM memory WHERE id = memory_link.from_id)",
+        [],
+    )?;
+    let preloads = crate::store::project::repoint_preload(&tx, &from, &into)?;
+    tx.execute("DELETE FROM memory WHERE id = ?1", params![from_id])?;
+    index::vec::delete(&tx, from_id)?;
+    tx.commit()?;
+
+    Ok(MergeInto {
+        from,
+        into,
+        bodies,
+        preloads,
+    })
+}
+
 /// What a [`rename`] changed.
 #[derive(Debug, Clone)]
 pub struct RenameOutcome {

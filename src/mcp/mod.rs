@@ -43,6 +43,7 @@ use crate::store::{self, project};
 pub const TOOLS: &[&str] = &[
     "memory_upsert",
     "memory_delete",
+    "memory_merge",
     "memory_search",
     "memory_get",
     "memory_backlinks",
@@ -129,6 +130,15 @@ windows over the timestamps (`updated_after` is the \"what changed since I last 
 are `key`-only by default; `fields` adds more, body never. `memory_get` \
 the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
 `max_distance`.";
+
+/// `memory_merge` description.
+const MERGE_DESCRIPTION: &str = "\
+Retire one memory into another: repoint every `[[from]]` reference at `into` — bodies, the `[[…]]` \
+graph, and any project `preload` naming it — then delete `from`. This is how to merge WITHOUT \
+leaving dangling links. The PROSE fold is yours: write the merged facts into `into` first \
+(`memory_upsert`, or a patch that keeps the rest), then retire `from` here; this never edits \
+`into`'s body. `[[prj:from]]` is not rewritten (that names a project). Both keys must exist — a \
+merge into a typo would destroy the source. Reports what moved.";
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
@@ -386,6 +396,21 @@ pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
     pub key: String,
+}
+
+/// Parameters for [`MemoryServer::memory_merge`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MergeParams {
+    /// The key to retire.
+    #[schemars(
+        description = "The key to retire — its `[[…]]` references are repointed at `into`, then it is deleted."
+    )]
+    pub from: String,
+    /// The key that survives.
+    #[schemars(
+        description = "The key that survives. Must already exist; its body is NOT edited (write the merged facts into it first)."
+    )]
+    pub into: String,
 }
 
 /// A many-key request (feedback sweep).
@@ -713,6 +738,40 @@ impl MemoryServer {
             tracing::warn!(tool = "memory_delete", key = %key, "no such memory");
             Err(format!("no such memory: {key}"))
         }
+    }
+
+    /// Retire one memory into another, repointing the graph — the safe way to merge.
+    #[tool(
+        name = "memory_merge",
+        description = MERGE_DESCRIPTION,
+        annotations(
+            title = "Merge memory",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_merge(
+        &self,
+        Parameters(p): Parameters<MergeParams>,
+    ) -> std::result::Result<String, String> {
+        let from = p.from;
+        let into = p.into;
+        let log_from = from.clone();
+        let log_into = into.clone();
+        let out = self
+            .with_store("memory_merge", move |s| s.merge_into(&from, &into))
+            .await?;
+        tracing::info!(
+            tool = "memory_merge",
+            from = %log_from,
+            into = %log_into,
+            bodies = out.bodies,
+            preloads = out.preloads,
+            "memories merged"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Semantic phrase search: KNN over the document embeddings.

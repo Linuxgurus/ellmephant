@@ -9,7 +9,7 @@ mod common;
 use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
-use ellmephant::store::{self, Memory, links};
+use ellmephant::store::{self, Memory, links, project};
 use rusqlite::Connection;
 
 const DIM: usize = 8;
@@ -25,6 +25,14 @@ fn memory(key: &str, body: &str) -> Memory {
 
 fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str) {
     store::add(conn, embedder, &memory(key, body)).expect("add");
+}
+
+fn project_fixture(key: &str) -> project::Project {
+    project::Project {
+        key: key.to_string(),
+        title: key.to_string(),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -203,4 +211,113 @@ fn a_link_to_a_project_resolves_and_is_not_rot() {
     let dangling = links::dangling(&conn).expect("dangling");
     assert_eq!(dangling.len(), 1, "only the ghost is rot: {dangling:?}");
     assert_eq!(dangling[0].to_key, "ghost");
+}
+
+#[test]
+fn merge_into_repoints_every_reference_and_retires_the_source() {
+    // The whole point: a merge must not leave dangling links, or hygiene never happens.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    seed(&conn, &embedder, "old", "the retired facts");
+    seed(&conn, &embedder, "new", "the surviving facts");
+    seed(&conn, &embedder, "a", "see [[old]] first");
+    seed(&conn, &embedder, "b", "also [[old]] here");
+
+    let out = links::merge_into(&conn, "old", "new").expect("merge");
+    assert_eq!(out.bodies, 2, "both referrers were rewritten");
+    assert!(store::get(&conn, "old").unwrap().is_none(), "source gone");
+    assert_eq!(
+        store::get(&conn, "new").unwrap().unwrap().body,
+        "the surviving facts",
+        "the PROSE fold is the caller's: the survivor's body is untouched"
+    );
+
+    for key in ["a", "b"] {
+        let body = store::get(&conn, key).unwrap().unwrap().body;
+        assert!(body.contains("[[new]]"), "{key}: {body}");
+        assert!(!body.contains("[[old]]"), "{key}: {body}");
+    }
+    assert!(
+        links::dangling(&conn).unwrap().is_empty(),
+        "nothing left dangling"
+    );
+    let to: Vec<String> = conn
+        .prepare("SELECT to_key FROM memory_link ORDER BY to_key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(to, vec!["new", "new"], "the edges followed the bodies");
+}
+
+#[test]
+fn merge_into_repoints_a_preload_but_not_a_project_link() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "old", "retired");
+    seed(&conn, &embedder, "new", "survivor");
+    project::upsert(&conn, &project_fixture("p"), Some(&["old".to_string()])).expect("project");
+    // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
+    seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
+
+    let out = links::merge_into(&conn, "old", "new").expect("merge");
+    assert_eq!(out.preloads, 1, "the project preload was repointed");
+    let refs = project::preload(&conn, "p", project::Hydrate::None).unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].key, "new", "the preload follows the merge");
+    assert!(
+        project::dangling(&conn).unwrap().is_empty(),
+        "no preload rot after the merge"
+    );
+
+    let body = store::get(&conn, "pointer").unwrap().unwrap().body;
+    assert!(
+        body.contains("[[prj:old]]"),
+        "a project link must not move: {body}"
+    );
+}
+
+#[test]
+fn merge_into_drops_the_self_link_the_rewrite_would_create() {
+    // `new`'s own body points at `old`; rewritten, it would be a self-link, which the write path
+    // never creates. The graph must keep that invariant.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "old", "retired");
+    seed(&conn, &embedder, "new", "see [[old]]");
+
+    links::merge_into(&conn, "old", "new").expect("merge");
+    let edges: i64 = conn
+        .query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(edges, 0, "a self-link carries no navigation value");
+    assert!(links::dangling(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn merge_into_refuses_a_missing_target_and_a_self_merge() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "a", "x");
+    seed(&conn, &embedder, "b", "y");
+
+    assert!(
+        links::merge_into(&conn, "ghost", "a").is_err(),
+        "source must exist"
+    );
+    assert!(
+        links::merge_into(&conn, "a", "ghost").is_err(),
+        "a merge into a typo must not destroy the source"
+    );
+    assert!(links::merge_into(&conn, "a", "a").is_err(), "self-merge");
+
+    // A refused merge destroyed nothing.
+    assert!(store::get(&conn, "a").unwrap().is_some());
+    assert!(store::get(&conn, "b").unwrap().is_some());
 }

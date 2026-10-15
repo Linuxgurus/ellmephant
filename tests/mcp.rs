@@ -578,6 +578,21 @@ async fn projects_round_trip_over_the_transport() {
         v.get("contains").is_none(),
         "membership is a tag now: there is no `contains` table on the wire"
     );
+    assert!(
+        v.get("bodies").is_none(),
+        "hydration is opt-in: the default read carries no bodies"
+    );
+
+    // ...and `hydrate: full` carries each preload memory's body in a sister table, in order.
+    let full = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "chronos", "hydrate": "full" }),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text(&full)).expect("json");
+    assert_eq!(v["bodies"]["cols"], serde_json::json!(["key", "body"]));
+    assert_eq!(v["bodies"]["rows"][0][0], serde_json::json!("boot-note"));
 
     // A memory JOINS the project by carrying its tag — set on the memory write, never a relation,
     // and read back with the ordinary `tags` filter.

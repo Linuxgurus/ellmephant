@@ -374,7 +374,7 @@ fn preload_is_ordered_and_replaced_wholesale() {
     let preload = vec!["c".to_string(), "a".to_string(), "b".to_string()];
     project::upsert(&conn, &project_fixture("chronos"), Some(&preload)).expect("set preload");
 
-    let refs = project::preload(&conn, &key).unwrap();
+    let refs = project::preload(&conn, &key, project::Hydrate::None).unwrap();
     let keys: Vec<&str> = refs.iter().map(|r| r.key.as_str()).collect();
     assert_eq!(keys, vec!["c", "a", "b"], "the ORDER is the point");
     assert!(refs.iter().all(|r| r.title.is_some()), "titles hydrate");
@@ -394,11 +394,18 @@ fn preload_is_ordered_and_replaced_wholesale() {
 
     // A second `Some` replaces the list; `None` leaves it alone.
     project::upsert(&conn, &project_fixture("chronos"), Some(&["b".to_string()])).expect("replace");
-    assert_eq!(project::preload(&conn, &key).unwrap().len(), 1);
+    assert_eq!(
+        project::preload(&conn, &key, project::Hydrate::None)
+            .unwrap()
+            .len(),
+        1
+    );
 
     project::upsert(&conn, &project_fixture("chronos"), None).expect("touch");
     assert_eq!(
-        project::preload(&conn, &key).unwrap().len(),
+        project::preload(&conn, &key, project::Hydrate::None)
+            .unwrap()
+            .len(),
         1,
         "None keeps it"
     );
@@ -422,7 +429,7 @@ fn preload_survives_a_reopen_in_order() {
 
     // The order is *stored*, not recomputed on the way out.
     let conn = db::open(&paths).expect("reopen");
-    let refs = project::preload(&conn, &key).unwrap();
+    let refs = project::preload(&conn, &key, project::Hydrate::None).unwrap();
     let keys: Vec<&str> = refs.iter().map(|r| r.key.as_str()).collect();
     assert_eq!(keys, vec!["b", "a"]);
 }
@@ -651,7 +658,9 @@ fn dangling_reports_forward_references_and_keeps_them_visible() {
     assert_eq!(rot[0].from_keys, vec![key.clone()]);
 
     // …and `project_get` shows it rather than dropping the row.
-    let view = project::view(&conn, &key).unwrap().unwrap();
+    let view = project::view(&conn, &key, project::Hydrate::None)
+        .unwrap()
+        .unwrap();
     assert_eq!(view.preload.len(), 2, "the dangling entry is still listed");
     let later = view.preload.iter().find(|r| r.key == "later").unwrap();
     assert!(later.title.is_none(), "a missing target reads as null");
@@ -691,7 +700,10 @@ fn preload_refuses_a_project_marker() {
     // A bare name is a memory of that name — even one that reads like the legacy prefix, because in
     // prose (and in this list) `prj-` is just letters.
     project::upsert(&conn, &p, Some(&["prj-notes".to_string()])).expect("bare name is a memory");
-    assert_eq!(project::preload(&conn, "x").unwrap()[0].key, "prj-notes");
+    assert_eq!(
+        project::preload(&conn, "x", project::Hydrate::None).unwrap()[0].key,
+        "prj-notes"
+    );
 }
 
 #[test]
@@ -775,6 +787,83 @@ fn a_project_link_is_not_a_memory_backlink() {
 }
 
 #[test]
+fn preload_hydrates_bodies_on_request() {
+    let (_dir, paths) = temp_store();
+    let embedder = HashEmbedder::new(DIM);
+    let conn = db::open(&paths).expect("open");
+    store::add(&conn, &embedder, &memory("a", "alpha body")).expect("a");
+    store::add(&conn, &embedder, &memory("b", "beta body")).expect("b");
+    let key = seed_project(&conn, "chronos");
+    // `ghost` never resolves: it must be SHOWN (a null title), not dropped.
+    project::upsert(
+        &conn,
+        &project_fixture("chronos"),
+        Some(&["b".to_string(), "ghost".to_string(), "a".to_string()]),
+    )
+    .expect("preload");
+
+    // Default: a reading list — keys and titles, no bodies.
+    let view = project::view(&conn, &key, project::Hydrate::None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        view.preload.iter().all(|r| r.body.is_none()),
+        "nothing is hydrated by default"
+    );
+
+    // Full: every *resolving* key carries its body, in ORDER; the missing key stays, body-less.
+    let view = project::view(&conn, &key, project::Hydrate::Full)
+        .unwrap()
+        .unwrap();
+    let keys: Vec<&str> = view.preload.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(keys, vec!["b", "ghost", "a"], "preload order is preserved");
+    assert_eq!(view.preload[0].body.as_deref(), Some("beta body"));
+    assert!(
+        view.preload[1].title.is_none() && view.preload[1].body.is_none(),
+        "an unresolved key is shown, not dropped"
+    );
+    assert_eq!(view.preload[2].body.as_deref(), Some("alpha body"));
+
+    // Snippet is a prefix: a body shorter than the cap comes back whole.
+    let view = project::view(&conn, &key, project::Hydrate::Snippet)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.preload[0].body.as_deref(), Some("beta body"));
+}
+
+#[test]
+fn project_view_wire_carries_bodies_in_a_sister_table() {
+    let (_dir, paths) = temp_store();
+    let embedder = HashEmbedder::new(DIM);
+    let conn = db::open(&paths).expect("open");
+    store::add(&conn, &embedder, &memory("a", "alpha body")).expect("a");
+    let key = seed_project(&conn, "chronos");
+    project::upsert(&conn, &project_fixture("chronos"), Some(&["a".to_string()])).unwrap();
+
+    let view = project::view(&conn, &key, project::Hydrate::Full)
+        .unwrap()
+        .unwrap();
+    let wire = project::view_to_wire_json(&view).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
+    assert_eq!(v["preload"]["cols"], serde_json::json!(["key", "title"]));
+    assert_eq!(v["bodies"]["cols"], serde_json::json!(["key", "body"]));
+    assert_eq!(
+        v["bodies"]["rows"][0],
+        serde_json::json!(["a", "alpha body"])
+    );
+
+    // The lean default shape is UNCHANGED: no `bodies` table at all.
+    let plain = project::view(&conn, &key, project::Hydrate::None)
+        .unwrap()
+        .unwrap();
+    let wire = project::view_to_wire_json(&plain).unwrap();
+    assert!(
+        !wire.contains("bodies"),
+        "no sister table when nothing is hydrated: {wire}"
+    );
+}
+
+#[test]
 fn the_wire_shapes_are_positional_and_self_describing() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
@@ -802,7 +891,9 @@ fn the_wire_shapes_are_positional_and_self_describing() {
     assert_eq!(v["projects"][0][0], serde_json::json!("chronos"));
     assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
 
-    let view = project::view(&conn, &key).unwrap().unwrap();
+    let view = project::view(&conn, &key, project::Hydrate::None)
+        .unwrap()
+        .unwrap();
     let wire = project::view_to_wire_json(&view).unwrap();
     let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
     assert_eq!(v["project"]["key"], serde_json::json!("chronos"));
@@ -1017,7 +1108,7 @@ fn merge_preload_replaces_the_list_and_keeps_it_when_absent() {
     )
     .expect("set preload");
     let keys = |c: &Connection| -> Vec<String> {
-        project::preload(c, "x")
+        project::preload(c, "x", project::Hydrate::None)
             .unwrap()
             .into_iter()
             .map(|r| r.key)

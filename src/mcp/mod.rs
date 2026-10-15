@@ -155,9 +155,11 @@ carrying the `prj:<key>` TAG; nothing links it. List a project's memories with `
 const PROJECT_GET_DESCRIPTION: &str = "\
 Read one project whole, with its `preload` resolved — the ordered context to load (project -> \
 memory), titles hydrated. A referenced key whose title is null resolves to nothing: a forward \
-reference or rot. The read reports it rather than hiding it. Membership is a TAG, not a relation: \
-a project's memories are the ones carrying `prj:<key>`, found with `memory_search`'s `tags` filter \
-(intersect with a topic tag to narrow to one facet).";
+reference or rot. The read reports it rather than hiding it. `hydrate` (`none` default, `snippet`, \
+`full`) optionally carries each preload memory's BODY, so a project can be a warm start rather than \
+a reading list; the bodies ride in a sister `bodies` table, in preload order. Membership is a TAG, \
+not a relation: a project's memories are the ones carrying `prj:<key>`, found with `memory_search`'s \
+`tags` filter (intersect with a topic tag to narrow to one facet).";
 
 /// `project_list` description.
 const PROJECT_LIST_DESCRIPTION: &str = "\
@@ -409,6 +411,12 @@ pub struct ProjectKeyParams {
     /// The project's key.
     #[schemars(description = "Project key — a plain slug (`prj:`/`prj-` accepted and stripped).")]
     pub key: String,
+    /// How much of each preload memory's body to carry.
+    #[serde(default)]
+    #[schemars(
+        description = "How much of each `preload` memory's BODY to carry: `none` (default — keys and titles only, a reading list), `snippet` (first ~280 chars), `full` (whole body). Order is preserved; a key that resolves to nothing is shown with a null title, not dropped."
+    )]
+    pub hydrate: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::project_upsert`].
@@ -1013,9 +1021,11 @@ impl MemoryServer {
         Parameters(p): Parameters<ProjectKeyParams>,
     ) -> std::result::Result<String, String> {
         let key = p.key;
+        let hydrate = project::Hydrate::parse(p.hydrate.as_deref().unwrap_or("none"))
+            .map_err(|e| e.to_string())?;
         let lookup = key.clone();
         let view = self
-            .with_store("project_get", move |s| s.project_view(&lookup))
+            .with_store("project_get", move |s| s.project_view(&lookup, hydrate))
             .await?;
         tracing::debug!(
             tool = "project_get",

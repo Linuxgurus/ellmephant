@@ -304,6 +304,11 @@ CREATE TABLE project_memory (      -- RETIRED in 0007; see "Membership is a TAG"
 - **One relation: `preload`.** project → memory, **ordered** — *"to work in here, load these"* — a
   project preloads memories it did not author (conventions, boot notes). Its only unique job is
   order; the *set* comes from tags.
+- **`preload` is inert by default; `project_get` can hydrate it.** The read resolves each key to a
+  title (a reading list, one `memory_get` away). An optional `hydrate` knob (`none` | `snippet` |
+  `full`, default `none`) additionally carries each memory's **body**, so a project can be a warm
+  start; the bodies ride in a sister `bodies` table in preload order, leaving the default shape
+  unchanged. A key that resolves to nothing is always *shown* (null title), never dropped.
 - **Membership is a TAG, not a relation** (0007 — the reversal). A memory belongs to a project by
   carrying the `prj:<key>` tag, intersected with topic tags by the ordinary `tags` filter:
   `prj:seaweedfs` + `storage` is *"the storage memories belonging to seaweedfs"*. There is no

@@ -141,6 +141,46 @@ pub struct Project {
     pub end_date: String,
 }
 
+/// How much of each preload memory's **body** the read carries.
+///
+/// The default ([`Hydrate::None`]) leaves `preload` a *reading list* — keys and titles, one
+/// `memory_get` away. A caller that means to *work in* a project can ask for the text instead, so a
+/// project becomes a warm start rather than a to-do list; the levels trade context for cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Hydrate {
+    /// Keys and titles only (the lean default): hydrate nothing.
+    #[default]
+    None,
+    /// The first [`crate::search::SNIPPET_CHARS`] of each body — a glance.
+    Snippet,
+    /// The whole body — a warm start.
+    Full,
+}
+
+impl Hydrate {
+    /// Parse the wire spelling (`none` | `snippet` | `full`). An unknown value is an error that
+    /// names the offenders rather than silently doing nothing.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "" | "none" => Ok(Hydrate::None),
+            "snippet" => Ok(Hydrate::Snippet),
+            "full" => Ok(Hydrate::Full),
+            other => Err(Error::Project(format!(
+                "unknown hydrate `{other}` (one of: none, snippet, full)"
+            ))),
+        }
+    }
+
+    /// The body to carry for `body` at this level, or `None` when nothing is hydrated.
+    fn body(self, body: &str) -> Option<String> {
+        match self {
+            Hydrate::None => None,
+            Hydrate::Snippet => Some(crate::search::snippet(body, crate::search::SNIPPET_CHARS)),
+            Hydrate::Full => Some(body.to_string()),
+        }
+    }
+}
+
 /// A key this project points at, with its title when the target still resolves.
 ///
 /// `title: None` means the target row does not exist (a forward reference or rot) — the read
@@ -151,6 +191,10 @@ pub struct Ref {
     pub key: String,
     /// The target's salient line, or `None` when nothing resolves.
     pub title: Option<String>,
+    /// The target's body, hydrated at the requested [`Hydrate`] level; `None` when hydration was
+    /// off (the default) or the target does not resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 /// A project with its relation resolved — "stand inside it".
@@ -158,7 +202,8 @@ pub struct Ref {
 pub struct View {
     /// The project itself.
     pub project: Project,
-    /// Ordered preload (`project → memory`), titles hydrated where they resolve.
+    /// Ordered preload (`project → memory`), titles hydrated where they resolve and bodies hydrated
+    /// at the requested level.
     pub preload: Vec<Ref>,
 }
 
@@ -596,11 +641,13 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Project>> {
         .optional()?)
 }
 
-/// The ordered preload (`project → memory`), titles hydrated where they resolve.
+/// The ordered preload (`project → memory`), titles hydrated where they resolve, and bodies at the
+/// requested [`Hydrate`] level.
 ///
-/// The list is one column, so this is a parse plus a single lookup for the titles — which are
-/// then put back into *list* order, because the query's order must never leak into the result.
-pub fn preload(conn: &Connection, key: &str) -> Result<Vec<Ref>> {
+/// The list is one column, so this is a parse plus a single lookup — which is then put back into
+/// *list* order, because the query's order must never leak into the result. A key that resolves to
+/// nothing is **kept** (with `title`/`body` null), not dropped: a forward reference is information.
+pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref>> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT mem_preload FROM project WHERE key = ?1",
@@ -614,29 +661,38 @@ pub fn preload(conn: &Connection, key: &str) -> Result<Vec<Ref>> {
     }
     let placeholders = vec!["?"; keys.len()].join(",");
     let mut stmt = conn.prepare(&format!(
-        "SELECT key, title FROM memory WHERE key IN ({placeholders})"
+        "SELECT key, title, body FROM memory WHERE key IN ({placeholders})"
     ))?;
-    let titles: HashMap<String, String> = stmt
+    let rows: HashMap<String, (String, String)> = stmt
         .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
         })?
         .collect::<rusqlite::Result<HashMap<_, _>>>()?;
     Ok(keys
         .into_iter()
-        .map(|key| Ref {
-            title: titles.get(&key).cloned(),
-            key,
+        .map(|key| match rows.get(&key) {
+            Some((title, body)) => Ref {
+                key,
+                title: Some(title.clone()),
+                body: hydrate.body(body),
+            },
+            None => Ref {
+                key,
+                title: None,
+                body: None,
+            },
         })
         .collect())
 }
 
-/// The project plus its preload — the `project_get` read ("stand inside it").
-pub fn view(conn: &Connection, key: &str) -> Result<Option<View>> {
+/// The project plus its preload — the `project_get` read ("stand inside it"). `hydrate` decides how
+/// much of each preload memory's body to carry ([`Hydrate::None`] keeps it a reading list).
+pub fn view(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Option<View>> {
     let Some(project) = get(conn, key)? else {
         return Ok(None);
     };
     Ok(Some(View {
-        preload: preload(conn, &project.key)?,
+        preload: preload(conn, &project.key, hydrate)?,
         project,
     }))
 }
@@ -766,18 +822,34 @@ pub fn list_to_wire_json(rows: &[Project]) -> Result<String> {
 /// `project_get` for the MCP wire: the project as a keyed object (one row, many fields) plus the
 /// ordered preload as its own `cols`/`rows` table.
 pub fn view_to_wire_json(view: &View) -> Result<String> {
-    let table = |refs: &[Ref]| {
-        let rows: Vec<serde_json::Value> = refs
-            .iter()
-            .map(|r| serde_json::json!([r.key, r.title]))
-            .collect();
-        crate::wire::rows_array(&rows)
-    };
-    Ok(format!(
-        "{{\"project\":{},\"preload\":{{\"cols\":[\"key\",\"title\"],\"rows\":{}}}}}",
+    let preload: Vec<serde_json::Value> = view
+        .preload
+        .iter()
+        .map(|r| serde_json::json!([r.key, r.title]))
+        .collect();
+    let mut out = format!(
+        "{{\"project\":{},\"preload\":{{\"cols\":[\"key\",\"title\"],\"rows\":{}}}",
         serde_json::to_string(&view.project)?,
-        table(&view.preload),
-    ))
+        crate::wire::rows_array(&preload),
+    );
+    // Hydrated bodies ride in a SISTER table rather than widening `preload`'s columns: the lean
+    // default shape stays byte-identical (the table appears only when something was hydrated), a
+    // caller that asked for bodies finds them under one key, and the shared `[key, title]` table is
+    // never padded with nulls. Rows keep the preload order; a key that resolves to nothing has no
+    // body and so is absent here (it is still *shown* in `preload`).
+    let bodies: Vec<serde_json::Value> = view
+        .preload
+        .iter()
+        .filter_map(|r| r.body.as_ref().map(|body| serde_json::json!([r.key, body])))
+        .collect();
+    if !bodies.is_empty() {
+        out.push_str(&format!(
+            ",\"bodies\":{{\"cols\":[\"key\",\"body\"],\"rows\":{}}}",
+            crate::wire::rows_array(&bodies)
+        ));
+    }
+    out.push('}');
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -808,6 +880,16 @@ mod tests {
         );
         let err = choice("nope", STATUSES, "todo", "status").unwrap_err();
         assert!(format!("{err}").contains("unknown status"), "{err}");
+    }
+
+    #[test]
+    fn hydrate_parses_its_three_levels_and_refuses_junk() {
+        assert_eq!(Hydrate::parse("").unwrap(), Hydrate::None);
+        assert_eq!(Hydrate::parse(" none ").unwrap(), Hydrate::None);
+        assert_eq!(Hydrate::parse("SNIPPET").unwrap(), Hydrate::Snippet);
+        assert_eq!(Hydrate::parse("full").unwrap(), Hydrate::Full);
+        let err = Hydrate::parse("lots").unwrap_err();
+        assert!(format!("{err}").contains("unknown hydrate"), "{err}");
     }
 
     #[test]

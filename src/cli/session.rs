@@ -178,9 +178,11 @@ impl Session {
         project::merge(&self.conn, patch)
     }
 
-    /// One project with both relations resolved — the "stand inside it" read.
-    pub fn project_view(&self, key: &str) -> Result<project::View> {
-        project::view(&self.conn, key)?.ok_or_else(|| Error::NoProject(project::normalize_key(key)))
+    /// One project with both relations resolved — the "stand inside it" read. `hydrate` decides how
+    /// much of each preload memory's body to carry.
+    pub fn project_view(&self, key: &str, hydrate: project::Hydrate) -> Result<project::View> {
+        project::view(&self.conn, key, hydrate)?
+            .ok_or_else(|| Error::NoProject(project::normalize_key(key)))
     }
 
     /// Projects matching `filter`, key order.

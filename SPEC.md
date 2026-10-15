@@ -530,35 +530,6 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   to notice it. `[[prj:from]]` is not rewritten (that names a project). This is the actor that makes
   hygiene safe: without it a merge leaves dangling references, so merging never happened. Returns
   `integrated` — the lines it appended on the caller's behalf (`store::links::merge_into`).
-- `memory_refactor` — **SPECIFIED, NOT YET BUILT** (the operation is decided; the code follows).
-  Refactor a SET of memories into a more coherent set by migrating information to the memory that
-  should own it, deduplicating details, and discarding what is redundant or trivial —
-  `memory_refactor { keys, memories, repoint, discard }`. It serves §9's unit: a memory is ONE
-  concept, so **refactoring is a RE-PARTITION OF FACTS BY CONCEPT and the COUNT follows the
-  concepts** — fewer outputs than inputs is the merge case, more is the split case, and it is one act
-  either way. It is deliberately absent from the tool list above, because a list of what exists must
-  not name what does not — the lesson this file's own parity table taught the hard way.
-  - **What the store can and cannot measure decides the whole shape.** SIMILARITY it measures
-    (embeddings — `memory_dupes`, the front door that selects the group); REDUNDANCY and COHESION it
-    cannot, so the caller judges both and the store does only the part that is checkable.
-  - **The guarantee: nothing leaves the store unaccounted for.** Every non-blank line of every memory
-    in `keys`, as it stood, appears somewhere in the union of the new bodies, or is named in
-    `discard` with a kind — `redundant` (the fact is stated elsewhere: no loss), `consolidated`
-    (facts combined into a new line: no loss, but unverifiable), or `trivial` (deliberate loss). A
-    complete partition, one pass. Every key deleted must appear in `repoint`, aimed at a key in the
-    new set. One transaction: a failed check changes nothing.
-  - **It is a FLOOR, NOT A PROOF.** The check catches a line vanishing with nothing replacing it. It
-    is blind to a good rewrite — three statements of one event folding into a single line leave all
-    three lines absent while every fact survives — and blind to FABRICATION: folding distinct
-    occasions into one memory INVENTS an event, and no mechanism in the store can see it. So the
-    caller judges "same concept" *and* "same instance", and the description must say which is which.
-  - **A refactor may be a NO-OP**, and must be allowed to be: similarity is not redundancy, and "this
-    set is already correctly partitioned" is a legitimate outcome. A tool that cannot improve a set
-    must not improve it anyway.
-  - **A key NAME is immutable for its lifetime; the CONTENTS under a key are modifiable.** So there
-    is no rename: a memory needing a different name is completed as a NEW memory and the old key is
-    DELETED. This decides the previously-open `memory_rename` question — there is none, and renaming
-    is a refactor. `store::links::rename` should therefore never be exposed.
 
 **CLI** — the shipped verbs, and nothing else:
 

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use crate::error::Result;
+use crate::store::codec;
 
 /// Canonicalise a tag: trim, lowercase, collapse internal whitespace to `-`, and replace any
 /// comma so a name can never break the stored comma-joined list. Returns `None` for tags that
@@ -36,12 +37,10 @@ pub fn encode(tags: &[String]) -> String {
     tags.join(",")
 }
 
-/// Decode a `memory.tags` column value back into names — the inverse of [`encode`].
+/// Decode a `memory.tags` column value back into names — the inverse of [`encode`], via the shared
+/// comma codec ([`codec::split`]).
 pub fn decode(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    codec::split(raw)
 }
 
 /// Every tag with its reference count, alphabetical — derived from the `memory.tags` column.

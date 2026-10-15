@@ -1087,6 +1087,35 @@ fn merge_reports_a_create_so_a_mistyped_key_is_loud() {
 }
 
 #[test]
+fn an_owner_name_with_a_comma_is_refused_not_split() {
+    // `owner` is the only free-text column among the comma-joined three (tags folds a comma away,
+    // a preload key cannot hold one), so a comma in a name is a refusal — not a silent split into
+    // two owners. `Smith, John` names ONE person.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    let mut p = project_fixture("wedding");
+    p.title = "Wedding".into();
+    p.owner = vec!["Smith, John".into()];
+    let err = project::upsert(&conn, &p, None).unwrap_err();
+    assert!(format!("{err}").contains("comma"), "{err}");
+    assert!(
+        project::get(&conn, "wedding").unwrap().is_none(),
+        "a refused owner writes nothing at all"
+    );
+
+    // The ordinary case still round-trips, canonicalised as a set.
+    p.owner = vec!["James".into(), "Cline".into(), "james".into()];
+    project::upsert(&conn, &p, None).expect("upsert");
+    let got = project::get(&conn, "wedding").unwrap().expect("exists");
+    assert_eq!(
+        got.owner,
+        vec!["Cline".to_string(), "James".to_string()],
+        "sorted, and case-folded to one person"
+    );
+}
+
+#[test]
 fn merge_refuses_an_end_date_on_a_project_that_has_not_ended() {
     // A live project may not carry an end date — `upsert` says so. The merge must say so too, or a
     // caller's `end_date` silently vanishes.

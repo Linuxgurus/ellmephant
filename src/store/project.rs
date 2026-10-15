@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::search::MatchMode;
 use crate::search::lexical::Matcher;
-use crate::store::{links, slug, tags};
+use crate::store::{codec, links, slug, tags};
 
 /// The prefix a project key *used* to carry. Accepted on input (muscle memory, and every doc ever
 /// written), never produced: a key is a plain name now, so a project and a memory may share one.
@@ -255,7 +255,7 @@ fn date_field(value: &str, field: &str) -> Result<String> {
 pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Result<String> {
     let key = resolve_key(conn, p)?;
     let status = choice(&p.status, STATUSES, "todo", "status")?;
-    let owner = encode_owners(&p.owner);
+    let owner = encode_owners(&p.owner)?;
     let start_date = date_field(&p.start_date, "start_date")?;
     let end_date = date_field(&p.end_date, "end_date")?;
     let ended = ENDED_STATUSES.contains(&status.as_str());
@@ -318,11 +318,7 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
 /// Encode an ordered preload as the `project.mem_preload` column: keys slugified, blanks dropped and
 /// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
 /// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
-/// can never occur inside one and the delimiter needs no escaping.
-/// Encode an ordered preload as the `project.mem_preload` column: keys slugified, blanks dropped and
-/// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
-/// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
-/// can never occur inside one and the delimiter needs no escaping.
+/// can never occur inside one and the delimiter needs no escaping ([`codec`]).
 ///
 /// `preload` holds **memory** keys, so a `prj:` token here is an error rather than a silent no-op:
 /// it names the other kind. (Membership in a project is the `prj:` tag, not this list.)
@@ -352,12 +348,10 @@ fn encode_preload(keys: &[String]) -> Result<String> {
 }
 
 /// Decode `project.mem_preload` back into its ordered keys. Inverse of [`encode_preload`], minus the
-/// normalisation that already happened on the way in.
+/// normalisation that already happened on the way in — via the shared comma codec ([`codec::split`]),
+/// so it cannot drift from the other two columns.
 fn decode_preload(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .filter(|key| !key.is_empty())
-        .map(str::to_string)
-        .collect()
+    codec::split(raw)
 }
 
 /// Encode an owner set as the `project.owner` column: blanks dropped, duplicates collapsed
@@ -369,27 +363,41 @@ fn decode_preload(raw: &str) -> Vec<String> {
 /// Free text, deliberately: no vocabulary, no `me`/`us`, nothing to validate against. The store does
 /// not know who exists, and it cannot — `me` resolves differently for every reader, which is
 /// precisely what a shared store cannot afford. An empty set is an unassigned project.
-pub fn encode_owners(owners: &[String]) -> String {
+///
+/// The one thing an owner may not contain is the **delimiter** ([`codec::DELIMITER`]): owners are a
+/// comma-joined list, and this is the only free-text column among the three, so unlike `tags`
+/// (which folds a comma away) the name cannot be normalised around it. A comma in a name is a
+/// refusal, not a silent split into two owners — `Smith, John` names *one* person.
+pub fn encode_owners(owners: &[String]) -> Result<String> {
     let mut seen = HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for owner in owners {
         let name = owner.trim();
-        if name.is_empty() || !seen.insert(name.to_lowercase()) {
+        if name.is_empty() {
+            continue;
+        }
+        if name.contains(codec::DELIMITER) {
+            return Err(Error::Project(format!(
+                "`{name}` contains a comma; owners are stored as a comma-joined list, so a name \
+                 cannot carry one. Write the name without the comma — a name is free text, so the \
+                 delimiter cannot be folded away the way a tag's is"
+            )));
+        }
+        if !seen.insert(name.to_lowercase()) {
             continue;
         }
         out.push(name.to_string());
     }
     out.sort_by_key(|name| name.to_lowercase());
-    out.join(",")
+    Ok(out.join(","))
 }
 
 /// Decode `project.owner` back into its set of names — the inverse of [`encode_owners`], minus the
-/// normalisation that already happened on the way in.
+/// normalisation that already happened on the way in — via the shared comma codec
+/// ([`codec::split`]), which trims each name (so a legacy `Smith, John` reads back as `Smith` and
+/// `John`, the split the write path now refuses to create).
 fn decode_owners(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect()
+    codec::split(raw)
 }
 
 /// Replace `project_key`'s ordered preload (one column, one write). Duplicates collapse to their
@@ -829,24 +837,27 @@ mod tests {
     fn owner_codec_keeps_names_free_and_stores_a_canonical_set() {
         // Free text: there is no vocabulary to validate against, and no `me`/`us`.
         assert_eq!(
-            encode_owners(&["Wile E. Coyote".to_string()]),
+            encode_owners(&["Wile E. Coyote".to_string()]).unwrap(),
             "Wile E. Coyote"
         );
         // A set: sorted (case-insensitively), so the stored form never depends on typing order.
         assert_eq!(
-            encode_owners(&["James".to_string(), "Cline".to_string()]),
+            encode_owners(&["James".to_string(), "Cline".to_string()]).unwrap(),
             "Cline,James"
         );
         // Case is kept as typed -- proper names -- but is not identity: `James` and `james` are one
         // person, so the first spelling wins.
         assert_eq!(
-            encode_owners(&["James".to_string(), "james".to_string()]),
+            encode_owners(&["James".to_string(), "james".to_string()]).unwrap(),
             "James",
             "one person, one entry"
         );
-        assert_eq!(encode_owners(&["".to_string(), "  ".to_string()]), "");
         assert_eq!(
-            encode_owners(&[]),
+            encode_owners(&["".to_string(), "  ".to_string()]).unwrap(),
+            ""
+        );
+        assert_eq!(
+            encode_owners(&[]).unwrap(),
             "",
             "no owner recorded is an honest answer"
         );
@@ -855,6 +866,30 @@ mod tests {
             vec!["Cline".to_string(), "James".to_string()]
         );
         assert!(decode_owners("").is_empty());
+    }
+
+    #[test]
+    fn a_comma_in_an_owner_name_is_refused() {
+        // Owners are the only free-text column among the comma-joined three, so the delimiter
+        // cannot be folded away -- it is refused instead. `Smith, John` names ONE person.
+        let err = encode_owners(&["Smith, John".to_string()]).unwrap_err();
+        assert!(format!("{err}").contains("comma"), "{err}");
+        // And the failure does not quietly write the half-name a split would have produced.
+        assert_eq!(
+            decode_owners("Smith,John"),
+            vec!["Smith".to_string(), "John".to_string()],
+            "the legacy stored form can only read back trimmed -- the fix is to never write it"
+        );
+    }
+
+    #[test]
+    fn owner_decode_trims_the_delimiters_neighbours() {
+        // A hand-written column (or a legacy row) may carry a stray space; decode trims it so the
+        // name is never stored/read with a leading blank.
+        assert_eq!(
+            decode_owners("Smith ,  John"),
+            vec!["Smith".to_string(), "John".to_string()]
+        );
     }
 
     #[test]

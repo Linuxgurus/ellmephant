@@ -843,7 +843,9 @@ fn lock(session: &Arc<Mutex<Session>>) -> crate::error::Result<std::sync::MutexG
 /// One pass: the head of the queue, embedded, then indexed. Returns whether it did a job.
 ///
 /// The lock is taken twice and held across *neither* half of the model call — that is the entire
-/// design; everything else here is bookkeeping around it.
+/// design; everything else here is bookkeeping around it. It also **says what it did**: a worker that
+/// only logs its failures is indistinguishable from one that is not running, which is the difference
+/// between a quiet store and a stalled one.
 #[cfg(feature = "encoder")]
 fn pass(
     session: &Arc<Mutex<Session>>,
@@ -856,6 +858,7 @@ fn pass(
     let Some(entry) = crate::store::encode::next(idle)? else {
         return Ok(false);
     };
+    let started = std::time::Instant::now();
     // 2. Claim under a short lock — witnessed, so `/health` can say who holds the writer.
     let claim = {
         let _held = watch.held("memory_encode");
@@ -874,18 +877,50 @@ fn pass(
             Err(err) => {
                 // Count the attempt and leave the entry: it is retried until `MAX_ATTEMPTS`, then
                 // skipped and reported, rather than spun on.
-                let session = lock(session)?;
-                session.record_encode_failure(&entry.key, &err)?;
+                let attempts = {
+                    let session = lock(session)?;
+                    session.record_encode_failure(&entry.key, &err)?
+                };
+                if attempts >= crate::store::encode::MAX_ATTEMPTS {
+                    // Once, at the moment it gives up: past here the document is skipped by `next`,
+                    // so this line is the only thing that ever says why it stopped being searchable.
+                    tracing::error!(
+                        key = %entry.key,
+                        attempts,
+                        error = %err,
+                        "encode worker: giving up on a document — it stays unsearchable until it is written again"
+                    );
+                } else {
+                    tracing::warn!(
+                        key = %entry.key,
+                        attempts,
+                        max = crate::store::encode::MAX_ATTEMPTS,
+                        error = %err,
+                        "encode worker: embed failed — the entry is retried"
+                    );
+                }
                 return Ok(true);
             }
         }
     } else {
         None
     };
-    // 4. Settle under a second short lock.
-    let _held = watch.held("memory_encode_write");
-    let session = lock(session)?;
-    session.settle_encode(&claim, vector.as_deref())?;
+    // 4. Settle under a second short lock, and read the queue's new shape while we are in there — the
+    //    log line then costs no second lock, and the number it prints is the one the settle left.
+    let counts = {
+        let _held = watch.held("memory_encode_write");
+        let session = lock(session)?;
+        session.settle_encode(&claim, vector.as_deref())?;
+        session.encode_counts()?
+    };
+    tracing::info!(
+        key = %entry.key,
+        embedded = vector.is_some(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        pending = counts.pending,
+        failed = counts.failed,
+        "encode worker: encoded"
+    );
     Ok(true)
 }
 
@@ -1309,7 +1344,7 @@ impl MemoryServer {
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
     #[tool(
         name = "memory_stats",
-        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age. One keyed JSON object. The lay of the land; glance before a big hunt. Pass `tags: true` to add `all_tags` — the full tag vocabulary.",
+        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age, and the ENCODE QUEUE (`encode_pending` documents still owing a vector, `encode_failed` those the encoder gave up on, `encode_oldest_s` how long the oldest has waited). A non-empty `encode_pending` is normal — a write schedules its document and returns; `encode_failed` above 0 is a defect, and a growing `encode_oldest_s` means the worker is not keeping up.",
         annotations(
             title = "Store stats",
             read_only_hint = true,

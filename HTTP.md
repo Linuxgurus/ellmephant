@@ -131,6 +131,7 @@ ellmephant 0.19.0 ready
   links       481 edge(s), 1 dangling
   projects    18 project(s), 0 dangling preload key(s)
   writer      free
+  encode      0 pending, 0 failed
 ```
 
 Unready (HTTP **503**, body still returned so the reason is in `kubectl describe`):
@@ -139,11 +140,24 @@ Unready (HTTP **503**, body still returned so the reason is in `kubectl describe
 ellmephant 0.19.0 NOT READY
   ...
   writer      busy 41.2s (memory_reembed)
-  ready       false: projection STALE — run `reembed`
+  ready       false: writer held too long (`busy 41.2s (memory_reembed)`) — a write would queue behind it
 ```
 
-Not ready means: schema behind the binary, projection stale, or vectors short of memories. A fresh
-empty store (0/0 vectors, projection unrecorded) *is* ready — that is a new install, not a fault.
+Not ready means: **schema behind the binary, projection stale, or a writer held past 2 s** — readiness
+for reads *and* writes, and nothing else. A fresh empty store (0/0 vectors, projection unrecorded) *is*
+ready — that is a new install, not a fault.
+
+**The encode queue is reported and never gated on.** A write schedules its document and returns, so
+between the write and the worker's pass there are more memories than vectors — the *normal* state of a
+healthy store, not a fault to 503 on or to fix with `reembed`. Read it as load, not as damage:
+
+- `encode_pending` — documents still owing a vector. Non-zero is normal; it is what a write burst looks
+  like from outside.
+- `encode_failed` — entries the encoder gave up on after `MAX_ATTEMPTS` (5). **This one is a defect**:
+  the document is unsearchable and no retry will fix it until it is written again.
+- `encode_oldest_s` — how long the oldest pending document has waited, in seconds (`null` when the
+  queue is empty). If it only grows, the worker is not running or not keeping up; nothing else in the
+  store would say so.
 
 `?format=json` returns the same fields as an object, with `"ready": false` and `"reason"`.
 
@@ -362,7 +376,7 @@ invariant 1. Boot observability already exists — the gateway's access log reco
 | 401 | write route with no/mismatched bearer | one line; `WWW-Authenticate: Bearer` — **nothing more** |
 | 404 | unknown key, or unknown path (our own `fallback`, never the gateway's) | `not found: <what>` |
 | 405 | wrong method on a known path | `method not allowed` |
-| 503 | `/health` unready (schema behind, projection stale, vectors short) | the health body, with the reason |
+| 503 | `/health` unready (schema behind, projection stale, writer held) | the health body, with the reason |
 
 Under `?format=json` every error is `{"error": "...", "status": N}`, so a script never parses prose.
 

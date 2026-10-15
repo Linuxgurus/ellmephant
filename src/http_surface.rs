@@ -1326,6 +1326,16 @@ fn stats_text(s: &store::stats::Stats) -> String {
         ("dangling", s.dangling.to_string()),
         ("visits", s.visits_total.to_string()),
         ("useful", s.useful_total.to_string()),
+        (
+            "encode queue",
+            match s.encode_oldest_s {
+                Some(age) => format!(
+                    "{} pending (oldest {}s), {} failed",
+                    s.encode_pending, age, s.encode_failed
+                ),
+                None => format!("{} pending, {} failed", s.encode_pending, s.encode_failed),
+            },
+        ),
     ] {
         out.push_str(&format!("  {label:<14}{value}\n"));
     }

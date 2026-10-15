@@ -287,14 +287,21 @@ impl Session {
     }
 
     /// Count a failed embed attempt. The entry stays and is retried until `encode::MAX_ATTEMPTS`,
-    /// after which it is skipped and reported rather than retried in a hot loop forever.
-    pub fn record_encode_failure(&self, key: &str, err: &Error) -> Result<()> {
+    /// after which it is skipped and reported rather than retried in a hot loop forever. Returns the
+    /// entry's attempt count, so a caller can say when it has just exhausted them.
+    pub fn record_encode_failure(&self, key: &str, err: &Error) -> Result<i64> {
         encode::record_failure(&self.conn, key, err)
     }
 
     /// Documents still waiting for a vector — the encoder's backlog.
     pub fn encode_pending(&self) -> Result<i64> {
         encode::pending(&self.conn)
+    }
+
+    /// The queue as a metric: backlog, exhausted entries, and the oldest wait (`store::encode::Counts`).
+    /// The honest form of [`Self::encode_pending`], which is now its `pending` head.
+    pub fn encode_counts(&self) -> Result<encode::Counts> {
+        encode::counts(&self.conn)
     }
 
     /// Embed one queued document **now**, instead of leaving it to the worker: the `?wait=true` door.

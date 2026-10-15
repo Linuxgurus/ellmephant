@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::error::Result;
-use crate::store::{links, tags};
+use crate::store::{encode, links, tags};
 
 /// How many of the busiest tags the digest carries.
 pub const TOP_TAGS: usize = 10;
@@ -91,6 +91,17 @@ pub struct Stats {
     pub added_7d: i64,
     /// Memories created in the last 30 days.
     pub added_30d: i64,
+    /// Documents still owing the vector index — the encoder's backlog. A non-empty backlog is
+    /// NORMAL (a write schedules its document and returns; see `ENCODE-WORKER.md`), so this is a
+    /// metric and never a readiness gate.
+    pub encode_pending: i64,
+    /// Entries the encoder has given up on after `encode::MAX_ATTEMPTS`. Non-zero means a document
+    /// that cannot be embedded and is therefore silently NOT searchable — the one queue number that
+    /// is a defect rather than a load.
+    pub encode_failed: i64,
+    /// Age of the oldest pending document, in seconds — `None` when nothing is queued. If this only
+    /// grows, the worker is not running or not keeping up; nothing else in the store would show it.
+    pub encode_oldest_s: Option<i64>,
 }
 
 impl Stats {
@@ -230,6 +241,10 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     // Dense clusters: connected components of the (undirected) link graph.
     let (link_components, largest_component) = component_sizes(conn)?;
 
+    // The encode queue's shape: how much work, how much of it is broken, how long the oldest wait
+    // has been. Derived state, but the only place the store reports on its own indexing.
+    let queue = encode::counts(conn)?;
+
     Ok(Stats {
         memories,
         db_bytes,
@@ -259,6 +274,9 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         newest,
         added_7d,
         added_30d,
+        encode_pending: queue.pending,
+        encode_failed: queue.failed,
+        encode_oldest_s: queue.oldest_s,
     })
 }
 
@@ -366,6 +384,9 @@ mod tests {
             newest: None,
             added_7d: 0,
             added_30d: 0,
+            encode_pending: 0,
+            encode_failed: 0,
+            encode_oldest_s: None,
         }
     }
 

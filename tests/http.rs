@@ -290,7 +290,8 @@ async fn seed(app: &axum::Router, token: &str, key: &str, title: &str, body: &st
 
 /// A read counts a visit — on **both** doors. Telemetry is the one write a `GET` may make: a counter
 /// is not data, so counting does not make a read unsafely repeatable, and `memory_get` has always done
-/// it. `POST /memory/{key}/visit` remains for a body read that came another way (a `preload` hydrate).
+/// it. There is no separate counter route to call: MCP has no such tool, and `project_get` counts
+/// nothing on either door.
 #[tokio::test]
 async fn reading_a_memory_counts_a_visit() {
     let dir = tempfile::tempdir().unwrap();

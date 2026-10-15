@@ -74,22 +74,27 @@ becomes a compatibility shim for clients that speak it rather than a dependency 
 
 | MCP tool | HTTP | state |
 | --- | --- | --- |
-| `memory_get` | `GET /memory/{key}` | planned |
-| `memory_search` | `GET /search` | planned |
-| `memory_backlinks` | `GET /memory/{key}/backlinks` | planned |
-| `memory_stats` | `GET /stats` (also folded into `/health` and `/bootstrap`) | planned |
-| `memory_dupes` | `GET /dupes` | planned |
-| `project_get` / `project_list` | `GET /project/{key}` / `GET /projects` | planned |
-| `memory_upsert` | `POST /memory` | planned — auth first |
-| `memory_delete` | `DELETE /memory/{key}` | planned — auth first |
-| `memory_merge` | `POST /memory/{key}/merge` | planned — auth first |
-| `memory_upvote` | `POST /memory/{key}/upvote` | planned — auth first |
-| `memory_coherent` | `PUT /memory/{key}/coherent` | planned — auth first |
-| `project_upsert` | `POST /project` | planned — auth first |
-| `memory_reembed` | `POST /reembed` | planned — **last** |
+| `memory_get` | `GET /memory/{key}` | **implemented** |
+| `memory_search` | `GET /search` | **implemented** |
+| `memory_backlinks` | `GET /memory/{key}/backlinks` | **implemented** |
+| `memory_stats` | `GET /stats` (also folded into `/health` and `/bootstrap`) | **implemented** |
+| `memory_dupes` | `GET /dupes` | **implemented** |
+| `project_get` / `project_list` | `GET /project/{key}` / `GET /projects` | **implemented** |
+| `memory_upsert` | `POST /memory` | **implemented** |
+| `memory_delete` | `DELETE /memory/{key}` | **implemented** |
+| `memory_merge` | `POST /memory/{key}/merge` | **implemented** |
+| `memory_upvote` | `POST /memory/{key}/upvote` | **implemented** |
+| `memory_coherent` | `PUT /memory/{key}/coherent` | **implemented** |
+| `project_upsert` | `POST /project` | **implemented** |
+| `memory_reembed` | `POST /reembed` | **implemented** — QUEUES (`{queued: N}`); the worker does the work |
 | — | `GET /health` | **implemented** |
+| — | `GET /bootstrap` | **implemented** |
 
-`/health` is the only row with no MCP equivalent: it is new capability, not a translation.
+This table read `planned` for every row until it was corrected on 2026-10-16: the surface shipped in
+PR #18 and had been live for a day, and the table below (the route-by-route one) had said so the whole
+time — two tables in one file disagreeing about whether the code existed.
+
+`/health` and `/bootstrap` are the rows with no MCP equivalent: new capability, not translations.
 
 ### Formats: text-first, and that is a design decision, not a preference
 
@@ -210,7 +215,7 @@ Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 | GET | `/projects` | `project_list` | `?status=&pattern=&mode=&tag=` |
 | GET | `/project/{key}` | `project_get` | `?hydrate=none\|snippet\|full` |
 
-Writes — **auth required**, all of them:
+Writes — **auth-gated by design and OPEN today** (invariant 3; set `ELLMEPHANT_WRITE_TOKEN` to close them):
 
 | method | path | maps to | body / parameters |
 | --- | --- | --- | --- |

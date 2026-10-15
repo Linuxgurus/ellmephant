@@ -152,7 +152,8 @@ impl Session {
         search::run(&self.conn, None, q)
     }
 
-    /// A read-only digest of the store (`stats`); `db_bytes` is filled from the store file.
+    /// A read-only digest of the store (`stats`); `db_bytes` comes from the store file, so the
+    /// MCP surface reports the real size rather than a zero the caller was expected to fill.
     pub fn stats(&self) -> Result<store::stats::Stats> {
         store::stats::compute(&self.conn)
     }

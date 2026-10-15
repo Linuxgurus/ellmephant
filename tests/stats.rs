@@ -49,9 +49,9 @@ fn digest_counts_spread_tags_and_links() {
     assert_eq!(s.body_max, "links to [[b]] and [[missing]]".len() as i64);
     assert_eq!(s.with_source, 3);
     assert_eq!(s.tagged, 2);
-    assert_eq!(
-        s.db_bytes, 0,
-        "the store layer leaves the disk size to the CLI"
+    assert!(
+        s.db_bytes > 0,
+        "the digest sizes the store file itself, so the field never reads as an empty database"
     );
 
     // tags: k8s x2 + infra x1

@@ -30,7 +30,8 @@ pub const UNVOTED_MIN_VISITS: i64 = 2;
 pub struct Stats {
     /// Rows in `memory`.
     pub memories: i64,
-    /// Bytes on disk (`.db` + `-wal` + `-shm`); set by the CLI, `0` in the store layer.
+    /// Bytes on disk (`.db` + `-wal` + `-shm`), read from the open connection's store file; `0`
+    /// for an in-memory store, which has no file to size.
     pub db_bytes: u64,
     /// Total characters across bodies.
     pub body_chars: i64,
@@ -119,8 +120,12 @@ fn ratio(a: i64, b: i64) -> f64 {
     if b <= 0 { 0.0 } else { a as f64 / b as f64 }
 }
 
-/// Compute the digest. `db_bytes` is left `0`; the CLI fills it from [`disk_bytes`].
+/// Compute the digest. `db_bytes` is read from the connection's store file ([`disk_bytes`]), so it
+/// is correct wherever the digest is taken; it is `0` only for an in-memory store, which has no
+/// file to size. (Leaving it `0` here and expecting the *caller* to fill it made the field lie:
+/// every MCP consumer saw a size of zero, which reads as an empty database.)
 pub fn compute(conn: &Connection) -> Result<Stats> {
+    let db_bytes = conn.path().map(|p| disk_bytes(Path::new(p))).unwrap_or(0);
     let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
 
     // Body/title sums run in SQLite via `length()` (characters, not bytes) — bodies stay on disk.
@@ -210,7 +215,7 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
 
     Ok(Stats {
         memories,
-        db_bytes: 0,
+        db_bytes,
         body_chars,
         body_min,
         body_max,

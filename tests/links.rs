@@ -135,7 +135,7 @@ fn rename_queues_a_new_vector_for_the_row_it_moves() {
     );
     assert_eq!(
         stored, fresh,
-        "the row was re-embedded under its new key, not left describing the old one"
+        "the row's vector was rebuilt under its new key, not left describing the old one"
     );
 
     // The pre-fix hash (documented under the OLD key) must NOT match — that drift is the bug.

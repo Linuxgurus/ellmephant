@@ -123,16 +123,17 @@ Tool descriptions are the spec.";
 
 /// `memory_reembed` description: the only path out of a model or dimension change.
 const REEMBED_DESCRIPTION: &str = "\
-Recompute every stored vector and rebuild the derived vector index. Needed when the encoder \
-changes — a different model, projection or dimension — because the vector table's width is fixed \
-when it is created, and the store refuses to reinterpret stored vectors rather than hand back \
-wrong neighbours. It also re-parses every body to rebuild the `[[link]]` graph, whose edges are \
-computed at write time and so do not follow a parser change on their own. The rows (`memory` — \
-keys, tags, titles, bodies; `project` — a project's own \
-fields) are the source of truth; everything \
-this touches is derived, so nothing written can be lost and re-running it is harmless. Heavy: it \
-loads the encoder and re-embeds the whole store in one call, so call it once and wait, rather \
-than retrying it.";
+Queue every stored document that needs (re-)embedding, and rebuild the derived index. Needed when \
+the encoder changes — a different model, projection or dimension — because the vector table's width \
+is fixed when it is created, and the store refuses to reinterpret stored vectors rather than hand \
+back wrong neighbours. It also re-parses every body to rebuild the `[[link]]` graph, whose edges are \
+computed at write time and so do not follow a parser change on their own. It repairs a torn index \
+too: a row with no vector is queued even when its `doc_hash` still claims it is indexed. The rows \
+(`memory` — keys, tags, titles, bodies; `project` — a project's own fields) are the source of truth; \
+everything this touches is derived, so nothing written can be lost and re-running it is harmless. \
+It is a PRODUCER, not an embedder: it returns immediately with `{queued: N}` and a background worker \
+embeds the documents one at a time, so a rebuild is no longer an hour-long write outage. Only a \
+dimension change still blocks, and only for the table's drop and recreate.";
 
 const UPSERT_DESCRIPTION: &str = "\
 Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clustered facts, one \
@@ -143,7 +144,9 @@ Skip facts cheap to derive, live state, or one-off. PATCHING: every field is opt
 the stored value is left alone, so a single field can change without resending the row. Empty is an \
 instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
 empty. A new key needs both a `title` and a `body`. Rewriting `title` or `body` re-opens the split \
-review (`coherent` resets); a tags or source change does not — filing is not meaning.";
+review (`coherent` resets); a tags or source change does not — filing is not meaning. The reply's \
+`queued` says whether this write scheduled an embed: a written document is indexed a moment later by \
+the store's encode worker, so a semantic search straight after a write may not see it yet.";
 
 /// `memory_upvote` description. The feedback nudge, carried here only.
 const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \

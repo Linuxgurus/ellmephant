@@ -41,7 +41,16 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 | `GET /search?q=&k=&tag=` | the query surface | **implemented** |
 | `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes | **implemented** |
 | `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes | **implemented** |
-| `POST /reembed` | the heaviest op; last, because it holds the store lock | **implemented** |
+| `POST /reembed` | QUEUES a re-embed (`{queued: N}`) and returns; the worker does the work | **implemented** |
+
+**A write returns before its vector exists.** `POST /memory` upserts the row and *schedules* its
+document; the store's encode worker indexes it a moment later, so a `GET /search` immediately after a
+write may not see it. The write's reply carries `queued: true|false` to say what happened.
+
+`?wait=true` on `POST /memory` is the exception: the request settles that one document before it
+answers, so the row is searchable the moment it returns. It holds the store lock across the model call
+— exactly the coupling the queue exists to remove — so it is opt-in and for callers that genuinely
+cannot proceed otherwise.
 
 **`/bootstrap` is a view, not a dump.** It carries the resident set a cold agent needs — the `cline-self`
 keys, the boot body, hot, todos, open projects, stats, health, links — and an index of the routes
@@ -267,7 +276,7 @@ the body, verbatim, on as many lines as needed -- quotes, colons, braces, even a
 `Tags:` is a comma list (empty = clear). An **unknown field is a 400 naming the field** rather than a
 silent drop: a typo that still writes is worse than a rejection. Everything after the first `---` is the
 body, byte-for-byte, with a trailing newline trimmed. Write responses are one line
-(`stored zz-probe (reembedded=true)`, `deleted zz-probe`, `merged a -> b (3 refs repointed)`), or the
+(`stored zz-probe (queued=true)`, `deleted zz-probe`, `merged a -> b (3 refs repointed)`), or the
 MCP tool's own object under `?format=json`.
 
 ### `GET /bootstrap` — the document

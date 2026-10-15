@@ -894,7 +894,7 @@ pub async fn upvote(
     }
 }
 
-/// `POST /memory/{key}/merge?into=` — retire one memory into another (`memory_merge`).
+/// `POST /memory/{key}/merge?into=` — integrate one memory into another and delete it (`memory_merge`).
 pub async fn merge(
     State(state): State<HttpState>,
     Path(key): Path<String>,

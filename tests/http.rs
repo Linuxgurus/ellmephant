@@ -1222,7 +1222,7 @@ async fn write_routes_accept_the_mcp_arguments_as_a_body() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, _, _) = get(&app, "/memory/mb?format=json").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "the source is retired");
+    assert_eq!(status, StatusCode::NOT_FOUND, "the source is deleted");
 
     // ...and a `from` that disagrees with the path, likewise.
     seed(&app, "tok", "mb2", "another", "x").await;
@@ -1462,9 +1462,9 @@ async fn a_merge_integrates_the_fact_instead_of_losing_or_refusing_it() {
         "the integrated line is reported, not just a link count: {body}"
     );
 
-    // The source retires, and its fact SURVIVED in the target: not lost, not paraphrased.
+    // The source is deleted, and its fact SURVIVED in the target: not lost, not paraphrased.
     let (status, _, _) = get(&app, "/memory/dup-from?format=json").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "the source retires");
+    assert_eq!(status, StatusCode::NOT_FOUND, "the source is deleted");
     let (status, body, _) = get(&app, "/memory/dup-into?format=json").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(

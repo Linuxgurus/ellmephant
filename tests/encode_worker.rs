@@ -540,7 +540,7 @@ fn stop_joins_the_worker_and_no_further_work_is_picked_up() {
 /// A ghost entry is not corruption — the worker drops an entry whose row has gone — but it is a leak
 /// nothing else would notice, and until it is collected a deleted key can still cause an embed.
 #[test]
-fn a_deleted_or_retired_key_leaves_no_queue_entry() {
+fn a_deleted_key_leaves_no_queue_entry() {
     let (_dir, paths) = common::temp_store();
     let conn = db::open(&paths).expect("open store");
     let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
@@ -566,12 +566,12 @@ fn a_deleted_or_retired_key_leaves_no_queue_entry() {
     );
 
     // Retire one key into another. `new` already carries `old`'s prose, so nothing is integrated and
-    // the only queue movement is the retired key's entry going with its row.
-    ellmephant::store::add(&conn, &spec, &memory("old", "retired")).expect("write");
+    // the only queue movement is the deleted key's entry going with its row.
+    ellmephant::store::add(&conn, &spec, &memory("old", "deleted")).expect("write");
     ellmephant::store::add(
         &conn,
         &spec,
-        &memory("new", "survivor, now carrying: retired"),
+        &memory("new", "survivor, now carrying: deleted"),
     )
     .expect("write");
     assert_eq!(queued(&conn), ["kept", "new", "old"]);
@@ -579,6 +579,6 @@ fn a_deleted_or_retired_key_leaves_no_queue_entry() {
     assert_eq!(
         queued(&conn),
         ["kept", "new"],
-        "the retired key's entry went with it"
+        "the deleted key's entry went with it"
     );
 }

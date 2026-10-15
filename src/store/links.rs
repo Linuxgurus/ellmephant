@@ -212,7 +212,7 @@ pub fn reparse(conn: &Connection) -> Result<usize> {
 /// What a [`merge_into`] did.
 #[derive(Debug, Clone, Serialize)]
 pub struct MergeInto {
-    /// The key that was retired (deleted).
+    /// The key that was deleted.
     pub from: String,
     /// The key it was folded into.
     pub into: String,
@@ -222,14 +222,14 @@ pub struct MergeInto {
     pub preloads: usize,
     /// Lines of `from`'s body the survivor did not already carry, appended to it verbatim.
     ///
-    /// Empty when the caller had already folded the prose — then the merge was a pure retire.
+    /// Empty when the caller had already folded the prose — then there was nothing to integrate.
     pub integrated: Vec<String>,
 }
 
 /// Every line of `from`'s body that the survivor does not already carry, in order, deduped.
 ///
 /// This is the *integration* — and the reason nothing here refuses. [`merge_into`] repoints links and
-/// retires `from`, so without this a merge would be a legal way to **destroy** prose: retire a memory
+/// deletes `from`, so without this a merge would be a legal way to **destroy** prose: delete a memory
 /// carrying a line the target lacks and the line is simply gone, behind a `200` that reports link
 /// counts and says nothing about the words. So the missing lines are folded in rather than demanded
 /// of the caller, and "every line of `from` survives in `into`" holds **by construction** instead of
@@ -260,7 +260,7 @@ fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Integrate `from` into `into`, then retire `from` (PLAN §3).
+/// Integrate `from` into `into`, then delete `from` (PLAN §3).
 ///
 /// **`into` is the survivor — the caller judges which memory is the stronger one.** Then, in one
 /// transaction:
@@ -279,7 +279,7 @@ fn squash(s: &str) -> String {
 ///
 /// A caller may still fold the prose itself FIRST, and should when it wants the survivor to read as
 /// one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and
-/// the call is a pure retire. `[[prj:from]]` is *not* rewritten: that names a project.
+/// the call has nothing to integrate. `[[prj:from]]` is *not* rewritten: that names a project.
 pub fn merge_into(conn: &Connection, spec: &VecSpec, from: &str, into: &str) -> Result<MergeInto> {
     let from = slug::slugify(from);
     let into = slug::slugify(into);
@@ -354,7 +354,7 @@ pub fn merge_into(conn: &Connection, spec: &VecSpec, from: &str, into: &str) -> 
     let preloads = crate::store::project::repoint_preload(&tx, &from, &into)?;
     tx.execute("DELETE FROM memory WHERE id = ?1", params![from_id])?;
     index::vec::delete(&tx, from_id)?;
-    // The retired key's queue entry goes with the row: `from` no longer exists, so a document for it
+    // The deleted key's queue entry goes with the row: `from` no longer exists, so a document for it
     // can never be embedded and must not be left for the worker to discover.
     crate::store::encode::forget(&tx, &from)?;
     tx.commit()?;

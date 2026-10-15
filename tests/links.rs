@@ -220,20 +220,20 @@ fn a_link_to_a_project_resolves_and_is_not_rot() {
 }
 
 #[test]
-fn merge_into_repoints_every_reference_and_retires_the_source() {
+fn merge_into_repoints_every_reference_and_deletes_the_source() {
     // The whole point: a merge must not leave dangling links, or hygiene never happens.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let spec = VecSpec::of(&embedder);
 
-    seed(&conn, &embedder, "old", "the retired facts");
-    // The caller folded it FIRST, so nothing is missing and this is a pure retire.
+    seed(&conn, &embedder, "old", "the deleted facts");
+    // The caller folded it FIRST, so nothing is missing and this is nothing to integrate.
     seed(
         &conn,
         &embedder,
         "new",
-        "the surviving facts, now carrying: the retired facts",
+        "the surviving facts, now carrying: the deleted facts",
     );
     seed(&conn, &embedder, "a", "see [[old]] first");
     seed(&conn, &embedder, "b", "also [[old]] here");
@@ -277,8 +277,8 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let spec = VecSpec::of(&embedder);
-    seed(&conn, &embedder, "old", "retired");
-    seed(&conn, &embedder, "new", "survivor, now carrying: retired");
+    seed(&conn, &embedder, "old", "deleted");
+    seed(&conn, &embedder, "new", "survivor, now carrying: deleted");
     project::upsert(&conn, &project_fixture("p"), Some(&["old".to_string()])).expect("project");
     // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
     seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
@@ -308,9 +308,9 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let spec = VecSpec::of(&embedder);
-    seed(&conn, &embedder, "old", "retired");
+    seed(&conn, &embedder, "old", "deleted");
     // `new` already carries `old`'s prose, so there is nothing to integrate.
-    seed(&conn, &embedder, "new", "see [[old]] — and retired");
+    seed(&conn, &embedder, "new", "see [[old]] — and deleted");
 
     links::merge_into(&conn, &spec, "old", "new").expect("merge");
     let edges: i64 = conn
@@ -341,7 +341,7 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
     assert!(out.integrated.is_empty(), "every line was already carried");
     assert!(
         store::get(&conn, "old").unwrap().is_none(),
-        "source retired"
+        "source deleted"
     );
     let body = store::get(&conn, "new").unwrap().unwrap().body;
     assert!(

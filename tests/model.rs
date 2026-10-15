@@ -314,12 +314,21 @@ fn remove_refuses_a_model_dir() {
 }
 
 /// Real fetch — needs the network and ~1.2 GB. `cargo test -- --ignored`.
+///
+/// The endpoint is the **real** one on purpose. Every other test in this file points at `hf.test` so it
+/// can never touch the network — which meant this test could never have passed, and nobody noticed,
+/// because `#[ignore]` is where tests go to be wrong quietly. `HF_ENDPOINT` still overrides, as it does
+/// in production.
 #[test]
 #[ignore = "downloads ~1.2 GB from the Hub"]
 fn real_fetch_of_qwen3_embedding() {
     let dir = tempfile::tempdir().unwrap();
-    let mut spec = spec(dir.path());
-    spec.offline = false;
+    let spec = Spec {
+        endpoint: std::env::var("HF_ENDPOINT")
+            .unwrap_or_else(|_| fetch::DEFAULT_ENDPOINT.to_string()),
+        ..spec(dir.path())
+    };
+    assert!(!spec.offline, "this test exists to hit the network");
     let fetcher = fetch::UreqFetcher::from_env();
     let out = model::ensure(&spec, &fetcher).expect("real fetch");
     let manifest = model::manifest::Manifest::load(&out).unwrap().unwrap();

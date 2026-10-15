@@ -288,3 +288,249 @@ fn a_queued_document_is_durable_before_it_is_ever_embedded() {
     assert_eq!(ellmephant::store::encode::pending(&conn).unwrap(), 0);
     assert_eq!(ellmephant::index::vec::count(&conn).unwrap(), 1);
 }
+
+/// A soak: many writers, one worker, and a store that must end up **consistent**, not merely quiet.
+///
+/// Convergence alone would pass even if the queue silently dropped work. So this asserts the stronger
+/// thing: every row has a vector, and every row's `doc_hash` describes the text the row actually
+/// holds. A swallowed write, or a stale settle, shows up as drift — an index or a hash describing text
+/// that is no longer there — which is exactly the failure with no other symptom.
+///
+/// All writers also rewrite ONE shared key, because that is where a dequeue that ignored the hash
+/// loses a write for good.
+#[test]
+fn many_writers_and_one_worker_converge_without_drift() {
+    const WRITERS: usize = 6;
+    const PER_WRITER: usize = 40;
+
+    let (_dir, paths) = common::temp_store();
+    let cfg = Config {
+        model: MODEL.to_string(),
+        dim: DIM,
+        ..Config::default()
+    };
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg, spec)
+        .expect("open store")
+        .with_embedder(Box::new(ellmephant::embed::HashEmbedder::new(DIM)));
+    let shared = Arc::new(Mutex::new(session));
+    let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(1));
+
+    let mut writers = Vec::new();
+    for w in 0..WRITERS {
+        let shared = Arc::clone(&shared);
+        writers.push(std::thread::spawn(move || {
+            for n in 0..PER_WRITER {
+                shared
+                    .lock()
+                    .unwrap()
+                    .memory_merge(&patch(&format!("w{w}-{n}"), &format!("body {w} {n}")))
+                    .expect("write");
+                shared
+                    .lock()
+                    .unwrap()
+                    .memory_merge(&patch("contended", &format!("writer {w} pass {n}")))
+                    .expect("contended write");
+            }
+        }));
+    }
+    for writer in writers {
+        writer.join().expect("a writer thread");
+    }
+
+    let idle = db::open_read_only(&paths).expect("read the store");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ellmephant::store::encode::pending(&idle).expect("queue") > 0 {
+        assert!(Instant::now() < deadline, "the queue never drained");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    worker.stop();
+
+    let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
+    let rows: Vec<(String, String, String, String)> = {
+        let mut stmt = idle
+            .prepare("SELECT key, title, body, doc_hash FROM memory ORDER BY key")
+            .expect("prepare");
+        let mapped = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query");
+        mapped.collect::<rusqlite::Result<Vec<_>>>().expect("rows")
+    };
+    let expected = WRITERS * PER_WRITER + 1; // + the contended key
+    assert_eq!(rows.len(), expected, "every distinct key is one row");
+    assert_eq!(
+        ellmephant::index::vec::count(&idle).expect("vectors") as usize,
+        expected,
+        "every row has a vector: a missing one is a dropped enqueue"
+    );
+    for (key, title, body, doc_hash) in rows {
+        let want = ellmephant::store::row_hash(
+            &spec,
+            &ellmephant::embed::projection::embed_document(&key, &title, &body),
+        );
+        assert_eq!(
+            doc_hash, want,
+            "{key}: the index describes text the row no longer holds — a write was swallowed"
+        );
+    }
+}
+
+/// The whole path with the **real encoder**: weights loaded, Qwen3 running *on the worker's thread*,
+/// real 1024-d vectors, and a real semantic comparison that puts the right row nearer the right
+/// question.
+///
+/// `#[ignore]`d because it needs ~1.2 GB of weights — the rest of the suite runs on `HashEmbedder` so
+/// it stays offline and fast. This is the one test that can catch a `Send`/re-entrancy problem in
+/// driving the encoder from the worker's thread instead of a request's, which no fake can, and the
+/// only one that can say the vectors are *meaningful* rather than merely present.
+///
+/// ```sh
+/// ELLMEPHANT_TEST_MODEL_DIR=~/.ellmephant/models/Qwen--Qwen3-Embedding-0.6B/<sha> \
+///   cargo test --locked --test encode_worker -- --ignored
+/// ```
+#[test]
+#[ignore = "needs downloaded Qwen3 weights (ELLMEPHANT_TEST_MODEL_DIR)"]
+fn the_worker_drives_the_real_encoder() {
+    use ellmephant::embed::qwen3::{Options, Qwen3Embedder};
+
+    let dir = std::env::var("ELLMEPHANT_TEST_MODEL_DIR")
+        .expect("set ELLMEPHANT_TEST_MODEL_DIR to a flat weights dir");
+    let (_tmp, paths) = common::temp_store();
+    // The real model, so the config and the encoder agree by construction.
+    let cfg = Config::default();
+    let spec = Spec::from_config(&cfg, &paths);
+    let embedder = Qwen3Embedder::load(
+        std::path::Path::new(&dir),
+        &Options::new(cfg.dim, "cpu", "bf16", ""),
+    )
+    .expect("load the real encoder");
+    let session = Session::open(paths.clone(), cfg.clone(), spec)
+        .expect("open store")
+        .with_embedder(Box::new(embedder));
+    let shared = Arc::new(Mutex::new(session));
+    let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(20));
+
+    // Both writes return immediately. The WORKER pays the weight load and does the embedding — which is
+    // the part no fake exercises.
+    for (key, body) in [
+        (
+            "where-logs-live",
+            "container logs ship to the ns1 log collector",
+        ),
+        (
+            "finance-wash-sale",
+            "a wash sale window reopens thirty days after the loss",
+        ),
+    ] {
+        shared
+            .lock()
+            .unwrap()
+            .memory_merge(&patch(key, body))
+            .expect("write");
+    }
+
+    let idle = db::open_read_only(&paths).expect("read the store");
+    let deadline = Instant::now() + Duration::from_secs(900);
+    while ellmephant::index::vec::count(&idle).expect("vectors") < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never indexed both rows"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(ellmephant::store::encode::pending(&idle).expect("queue"), 0);
+    worker.stop();
+
+    // Real vectors, at the configured width — and read back through the index the worker wrote.
+    let mut vectors = std::collections::HashMap::new();
+    {
+        let mut stmt = idle
+            .prepare("SELECT key, id FROM memory ORDER BY key")
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .expect("query");
+        for row in rows {
+            let (key, id) = row.expect("row");
+            let vector = ellmephant::index::vec::get(&idle, id)
+                .expect("read the vector")
+                .expect("a vector, since the worker indexed this row");
+            assert_eq!(vector.len(), cfg.dim, "{key} is indexed at the width");
+            vectors.insert(key, vector);
+        }
+    }
+
+    // The one thing only the real encoder can answer: does it put the right row nearer the right
+    // question? A fake cannot, and neither can a dimension check.
+    let encoder = shared.lock().unwrap().encoder();
+    let query = encoder
+        .with(|e| e.embed_query("where do the logs go"))
+        .expect("embed the query");
+    let logs = dot(&query, &vectors["where-logs-live"]);
+    let tax = dot(&query, &vectors["finance-wash-sale"]);
+    assert!(
+        logs > tax,
+        "the logs memory ({logs:.4}) should beat the tax memory ({tax:.4}) for a logs question"
+    );
+}
+
+/// Cosine similarity of two L2-normalised vectors: just the dot product.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// `stop()` returns, and the worker really has stopped: work queued afterwards is left alone rather
+/// than picked up by a thread that is still running.
+#[test]
+fn stop_joins_the_worker_and_no_further_work_is_picked_up() {
+    let (_dir, paths) = common::temp_store();
+    let cfg = Config {
+        model: MODEL.to_string(),
+        dim: DIM,
+        ..Config::default()
+    };
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg, spec)
+        .expect("open store")
+        .with_embedder(Box::new(ellmephant::embed::HashEmbedder::new(DIM)));
+    let shared = Arc::new(Mutex::new(session));
+    let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(5));
+
+    // It works while running.
+    shared
+        .lock()
+        .unwrap()
+        .memory_merge(&patch("a", "alpha"))
+        .expect("write");
+    let idle = db::open_read_only(&paths).expect("read the store");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ellmephant::index::vec::count(&idle).expect("vectors") == 0 {
+        assert!(Instant::now() < deadline, "the worker never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Then it stops — promptly, since it is only ever between passes or inside a fast fake embed.
+    let started = Instant::now();
+    worker.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stop() took {:?} to join: the worker is not honoring the stop flag between passes",
+        started.elapsed()
+    );
+
+    // And work queued after the stop is stranded, which is the point: nothing is consuming it.
+    shared
+        .lock()
+        .unwrap()
+        .memory_merge(&patch("b", "beta"))
+        .expect("write");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        ellmephant::store::encode::pending(&idle).expect("queue"),
+        1,
+        "the queue should be stranded with the worker stopped"
+    );
+}

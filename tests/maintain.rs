@@ -121,6 +121,43 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     assert_eq!(vec::get(&conn, a).unwrap(), before, "vectors are stable");
 }
 
+/// A changed **projection** forces a full re-embed, and `doc_hash` cannot detect it: the hash covers the
+/// model, the dimension and the text — never the recipe that assembled them. So every row is queued on
+/// the fingerprint's say-so alone. Without that, a projection change would queue *nothing* and every
+/// vector would keep describing the old recipe in silence — the drift the fingerprint exists to catch.
+#[test]
+fn reembed_requeues_everything_when_the_projection_changed() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    add(&conn, &embedder, "a", "alpha", &[]);
+    add(&conn, &embedder, "b", "beta", &[]);
+    let spec = VecSpec::of(&embedder);
+
+    // A settled store owes nothing.
+    assert_eq!(maintain::reembed(&conn, &spec, "").unwrap().queued, 0);
+    assert!(!vec::projection_stale(&conn).unwrap());
+
+    // Now the projection moves underneath it, which is what a code change to `embed_document` looks
+    // like from the store's side — the fingerprint is a hash of the projection's own output.
+    conn.execute("UPDATE meta SET v = 'moved' WHERE k = 'projection'", [])
+        .unwrap();
+    assert!(vec::projection_stale(&conn).unwrap(), "precondition");
+
+    let report = maintain::reembed(&conn, &spec, "").unwrap();
+    assert!(!report.rebuilt, "the width did not change");
+    assert_eq!(
+        report.queued, 2,
+        "a projection change owes EVERY row a vector"
+    );
+    common::settle(&conn, &embedder);
+    assert_eq!(ellmephant::store::encode::pending(&conn).unwrap(), 0);
+    assert!(
+        !vec::projection_stale(&conn).unwrap(),
+        "and the store is back in step"
+    );
+}
+
 #[test]
 fn reembed_records_the_projection_fingerprint() {
     // A change to what the projection emits would leave every stored vector describing the old

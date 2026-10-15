@@ -51,6 +51,12 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
         index::vec::recreate(conn, dim)?;
     }
 
+    // A changed PROJECTION is a full re-embed too, and **`doc_hash` cannot see it**: the hash covers the
+    // model, the dimension and the text — not the recipe that assembled them. The fingerprint is the
+    // signal, and without it a projection change would queue nothing at all while every stored vector
+    // quietly kept describing the old recipe. That is the drift the fingerprint exists to catch, and
+    // this is the one place it is acted on.
+    let reset = rebuilt || index::vec::projection_stale(conn)?;
     // Snapshot the rows first, so the scan is not interleaved with the enqueues.
     let rows: Vec<(i64, String, String, String, String)> = {
         let mut stmt =
@@ -76,11 +82,12 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
     let mut queued = 0;
     for (id, key, title, body, stored) in rows {
         let doc_hash = row_hash(spec, &projection::embed_document(&key, &title, &body));
-        // A row is owed a vector when the table was rebuilt (every stored vector is the wrong width),
-        // when its document moved, or when it has no vector at all. `doc_hash` cannot see that last
-        // case — it reports "indexed" precisely because a vector was once written — and a torn index
-        // (a killed rebuild, a hand-deleted vector) is exactly what this function exists to repair.
-        if rebuilt || stored != doc_hash || !indexed.contains(&id) {
+        // A row is owed a vector when the table was rebuilt or the projection moved (every stored
+        // vector is the wrong width, or describes the old recipe), when its document changed, or when
+        // it has no vector at all. `doc_hash` cannot see the last two on its own — a killed rebuild
+        // leaves the hash saying "indexed", and the projection was never part of the hash — and a torn
+        // or drifted index is exactly what this function exists to repair.
+        if reset || stored != doc_hash || !indexed.contains(&id) {
             encode::enqueue(&tx, &key, &doc_hash, encode::BACKFILL)?;
             queued += 1;
         }

@@ -44,6 +44,35 @@ pub fn decode(raw: &str) -> Vec<String> {
 }
 
 /// Every tag with its reference count, alphabetical — derived from the `memory.tags` column.
+/// The `(key, title)` pairs carrying `tag`, key-ascending — `/bootstrap`'s index of the self set.
+///
+/// Matching goes through [`normalize`] then [`decode`], which are the same two calls the structured
+/// search predicate makes (`search::matches`), so a boot can never list a key that
+/// `GET /search?tags=…` would not return. (Deliberately *not* a second `LIKE` over the stored
+/// column: the tag filter has drifted from the writer's encoding once already.)
+pub fn keys_with(conn: &Connection, tag: &str) -> Result<Vec<(String, String)>> {
+    let Some(want) = normalize(tag) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare("SELECT key, title, tags FROM memory ORDER BY key")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (key, title, tags) = row?;
+        if decode(&tags).iter().any(|t| t == &want) {
+            out.push((key, title));
+        }
+    }
+    Ok(out)
+}
+
+/// Single-tag counts over the whole store: `[(tag, count)]`, name-ascending.
 pub fn list(conn: &Connection) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare("SELECT tags FROM memory")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;

@@ -437,6 +437,29 @@ async fn seed(app: &axum::Router, token: &str, key: &str, title: &str, body: &st
     assert_eq!(status, StatusCode::OK, "seed failed: {response}");
 }
 
+/// [`seed`] with tags, so the memory lands inside a tag's set — which is what the boot's self-set
+/// index reads. (The front-matter carries `Tags:` as a comma list.)
+async fn seed_tagged(
+    app: &axum::Router,
+    token: &str,
+    key: &str,
+    title: &str,
+    tags: &str,
+    body: &str,
+) {
+    let front = format!("Key: {key}\nTitle: {title}\nTags: {tags}\n---\n{body}\n");
+    let (status, response, _) = request(
+        app,
+        Method::POST,
+        "/memory",
+        Some(token),
+        Some("text/plain"),
+        &front,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed failed: {response}");
+}
+
 /// A read counts a visit — on **both** doors. Telemetry is the one write a `GET` may make: a counter
 /// is not data, so counting does not make a read unsafely repeatable, and `memory_get` has always done
 /// it. There is no separate counter route to call: MCP has no such tool, and `project_get` counts
@@ -674,14 +697,13 @@ async fn failures_are_ours_not_the_gateways() {
     );
 }
 
-/// `/bootstrap` is the MCP boot and **nothing more**: the server identity, the instruction text, and
-/// every tool with an HTTP verb in place of its MCP verb. No resident set, no counts, no route
-/// index — a boot is the *API surface*, not a view of the store's contents.
+/// `/bootstrap` is the door to the store, not a handshake dump: it says what this is, how to fetch a
+/// memory, and hands over the resident note in full — all inside the byte budget a fetching client
+/// will actually deliver intact.
 #[tokio::test]
-async fn bootstrap_is_the_mcp_boot_and_nothing_more() {
+async fn bootstrap_is_the_door_to_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    // Seed exactly the content the OLD boot inlined, to prove the boot no longer reads the store.
     seed(
         &app,
         "tok",
@@ -690,71 +712,184 @@ async fn bootstrap_is_the_mcp_boot_and_nothing_more() {
         "BOOT: read me first, then go",
     )
     .await;
-    let secret = "this body must not be resident";
-    seed(&app, "tok", "other-self", "another cline-self key", secret).await;
+    let secret = "a body that is NOT resident, only indexed by key";
+    seed_tagged(
+        &app,
+        "tok",
+        "other-self",
+        "another cline-self key",
+        "cline-self",
+        secret,
+    )
+    .await;
 
     let (status, doc, content_type) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
     assert!(content_type.unwrap().starts_with("text/plain"));
 
-    // The handshake, and only the handshake.
+    // It says what it IS, in the first line, and how to get at what is in it.
     assert!(
-        doc.contains("INSTRUCTIONS"),
-        "the standing law rides the boot"
+        doc.lines().next().unwrap().contains("your memory"),
+        "the first line must say what this endpoint is: {doc}"
     );
-    assert!(doc.contains("smart-caveman"), "and it is the MCP text");
     assert!(
-        doc.contains(&format!("TOOLS — {}", ellmephant::mcp::TOOLS.len())),
-        "the tool list is complete: {doc}"
+        doc.contains("HOW TO GET AT IT") && doc.contains("GET /search?q="),
+        "the reader is told how to fetch memories: {doc}"
     );
 
-    // Every tool, named by the HTTP verb that reaches it rather than by its MCP tool name.
-    for route in ellmephant::http_surface::ROUTES {
-        assert!(
-            doc.contains(&format!("{} {}", route.method, route.path)),
-            "`{} {}` is missing from the boot",
-            route.method,
-            route.path
+    // The resident note is INLINE — the one body a cold client needs before it can decide anything.
+    assert!(
+        doc.contains("BOOT: read me first, then go"),
+        "the boot note's body must be resident: {doc}"
+    );
+    assert!(
+        doc.contains("bootstrap-self"),
+        "and named, so it can be fetched again: {doc}"
+    );
+
+    // Everything else in the self set is an INDEX: key and title, never the body.
+    assert!(
+        doc.contains("other-self") && doc.contains("another cline-self key"),
+        "the self set is indexed by key and title: {doc}"
+    );
+    assert!(
+        !doc.contains(secret),
+        "a non-resident body must not be smuggled in: {doc}"
+    );
+
+    // The catalogue is NOT inline: no argument schemas, and the pointer says how much it would cost.
+    assert!(
+        !doc.contains("args:") && !doc.contains("inputSchema"),
+        "the default boot carries no tool schemas: {doc}"
+    );
+    assert!(
+        doc.contains("?tools=true"),
+        "and it says where they are: {doc}"
+    );
+}
+
+/// **The boot has to survive being fetched.** A client that truncates on size delivered this endpoint's
+/// old body minus 7 KB of its middle — a document that reads as complete and is not. So the default
+/// view is held under a budget, and this test is what holds it there: it fails on the day the boot
+/// regrows past what a fetcher will hand over, which is a decision, not an accident.
+#[tokio::test]
+async fn bootstrap_stays_inside_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    // A store shaped like the real one: a ~1.6 KB resident note, a self set of 20 tagged keys with
+    // titles long enough to exercise the clip, and open projects. A stress fixture would only prove
+    // the budget is smaller than a stress fixture.
+    seed(
+        &app,
+        "tok",
+        "bootstrap-self",
+        "boot me",
+        &"resident prose. ".repeat(100),
+    )
+    .await;
+    for i in 0..20 {
+        seed_tagged(
+            &app,
+            "tok",
+            &format!("self-{i:02}"),
+            &"a title that is long enough to be clipped somewhere sensible".repeat(2),
+            "cline-self",
+            "body",
+        )
+        .await;
+    }
+    for i in 0..13 {
+        let body = format!(
+            r#"{{"key":"prj-{i:02}","title":"project {i}","status":"active","goal":"a goal line long enough to be clipped by the boot, as the real ones are"}}"#
         );
+        let (status, response, _) = request(
+            &app,
+            Method::POST,
+            "/project",
+            Some("tok"),
+            Some("application/json"),
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "project seed failed: {response}");
     }
 
-    // NOTHING MORE. Every section the boot used to compose is gone.
-    for gone in [
-        "SELF (tag",
-        "BOOT NOTE",
-        "OPEN (tag",
-        "ACTIVE PROJECTS",
-        "HOT —",
-        "ROUTES",
-    ] {
-        assert!(
-            !doc.contains(gone),
-            "`{gone}` is not part of an MCP boot: {doc}"
-        );
-    }
+    let (_, doc, _) = get(&app, "/bootstrap").await;
     assert!(
-        !doc.contains("bootstrap-self") && !doc.contains(secret),
-        "a boot is built from code, not read from the store: {doc}"
+        doc.len() < ellmephant::http_surface::BOOT_BUDGET_BYTES,
+        "the boot is {} bytes, over the {} it must fit in — trim a section or raise the budget \
+         deliberately",
+        doc.len(),
+        ellmephant::http_surface::BOOT_BUDGET_BYTES
+    );
+    // The size is not bought by dropping the content the boot exists for.
+    assert!(doc.contains("resident prose."), "{doc}");
+    assert!(doc.contains("self-00") && doc.contains("self-19"), "{doc}");
+}
+
+/// A boot still becomes a boot with no store to read: the API part survives, and the missing facts are
+/// NAMED rather than omitted — silence would read as "there is nothing in here".
+#[tokio::test]
+async fn bootstrap_survives_an_unreadable_store() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let missing = tempfile::tempdir().unwrap();
+    let state = HttpState::new(
+        Paths::from_root(missing.path()),
+        Config::default(),
+        Arc::new(LockWatch::new()),
+        Instant::now(),
+    );
+    let server = MemoryServer::new(session(server_dir.path()));
+
+    let (status, doc, _) = get(&router(server, state), "/bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "a boot is still useful: {doc}");
+    assert!(doc.contains("STORE UNREADABLE"), "{doc}");
+    assert!(
+        doc.contains("HOW TO GET AT IT"),
+        "the API part does not depend on the store: {doc}"
+    );
+    assert!(
+        !missing.path().join("memory.db").exists(),
+        "the boot must not create a store either"
     );
 }
 
 /// `/bootstrap?format=json` is the MCP handshake in MCP's own shape: `initialize`'s fields plus
 /// `tools/list`'s, with `method`/`path` where MCP carries `name` and every other field untouched.
 #[tokio::test]
-async fn bootstrap_json_is_the_mcp_handshake() {
+async fn bootstrap_json_is_the_door_in_json() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
+    seed(
+        &app,
+        "tok",
+        "bootstrap-self",
+        "boot me",
+        "BOOT: read me first, then go",
+    )
+    .await;
 
     let (status, body, _) = get(&app, "/bootstrap?format=json").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-    // Exactly the handshake's fields, and no others — this is the "nothing more" assertion.
+    // The MCP names a client already knows how to read, plus the door and its content. `tools` is
+    // NOT here by default — that is the whole point of the split.
     let mut keys: Vec<&String> = doc.as_object().unwrap().keys().collect();
     keys.sort();
     assert_eq!(
         keys,
-        ["capabilities", "instructions", "serverInfo", "tools"],
+        [
+            "capabilities",
+            "howToUse",
+            "instructions",
+            "openProjects",
+            "selfSet",
+            "serverInfo",
+            "state",
+            "unreadable",
+            "youResident",
+        ],
         "{doc}"
     );
     assert_eq!(doc["serverInfo"]["name"], serde_json::json!("ellmephant"));
@@ -770,10 +905,48 @@ async fn bootstrap_json_is_the_mcp_handshake() {
             .contains("smart-caveman")
     );
 
-    let tools = doc["tools"].as_array().expect("tools");
+    // The calls are stated as calls, so a machine can act without parsing prose.
+    let calls: Vec<&str> = doc["howToUse"]["calls"]
+        .as_array()
+        .expect("calls")
+        .iter()
+        .map(|c| c["call"].as_str().unwrap())
+        .collect();
+    assert!(
+        calls.iter().any(|c| c.starts_with("GET /search")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("GET /memory/")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("POST /memory")),
+        "{calls:?}"
+    );
+
+    // The resident note is carried, body and all; the rest of the set is keys and titles.
+    assert_eq!(
+        doc["youResident"]["key"],
+        serde_json::json!("bootstrap-self")
+    );
+    assert_eq!(
+        doc["youResident"]["body"],
+        serde_json::json!("BOOT: read me first, then go")
+    );
+    assert!(doc["selfSet"]["keys"].is_array(), "{doc}");
+    assert!(
+        doc["state"].as_str().unwrap().contains("ready"),
+        "the state line rides the JSON too: {doc}"
+    );
+
+    // And with `?tools=true` the catalogue is exactly what it used to be.
+    let (_, body, _) = get(&app, "/bootstrap?format=json&tools=true").await;
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let tools = doc["tools"].as_array().expect("tools with ?tools=true");
     assert_eq!(tools.len(), ellmephant::mcp::TOOLS.len());
 
-    // Each card is the MCP card with the verb swapped in: same title, description, schema, hints.
+    // Each card is the MCP card with the verb swapped in: same description, schema, hints.
     for route in ellmephant::http_surface::ROUTES {
         let card = tools
             .iter()
@@ -807,13 +980,14 @@ async fn bootstrap_json_is_the_mcp_handshake() {
 }
 
 /// The text form renders each argument from the tool's own schema, so a caller can construct the
-/// call from the boot alone: a nullable property reports the type it carries, an enum reports its
-/// values, and a required argument says so.
+/// call from the catalogue alone: a nullable property reports the type it carries, an enum reports
+/// its values, and a required argument says so. (With `?tools=true` — the boot itself carries no
+/// schemas.)
 #[tokio::test]
 async fn boot_text_renders_arguments_from_the_schema() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    let (status, doc, _) = get(&app, "/bootstrap").await;
+    let (status, doc, _) = get(&app, "/bootstrap?tools=true").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
 
     // `k` is `["integer", "null"]` — an optional integer, not "any".

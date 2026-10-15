@@ -829,6 +829,28 @@ pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT count(*) FROM project", [], |r| r.get(0))?)
 }
 
+/// The projects still running: everything not `done` and not `aborted`, most recently started first —
+/// `/bootstrap`'s "what is in flight" list, as `(key, status, goal)`.
+///
+/// Deliberately not `list()`: the boot wants three columns of every open project and nothing else,
+/// and loading every project's prose, owner set and `preload` to print one line each would be the
+/// context fill the boot exists to avoid.
+pub fn open(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, status, coalesce(goal, '') FROM project \
+         WHERE status NOT IN ('done', 'aborted') ORDER BY status, key",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(crate::error::Error::from)
+}
+
 /// `project_list` for the MCP wire: a `cols` header plus positional rows, one per line (the
 /// convention for list-shaped reads; `state` is deliberately absent — fetch it with `project_get`).
 /// The dates *are* here: "what did I finish last month" is a list question.

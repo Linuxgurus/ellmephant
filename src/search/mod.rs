@@ -65,6 +65,29 @@ pub struct Query {
     pub max_chars: Option<usize>,
     /// Coherence-verdict filter over `memory.coherent`. `None` = any.
     pub coherent: Option<Coherent>,
+    /// Only rows whose `created` is at or after this ISO timestamp.
+    pub created_after: Option<String>,
+    /// Only rows whose `created` is at or before this ISO timestamp.
+    pub created_before: Option<String>,
+    /// Only rows whose `updated` is at or after this ISO timestamp.
+    pub updated_after: Option<String>,
+    /// Only rows whose `updated` is at or before this ISO timestamp.
+    pub updated_before: Option<String>,
+}
+
+impl Query {
+    /// Whether any structured predicate is set — if not, the filter leg has no work to do and
+    /// [`filter_set`] returns `None` (no filtering) rather than scanning every row.
+    fn has_structured(&self) -> bool {
+        !self.tags.is_empty()
+            || self.min_chars.is_some()
+            || self.max_chars.is_some()
+            || self.coherent.is_some()
+            || self.created_after.is_some()
+            || self.created_before.is_some()
+            || self.updated_after.is_some()
+            || self.updated_before.is_some()
+    }
 }
 
 /// A predicate over `memory.coherent` (a nullable bool). `!X` reads "not X", so the six
@@ -337,10 +360,10 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     Ok(Bundle { hits, neighbors })
 }
 
-/// The ids passing every structured predicate (`tags`, size, `coherent`), or `None` when the
-/// query carries none (no filtering). Size is the length of the row's embedded document.
+/// The ids passing every structured predicate (`tags`, size, `coherent`, time bounds), or `None`
+/// when the query carries none (no filtering). Size is the length of the row's embedded document.
 fn filter_set(conn: &Connection, q: &Query) -> Result<Option<HashSet<i64>>> {
-    if q.tags.is_empty() && q.min_chars.is_none() && q.max_chars.is_none() && q.coherent.is_none() {
+    if !q.has_structured() {
         return Ok(None);
     }
     let mut set = HashSet::new();
@@ -396,7 +419,20 @@ fn passes(mem: &Memory, q: &Query) -> bool {
     if q.coherent.is_some_and(|c| !c.matches(mem.coherent)) {
         return false;
     }
+    // Time bounds compare the STORED ISO shape (`datetime('now')` writes `YYYY-MM-DD HH:MM:SS`)
+    // lexicographically, which is why the shape is insisted on at write time — `>=` reads as "at or
+    // after". A bound outside that shape is the caller's typo and simply matches nothing.
+    if !within(&q.created_after, &q.created_before, &mem.created)
+        || !within(&q.updated_after, &q.updated_before, &mem.updated)
+    {
+        return false;
+    }
     true
+}
+
+/// Whether `value` (an ISO timestamp) lies inside an optional `[after, before]` window.
+fn within(after: &Option<String>, before: &Option<String>, value: &str) -> bool {
+    after.as_deref().is_none_or(|lo| value >= lo) && before.as_deref().is_none_or(|hi| value <= hi)
 }
 
 /// Length (chars) of the document a row embeds: `key` + tags + `title` + `body`, links stripped.
@@ -544,6 +580,10 @@ mod tests {
             min_chars: None,
             max_chars: None,
             coherent: None,
+            created_after: None,
+            created_before: None,
+            updated_after: None,
+            updated_before: None,
         };
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         // No phrase ⇒ no candidates, and no embedder required.

@@ -124,7 +124,9 @@ const SEARCH_DESCRIPTION: &str = "\
 Hunt memory by meaning (`query`) or by literal (`pattern`) — semantics reach sense; `pattern` reaches \
 a half-remembered string (a key, a filename, an error). `mode` reads `pattern` as `literal` (a \
 substring, the default) or `regex`. Both legs and the filters intersect (all must hold); omit all to \
-filter the whole store. Hits are `key`-only by default; `fields` adds more, body never. `memory_get` \
+filter the whole store. `created_after`/`created_before` and `updated_after`/`updated_before` are ISO \
+windows over the timestamps (`updated_after` is the \"what changed since I last woke\" filter). Hits \
+are `key`-only by default; `fields` adds more, body never. `memory_get` \
 the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
 `max_distance`.";
 
@@ -258,6 +260,26 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Split-review verdict: `true`, `false`, `null`, or negate with `!`.")]
     pub coherent: Option<CoherentFilter>,
+    /// Lower bound on `created`.
+    #[serde(default)]
+    #[schemars(
+        description = "Only memories created at or after this ISO timestamp (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`). Compared lexicographically, so a date bounds the whole day."
+    )]
+    pub created_after: Option<String>,
+    /// Upper bound on `created`.
+    #[serde(default)]
+    #[schemars(description = "Only memories created at or before this ISO timestamp.")]
+    pub created_before: Option<String>,
+    /// Lower bound on `updated`.
+    #[serde(default)]
+    #[schemars(
+        description = "Only memories last written at or after this ISO timestamp — the \"what changed since I last woke\" filter."
+    )]
+    pub updated_after: Option<String>,
+    /// Upper bound on `updated`.
+    #[serde(default)]
+    #[schemars(description = "Only memories last written at or before this ISO timestamp.")]
+    pub updated_before: Option<String>,
     /// Hit fields to return beyond `key`.
     #[serde(default)]
     #[schemars(
@@ -719,6 +741,10 @@ impl MemoryServer {
         let min_chars = p.min_chars;
         let max_chars = p.max_chars;
         let coherent = p.coherent.map(CoherentFilter::to_coherent);
+        let created_after = p.created_after;
+        let created_before = p.created_before;
+        let updated_after = p.updated_after;
+        let updated_before = p.updated_before;
         // Default: `key` only (lean). Named fields are added, in canonical order.
         let fields = Fields::selection(p.fields.into_iter().map(FieldParam::to_field));
         // Keep a copy for the log line: the original moves into the store closure.
@@ -738,6 +764,10 @@ impl MemoryServer {
                     min_chars,
                     max_chars,
                     coherent,
+                    created_after,
+                    created_before,
+                    updated_after,
+                    updated_before,
                 };
                 s.search(&q)
             })
@@ -1351,6 +1381,8 @@ mod tests {
             searchable,
             [
                 "coherent",
+                "created_after",
+                "created_before",
                 "expand",
                 "fields",
                 "k",
@@ -1360,7 +1392,9 @@ mod tests {
                 "mode",
                 "pattern",
                 "query",
-                "tags"
+                "tags",
+                "updated_after",
+                "updated_before"
             ]
         );
         // The `mode` values live in the schema (a `MatchModeParam` enum), never in the description.

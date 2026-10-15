@@ -412,6 +412,10 @@ plus a pattern keeps the semantic ranking and merely drops the rows the pattern 
   - `min_chars` / `max_chars` — bounds on the **embedded-document** length (chars).
   - `coherent` — the §9 split-review verdict: `true`, `false`, `null`, or negate with `!`
     (`!true` = false-or-null = the review queue; also `!false`, `!null`); omit = any.
+  - `created_after` / `created_before` / `updated_after` / `updated_before` — ISO windows over the
+    row's timestamps, compared **lexicographically** (which is why the stored shape is ISO: it sorts
+    as it reads). `updated_after` is the *"what changed since I last woke"* filter; `created_before`
+    is a review window. A window containing nothing matches nothing, never everything.
   - the **lexical leg** is a plain scan of the store's raw text — **no FTS index, no `LIKE`** — so
     nothing needs keeping in sync (`memory` is the only truth, §5/§7) and a malformed regex is a
     clean error. `key`/`tags` stay identity/lookup; a tag match is the `tags` filter, not a pattern.

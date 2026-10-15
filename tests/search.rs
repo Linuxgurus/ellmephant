@@ -42,6 +42,10 @@ fn query(text: Option<&str>) -> Query {
         min_chars: None,
         max_chars: None,
         coherent: None,
+        created_after: None,
+        created_before: None,
+        updated_after: None,
+        updated_before: None,
     }
 }
 
@@ -481,4 +485,51 @@ fn the_lexical_leg_intersects_the_tag_filter() {
     q.pattern = Some("kubectl".into());
     q.tags = vec!["k8s".into()];
     assert_eq!(hit_keys(&conn, &q), ["k8s-note"]);
+}
+#[test]
+fn time_bounds_filter_created_and_updated() {
+    // The stored ISO shape is what makes a lexicographic compare correct, and `add` honours a
+    // stated timestamp — so the fixture can set its own clock.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    for (key, created, updated) in [
+        ("old", "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+        ("mid", "2026-06-15 12:00:00", "2026-09-01 09:00:00"),
+        ("new", "2026-10-14 08:00:00", "2026-10-14 08:00:00"),
+    ] {
+        let mut m = memory(key, key, "a fact", &[]);
+        m.created = created.into();
+        m.updated = updated.into();
+        store::add(&conn, &embedder, &m).expect("add");
+    }
+
+    // A `created` window: only `mid` was created in June.
+    let mut q = query(None);
+    q.created_after = Some("2026-06-01".into());
+    q.created_before = Some("2026-06-30".into());
+    assert_eq!(hit_keys(&conn, &q), ["mid"]);
+
+    // `updated_after`: `old` never moved past January.
+    let mut q = query(None);
+    q.updated_after = Some("2026-09-01 00:00:00".into());
+    assert_eq!(hit_keys(&conn, &q), ["mid", "new"]);
+
+    // A window containing nothing matches NOTHING — not everything.
+    let mut q = query(None);
+    q.created_after = Some("2030-01-01".into());
+    assert!(hit_keys(&conn, &q).is_empty());
+
+    // Bounds compose with the semantic phrase by intersection (this leg needs the encoder).
+    let mut q = query(Some("fact"));
+    q.updated_before = Some("2026-02-01".into());
+    let bundle = search::run(&conn, Some(&embedder), &q).expect("search");
+    assert_eq!(
+        bundle
+            .hits
+            .iter()
+            .map(|h| h.key.as_str())
+            .collect::<Vec<_>>(),
+        ["old"]
+    );
 }

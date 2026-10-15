@@ -22,7 +22,7 @@ KUBE_VERSION ?= 1.34.0
 
 .PHONY: build release test fmt clippy lint doc docker-build docker-run clean \
         chart-lint chart-template chart-package chart-push \
-        builder-image
+        builder-image coverage coverage-report
 
 build:        ## debug build
 	$(CARGO) build
@@ -40,6 +40,31 @@ clippy:       ## lints, warnings are errors
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
 lint: fmt clippy
+
+# Coverage. This toolchain is Homebrew's rustc, so there is no rustup `llvm-tools` component to
+# add: point llvm-cov at Homebrew's llvm instead. Its version must be >= the compiler's own LLVM
+# (`rustc -vV | grep LLVM`) — Xcode's CLT llvm is generally too old for it.
+#
+# One-time: `cargo install cargo-llvm-cov`. Note `--branch` is deliberately absent: branch
+# coverage needs `-Z coverage-options=branch`, i.e. a nightly compiler.
+LLVM_BIN  ?= /opt/homebrew/opt/llvm/bin
+CARGO_BIN ?= $(HOME)/.cargo/bin
+
+coverage:  ## line/region coverage (a measurement; fmt/clippy/test remain the gates)
+	PATH="$(CARGO_BIN):$$PATH" \
+	LLVM_COV="$(LLVM_BIN)/llvm-cov" LLVM_PROFDATA="$(LLVM_BIN)/llvm-profdata" \
+		$(CARGO) llvm-cov --locked --summary-only
+	@echo
+	@echo "re-slice without re-running: make coverage-report"
+	@echo "WARNING: per-function 'never ran' is unreliable — each function is compiled into two"
+	@echo "         crates, so one copy runs while the other reads zero. Trust the per-file line"
+	@echo "         percent, and triage a 0% method by grepping for CALLERS before writing a test."
+
+coverage-report:  ## re-render the last coverage run as JSON (no re-run)
+	PATH="$(CARGO_BIN):$$PATH" \
+	LLVM_COV="$(LLVM_BIN)/llvm-cov" LLVM_PROFDATA="$(LLVM_BIN)/llvm-profdata" \
+		$(CARGO) llvm-cov report --json --output-path target/cov.json
+	@echo "wrote target/cov.json"
 
 doc:          ## rustdoc
 	$(CARGO) doc --no-deps

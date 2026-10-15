@@ -787,3 +787,97 @@ async fn upsert_patches_one_field_over_the_transport() {
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }
+
+#[tokio::test]
+async fn dupes_and_reembed_round_trip_over_the_transport() {
+    // The two tools that were wired but never called by a test.
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    // Two rows that differ only in their key, so the finder has a pair to report.
+    for key in ["dup-a", "dup-b"] {
+        call(
+            &client,
+            "memory_upsert",
+            serde_json::json!({
+                "key": key, "title": "Same thing twice", "body": "identical facts"
+            }),
+        )
+        .await;
+    }
+
+    let dupes = call(
+        &client,
+        "memory_dupes",
+        serde_json::json!({ "max_distance": 1.0 }),
+    )
+    .await;
+    assert!(!dupes.is_error.unwrap_or(false), "{}", text(&dupes));
+    let d: serde_json::Value = serde_json::from_str(&text(&dupes)).expect("json");
+    assert_eq!(
+        d["cols"],
+        serde_json::json!(["key_a", "title_a", "key_b", "title_b", "distance"]),
+        "the positional table is self-describing"
+    );
+    assert!(
+        d["count"].as_u64().expect("count") >= 1,
+        "near-identical rows must pair: {d}"
+    );
+
+    // `memory_reembed` takes no arguments: it recomputes every vector and rebuilds the index.
+    let re = call(&client, "memory_reembed", serde_json::json!({})).await;
+    assert!(!re.is_error.unwrap_or(false), "{}", text(&re));
+    let r: serde_json::Value = serde_json::from_str(&text(&re)).expect("json");
+    assert_eq!(r["status"], serde_json::json!("re-embedded"));
+    assert!(r["rows"].as_u64().expect("rows") >= 2);
+    assert!(r["dim"].as_u64().expect("dim") > 0);
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}
+
+#[tokio::test]
+async fn project_get_on_a_missing_key_is_a_tool_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path()));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    let missing = call(
+        &client,
+        "project_get",
+        serde_json::json!({ "key": "ghost" }),
+    )
+    .await;
+    assert!(missing.is_error.unwrap_or(false), "{}", text(&missing));
+    assert!(
+        text(&missing).contains("no such project"),
+        "got: {}",
+        text(&missing)
+    );
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

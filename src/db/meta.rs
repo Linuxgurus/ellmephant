@@ -11,6 +11,10 @@ pub const DIM: &str = "dim";
 pub const MODEL: &str = "model";
 /// Query-side instruction the stored vectors were built with.
 pub const INSTRUCTION: &str = "instruction";
+/// Fingerprint of the embed projection the stored vectors were built with
+/// ([`crate::embed::projection::fingerprint`]). A change to what the projection emits is otherwise
+/// undetectable, so the vectors would silently keep describing the old recipe.
+pub const PROJECTION: &str = "projection";
 
 /// Read one `meta` value.
 pub fn get(conn: &Connection, key: &str) -> Result<Option<String>> {

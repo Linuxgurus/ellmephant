@@ -88,6 +88,17 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     };
     println!("  vec0           {vec_status}");
 
+    // The embed projection is fingerprinted in `meta`; a mismatch means the stored vectors were
+    // built from a different document than the code now emits — a `reembed` job, not corruption.
+    let projection = if index::vec::projection_stale(conn)? {
+        "STALE — run `reembed`".to_string()
+    } else if db::meta::get(conn, db::meta::PROJECTION)?.is_some() {
+        "current".to_string()
+    } else {
+        "unrecorded (reembed to record)".to_string()
+    };
+    println!("  projection     {projection}");
+
     // Derived-index health (PLAN §6 P9): a dangling `[[key]]` is a lost rename target, a
     // missing vector is a `reembed` job.
     let edges: i64 = conn.query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))?;

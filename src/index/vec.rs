@@ -179,6 +179,12 @@ pub fn upsert(conn: &Connection, id: i64, vector: &[f32]) -> Result<()> {
 
 /// Remove the vector for `id` (a virtual table cannot be a FK target, so this is explicit).
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    if !table_exists(conn)? {
+        // No table means no vector to delete — the same answer as an empty table (see `get`). This is
+        // reachable now: the table appears on the first *embed*, not the first write, so deleting a
+        // memory from a store that has not encoded anything yet lands here.
+        return Ok(());
+    }
     conn.execute(
         &format!("DELETE FROM {TABLE} WHERE memory_id = ?1"),
         params![id],
@@ -211,6 +217,20 @@ pub fn count(conn: &Connection) -> Result<i64> {
         return Ok(0);
     }
     Ok(conn.query_row(&format!("SELECT count(*) FROM {TABLE}"), [], |r| r.get(0))?)
+}
+
+/// Every `memory_id` that has a stored vector. Empty when the table has not been created.
+///
+/// `doc_hash` says "this row was indexed", which is not the same as "this row HAS a vector": a killed
+/// rebuild or a hand-deleted vector leaves the hash intact and the index torn. `reembed` uses this to
+/// see the difference.
+pub fn ids(conn: &Connection) -> Result<Vec<i64>> {
+    if !table_exists(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT memory_id FROM {TABLE}"))?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
 }
 
 /// Whether the vec0 table has been created yet.

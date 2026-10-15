@@ -187,6 +187,14 @@ size, coherence); it is **read whole** by `memory_get`; and it **points** at oth
 bookkeeping (`visits`, `times_useful`, `coherent`) that is never written by hand and never
 embedded.
 
+**A write schedules its document; it does not embed it.** The upsert and the row's place in
+`encode_queue` are written in one transaction — one file, so the two cannot come apart — and a single
+background worker turns the queue into `memory_vec`, holding the store lock for a row write and
+*nothing* across the model call. `doc_hash` records the text whose vector is **stored**, so a write
+does not advance it; the worker does, when it writes the vector. That is what keeps a pending row
+detectable, and it is why a search posted immediately after a write may not see it yet. The reply's
+`queued` says whether this write scheduled anything. `ENCODE-WORKER.md` is the design.
+
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;

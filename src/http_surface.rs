@@ -721,7 +721,11 @@ pub async fn upsert(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let json = Params::parse(raw.as_deref()).json();
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    // `?wait=true`: settle this document before answering, so the caller can search the moment it has
+    // a reply. Opt-in, because it is the one path that holds the store lock across the model call.
+    let wait = matches!(params.get("wait"), Some("true") | Some("1"));
     let scope = match authorize(&state, &headers, json) {
         Ok(s) => s,
         Err(r) => return r,
@@ -748,18 +752,36 @@ pub async fn upsert(
         .await
     {
         Ok(out) => {
-            tracing::info!(area = scope.area, key = %out.key, "memory stored over http");
-            render(
-                StatusCode::OK,
-                json,
-                json_ok(serde_json::json!({
-                    "status": if out.created { "created" } else { "updated" },
-                    "key": out.key,
-                    "reembedded": out.reembedded,
-                    "coherent_reset": out.coherent_reset,
-                })),
-                format!("stored {} (reembedded={})", out.key, out.reembedded),
-            )
+            let key = out.key.clone();
+            let mut result = serde_json::json!({
+                "status": if out.created { "created" } else { "updated" },
+                "key": key.clone(),
+                "queued": out.queued,
+                "coherent_reset": out.coherent_reset,
+            });
+            // Filled in below when `?wait=true` was asked for.
+            let mut indexed: Option<bool> = None;
+            if wait {
+                indexed = Some(match server.encode_now(&out.key).await {
+                    Ok(indexed) => indexed,
+                    Err(err) => {
+                        // The WRITE stands: the queue is derived state, so the row is safe and the
+                        // worker will come back to it. Say so rather than claim a guarantee we missed.
+                        tracing::warn!(key = %out.key, error = %err, "?wait=true could not index");
+                        result["encode_error"] = serde_json::json!(err);
+                        false
+                    }
+                });
+                result["indexed"] = serde_json::json!(indexed);
+            }
+            tracing::info!(area = scope.area, key = %key, "memory stored over http");
+            let text = match indexed {
+                Some(indexed) => {
+                    format!("stored {key} (queued={}, indexed={indexed})", out.queued)
+                }
+                None => format!("stored {key} (queued={})", out.queued),
+            };
+            render(StatusCode::OK, json, json_ok(result), text)
         }
         Err(e) => error(json, error_status(&e), e),
     }
@@ -1032,8 +1054,11 @@ pub async fn coherent(
     }
 }
 
-/// `POST /reembed` — recompute every vector (`memory_reembed`); the heaviest lock holder, so last
-/// in the route table and watched by `/health`.
+/// `POST /reembed` — queue every document that needs (re-)embedding (`memory_reembed`).
+///
+/// It used to be the heaviest lock holder in the store: one transaction from the first row to the last,
+/// ~45 minutes on a 291-row store, with every write timing out for the duration. Now it enqueues and
+/// returns, so it is one of the cheapest.
 pub async fn reembed(
     State(state): State<HttpState>,
     RawQuery(raw): RawQuery,
@@ -1055,22 +1080,22 @@ pub async fn reembed(
         Ok(report) => {
             tracing::info!(
                 area = scope.area,
-                rows = report.rows,
-                "re-embedded over http"
+                queued = report.queued,
+                "queued a re-embed over http"
             );
             render(
                 StatusCode::OK,
                 json,
                 json_ok(serde_json::json!({
-                    "status": "re-embedded",
-                    "rows": report.rows,
+                    "status": "queued",
+                    "queued": report.queued,
                     "dim": report.dim,
                     "rebuilt": report.rebuilt,
                     "model": report.model,
                 })),
                 format!(
-                    "re-embedded {} rows ({} rebuilt)",
-                    report.rows, report.rebuilt
+                    "queued {} document(s) for re-embedding ({} rebuilt)",
+                    report.queued, report.rebuilt
                 ),
             )
         }

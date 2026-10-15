@@ -9,7 +9,7 @@ mod common;
 
 use common::temp_store;
 use ellmephant::db;
-use ellmephant::embed::HashEmbedder;
+use ellmephant::embed::{HashEmbedder, VecSpec};
 use ellmephant::store::links;
 use ellmephant::store::project;
 use ellmephant::store::{self, Memory};
@@ -39,7 +39,7 @@ fn seed_project(conn: &Connection, key: &str) -> String {
 }
 
 fn seed_memory(conn: &Connection, embedder: &HashEmbedder, key: &str) -> String {
-    let (_id, key) = store::add(conn, embedder, &memory(key, "fact")).expect("add memory");
+    let (_id, key) = common::add_now(conn, embedder, &memory(key, "fact")).expect("add memory");
     key
 }
 
@@ -448,7 +448,7 @@ fn a_project_tag_is_how_memories_join() {
 
     let mut m = memory("a", "fact");
     m.tags = vec!["prj:chronos".into(), "storage".into()];
-    store::add(&conn, &embedder, &m).expect("add");
+    common::add_now(&conn, &embedder, &m).expect("add");
 
     let hits = |tags: &[&str]| -> Vec<String> {
         let q = Query {
@@ -719,7 +719,7 @@ fn a_memory_and_a_project_may_share_a_name() {
     // The case that moved the type out of the name: `sessions` is a project, and `sessions` is also
     // what the memories about it get called.
     project::upsert(&conn, &project_fixture("sessions"), None).expect("project");
-    store::add(
+    common::add_now(
         &conn,
         &embedder,
         &memory(
@@ -763,8 +763,8 @@ fn a_project_link_is_not_a_memory_backlink() {
     let embedder = HashEmbedder::new(DIM);
 
     project::upsert(&conn, &project_fixture("sessions"), None).expect("project");
-    store::add(&conn, &embedder, &memory("about", "[[prj:sessions]]")).expect("pointer");
-    store::add(
+    common::add_now(&conn, &embedder, &memory("about", "[[prj:sessions]]")).expect("pointer");
+    common::add_now(
         &conn,
         &embedder,
         &memory("sessions", "the memory of the same name"),
@@ -775,7 +775,8 @@ fn a_project_link_is_not_a_memory_backlink() {
     assert!(links::backlinks(&conn, "sessions").unwrap().is_empty());
 
     // ...and renaming that memory must not drag the project's edge along.
-    links::rename(&conn, &embedder, "sessions", "session-notes").expect("rename");
+    let spec = VecSpec::of(&embedder);
+    links::rename(&conn, &spec, "sessions", "session-notes").expect("rename");
     let typed: Vec<(String, String)> = conn
         .prepare("SELECT to_key, to_type FROM memory_link")
         .unwrap()
@@ -795,8 +796,8 @@ fn preload_hydrates_bodies_on_request() {
     let (_dir, paths) = temp_store();
     let embedder = HashEmbedder::new(DIM);
     let conn = db::open(&paths).expect("open");
-    store::add(&conn, &embedder, &memory("a", "alpha body")).expect("a");
-    store::add(&conn, &embedder, &memory("b", "beta body")).expect("b");
+    common::add_now(&conn, &embedder, &memory("a", "alpha body")).expect("a");
+    common::add_now(&conn, &embedder, &memory("b", "beta body")).expect("b");
     let key = seed_project(&conn, "chronos");
     // `ghost` never resolves: it must be SHOWN (a null title), not dropped.
     project::upsert(
@@ -840,7 +841,7 @@ fn project_view_wire_carries_bodies_in_a_sister_table() {
     let (_dir, paths) = temp_store();
     let embedder = HashEmbedder::new(DIM);
     let conn = db::open(&paths).expect("open");
-    store::add(&conn, &embedder, &memory("a", "alpha body")).expect("a");
+    common::add_now(&conn, &embedder, &memory("a", "alpha body")).expect("a");
     let key = seed_project(&conn, "chronos");
     project::upsert(&conn, &project_fixture("chronos"), Some(&["a".to_string()])).unwrap();
 

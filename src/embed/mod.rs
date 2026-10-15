@@ -38,6 +38,38 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// The identity of the vector space a row's `doc_hash` is written in.
+///
+/// [`row_hash`](crate::store::row_hash) needs a model id and a dimension to fingerprint a document,
+/// and both are *config* — not a property of loaded weights. Carrying them in a value is what lets
+/// the write path hash a document **without loading 1.2 GB of encoder**, which is what the encode
+/// worker is built on (see `ENCODE-WORKER.md`).
+///
+/// [`VecSpec::of`] is the bridge for the callers that already hold a live embedder — a re-embed, a
+/// rename — so they need no config plumbed down to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VecSpec {
+    /// The model id recorded in `meta` and folded into every `doc_hash`.
+    pub model_id: String,
+    /// Vector length; must be stable for a given model.
+    pub dim: usize,
+}
+
+impl VecSpec {
+    /// A vector space identified by its model id and its dimension.
+    pub fn new(model_id: impl Into<String>, dim: usize) -> Self {
+        Self {
+            model_id: model_id.into(),
+            dim,
+        }
+    }
+
+    /// The vector space a live embedder speaks.
+    pub fn of(embedder: &dyn Embedder) -> Self {
+        Self::new(embedder.model_id(), embedder.dim())
+    }
+}
+
 /// L2-normalise in place. No-op for the zero vector.
 pub fn l2_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();

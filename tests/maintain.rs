@@ -7,7 +7,7 @@ mod common;
 
 use common::temp_store;
 use ellmephant::db;
-use ellmephant::embed::{Embedder, HashEmbedder, projection};
+use ellmephant::embed::{Embedder, HashEmbedder, VecSpec, projection};
 use ellmephant::index::vec;
 use ellmephant::store::{self, Memory, links, maintain};
 use rusqlite::{Connection, params};
@@ -23,7 +23,7 @@ fn memory(key: &str, body: &str, tags_: &[&str]) -> Memory {
 }
 
 fn add(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str, tags_: &[&str]) -> i64 {
-    store::add(conn, embedder, &memory(key, body, tags_))
+    common::add_now(conn, embedder, &memory(key, body, tags_))
         .expect("add")
         .0
 }
@@ -51,9 +51,16 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
 
     // Swap to a wider model (a dim change `index::vec::ensure` would refuse).
     let wide = HashEmbedder::new(16);
-    let report = maintain::reembed(&conn, &wide, "test instruction").expect("reembed");
+    let spec = VecSpec::of(&wide);
+    let report = maintain::reembed(&conn, &spec, "test instruction").expect("reembed");
     assert!(report.rebuilt, "a dimension change recreates the tables");
-    assert_eq!((report.rows, report.dim), (2, 16));
+    assert_eq!(
+        (report.queued, report.dim),
+        (2, 16),
+        "every row is owed a vector at the new width"
+    );
+    // The vectors are the worker's job now, so settle exactly as it would.
+    common::settle(&conn, &wide);
 
     assert_eq!(vec::stored_dim(&conn).unwrap(), Some(16));
     assert_eq!(meta(&conn, "dim").as_deref(), Some("16"));
@@ -79,7 +86,7 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
         assert_eq!(
             doc_hash,
             store::row_hash(
-                &wide,
+                &ellmephant::embed::VecSpec::of(&wide),
                 &projection::embed_document(&mem.key, &mem.title, &mem.body)
             )
         );
@@ -98,14 +105,57 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     vec::delete(&conn, a).unwrap();
     assert_eq!(vec::count(&conn).unwrap(), 1);
 
-    let report = maintain::reembed(&conn, &embedder, "").expect("reembed");
+    let spec = VecSpec::of(&embedder);
+    let report = maintain::reembed(&conn, &spec, "").expect("reembed");
     assert!(!report.rebuilt, "same dim keeps the table");
-    assert_eq!(report.rows, 2);
+    // ONE row is owed, not two: `b` still carries its vector and its document never moved, and the
+    // producer is precise about that. `a` is owed because it has no vector at all — which `doc_hash`
+    // cannot see, since the hash still says "indexed".
+    assert_eq!(report.queued, 1, "only the row with no vector is owed one");
+    common::settle(&conn, &embedder);
     assert_eq!(vec::count(&conn).unwrap(), 2, "the missing vector is back");
 
     let before = vec::get(&conn, a).unwrap();
-    maintain::reembed(&conn, &embedder, "").expect("reembed again");
+    let again = maintain::reembed(&conn, &spec, "").expect("reembed again");
+    assert_eq!(again.queued, 0, "a settled store owes nothing");
     assert_eq!(vec::get(&conn, a).unwrap(), before, "vectors are stable");
+}
+
+/// A changed **projection** forces a full re-embed, and `doc_hash` cannot detect it: the hash covers the
+/// model, the dimension and the text — never the recipe that assembled them. So every row is queued on
+/// the fingerprint's say-so alone. Without that, a projection change would queue *nothing* and every
+/// vector would keep describing the old recipe in silence — the drift the fingerprint exists to catch.
+#[test]
+fn reembed_requeues_everything_when_the_projection_changed() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    add(&conn, &embedder, "a", "alpha", &[]);
+    add(&conn, &embedder, "b", "beta", &[]);
+    let spec = VecSpec::of(&embedder);
+
+    // A settled store owes nothing.
+    assert_eq!(maintain::reembed(&conn, &spec, "").unwrap().queued, 0);
+    assert!(!vec::projection_stale(&conn).unwrap());
+
+    // Now the projection moves underneath it, which is what a code change to `embed_document` looks
+    // like from the store's side — the fingerprint is a hash of the projection's own output.
+    conn.execute("UPDATE meta SET v = 'moved' WHERE k = 'projection'", [])
+        .unwrap();
+    assert!(vec::projection_stale(&conn).unwrap(), "precondition");
+
+    let report = maintain::reembed(&conn, &spec, "").unwrap();
+    assert!(!report.rebuilt, "the width did not change");
+    assert_eq!(
+        report.queued, 2,
+        "a projection change owes EVERY row a vector"
+    );
+    common::settle(&conn, &embedder);
+    assert_eq!(ellmephant::store::encode::pending(&conn).unwrap(), 0);
+    assert!(
+        !vec::projection_stale(&conn).unwrap(),
+        "and the store is back in step"
+    );
 }
 
 #[test]
@@ -124,7 +174,7 @@ fn reembed_records_the_projection_fingerprint() {
     );
     assert!(!vec::projection_stale(&conn).unwrap());
 
-    maintain::reembed(&conn, &embedder, "").expect("reembed");
+    maintain::reembed(&conn, &VecSpec::of(&embedder), "").expect("reembed");
     assert_eq!(
         meta(&conn, "projection").as_deref(),
         Some(projection::fingerprint().as_str()),
@@ -152,7 +202,7 @@ fn reembed_rebuilds_the_link_graph_from_the_bodies() {
     .expect("stale edge");
     assert_eq!(edge_count(&conn), 2, "[[b]] plus the stale [[ghost]]");
 
-    let report = maintain::reembed(&conn, &embedder, "").expect("reembed");
+    let report = maintain::reembed(&conn, &VecSpec::of(&embedder), "").expect("reembed");
     assert_eq!(report.linked, 2, "both rows were re-parsed");
     assert_eq!(
         edge_count(&conn),
@@ -181,7 +231,7 @@ fn reparse_applies_the_code_span_rule_to_an_existing_body() {
     .expect("legacy edge");
     assert_eq!(edge_count(&conn), 1);
 
-    maintain::reembed(&conn, &embedder, "").expect("reembed");
+    maintain::reembed(&conn, &VecSpec::of(&embedder), "").expect("reembed");
     assert_eq!(
         edge_count(&conn),
         0,

@@ -9,7 +9,7 @@ use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
 use ellmephant::index::vec;
-use ellmephant::store::{self, Memory, dupes};
+use ellmephant::store::{Memory, dupes};
 
 /// A memory with an explicit key.
 fn memory(key: &str, title: &str, body: &str) -> Memory {
@@ -27,9 +27,9 @@ fn finds_only_the_pair_inside_the_ceiling() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
 
-    let (a, _) = store::add(&conn, &embedder, &memory("alpha", "A", "body a")).unwrap();
-    let (b, _) = store::add(&conn, &embedder, &memory("beta", "B", "body b")).unwrap();
-    let (c, _) = store::add(&conn, &embedder, &memory("gamma", "C", "body c")).unwrap();
+    let (a, _) = common::add_now(&conn, &embedder, &memory("alpha", "A", "body a")).unwrap();
+    let (b, _) = common::add_now(&conn, &embedder, &memory("beta", "B", "body b")).unwrap();
+    let (c, _) = common::add_now(&conn, &embedder, &memory("gamma", "C", "body c")).unwrap();
 
     // Controlled vectors: alpha ≈ beta; gamma orthogonal to both.
     vec::upsert(&conn, a, &[1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -54,8 +54,8 @@ fn a_pair_is_emitted_once_not_twice() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
-    let (a, _) = store::add(&conn, &embedder, &memory("one", "One", "x")).unwrap();
-    let (b, _) = store::add(&conn, &embedder, &memory("two", "Two", "y")).unwrap();
+    let (a, _) = common::add_now(&conn, &embedder, &memory("one", "One", "x")).unwrap();
+    let (b, _) = common::add_now(&conn, &embedder, &memory("two", "Two", "y")).unwrap();
     // Identical vectors: distance 0, and the pair must not appear from both ends.
     vec::upsert(&conn, a, &[1.0, 0.0, 0.0, 0.0]).unwrap();
     vec::upsert(&conn, b, &[1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -72,6 +72,6 @@ fn an_empty_or_single_row_store_is_quiet() {
     assert!(dupes::find(&conn, 0.05, 50).unwrap().is_empty());
 
     let embedder = HashEmbedder::new(4);
-    store::add(&conn, &embedder, &memory("solo", "Solo", "only")).unwrap();
+    common::add_now(&conn, &embedder, &memory("solo", "Solo", "only")).unwrap();
     assert!(dupes::find(&conn, 0.05, 50).unwrap().is_empty());
 }

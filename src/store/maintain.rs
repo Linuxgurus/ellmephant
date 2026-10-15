@@ -12,114 +12,107 @@
 use rusqlite::{Connection, params};
 
 use crate::db::meta;
-use crate::embed::{Embedder, projection};
+use crate::embed::{VecSpec, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::{links, row_hash, tags};
+use crate::store::{encode, links, row_hash};
 
-/// Rows embedded per `Embedder::embed` batch.
-const BATCH: usize = 16;
-
-/// What a re-embed did.
+/// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// Rows re-embedded.
-    pub rows: usize,
+    /// Documents queued for embedding.
+    pub queued: usize,
     /// The (possibly new) vector dimension.
     pub dim: usize,
-    /// Whether the `vec0` table was recreated because the dimension changed.
+    /// Whether the `vec0` table was rebuilt because the dimension changed.
     pub rebuilt: bool,
-    /// The model id the vectors now correspond to.
+    /// The model id the queued vectors will belong to.
     pub model: String,
     /// Memories whose `[[link]]` graph was re-parsed from its body.
     pub linked: usize,
 }
 
-/// Recompute every vector and rebuild the vec0 table (PLAN §6 P9). Handles a dimension
-/// change by dropping and recreating the table (the one path [`index::vec::ensure`]
-/// refuses), and records `dim`/`model`/`instruction` in `meta`.
+/// Queue every document that needs (re-)embedding (PLAN §6 P9), and rebuild the derived parts that
+/// take no model: the `[[link]]` graph, and the `vec0` table itself when the width changed.
 ///
-/// Also re-parses every body into `memory_link` ([`links::reparse`]): that graph is derived from
-/// the rows too, so a full rebuild is where a parser change (or an older body) catches up.
-pub fn reembed(conn: &Connection, embedder: &dyn Embedder, instruction: &str) -> Result<Report> {
-    let dim = embedder.dim();
+/// **A producer, not an embedder.** It used to recompute every vector inside one transaction, holding
+/// the store lock from the first row to the last — measured at ~45 minutes on a 291-row store, with
+/// every write timing out for the duration while `/health` still said `ready`
+/// (`ENCODE-WORKER.md`). Now it writes the `meta` facts, enqueues the work at
+/// [`encode::BACKFILL`] priority so a live edit still wins the queue, and returns. The worker does the
+/// rest, one document at a time.
+pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<Report> {
+    let dim = spec.dim;
     let rebuilt = index::vec::stored_dim(conn)? != Some(dim);
     if rebuilt {
         // A dimension change makes every stored vector the wrong width and therefore unreadable, so
-        // the table is dropped and recreated. The one path that cannot be a swap, because there is
-        // no old index worth keeping.
+        // the table is dropped and recreated. The one step that cannot be a swap, and the only one
+        // that has to happen *before* anything is queued.
         index::vec::recreate(conn, dim)?;
     }
 
-    // Snapshot the rows to embed before opening the write transaction.
-    let rows: Vec<(i64, String, Vec<String>, String, String)> = {
-        let mut stmt = conn.prepare("SELECT id, key, tags, title, body FROM memory ORDER BY id")?;
+    // A changed PROJECTION is a full re-embed too, and **`doc_hash` cannot see it**: the hash covers the
+    // model, the dimension and the text — not the recipe that assembled them. The fingerprint is the
+    // signal, and without it a projection change would queue nothing at all while every stored vector
+    // quietly kept describing the old recipe. That is the drift the fingerprint exists to catch, and
+    // this is the one place it is acted on.
+    let reset = rebuilt || index::vec::projection_stale(conn)?;
+    // Snapshot the rows first, so the scan is not interleaved with the enqueues.
+    let rows: Vec<(i64, String, String, String, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, key, title, body, doc_hash FROM memory ORDER BY id")?;
         let mapped = stmt.query_map([], |r| {
-            let tags: String = r.get(2)?;
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                tags::decode(&tags),
-                r.get(3)?,
-                r.get(4)?,
-            ))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // Which rows actually HAVE a vector, which is not what `doc_hash` records: that column says a
+    // vector was once written for this text, and it survives a torn index.
+    let indexed: std::collections::HashSet<i64> = index::vec::ids(conn)?.into_iter().collect();
 
-    let rows_count = rows.len();
-    let batches = rows_count.div_ceil(BATCH).max(1);
-    // ONE transaction, and the clear is INSIDE it. The clear used to run before the tx opened,
-    // which left `memory_vec` genuinely empty for the whole rebuild: `/health` reported `vectors: 0`
-    // and `/search` answered an empty hit list at HTTP 200 while the store still held every memory.
-    // A reader sees the OLD index until this commits, so a rebuild is slow, not broken.
     let tx = conn.unchecked_transaction()?;
-    if !rebuilt {
-        index::vec::clear(&tx)?; // full rebuild: drop any stale or orphaned vectors, atomically
-    }
     meta::set(&tx, meta::DIM, &dim.to_string())?;
-    meta::set(&tx, meta::MODEL, embedder.model_id())?;
+    meta::set(&tx, meta::MODEL, &spec.model_id)?;
     meta::set(&tx, meta::INSTRUCTION, instruction)?;
-    // The vectors now correspond to the *current* projection, so this is the one place the
-    // fingerprint legitimately moves ([`crate::index::vec::projection_stale`]).
+    // The vectors are about to correspond to the *current* projection, so this is the one place the
+    // fingerprint legitimately moves ([`crate::index::vec::projection_stale`]) — and the store is only
+    // truly back in step once the worker's last job lands.
     meta::set(&tx, meta::PROJECTION, &projection::fingerprint())?;
 
-    let mut done = 0;
-    for (batch, chunk) in rows.chunks(BATCH).enumerate() {
-        let docs: Vec<String> = chunk
-            .iter()
-            .map(|(_, key, _tags, title, body)| projection::embed_document(key, title, body))
-            .collect();
-        let vectors = embedder.embed(&docs)?;
-        for (i, (id, _, _, _, _)) in chunk.iter().enumerate() {
-            index::vec::upsert(&tx, *id, &vectors[i])?;
-            tx.execute(
-                "UPDATE memory SET doc_hash = ?2 WHERE id = ?1",
-                params![id, row_hash(embedder, &docs[i])],
-            )?;
+    let mut queued = 0;
+    for (id, key, title, body, stored) in rows {
+        let doc_hash = row_hash(spec, &projection::embed_document(&key, &title, &body));
+        // A row is owed a vector when the table was rebuilt or the projection moved (every stored
+        // vector is the wrong width, or describes the old recipe), when its document changed, or when
+        // it has no vector at all. `doc_hash` cannot see the last two on its own — a killed rebuild
+        // leaves the hash saying "indexed", and the projection was never part of the hash — and a torn
+        // or drifted index is exactly what this function exists to repair.
+        if reset || stored != doc_hash || !indexed.contains(&id) {
+            encode::enqueue(&tx, &key, &doc_hash, encode::BACKFILL)?;
+            if reset {
+                // **Clear the hash, or the work never happens.** A reset means the stored vector was
+                // built with a different recipe (or a different width), so it is not this row's vector
+                // *under the current one* — and the worker would otherwise look at the still-matching
+                // `doc_hash`, find the old vector present, decide `needs_embed = false`, and settle the
+                // entry without embedding anything. The re-embed would report 280 queued and change
+                // nothing at all, silently. `doc_hash = ''` is precisely the store saying "no vector for
+                // this text", so the worker embeds.
+                tx.execute("UPDATE memory SET doc_hash = '' WHERE id = ?1", params![id])?;
+            }
+            queued += 1;
         }
-        done += chunk.len();
-        // A real rebuild runs for minutes and used to log nothing between "starting" and the reply,
-        // so the only way to tell progress from a hang was to watch the CPU.
-        tracing::info!(
-            batch = batch + 1,
-            batches,
-            done,
-            rows = rows_count,
-            "reembed progress"
-        );
     }
     tx.commit()?;
 
-    // The link graph is derived too: re-parse every body, so a parser change — or a body written by
-    // an older version — finally reaches the stored edges.
+    // The link graph is derived from the bodies too, so a full rebuild is where a parser change — or a
+    // body written by an older version — finally reaches the stored edges. No model involved.
     let linked = links::reparse(conn)?;
 
     Ok(Report {
-        rows: rows_count,
+        queued,
         dim,
         rebuilt,
-        model: embedder.model_id().to_string(),
+        model: spec.model_id.clone(),
         linked,
     })
 }

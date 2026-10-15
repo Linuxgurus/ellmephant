@@ -14,11 +14,11 @@ use rusqlite::Connection;
 
 use crate::config::{Config, Paths};
 use crate::db;
-use crate::embed::Embedder;
+use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, links, maintain, project};
+use crate::store::{self, Memory, encode, links, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -146,6 +146,15 @@ impl Session {
         &self.cfg
     }
 
+    /// The vector space this store is configured for.
+    ///
+    /// The write path needs exactly two things from the embedder — the model id and the dimension, to
+    /// fingerprint a document — and both are config. That is what lets a write run without loading
+    /// 1.2 GB of weights (`ENCODE-WORKER.md`).
+    pub fn vec_spec(&self) -> VecSpec {
+        VecSpec::new(self.cfg.model.clone(), self.cfg.dim)
+    }
+
     /// Default result count for searches with no explicit `-k` (SPEC §12 config).
     pub fn default_k(&self) -> usize {
         self.cfg.default_k
@@ -158,10 +167,12 @@ impl Session {
     }
 
     /// Upsert a memory from a partial patch (SPEC §7): `None` fields keep their stored value, so one
-    /// field can change without resending the row. The document may have moved, so this borrows the
-    /// encoder — but only to embed, and the encoder has its own lock ([`Encoder`]).
+    /// field can change without resending the row.
+    ///
+    /// **No encoder.** The document is queued, not embedded (`ENCODE-WORKER.md`), so a write holds
+    /// nothing slower than a row insert — that coupling is what this whole design removes.
     pub fn memory_merge(&self, patch: &store::Patch) -> Result<store::MergeOutcome> {
-        self.encoder.with(|e| store::merge(&self.conn, e, patch))
+        store::merge(&self.conn, &self.vec_spec(), patch)
     }
 
     /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
@@ -247,12 +258,53 @@ impl Session {
         Ok(stats)
     }
 
-    /// Recompute every vector and rebuild the derived indexes — the vector index and the `[[link]]`
-    /// graph — handling a model or dimension change (P9). Loads the encoder, so it is the heaviest
-    /// call the server makes; it backs the `memory_reembed` tool.
+    /// Queue every document that needs (re-)embedding, and rebuild the derived indexes that take no
+    /// model — the `[[link]]` graph, and the `vec0` table when the width changed (P9).
+    ///
+    /// **No encoder.** This used to recompute every vector under the store lock — ~45 minutes on a
+    /// 291-row store, which made it a total write outage — and now schedules the work and returns.
+    /// It backs the `memory_reembed` tool.
     pub fn reembed(&self) -> Result<maintain::Report> {
+        maintain::reembed(&self.conn, &self.vec_spec(), &self.cfg.instruction)
+    }
+
+    /// The head of the encode queue, or `None` when nothing is waiting to be embedded.
+    pub fn next_encode(&self) -> Result<Option<encode::Entry>> {
+        encode::next(&self.conn)
+    }
+
+    /// Take one queued document **without embedding anything**: the read half of a job.
+    ///
+    /// Split from [`settle_encode`](Self::settle_encode) on purpose — the worker drops the store lock
+    /// between the two, so the model call runs holding nothing at all. `ENCODE-WORKER.md` is the why.
+    pub fn claim_encode(&self, key: &str) -> Result<Option<encode::Claim>> {
+        encode::claim(&self.conn, &self.vec_spec(), key)
+    }
+
+    /// Store a claim's vector and settle its queue entry: the write half of a job.
+    pub fn settle_encode(&self, claim: &encode::Claim, vector: Option<&[f32]>) -> Result<()> {
+        encode::settle_encoded(&self.conn, claim, vector)
+    }
+
+    /// Count a failed embed attempt. The entry stays and is retried until `encode::MAX_ATTEMPTS`,
+    /// after which it is skipped and reported rather than retried in a hot loop forever.
+    pub fn record_encode_failure(&self, key: &str, err: &Error) -> Result<()> {
+        encode::record_failure(&self.conn, key, err)
+    }
+
+    /// Documents still waiting for a vector — the encoder's backlog.
+    pub fn encode_pending(&self) -> Result<i64> {
+        encode::pending(&self.conn)
+    }
+
+    /// Embed one queued document **now**, instead of leaving it to the worker: the `?wait=true` door.
+    ///
+    /// Deliberately the exception. It holds the store lock across the model call, which is precisely
+    /// the coupling the queue exists to remove — so it is opt-in, and for a caller that genuinely
+    /// cannot proceed until the row is searchable.
+    pub fn encode_document(&self, key: &str) -> Result<bool> {
         self.encoder
-            .with(|e| maintain::reembed(&self.conn, e, &self.cfg.instruction))
+            .with(|e| encode::encode_one(&self.conn, e, &self.vec_spec(), key))
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.

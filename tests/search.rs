@@ -26,7 +26,7 @@ fn memory(key: &str, title: &str, body: &str, tags: &[&str]) -> Memory {
 }
 
 fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str, tags: &[&str]) {
-    store::add(conn, embedder, &memory(key, key, body, tags)).expect("add");
+    common::add_now(conn, embedder, &memory(key, key, body, tags)).expect("add");
 }
 
 /// A query with no constraints beyond the phrase, overridable by the caller.
@@ -507,7 +507,7 @@ fn time_bounds_filter_created_and_updated() {
         let mut m = memory(key, key, "a fact", &[]);
         m.created = created.into();
         m.updated = updated.into();
-        store::add(&conn, &embedder, &m).expect("add");
+        common::add_now(&conn, &embedder, &m).expect("add");
     }
 
     // A `created` window: only `mid` was created in June.

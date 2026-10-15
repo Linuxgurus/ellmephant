@@ -2,7 +2,7 @@
 //! `oneshot`, with the deterministic `HashEmbedder`, so no weights and no network.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
@@ -20,11 +20,19 @@ use tower::ServiceExt as _;
 fn session(dir: &std::path::Path) -> Session {
     let paths = Paths::from_root(dir);
     paths.ensure().expect("create store root");
-    let cfg = Config::default();
+    // The config is the WRITE path's view of the vector space — a write has no embedder to ask — so it
+    // has to agree with the fake injected below. Disagree, and `doc_hash` describes a different space
+    // than the stored vectors do, which makes every later write look like a document change.
+    let cfg = Config {
+        model: HASH_MODEL.to_string(),
+        dim: DIM,
+        ..Config::default()
+    };
+    cfg.validate().expect("valid config");
     let spec = Spec::from_config(&cfg, &paths);
     Session::open(paths, cfg, spec)
         .expect("open store")
-        .with_embedder(Box::new(HashEmbedder::new(64)))
+        .with_embedder(Box::new(HashEmbedder::new(DIM)))
 }
 
 /// A router over a server and a health state that share one witness.
@@ -273,6 +281,25 @@ async fn tool(peer: &Peer<RoleClient>, name: &'static str, args: serde_json::Val
         .unwrap_or_default()
 }
 
+/// The embedder every app in this file is built with (`app_with_token`).
+const DIM: usize = 64;
+/// Its model id, which the config has to echo (see `session`).
+const HASH_MODEL: &str = "fake-hash-v1";
+
+/// Settle every queued document, the way the worker would.
+///
+/// A write only *queues* its embed now (`ENCODE-WORKER.md`) and a test process has no worker, so
+/// anything that asserts on search results or vector counts has to settle first. The store is one
+/// file, so a second connection to it is how a test drives the queue — the one-writer rule is the
+/// *service's*, not the file's.
+fn settle(dir: &std::path::Path) {
+    ellmephant::index::vec::register_extension();
+    let conn = ellmephant::db::open(&Paths::from_root(dir)).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let spec = ellmephant::embed::VecSpec::of(&embedder);
+    while ellmephant::store::encode::drain(&conn, &embedder, &spec, 64).expect("drain") > 0 {}
+}
+
 /// Seed one memory over HTTP.
 async fn seed(app: &axum::Router, token: &str, key: &str, title: &str, body: &str) {
     let front = format!("Key: {key}\nTitle: {title}\n---\n{body}\n");
@@ -297,6 +324,7 @@ async fn reading_a_memory_counts_a_visit() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
     seed(&app, "tok", "counted", "one sharp line", "the body").await;
+    settle(dir.path());
 
     let (_, first, _) = get(&app, "/memory/counted?format=json").await;
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
@@ -759,6 +787,10 @@ async fn the_two_doors_are_one_core() {
     )
     .await;
 
+    // The two writes queued their embeds; settle them so the semantic read below has an index to
+    // read, and the MCP and HTTP answers are comparable.
+    settle(dir.path());
+
     let cases: [(&str, &str, serde_json::Value); 6] = [
         ("/stats?format=json", "memory_stats", json!({})),
         (
@@ -1017,6 +1049,7 @@ async fn search_says_so_when_the_index_is_empty() {
         "a body with words worth finding",
     )
     .await;
+    settle(dir.path());
 
     // The truth first: with vectors, the phrase finds it.
     let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
@@ -1167,5 +1200,180 @@ async fn a_merge_that_would_drop_prose_is_refused() {
         status,
         StatusCode::NOT_FOUND,
         "the source retires once the fold is in"
+    );
+}
+
+/// `?wait=true` settles the document before answering, so the row is searchable the moment the write
+/// returns — the one path that deliberately holds the store lock across the model call.
+#[tokio::test]
+async fn wait_true_indexes_before_it_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let front = "Key: waited\nTitle: Waited\n---\na body with words worth finding\n";
+
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?wait=true&format=json",
+        Some("tok"),
+        Some("text/plain"),
+        front,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("\"indexed\":true"),
+        "the write should report it indexed: {body}"
+    );
+
+    // Deliberately NO `settle(dir.path())` here: the request drained the queue itself, and that is the
+    // whole promise of `?wait=true`.
+    let (status, body, _) = get(&app, "/search?q=words%20worth%20finding&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("waited"), "{body}");
+}
+
+/// `?wait=true` when the encoder **cannot** embed: the write still stands, and the reply says so rather
+/// than claiming a guarantee that was missed. This is the path a vanished weights cache would take.
+#[tokio::test]
+async fn wait_true_reports_a_write_that_could_not_be_indexed() {
+    /// An encoder that always fails.
+    struct Broken;
+
+    impl ellmephant::embed::Embedder for Broken {
+        fn dim(&self) -> usize {
+            64
+        }
+        fn model_id(&self) -> &str {
+            "broken"
+        }
+        fn embed(&self, _texts: &[String]) -> ellmephant::error::Result<Vec<Vec<f32>>> {
+            Err(ellmephant::error::Error::Config("no vector for you".into()))
+        }
+    }
+
+    // Built WITH the failing encoder: `Encoder::inject` sets a `OnceLock`, so it cannot be replaced
+    // after the fact — a test that tried would silently keep the working one.
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let paths = Paths::from_root(dir.path());
+    let cfg = Config::default();
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg.clone(), spec)
+        .expect("open store")
+        .with_embedder(Box::new(Broken));
+    let state = HttpState::new(paths, cfg, Arc::clone(&watch), Instant::now())
+        .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::new(Mutex::new(session)), watch),
+        "127.0.0.1",
+        state,
+    );
+
+    let front = "Key: unindexable\nTitle: Unindexable\n---\na body the encoder will refuse\n";
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory?wait=true&format=json",
+        Some("tok"),
+        Some("text/plain"),
+        front,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failed index must not fail the write: {body}"
+    );
+    assert!(body.contains("\"indexed\":false"), "{body}");
+    assert!(
+        body.contains("encode_error"),
+        "and it must say why, not just that it did not: {body}"
+    );
+
+    // The row is there: the queue is derived state, so the write was never at risk.
+    let (status, _, _) = get(&app, "/memory/unindexable?format=json").await;
+    assert_eq!(status, StatusCode::OK, "the row is written regardless");
+}
+
+/// `?wait=true` costs exactly what its docs say it costs — it holds the store lock across the model
+/// call — and **`/health` says so while it does**.
+///
+/// That witness is not decoration: `writer: busy 1239.1s (memory_reembed)` is what made the 45-minute
+/// incident legible in the first place. A writer nobody can see is how a store comes to report `ready`
+/// while it cannot write.
+#[tokio::test]
+async fn wait_true_holds_the_lock_and_health_names_the_holder() {
+    /// Slow enough that a poller cannot miss the window.
+    struct Slow;
+
+    impl ellmephant::embed::Embedder for Slow {
+        fn dim(&self) -> usize {
+            64
+        }
+        fn model_id(&self) -> &str {
+            "slow"
+        }
+        fn embed(&self, texts: &[String]) -> ellmephant::error::Result<Vec<Vec<f32>>> {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Ok(vec![vec![0.0; 64]; texts.len()])
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let paths = Paths::from_root(dir.path());
+    let cfg = Config::default();
+    let spec = Spec::from_config(&cfg, &paths);
+    let session = Session::open(paths.clone(), cfg.clone(), spec)
+        .expect("open store")
+        .with_embedder(Box::new(Slow));
+    let state = HttpState::new(paths, cfg, Arc::clone(&watch), Instant::now())
+        .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::new(Mutex::new(session)), watch),
+        "127.0.0.1",
+        state,
+    );
+
+    // The synchronous write runs in the background; the poller watches the witness in the foreground.
+    let writing = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let front = "Key: witnessed\nTitle: Witnessed\n---\na body embedded slowly\n";
+            request(
+                &app,
+                Method::POST,
+                "/memory?wait=true&format=json",
+                Some("tok"),
+                Some("text/plain"),
+                front,
+            )
+            .await
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        let (_, body, _) = get(&app, "/health?format=json").await;
+        if body.contains("memory_encode_now") {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the witness never named the lock holder: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        seen.contains("\"writer\":\"busy"),
+        "and it should read as busy while held: {seen}"
+    );
+
+    let (status, body, _) = writing.await.expect("the write task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("\"indexed\":true"),
+        "the synchronous door settles it before answering: {body}"
     );
 }

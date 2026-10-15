@@ -17,11 +17,38 @@ use tower::ServiceExt as _;
 fn session(dir: &std::path::Path) -> Session {
     let paths = Paths::from_root(dir);
     paths.ensure().expect("create store root");
-    let cfg = Config::default();
+    // The config is the WRITE path's view of the vector space — a write has no embedder to ask — so it
+    // has to agree with the fake injected below. Disagree, and `doc_hash` describes a different space
+    // than the stored vectors do, which makes every later write look like a document change.
+    let cfg = Config {
+        model: HASH_MODEL.to_string(),
+        dim: DIM,
+        ..Config::default()
+    };
+    cfg.validate().expect("valid config");
     let spec = Spec::from_config(&cfg, &paths);
     Session::open(paths, cfg, spec)
         .expect("open store")
-        .with_embedder(Box::new(HashEmbedder::new(64)))
+        .with_embedder(Box::new(HashEmbedder::new(DIM)))
+}
+
+/// The embedder every session in this file is built with (see `session`).
+const DIM: usize = 64;
+/// Its model id, which the config has to echo (see `session`).
+const HASH_MODEL: &str = "fake-hash-v1";
+
+/// Settle every queued document, the way the worker would.
+///
+/// A write only *queues* its embed now (`ENCODE-WORKER.md`) and a test process has no worker, so a
+/// test that asserts on a search, a duplicate pair or a vector count has to settle first. The store is
+/// one file, so a second connection to it is how a test drives the queue — the one-writer rule is the
+/// *service's*, not the file's.
+fn settle(dir: &std::path::Path) {
+    ellmephant::index::vec::register_extension();
+    let conn = ellmephant::db::open(&Paths::from_root(dir)).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let spec = ellmephant::embed::VecSpec::of(&embedder);
+    while ellmephant::store::encode::drain(&conn, &embedder, &spec, 64).expect("drain") > 0 {}
 }
 
 /// Call one tool and return its result (tool *errors* come back as `is_error`, not `Err`).
@@ -163,6 +190,7 @@ async fn tools_round_trip_over_the_transport() {
     assert_eq!(mixed["upvoted"][0]["key"], serde_json::json!("infra-logs"));
     assert_eq!(mixed["upvoted"][0]["times_useful"], serde_json::json!(2));
     assert_eq!(mixed["missing"], serde_json::json!(["ghost"]));
+    settle(dir.path());
 
     let found = call(
         &client,
@@ -213,6 +241,9 @@ async fn tools_round_trip_over_the_transport() {
         back["backlinks"][0][0],
         serde_json::json!("infra-observability")
     );
+    // Settle the row just written, so the index is non-empty for the searches below. The later
+    // re-upsert of `infra-logs` and its delete remove that row's vector on purpose.
+    settle(dir.path());
 
     // `memory_upsert` upserts: re-storing an existing key overwrites it, no twin row.
     let upserted = call(
@@ -792,7 +823,9 @@ async fn upsert_patches_one_field_over_the_transport() {
     )
     .await;
 
-    // Patch ONE field: the tags are NOT resent, so they must survive.
+    // Patch ONE field: the tags are NOT resent, so they must survive. The row is settled first, so
+    // that `queued: false` is a fact about the document and not about an un-encoded row.
+    settle(dir.path());
     let patched = call(
         &client,
         "memory_upsert",
@@ -802,7 +835,7 @@ async fn upsert_patches_one_field_over_the_transport() {
     let v: serde_json::Value = serde_json::from_str(&text(&patched)).expect("json");
     assert_eq!(v["status"], serde_json::json!("updated"));
     assert_eq!(
-        v["reembedded"],
+        v["queued"],
         serde_json::json!(false),
         "`source` is not part of the document"
     );
@@ -913,6 +946,7 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         )
         .await;
     }
+    settle(dir.path());
 
     let dupes = call(
         &client,
@@ -932,12 +966,30 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         "near-identical rows must pair: {d}"
     );
 
-    // `memory_reembed` takes no arguments: it recomputes every vector and rebuilds the index.
+    // Tear the index, the way a killed rebuild would: drop one row's vector and leave its `doc_hash`
+    // still saying "indexed". That is precisely the case the hash alone cannot see.
+    {
+        ellmephant::index::vec::register_extension();
+        let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
+        let id: i64 = conn
+            .query_row("SELECT id FROM memory WHERE key = 'dup-a'", [], |r| {
+                r.get(0)
+            })
+            .expect("row id");
+        ellmephant::index::vec::delete(&conn, id).expect("tear the index");
+    }
+
+    // `memory_reembed` takes no arguments: it QUEUES every document that owes a vector and rebuilds the
+    // parts that take no model. It embeds nothing itself — the worker does that.
     let re = call(&client, "memory_reembed", serde_json::json!({})).await;
     assert!(!re.is_error.unwrap_or(false), "{}", text(&re));
     let r: serde_json::Value = serde_json::from_str(&text(&re)).expect("json");
-    assert_eq!(r["status"], serde_json::json!("re-embedded"));
-    assert!(r["rows"].as_u64().expect("rows") >= 2);
+    assert_eq!(r["status"], serde_json::json!("queued"));
+    assert_eq!(
+        r["queued"],
+        serde_json::json!(1),
+        "the torn row is owed a vector; the intact one is not"
+    );
     assert!(r["dim"].as_u64().expect("dim") > 0);
 
     client.cancel().await.expect("cancel");

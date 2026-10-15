@@ -298,6 +298,20 @@ after P2 because P3 depends on it and it can be built and tested entirely offlin
   into SPEC/config.
 - **Commit:** `feat: bench + golden eval`
 
+### P11 — The encode worker (post-v1: the write path stops embedding)
+- **Goal:** a write returns in milliseconds, and a rebuild stops being a write outage. The design is
+  `ENCODE-WORKER.md`; this is its implementation record.
+- **Tasks:** migration `0008_encode_queue`; `store::encode` (`enqueue`, `claim`, `settle_encoded`,
+  `encode_one`, `drain`, `next`, `pending`, `failed`, `record_failure`); `VecSpec`, so `row_hash` takes
+  config rather than a loaded embedder; the write path queues instead of embedding and stops advancing
+  `doc_hash`; one worker thread started from `serve`; the `encode_interval_ms` config key; `?wait=true`;
+  `reembed` becomes a producer.
+- **Accept:** a write completes while a model call is *provably* in flight (`tests/encode_worker.rs`);
+  a re-embed of a 291-row store returns in seconds with `{queued: N}`, where it used to hold the store
+  for ~45 minutes; the queue drains to empty; and a torn index — a row whose vector was deleted while
+  its `doc_hash` still claims it is indexed — is repaired by `reembed`.
+- **Commit:** `feat: the encode worker — a write queues its document`
+
 ## 7. Testing strategy
 
 - **Unit:** projection (link stripping), slug + collision, link regex, RRF merge, hash stability.

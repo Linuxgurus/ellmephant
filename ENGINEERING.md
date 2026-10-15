@@ -33,9 +33,14 @@ The decisions the code obeys:
   place to stand: identity, fields, and its relations to memories. Listed by field and read whole —
   which is what makes embedding it pointless, so it carries no vector, no votes and no verdict of
   its own.
-- **Everything else is derived.** `memory_vec` (the KNN index) and `memory_link` (the `[[key]]`
-  graph) are computed from the rows and rebuildable at any time (the `memory_reembed` tool). The
-  relational store must never lie, so there is no FTS index and no tag table to keep in sync.
+- **Everything else is derived.** `memory_vec` (the KNN index), `memory_link` (the `[[key]]` graph)
+  and `encode_queue` (the documents that still owe a vector) are computed from the rows and
+  rebuildable at any time (the `memory_reembed` tool). The relational store must never lie, so there
+  is no FTS index and no tag table to keep in sync.
+- **A write does not embed.** It upserts the row and schedules the document — both in one transaction,
+  because both are one file — and one background worker indexes it, holding the store lock for a row
+  write and *nothing* across the model call. The encoder is the slow part of a write, and it is not
+  part of a write (`ENCODE-WORKER.md`).
 - **The two kinds live in different tables, split where the machinery changes** — not on a hunch:
   "project = memory + type" would ship cheaply and model nothing (SPEC §7.1). **Inside a structure,
   a relation earns its own table only when its invariant is cross-row:** `contains` has one (a memory
@@ -81,7 +86,7 @@ Five layers, one crate:
 | Layer | Module | Responsibility |
 |---|---|---|
 | Storage | `db`, `migrations/` | open SQLite, pragmas, schema, `meta` kv |
-| Write path | `store`, `embed`, `index/vec` | upsert a row: key, one hash, tags, links, one vector |
+| Write path | `store`, `embed`, `index/vec`, `store::encode` | upsert a row: key, one hash, tags, links, and a queued document |
 | Structures | `store::project` | projects: identity, the ordered preload (membership is a tag) |
 | Read path | `search`, `index/vec` | one semantic phrase → KNN over the document vectors |
 | Interfaces | `cli`, `mcp` | MCP server (HTTP default, stdio option); `doctor` + `model` for operations |
@@ -181,10 +186,14 @@ rename OLD NEW` rewrites the tokens and repoints the memory edges in one transac
 The rows are the source of truth — `memory`, `project`; every index on top of them
 is rebuildable.
 
-- `reembed` drops and recreates the vec0 table when the embedder's width changes, recomputes
-  every row's document vector, rewrites each row's `doc_hash`, and records
-  `dim`/`model`/`instruction` in `meta`. This is the deliberate path that the frozen-dimension
-  guard in `index::vec::ensure` refuses to take implicitly.
+- `reembed` QUEUES: it drops and recreates the vec0 table when the embedder's width changes (the one
+  step that cannot be a swap), records `dim`/`model`/`instruction` in `meta`, and enqueues every row
+  that owes a vector — rebuilt, moved, or missing from the index — at backfill priority. The worker
+  does the rest, so a rebuild is no longer a write outage. This is the deliberate path that the
+  frozen-dimension guard in `index::vec::ensure` refuses to take implicitly.
+- The **encode worker** is the queue's one consumer: one thread per process, started from `serve`.
+  Claim under a short lock, embed with the lock held nowhere, settle under a second short lock, sleep,
+  repeat. It is why a write returns in milliseconds and why a rebuild cannot stall one.
 - `rename` runs in one transaction and refuses to clobber an existing key.
 
 ## Model weights cache

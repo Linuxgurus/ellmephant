@@ -22,6 +22,16 @@ pub fn open(paths: &Paths) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open the store READ-ONLY: a connection of the caller's own, for a read that must not queue behind
+/// a writer. No migration, and no pragma that writes — in WAL mode a reader sees the last committed
+/// state alongside a writer, which is what `/health` has always relied on from outside the session.
+pub fn open_read_only(paths: &Paths) -> Result<Connection> {
+    crate::index::vec::register_extension();
+    let conn = Connection::open_with_flags(paths.db(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_millis(5_000))?;
+    Ok(conn)
+}
+
 /// PRAGMAs from SPEC §7 / PLAN §2 #10. `journal_mode` returns a row, so it is
 /// queried rather than executed.
 pub fn configure(conn: &Connection) -> Result<()> {

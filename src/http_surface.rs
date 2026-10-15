@@ -545,11 +545,17 @@ pub async fn memory_get(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let lookup = key.clone();
     match server
-        .with_store("memory_get", move |s| s.fetch(&key))
+        .with_read("memory_get", move |s| s.show(&lookup))
         .await
     {
-        Ok(mem) => {
+        Ok(mut mem) => {
+            // Count the read best-effort (see `MemoryServer::bump_visit`): telemetry never makes a
+            // reader wait, so a write in flight means this visit goes uncounted.
+            if let Some(seen) = server.bump_visit(&key) {
+                mem.visits = seen;
+            }
             let mut value = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));

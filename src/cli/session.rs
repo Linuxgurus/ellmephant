@@ -8,6 +8,8 @@
 //! no caller reads like a load-bearing one, and this file collected several: `paths`, `rename`,
 //! `dangling`, `tags` and `keys` all sat here, unused, for as long as they did.
 
+use std::sync::Arc;
+
 use rusqlite::Connection;
 
 use crate::config::{Config, Paths};
@@ -18,31 +20,130 @@ use crate::model;
 use crate::search::{self, Bundle, Query};
 use crate::store::{self, Memory, links, maintain, project};
 
-/// A store handle plus its (lazily loaded) encoder.
-pub struct Session {
-    cfg: Config,
+/// The store's encoder: lazily loaded, and shared by the writer and by every reader.
+///
+/// **Lock-free after the load, and that is the fix, not a detail.** Embedding is the slow part of a
+/// write (~1.3-8.5 s per KB of body), and it used to run while the caller held the store lock — which
+/// is what turned one write into a store-wide stall. Giving the encoder its own lock only *moved* the
+/// stall: a semantic search then waited out the write's entire embed instead of the store's. So there
+/// is no lock over the weights at all. `Embedder` is `Send + Sync` for exactly this: two inferences at
+/// once contend for CPU and both finish, where serializing them makes the reader wait for the writer.
+///
+/// Loading happens once, on first use: ~1.2 GB of weights that a command which never embeds never
+/// pays for, while a running server keeps them warm across calls.
+pub struct Encoder {
     spec: model::Spec,
+    cfg: Config,
+    /// The weights. A `OnceLock`, deliberately not a mutex — see the note above.
+    inner: std::sync::OnceLock<Box<dyn Embedder>>,
+    /// Held only while the weights LOAD — once, ever — never while they are used.
+    loading: std::sync::Mutex<()>,
+}
+
+impl Encoder {
+    /// A shared handle over the weights, not yet loaded.
+    pub fn new(spec: model::Spec, cfg: Config) -> Arc<Self> {
+        Arc::new(Self {
+            spec,
+            cfg,
+            inner: std::sync::OnceLock::new(),
+            loading: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// Run `f` with the encoder, loading it on first use.
+    pub fn with<T>(&self, f: impl FnOnce(&dyn Embedder) -> Result<T>) -> Result<T> {
+        if let Some(embedder) = self.inner.get() {
+            return f(embedder.as_ref());
+        }
+        // Only the first use arrives here, and two threads may arrive together: this lock serializes
+        // the LOAD. It is released before `f`, so the first caller's work cannot block a second
+        // caller's load.
+        {
+            let _loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+            if self.inner.get().is_none() {
+                // Log both ends: a "stuck" first search in `docker logs` must be visibly a model
+                // load, not a hang.
+                tracing::info!(
+                    model = %self.cfg.model,
+                    device = %self.cfg.device,
+                    precision = %self.cfg.precision,
+                    dim = self.cfg.dim,
+                    "loading encoder"
+                );
+                let started = std::time::Instant::now();
+                let loaded: Box<dyn Embedder> =
+                    Box::new(super::embed::load_embedder(&self.spec, &self.cfg)?);
+                // Losing a race is fine: whoever set it first loaded the same weights.
+                let _ = self.inner.set(loaded);
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "encoder loaded"
+                );
+            }
+        }
+        f(self.inner.get().expect("set just above").as_ref())
+    }
+
+    /// Inject a pre-built encoder instead of loading Qwen3 — the MCP and HTTP harnesses feed a
+    /// deterministic fake so their round trips need no weights (PLAN §7). Must run before first use.
+    pub fn inject(&self, embedder: Box<dyn Embedder>) {
+        let _ = self.inner.set(embedder);
+    }
+}
+
+/// A store handle: one connection, the settings, and a share of the encoder.
+pub struct Session {
+    paths: Paths,
+    cfg: Config,
     conn: Connection,
-    embedder: Option<Box<dyn Embedder>>,
+    encoder: Arc<Encoder>,
 }
 
 impl Session {
     /// Open (creating if needed) the store and hold the connection.
     pub fn open(paths: Paths, cfg: Config, spec: model::Spec) -> Result<Self> {
         let conn = db::open(&paths)?;
+        let encoder = Encoder::new(spec, cfg.clone());
         Ok(Self {
+            paths,
             cfg,
-            spec,
             conn,
-            embedder: None,
+            encoder,
         })
     }
 
-    /// Inject a pre-built encoder instead of loading Qwen3 on first use. The MCP test
-    /// harness feeds a deterministic fake, so its round-trip needs no weights (PLAN §7).
-    pub fn with_embedder(mut self, embedder: Box<dyn Embedder>) -> Self {
-        self.embedder = Some(embedder);
+    /// A READ-ONLY session: its own connection, the shared encoder, and no store lock. This is how a
+    /// read is served while a write is in flight — the writer holds its session for the whole write,
+    /// embedding included, so a read that queued on it would wait out the write.
+    pub fn read_only(paths: &Paths, cfg: Config, encoder: Arc<Encoder>) -> Result<Self> {
+        Ok(Self {
+            paths: paths.clone(),
+            cfg,
+            conn: db::open_read_only(paths)?,
+            encoder,
+        })
+    }
+
+    /// Inject a pre-built encoder (see [`Encoder::inject`]) — the test harnesses' fake.
+    pub fn with_embedder(self, embedder: Box<dyn Embedder>) -> Self {
+        self.encoder.inject(embedder);
         self
+    }
+
+    /// The store root, so a reader can open a connection of its own.
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
+    /// The shared encoder, for a reader that needs the same warm weights.
+    pub fn encoder(&self) -> Arc<Encoder> {
+        Arc::clone(&self.encoder)
+    }
+
+    /// The settings a reader needs (`default_k`, `default_max_distance`) without the store lock.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
     }
 
     /// Default result count for searches with no explicit `-k` (SPEC §12 config).
@@ -56,45 +157,11 @@ impl Session {
         self.cfg.default_max_distance
     }
 
-    /// Load the encoder once; later calls are free. This is the only path that touches
-    /// the weights cache, so nothing else in the CLI needs it.
-    fn ensure_embedder(&mut self) -> Result<()> {
-        if self.embedder.is_none() {
-            // Loading ~1.2 GB of weights can take a while; log both ends so a "stuck" first
-            // search in `docker logs` is visibly a model load, not a hang.
-            tracing::info!(
-                model = %self.cfg.model,
-                device = %self.cfg.device,
-                precision = %self.cfg.precision,
-                dim = self.cfg.dim,
-                "loading encoder"
-            );
-            let started = std::time::Instant::now();
-            self.embedder = Some(Box::new(super::embed::load_embedder(
-                &self.spec, &self.cfg,
-            )?));
-            tracing::info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "encoder loaded"
-            );
-        }
-        Ok(())
-    }
-
-    /// The encoder as a trait object; an error if `ensure_embedder` has not run yet.
-    fn embedder(&self) -> Result<&dyn Embedder> {
-        self.embedder
-            .as_deref()
-            .ok_or_else(|| Error::Config("encoder was not loaded".into()))
-    }
-
     /// Upsert a memory from a partial patch (SPEC §7): `None` fields keep their stored value, so one
-    /// field can change without resending the row. The encoder is always loaded — the document may
-    /// have moved — but the store re-embeds only when it actually did.
-    pub fn memory_merge(&mut self, patch: &store::Patch) -> Result<store::MergeOutcome> {
-        self.ensure_embedder()?;
-        let embedder = self.embedder()?;
-        store::merge(&self.conn, embedder, patch)
+    /// field can change without resending the row. The document may have moved, so this borrows the
+    /// encoder — but only to embed, and the encoder has its own lock ([`Encoder`]).
+    pub fn memory_merge(&self, patch: &store::Patch) -> Result<store::MergeOutcome> {
+        self.encoder.with(|e| store::merge(&self.conn, e, patch))
     }
 
     /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
@@ -113,10 +180,19 @@ impl Session {
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
     /// point, backing `memory_get` on **both** doors: MCP's tool and `GET /memory/{key}`.
+    ///
+    /// This one WRITES the counter, so it belongs to the writer's session. The read door serves the
+    /// row from a read-only connection and then bumps the count best-effort ([`Self::record_visit`]);
+    /// a read must never wait for its own telemetry.
     pub fn fetch(&self, key: &str) -> Result<Memory> {
         let mut mem = self.show(key)?;
         mem.visits = store::record_visit(&self.conn, key)?;
         Ok(mem)
+    }
+
+    /// Count one read (`visits`) on this session's connection.
+    pub fn record_visit(&self, key: &str) -> Result<i64> {
+        store::record_visit(&self.conn, key)
     }
 
     /// Bump `times_useful` for many keys at once. Returns `(key, new_total)` for the keys that
@@ -146,16 +222,16 @@ impl Session {
         store::delete(&self.conn, key)
     }
 
-    /// Run a query, loading the encoder only when there is a phrase to embed.
-    pub fn search(&mut self, q: &Query) -> Result<Bundle> {
+    /// Run a query, borrowing the encoder only when there is a phrase to embed. A read-only session
+    /// serves the rows from its own connection, so a search does not wait for a write to finish.
+    pub fn search(&self, q: &Query) -> Result<Bundle> {
         let needs_embedder = q
             .text
             .as_deref()
             .map(str::trim)
             .is_some_and(|s| !s.is_empty());
         if needs_embedder {
-            self.ensure_embedder()?;
-            return search::run(&self.conn, Some(self.embedder()?), q);
+            return self.encoder.with(|e| search::run(&self.conn, Some(e), q));
         }
         search::run(&self.conn, None, q)
     }
@@ -174,10 +250,9 @@ impl Session {
     /// Recompute every vector and rebuild the derived indexes — the vector index and the `[[link]]`
     /// graph — handling a model or dimension change (P9). Loads the encoder, so it is the heaviest
     /// call the server makes; it backs the `memory_reembed` tool.
-    pub fn reembed(&mut self) -> Result<maintain::Report> {
-        self.ensure_embedder()?;
-        let embedder = self.embedder()?;
-        maintain::reembed(&self.conn, embedder, &self.cfg.instruction)
+    pub fn reembed(&self) -> Result<maintain::Report> {
+        self.encoder
+            .with(|e| maintain::reembed(&self.conn, e, &self.cfg.instruction))
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.
@@ -207,5 +282,67 @@ impl Session {
     /// Projects matching `filter`, key order.
     pub fn project_list(&self, filter: &project::Filter) -> Result<Vec<project::Project>> {
         project::list(&self.conn, filter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A fake encoder that takes a measurable moment, so "did the second caller wait?" is a fact and
+    /// not an opinion.
+    struct Slow;
+
+    impl Embedder for Slow {
+        fn dim(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "slow-test"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            // The read pays this too. Concurrent, the reader finishes at ~250ms; serialized it waits
+            // out the writer first and finishes at ~400ms. The assert below separates those.
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(vec![vec![0.0, 1.0]; texts.len()])
+        }
+    }
+
+    /// The encoder must NOT serialize its callers.
+    ///
+    /// A write embedding a document can take seconds; a read embedding a query must not wait for it.
+    /// That serialization was the whole stall, and putting a lock over the weights only moved it from
+    /// the store to the model — which is why there is a `OnceLock` here and not a `Mutex`. This test
+    /// is what keeps it one.
+    #[test]
+    fn the_encoder_does_not_serialize_its_callers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_root(dir.path());
+        paths.ensure().expect("store root");
+        let cfg = Config::default();
+        let spec = crate::model::Spec::from_config(&cfg, &paths);
+        let encoder = Encoder::new(spec, cfg);
+        encoder.inject(Box::new(Slow));
+
+        let writer = Arc::clone(&encoder);
+        let writing =
+            std::thread::spawn(move || writer.with(|e| e.embed_one("a document being written")));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        encoder
+            .with(|e| e.embed_one("a query being searched"))
+            .expect("the read's own embed");
+        let waited = started.elapsed();
+
+        writing
+            .join()
+            .expect("the writer's thread")
+            .expect("its embed");
+        assert!(
+            waited < Duration::from_millis(350),
+            "the read waited {waited:?} for the write's embed: the encoder is serializing them again"
+        );
     }
 }

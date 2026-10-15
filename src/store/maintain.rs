@@ -9,7 +9,7 @@
 //! records what the vectors now correspond to so `doctor` can tell a swapped model from a corrupt
 //! one.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use crate::db::meta;
 use crate::embed::{VecSpec, projection};
@@ -89,6 +89,16 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
         // or drifted index is exactly what this function exists to repair.
         if reset || stored != doc_hash || !indexed.contains(&id) {
             encode::enqueue(&tx, &key, &doc_hash, encode::BACKFILL)?;
+            if reset {
+                // **Clear the hash, or the work never happens.** A reset means the stored vector was
+                // built with a different recipe (or a different width), so it is not this row's vector
+                // *under the current one* — and the worker would otherwise look at the still-matching
+                // `doc_hash`, find the old vector present, decide `needs_embed = false`, and settle the
+                // entry without embedding anything. The re-embed would report 280 queued and change
+                // nothing at all, silently. `doc_hash = ''` is precisely the store saying "no vector for
+                // this text", so the worker embeds.
+                tx.execute("UPDATE memory SET doc_hash = '' WHERE id = ?1", params![id])?;
+            }
             queued += 1;
         }
     }

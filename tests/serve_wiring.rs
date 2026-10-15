@@ -10,9 +10,11 @@
 
 #![cfg(feature = "encoder")]
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+mod common;
+
 use std::time::{Duration, Instant};
+
+use common::{Server, assert_port_free, request, wait_for_health};
 
 /// A port of our own: the live store is on 8888, and this must not touch it. `ELLMEPHANT_TEST_PORT`
 /// overrides, so a busy machine can move it.
@@ -23,46 +25,6 @@ fn port() -> u16 {
         .unwrap_or(8973)
 }
 
-/// The server process, killed on the way out **whatever happens — including a panic**.
-///
-/// A test that leaked a server would hold the port, and the next run would then talk to a zombie whose
-/// store had been deleted along with its temp dir. That is precisely how this test failed the first
-/// time it was written, and it cost ten minutes of a hung search loop to find out.
-struct Server(std::process::Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// One hand-rolled request. No HTTP client on purpose: what this test cares about is the *wording* of
-/// the replies, and scanning the raw bytes for a token is immune to chunked transfer-encoding, which a
-/// parsed body would not be.
-fn request(method: &str, path: &str, body: Option<&str>) -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port())).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok()?;
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
-         Authorization: Bearer tok\r\n"
-    );
-    if let Some(body) = body {
-        head.push_str("Content-Type: application/json\r\n");
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    head.push_str("\r\n");
-    if let Some(body) = body {
-        head.push_str(body);
-    }
-    stream.write_all(head.as_bytes()).ok()?;
-    let mut out = String::new();
-    stream.read_to_string(&mut out).ok()?;
-    Some(out)
-}
-
 #[test]
 #[ignore = "needs Qwen3 weights (ELLMEPHANT_TEST_MODEL_DIR)"]
 fn serve_starts_a_worker_that_indexes_what_was_written() {
@@ -70,47 +32,15 @@ fn serve_starts_a_worker_that_indexes_what_was_written() {
         std::env::var("ELLMEPHANT_TEST_MODEL_DIR").expect("set ELLMEPHANT_TEST_MODEL_DIR");
     let home = tempfile::tempdir().expect("tempdir");
 
-    // The port has to be OURS. Something already listening means a leaked server from an earlier run,
-    // and talking to it would be nonsense — its store lives in a temp dir that no longer exists.
-    assert!(
-        TcpStream::connect(("127.0.0.1", port())).is_err(),
-        "port {} is already in use (a leaked server?); free it with \
-         `pkill -f 'target/debug/ellmephant --home'` and retry",
-        port()
-    );
-
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_ellmephant"))
-        .args(["--home", home.path().to_str().expect("utf8 path")])
-        // `--model-dir` points the encoder at the flat weights and implies offline.
-        .args(["--model-dir", &weights])
-        .args(["mcp", "--host", "127.0.0.1", "--port"])
-        .arg(port().to_string())
-        .env("ELLMEPHANT_WRITE_TOKEN", "tok")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn `ellmephant mcp`");
-    // Killed on every exit path from here, panic included.
-    let _server = Server(child);
-
-    // Wait for the surface, and check it is OURS: a busy port would answer with somebody else's bytes.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match request("GET", "/health", None) {
-            Some(health) if health.contains("ellmephant") => break,
-            _ => {
-                assert!(
-                    Instant::now() < deadline,
-                    "`ellmephant mcp` never answered /health on port {}",
-                    port()
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
+    // The port has to be OURS: something already listening is a leaked server, and its store lives in
+    // a temp dir that no longer exists.
+    assert_port_free(port());
+    // Killed on every exit path from here, a panic included.
+    let _server = Server::start(home.path(), &weights, port());
+    wait_for_health(port(), Duration::from_secs(60));
 
     // A write, over the real door. Nothing in this test drains anything by hand.
-    let reply = request(
+    let reply = request(port(),
         "POST",
         "/memory?format=json",
         Some(
@@ -128,6 +58,7 @@ fn serve_starts_a_worker_that_indexes_what_was_written() {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let found = request(
+            port(),
             "GET",
             "/search?q=which+worker+indexes+what+was+written&format=json",
             None,
@@ -139,7 +70,7 @@ fn serve_starts_a_worker_that_indexes_what_was_written() {
         assert!(
             Instant::now() < deadline,
             "the row never became searchable — did `serve` start the worker? {}",
-            request("GET", "/health?format=json", None).unwrap_or_default()
+            request(port(), "GET", "/health?format=json", None).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(500));
     }

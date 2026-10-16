@@ -1,0 +1,14 @@
+-- 0009_drop_coherent — the split-review verdict LEAVES the schema.
+--
+-- `coherent` was ONE mechanism standing in for two things that have since got their own
+-- homes: "we need to reembed" (the encode queue + `memory_reembed`) and "this row has no
+-- hygiene" (the hygiene cluster). What remained was a stored self-judgement with no reader —
+-- every upsert reset it to NULL (`update_row`'s CASE WHEN ?7), so a verdict's half-life was
+-- one edit.
+--
+-- Fresh stores run 0004 and then this; the ADD stays in history because an applied migration
+-- is never edited (it is keyed by `PRAGMA user_version`) and `doctor` would not notice.
+--
+-- The ROT the column tracked is unaffected: a memory holding two topics is still worth
+-- splitting; the verdict is simply an edit now, not a flag.
+ALTER TABLE memory DROP COLUMN coherent;

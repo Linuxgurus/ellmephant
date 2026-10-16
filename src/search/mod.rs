@@ -63,8 +63,6 @@ pub struct Query {
     pub min_chars: Option<usize>,
     /// Maximum embedded-document length in chars. `None` = no ceiling.
     pub max_chars: Option<usize>,
-    /// Coherence-verdict filter over `memory.coherent`. `None` = any.
-    pub coherent: Option<Coherent>,
     /// Only rows whose `created` is at or after this ISO timestamp.
     pub created_after: Option<String>,
     /// Only rows whose `created` is at or before this ISO timestamp.
@@ -82,43 +80,10 @@ impl Query {
         !self.tags.is_empty()
             || self.min_chars.is_some()
             || self.max_chars.is_some()
-            || self.coherent.is_some()
             || self.created_after.is_some()
             || self.created_before.is_some()
             || self.updated_after.is_some()
             || self.updated_before.is_some()
-    }
-}
-
-/// A predicate over `memory.coherent` (a nullable bool). `!X` reads "not X", so the six
-/// values are exactly the six non-empty proper subsets of `{true, false, null}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Coherent {
-    /// `coherent = true` — judged one coherent topic.
-    True,
-    /// `coherent = false` — judged a grab-bag worth splitting.
-    False,
-    /// `coherent IS NULL` — never judged.
-    Null,
-    /// `NOT true` — false or null (everything not proven coherent; the review queue).
-    NotTrue,
-    /// `NOT false` — true or null.
-    NotFalse,
-    /// `NOT null` — judged at all (true or false).
-    NotNull,
-}
-
-impl Coherent {
-    /// Whether a row's `coherent` value satisfies this predicate.
-    pub fn matches(self, value: Option<bool>) -> bool {
-        match self {
-            Coherent::True => value == Some(true),
-            Coherent::False => value == Some(false),
-            Coherent::Null => value.is_none(),
-            Coherent::NotTrue => value != Some(true),
-            Coherent::NotFalse => value != Some(false),
-            Coherent::NotNull => value.is_some(),
-        }
     }
 }
 
@@ -135,9 +100,6 @@ pub struct Hit {
     /// Attached tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Split-review verdict (§9): `Some(true)`/`Some(false)`/`None` (unjudged).
-    #[serde(default)]
-    pub coherent: Option<bool>,
     /// Length (chars) of the row's embedded document — the size the `min_chars`/`max_chars`
     /// filters key on. Lets a caller sort the fat tail itself (no server-side sort).
     #[serde(default)]
@@ -178,8 +140,6 @@ pub enum Field {
     Title,
     /// Attached tags.
     Tags,
-    /// Split-review verdict (§9).
-    Coherent,
     /// Embedded-document length (chars).
     Chars,
     /// Cosine distance (semantic ranking only).
@@ -188,11 +148,10 @@ pub enum Field {
 
 impl Field {
     /// Every field, in canonical wire order.
-    pub const ALL: [Field; 6] = [
+    pub const ALL: [Field; 5] = [
         Field::Key,
         Field::Title,
         Field::Tags,
-        Field::Coherent,
         Field::Chars,
         Field::Distance,
     ];
@@ -203,7 +162,6 @@ impl Field {
             Field::Key => "key",
             Field::Title => "title",
             Field::Tags => "tags",
-            Field::Coherent => "coherent",
             Field::Chars => "chars",
             Field::Distance => "distance",
         }
@@ -255,7 +213,6 @@ impl Fields {
             Field::Key => serde_json::json!(h.key),
             Field::Title => serde_json::json!(h.title),
             Field::Tags => serde_json::json!(h.tags),
-            Field::Coherent => serde_json::json!(h.coherent),
             Field::Chars => serde_json::json!(h.chars),
             Field::Distance => serde_json::json!(h.distance.map(wire_distance)),
         }
@@ -346,7 +303,6 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
             key: mem.key,
             title: mem.title,
             tags: mem.tags,
-            coherent: mem.coherent,
             chars,
             distance,
         });
@@ -360,7 +316,7 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     Ok(Bundle { hits, neighbors })
 }
 
-/// The ids passing every structured predicate (`tags`, size, `coherent`, time bounds), or `None`
+/// The ids passing every structured predicate (`tags`, size, time bounds), or `None`
 /// when the query carries none (no filtering). Size is the length of the row's embedded document.
 fn filter_set(conn: &Connection, q: &Query) -> Result<Option<HashSet<i64>>> {
     if !q.has_structured() {
@@ -414,9 +370,6 @@ fn passes(mem: &Memory, q: &Query) -> bool {
     }
     let chars = embedded_len(mem);
     if q.min_chars.is_some_and(|min| chars < min) || q.max_chars.is_some_and(|max| chars > max) {
-        return false;
-    }
-    if q.coherent.is_some_and(|c| !c.matches(mem.coherent)) {
         return false;
     }
     // Time bounds compare the STORED ISO shape (`datetime('now')` writes `YYYY-MM-DD HH:MM:SS`)
@@ -593,7 +546,6 @@ mod tests {
             tags: Vec::new(),
             min_chars: None,
             max_chars: None,
-            coherent: None,
             created_after: None,
             created_before: None,
             updated_after: None,

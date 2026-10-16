@@ -31,7 +31,7 @@ attempt.
 - SQLite is the single source of truth (one file, `~/.ellmephant/memory.db`).
 - Embedder *engine* in-binary; *weights* external (disk or HuggingFace).
 - Retrieval by **meaning** (a semantic phrase, KNN) or by **literal** (a substring/regex `pattern`),
-  with optional structured filters (tags, size, coherence); `key`/`tags` remain identity and lookup.
+  with optional structured filters (tags, size); `key`/`tags` remain identity and lookup.
 - Wiki-style links with backlinks and one-hop graph expansion.
 - Multi-client via MCP: one shared memory, many clients (Cline, TypingMind, anything that speaks MCP).
 
@@ -182,9 +182,9 @@ global-unique slug) and gisted by its `title`; the facts live in the `body`, wri
 smart-caveman. It carries `tags` — a normalised, comma-joined list of aspects — and a `source`
 (where it came from: a command, a path, a repo, a quote). A memory is **found** by meaning (the
 semantic `query`) or by a literal/`regex` `pattern`, and narrowed by structured filters (tags,
-size, coherence); it is **read whole** by `memory_get`; and it **points** at other rows with
+size); it is **read whole** by `memory_get`; and it **points** at other rows with
 `[[key]]` — another memory's key, or a project's (`[[prj:key]]`; see §8). Its row also holds runtime
-bookkeeping (`visits`, `times_useful`, `coherent`) that is never written by hand and never
+bookkeeping (`visits`, `times_useful`) that is never written by hand and never
 embedded.
 
 **A write schedules its document; it does not embed it.** The upsert and the row's place in
@@ -234,9 +234,8 @@ Notes: `memory_vec` is **app-written** (SQLite can't embed). `tags` is a normali
 column on `memory` (filtered in Rust, rewritten on rename); there is no FTS index or tag table.
 
 Later migrations add runtime columns to `memory`: `visits` / `times_useful` (0002–0003, usage
-counters) and `coherent` (0004) — the §9 split-review verdict, a **nullable bool** (`NULL` =
-unjudged, `TRUE` = one topic, `FALSE` = a grab-bag worth splitting). `coherent` is not part of
-the embedded document, and an upsert resets it to `NULL` (the row changed, so re-judge it).
+counters). `coherent` (0004) once stored the §9 split-review verdict; **0009 drops it** — the
+verdict is now an edit, not a flag (§9).
 
 ### 7.1 Projects — the structures half (v5)
 
@@ -251,7 +250,7 @@ dates: `start_date` (when the work started) and `end_date` (when it ended, if it
 shape is not something you match by meaning.
 
 Memories and projects are the two halves of one store, and the line between them is drawn where the
-machinery changes. A memory is a **fact** — voted, ranked, judged for coherence, matched by meaning.
+machinery changes. A memory is a **fact** — voted, ranked, matched by meaning.
 A project is a **structure** — identity, fields, relations — so none of that machinery applies to
 it. That is why they are separate tables, and why a **key is a plain name**: a project and a memory
 may share one (`sessions` the project, `sessions` the memories about it — normal, not pathological),
@@ -390,12 +389,12 @@ The store is **atomics-first**; generalization is derived, not stored.
   state) · upsert-by-`key` (whole-body replace, **no auto-merge**) · **merge redundant
   memories by hand** (fold both bodies, upsert the survivor, delete the twin) · trim junk on edit
   — deepen the topic, never add a second (**coherence, not size** — a topic accrues facts over
-  time; # of chars is not the signal, the `coherent` verdict is) · never store cheaply-derivable
+  time, and a grab-bag is a judgement, not a char count) · never store cheaply-derivable
   state.
-- **Split review (`coherent`).** No size or geometry heuristic detects a grab-bag — the judgement
-  is a **read**. Review a fat row with `memory_search` (`min_chars`, `coherent: "!true"` — the rows
-  not proven coherent), split it by hand, then stamp the verdict (`memory_coherent`). An upsert
-  resets the verdict to unjudged, so an edit re-opens review.
+- **Split review.** No size or geometry heuristic detects a grab-bag — the judgement is a **read**.
+  Review a fat row with `memory_search` (`min_chars` — the rows worth a look), read it, and split it
+  by hand. The verdict is the **edit, not a flag**: rewrite a muddled body to deepen one topic, or
+  re-partition genuinely distinct facts into their own keys. Nothing is stamped or stored.
 - **Read policy:** ask for **keys plus titles, tags and scores** (`fields`) — never dumps (tokens
   regress otherwise); the body is a deliberate `memory_get` away. Recall runs **narrow-to-wide**: a semantic phrase
   at a small `k`, judged from titles/tags/distances, `memory_get` only the hit(s) you'll use,
@@ -420,8 +419,6 @@ plus a pattern keeps the semantic ranking and merely drops the rows the pattern 
   columns to return; default = `key` only), and the filters:
   - `tags` — every listed tag must be present (AND).
   - `min_chars` / `max_chars` — bounds on the **embedded-document** length (chars).
-  - `coherent` — the §9 split-review verdict: `true`, `false`, `null`, or negate with `!`
-    (`!true` = false-or-null = the review queue; also `!false`, `!null`); omit = any.
   - `created_after` / `created_before` / `updated_after` / `updated_before` — ISO windows over the
     row's timestamps, compared **lexicographically** (which is why the stored shape is ISO: it sorts
     as it reads). `updated_after` is the *"what changed since I last woke"* filter; `created_before`
@@ -433,7 +430,7 @@ plus a pattern keeps the semantic ranking and merely drops the rows the pattern 
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
 - **Returns:** `key` **alone by default** — **never the body** (fetch it with `memory_get`/`show`).
-  The caller names any extra `fields` it wants (`title`, `tags`, `coherent`, `chars`, `distance`);
+  The caller names any extra `fields` it wants (`title`, `tags`, `chars`, `distance`);
   they are added in that **canonical order**, `key` always leading. So a hit says *which* memory,
   and nothing more unless asked — the lean default keeps a search from bloating context. Over MCP
   this is emitted as **positional JSON**: a top-level `cols` header names the returned fields and
@@ -453,7 +450,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
 `memory_delete`, `memory_merge`,
 `memory_search`,
-`memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
+`memory_get`, `memory_backlinks`, `memory_upvote`, `memory_stats`,
 `memory_dupes`, `memory_reembed`, `project_upsert`, `project_get`, `project_list`.
 
 - **Each tool states its own law in its own description** — that is what the model actually
@@ -471,7 +468,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   meaning lives in that field's schema.
 - `memory_search` takes a semantic `query`, a lexical `pattern` (+ `mode`), the ranking knobs
   `k`/`max_distance`/`expand`, the `fields` projection (default `key` only), and the structured
-  filters `tags` (AND), `min_chars`/`max_chars` and `coherent` (§10); there is still no `key` leg —
+  filters `tags` (AND) and `min_chars`/`max_chars` (§10); there is still no `key` leg —
   `memory_get` reads a known key.
 - The list-shaped reads return **positional JSON** to keep the LLM-facing payload small: a
   top-level `cols` header names the fields and the rows are bare arrays, **one row per line**
@@ -482,22 +479,17 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   `{"cols":["key",…],"hits":[[…],…]}` (`key` default; `fields` adds columns per §10); link `neighbors`
   (with `expand>0`) carry their own `cols`/`rows` table. `memory_backlinks` →
   `{"cols":["key","title"],"backlinks":[[…],…]}`. `--json`/core keep the keyed form.
-- `memory_coherent` records the §9 split-review verdict for a key (`true` = one topic, `false` =
-  a grab-bag, omit/`null` = unjudged); an upsert resets it to unjudged.
 - `memory_upsert` / `project_upsert` are **partial** writes: every field is optional, and an omitted
   field keeps the value already stored under `key`. That is what lets one field change without
   resending the row. Empty is an instruction only where empty is a **fact** — `source: ""`,
   `tags: []`, `owner: []` clear — and is **refused** where empty is nonsense (`title`, `body`,
   `status`), so an empty `status` cannot quietly read as `todo`. A create (a key with no row) still
   needs its minimum: a `title` and a `body` for a memory, a `title` for a project.
-- The write law is **per-field invalidation**, and it separates two questions. *Re-embed?* follows
+- The write law is **per-field invalidation**, and it asks one question. *Re-embed?* follows
   the document (`key` + title + body): `title`/`body` re-embed, `tags`/`source` do not, and
-  a project never does. *Re-judge?* follows **meaning**: `coherent` clears only when the title or the
-  body actually changed, because a tag or a source is *filing*, not *meaning*. So a patch that
-  changes nothing re-embeds nothing and un-judges nothing — and, unlike a whole-row write, a tags or
-  source edit no longer re-opens the §9 split review, nor moves the vector. Membership in a project
-  is a `tags` write
-  (`prj:<key>`); `project_upsert`'s `status` still follows the §7.1 date rules.
+  a project never does. So a `tags` or `source` edit is *filing*, not *meaning*: it moves no vector.
+  Membership in a project is a `tags` write (`prj:<key>`); `project_upsert`'s `status` still follows
+  the §7.1 date rules.
 - `memory_upvote` takes one or more `keys` (`{keys:[…]}`) and bumps `times_useful` for each that
   exists — a feedback sweep in one call. It returns `{status, upvoted:[{key,times_useful}], missing?}`;
   a key that does not exist is reported in `missing` (not fatal), but a sweep that hits **nothing**
@@ -608,7 +600,7 @@ any model is touched; flags are re-checked the same way after they override the 
 
 1. **Golden eval set + `bench`** — shipped (P10): `tests/golden/` (corpus + ≥20 questions),
    `bench` / `--golden` / `--sweep`; default `k=10`; recall@3 gate 0.8. Grown from real usage.
-2. **MCP tool schema + annotations** — shipped (P7): 9 tools with JSON-Schema params and
+2. **MCP tool schema + annotations** — shipped (P7): 9 tools (13 today) with JSON-Schema params and
    read-only / destructive / idempotent hints (`src/mcp`).
 3. **Rename implementation + collision policy** — shipped (P9) in the store layer: one transaction
    rewrites `[[old]]` and repoints edges; refuses to clobber an existing key

@@ -17,8 +17,8 @@ use crate::config::Paths;
 use crate::db;
 use crate::http::HttpState;
 use crate::mcp::{
-    CoherentFilter, DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SERVER_NAME,
-    SearchParams, instructions, json_ok, tool_catalog,
+    DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SERVER_NAME, SearchParams,
+    instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
 use crate::store::{self, encode, links::backlinks_to_wire_json, project, tags};
@@ -67,11 +67,6 @@ pub const ROUTES: &[Route] = &[
         method: "GET",
         path: "/memory/{key}/backlinks",
         tool: "memory_backlinks",
-    },
-    Route {
-        method: "PUT",
-        path: "/memory/{key}/coherent",
-        tool: "memory_coherent",
     },
     Route {
         method: "POST",
@@ -497,8 +492,8 @@ async fn body_bytes(body: Body) -> Result<Vec<u8>, String> {
 
 /// The request's JSON body, when it sent one — `None` for an empty body or a non-JSON content type.
 ///
-/// This is what lets a route take its arguments **the way the MCP tool does** (`{"into": ...}`,
-/// `{"coherent": ...}`) *and* its own query parameters, so a caller that knows the tool can post the
+/// This is what lets a route take its arguments **the way the MCP tool does** (`{"into": ...}`)
+/// *and* its own query parameters, so a caller that knows the tool can post the
 /// tool's own arguments unchanged. Parity is the point of this door; guessing at the shape is not.
 async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json::Value>, String> {
     if !is_json_content(headers) {
@@ -760,7 +755,6 @@ pub async fn upsert(
                 "status": if out.created { "created" } else { "updated" },
                 "key": key.clone(),
                 "queued": out.queued,
-                "coherent_reset": out.coherent_reset,
             });
             // Filled in below when `?wait=true` was asked for.
             let mut indexed: Option<bool> = None;
@@ -971,96 +965,6 @@ pub async fn merge(
     }
 }
 
-/// `PUT /memory/{key}/coherent?value=true|false|null` — the split-review verdict (`memory_coherent`).
-pub async fn coherent(
-    State(state): State<HttpState>,
-    Path(key): Path<String>,
-    RawQuery(raw): RawQuery,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let params = Params::parse(raw.as_deref());
-    let json = params.json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    // Two ways in, one meaning. The MCP tool takes `{"key", "coherent"}` — accept exactly that as the
-    // body, so a caller can send the tool's own arguments unchanged; a body field that is absent is
-    // `null` (unjudged), which is what an optional field means on the tool. `?value=` stays for a
-    // caller that only has a URL.
-    let body = match json_body(&headers, body).await {
-        Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
-    };
-    if let Some(given) = body
-        .as_ref()
-        .and_then(|b| b.get("key"))
-        .and_then(|k| k.as_str())
-        && given != key
-    {
-        return error(
-            json,
-            StatusCode::BAD_REQUEST,
-            format!("body `key` is `{given}` but the path names `{key}`"),
-        );
-    }
-    let value = match body.as_ref().and_then(|b| b.get("coherent")) {
-        Some(serde_json::Value::Bool(b)) => Some(*b),
-        Some(serde_json::Value::Null) => None,
-        Some(other) => {
-            return error(
-                json,
-                StatusCode::BAD_REQUEST,
-                format!("bad `coherent`: {other} (true, false or null)"),
-            );
-        }
-        None if body.is_some() => None,
-        None => match params.get("value") {
-            Some("true") => Some(true),
-            Some("false") => Some(false),
-            Some("null") => None,
-            Some(other) => {
-                return error(
-                    json,
-                    StatusCode::BAD_REQUEST,
-                    format!("bad `value`: {other} (one of: true, false, null)"),
-                );
-            }
-            None => {
-                return error(
-                    json,
-                    StatusCode::BAD_REQUEST,
-                    "missing the verdict: send `?value=true|false|null`, or a JSON body {\"coherent\": …}",
-                );
-            }
-        },
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let mark = key.clone();
-    match server
-        .with_store("memory_coherent", move |s| s.mark_coherent(&mark, value))
-        .await
-    {
-        Ok(()) => {
-            tracing::info!(area = scope.area, key = %key, coherent = ?value, "marked over http");
-            render(
-                StatusCode::OK,
-                json,
-                json_ok(serde_json::json!({ "status": "marked", "key": key, "coherent": value })),
-                format!(
-                    "marked {key} (coherent={})",
-                    value.map_or("null", |v| if v { "true" } else { "false" })
-                ),
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
-    }
-}
-
 /// `POST /reembed` — queue every document that needs (re-)embedding (`memory_reembed`).
 ///
 /// It used to be the heaviest lock holder in the store: one transaction from the first row to the last,
@@ -1192,10 +1096,6 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
             }
         }
     }
-    let coherent = match p.maybe("coherent") {
-        Some(c) => Some(coherent_param(c)?),
-        None => None,
-    };
     let mut tags = p.all("tag");
     tags.extend(p.all("tags"));
     Ok(SearchParams {
@@ -1208,7 +1108,6 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         tags,
         min_chars: p.parse_as::<usize>("min_chars")?,
         max_chars: p.parse_as::<usize>("max_chars")?,
-        coherent,
         created_after: p.maybe("created_after").map(str::to_string),
         created_before: p.maybe("created_before").map(str::to_string),
         updated_after: p.maybe("updated_after").map(str::to_string),
@@ -1241,23 +1140,9 @@ fn field_param(name: &str) -> Option<FieldParam> {
         "key" => Some(FieldParam::Key),
         "title" => Some(FieldParam::Title),
         "tags" => Some(FieldParam::Tags),
-        "coherent" => Some(FieldParam::Coherent),
         "chars" => Some(FieldParam::Chars),
         "distance" => Some(FieldParam::Distance),
         _ => None,
-    }
-}
-
-/// The `coherent` filter value.
-fn coherent_param(raw: &str) -> Result<CoherentFilter, String> {
-    match raw {
-        "true" => Ok(CoherentFilter::True),
-        "false" => Ok(CoherentFilter::False),
-        "null" => Ok(CoherentFilter::Null),
-        "!true" => Ok(CoherentFilter::NotTrue),
-        "!false" => Ok(CoherentFilter::NotFalse),
-        "!null" => Ok(CoherentFilter::NotNull),
-        other => Err(format!("bad `coherent`: {other}")),
     }
 }
 

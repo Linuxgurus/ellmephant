@@ -129,6 +129,12 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         .unwrap();
     // A v4 store predates the encode queue as well.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
+    // ...and it still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
+    conn.execute(
+        "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
+        [],
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -179,6 +185,12 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
+    // ...and still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
+    conn.execute(
+        "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
+        [],
+    )
+    .unwrap();
     drop(conn);
 
     // 0006 interprets the prefix exactly once — while it still means something — and 0007 then

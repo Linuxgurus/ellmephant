@@ -18,7 +18,10 @@
 //!   * no cascade from `memory` (there is no FK), so history survives a delete — which makes erasure
 //!     a POLICY ([`erase`]) rather than an accident of the schema;
 //!   * nothing when `memory_merge` absorbs a row: a merge is lossless by construction, so there is
-//!     nothing to preserve.
+//!     nothing to preserve;
+//!   * a DELETE **does** snapshot: it supersedes the state the memory is in, so the newest version of
+//!     a deleted key IS the content it held. A delete therefore loses nothing — it only silences an
+//!     address — which makes [`erase`] the store's single true destroyer.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};

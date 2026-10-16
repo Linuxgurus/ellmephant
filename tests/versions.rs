@@ -99,12 +99,17 @@ fn history_survives_a_delete_so_erasure_is_a_policy() -> Result<()> {
 
     // No FK on the version table, so history OUTLIVES the row. That is deliberate: the evidence of
     // what a key said is worth more than the tidiness of a cascade.
-    assert_eq!(count(&conn, "SELECT count(*) FROM memory_version"), 1);
+    assert_eq!(count(&conn, "SELECT count(*) FROM memory_version"), 2);
     let v = store::version::read(&conn, "gone", 1)?.expect("still there");
     assert_eq!(v["body"], "first");
+    // AND the delete snapshotted the state it removed, so the newest version IS what the key said
+    // when it died. Nothing is lost by a delete — only an address goes quiet.
+    let last = store::version::read(&conn, "gone", 2)?.expect("the deleted state");
+    assert_eq!(last["body"], "second");
 
-    // Which makes erasure a POLICY rather than an accident: one act, and it is gone.
-    assert_eq!(store::version::erase(&conn, "gone")?, 1);
+    // Which makes erasure a POLICY rather than an accident: one act, and it is gone. This is now the
+    // store's ONLY true destroyer, because every other write path keeps what it supersedes.
+    assert_eq!(store::version::erase(&conn, "gone")?, 2);
     assert_eq!(count(&conn, "SELECT count(*) FROM memory_version"), 0);
     assert_eq!(
         store::version::erase(&conn, "gone")?,
@@ -136,7 +141,7 @@ fn the_index_finds_history_whose_row_is_gone() -> Result<()> {
         gone.orphan,
         "its row is gone, so the history is the only copy"
     );
-    assert_eq!(gone.versions, 1);
+    assert_eq!(gone.versions, 2, "the edit AND the delete's own snapshot");
     // ...and it is still readable one version at a time, by ADDRESS.
     assert_eq!(
         store::version::read(&conn, "gone", 1)?.expect("version 1")["body"],

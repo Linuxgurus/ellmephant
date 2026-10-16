@@ -438,6 +438,11 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
         })
         .optional()?;
     if let Some(id) = id {
+        // A delete SUPERSEDES the state the memory is in, so it snapshots it first — exactly as an
+        // edit does, and in the same transaction. Without this, a deleted key's newest version would
+        // be some earlier state and the content it actually held would be the one thing versioning
+        // did not keep; with it, `erase` is the store's single true destroyer.
+        version::snapshot(&tx, id, key, None)?;
         tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
         index::vec::delete(&tx, id)?;
     }

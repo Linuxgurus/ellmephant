@@ -918,12 +918,11 @@ pub async fn memory_delete(
                 json_ok(serde_json::json!({
                     "status": "removed",
                     "key": key,
+                    // The newest of these is the state it was deleted in (the delete snapshots it).
                     "versions_remaining": remaining,
-                    // The count alone would read as "recoverable". It is not (see the MCP tool).
-                    "final_state_kept": false,
                 })),
                 format!(
-                    "deleted {key} ({remaining} earlier version(s) remain; the state it had is gone)"
+                    "deleted {key} ({remaining} version(s) remain, the newest being the state it had)"
                 ),
             )
         }

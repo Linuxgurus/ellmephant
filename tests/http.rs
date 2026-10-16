@@ -1652,9 +1652,8 @@ async fn history_is_reachable_by_address_after_the_row_is_gone() {
     )
     .expect("delete json");
     assert_eq!(receipt["status"], "removed");
-    assert_eq!(receipt["versions_remaining"], 1);
-    // The boundary, stated: what remains is the state an EDIT superseded, not the state it had.
-    assert_eq!(receipt["final_state_kept"], false);
+    // The delete snapshotted the state it removed, so what remains is COMPLETE: both states.
+    assert_eq!(receipt["versions_remaining"], 2);
 
     // The row is gone from the door...
     let (status, _, _) = request(&app, Method::GET, "/memory/kept", None, None, "").await;
@@ -1664,6 +1663,25 @@ async fn history_is_reachable_by_address_after_the_row_is_gone() {
         request(&app, Method::GET, "/memory/kept?version=1", None, None, "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("first state"), "{body}");
+    // A delete loses NOTHING: the newest version IS the state it was deleted in, so the content it
+    // held survives the row. That is why `erase` is the only real destroyer left.
+    let (status, body, _) =
+        request(&app, Method::GET, "/memory/kept?version=2", None, None, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("second state"), "{body}");
+    let listed: serde_json::Value = serde_json::from_str(
+        &tool(
+            &peer,
+            "memory_history",
+            serde_json::json!({ "key": "kept" }),
+        )
+        .await,
+    )
+    .expect("history json");
+    assert_eq!(
+        listed["count"], 2,
+        "the delete added a version, not removed one"
+    );
     let idx: serde_json::Value = serde_json::from_str(
         &tool(
             &peer,

@@ -113,3 +113,40 @@ fn history_survives_a_delete_so_erasure_is_a_policy() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn the_index_finds_history_whose_row_is_gone() -> Result<()> {
+    // A delete leaves an ADDRESS with history behind it. Nothing lists deleted keys, so the
+    // question "where did it go?" needs its own answer: the index of history, with orphans marked.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    common::add_now(&conn, &embedder, &memory("kept", "Kept", "first"))?;
+    common::add_now(&conn, &embedder, &memory("kept", "Kept", "second"))?;
+    common::add_now(&conn, &embedder, &memory("gone", "Gone", "first"))?;
+    common::add_now(&conn, &embedder, &memory("gone", "Gone", "second"))?;
+    assert!(store::delete(&conn, "gone")?);
+
+    let idx = store::version::index(&conn)?;
+    assert_eq!(idx.len(), 2, "two keys hold history");
+
+    let gone = idx.iter().find(|i| i.key == "gone").expect("orphan listed");
+    assert!(
+        gone.orphan,
+        "its row is gone, so the history is the only copy"
+    );
+    assert_eq!(gone.versions, 1);
+    // ...and it is still readable one version at a time, by ADDRESS.
+    assert_eq!(
+        store::version::read(&conn, "gone", 1)?.expect("version 1")["body"],
+        "first"
+    );
+
+    let kept = idx
+        .iter()
+        .find(|i| i.key == "kept")
+        .expect("live key listed");
+    assert!(!kept.orphan);
+    Ok(())
+}

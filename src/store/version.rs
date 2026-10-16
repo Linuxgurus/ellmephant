@@ -155,3 +155,47 @@ pub fn erase(conn: &Connection, key: &str) -> Result<usize> {
         params![MEMORY, key],
     )?)
 }
+
+/// One key's roll-up for the history INDEX: what you can see without fetching a single body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryIndex {
+    /// The address the history belongs to.
+    pub key: String,
+    /// How many versions it holds.
+    pub versions: i64,
+    /// When the most recent snapshot was taken.
+    pub last_written: String,
+    /// True when the `memory` row is GONE: this history is then the ONLY copy of that content.
+    pub orphan: bool,
+}
+
+/// Every key that has versions, with a count and the last write — the INDEX of history.
+///
+/// It answers the question a delete raises: *where did it go?* A key with no row still has an
+/// address, and its versions are still reachable one at a time by [`read`]. Discovery is by KEY, not
+/// by meaning (a version is never embedded), and that is enough in practice because keys are
+/// descriptive slugs — the key list IS the search index for history.
+///
+/// `orphan` is the flag that matters most: it marks history whose row is gone. For an orphan,
+/// history IS the source, so a retention pass must treat it differently — prune orphans LAST or not
+/// at all, because pruning one is a real deletion of the only copy.
+pub fn index(conn: &Connection) -> Result<Vec<HistoryIndex>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.key, count(*) AS versions, max(v.written_at) AS last_written,
+                (m.id IS NULL) AS orphan
+           FROM memory_version v
+           LEFT JOIN memory m ON m.key = v.key
+          WHERE v.type = ?1
+          GROUP BY v.key
+          ORDER BY v.key",
+    )?;
+    let rows = stmt.query_map(params![MEMORY], |r| {
+        Ok(HistoryIndex {
+            key: r.get(0)?,
+            versions: r.get(1)?,
+            last_written: r.get(2)?,
+            orphan: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}

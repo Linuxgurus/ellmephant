@@ -60,6 +60,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0010_rename_doc_hash.sql"),
         "rename doc_hash -> encode_hash: the column says it is this row's embedding state",
     ),
+    (
+        11,
+        include_str!("../../migrations/0011_memory_versions.sql"),
+        "memory versions: the state a document change replaces",
+    ),
 ];
 
 /// Current schema version recorded in the file.

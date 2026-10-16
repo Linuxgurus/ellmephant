@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::error::Result;
-use crate::store::{encode, links, tags};
+use crate::store::{encode, links, tags, version};
 
 /// How many of the busiest tags the digest carries.
 pub const TOP_TAGS: usize = 10;
@@ -102,6 +102,15 @@ pub struct Stats {
     /// Age of the oldest pending document, in seconds — `None` when nothing is queued. If this only
     /// grows, the worker is not running or not keeping up; nothing else in the store would show it.
     pub encode_oldest_s: Option<i64>,
+    /// Rows in `memory_version` — the states writes have superseded (migration 0011). Zero is normal
+    /// on a young store; it only grows, because nothing but `memory_history_erase` removes a row.
+    pub versions: i64,
+    /// Bytes of snapshot content those versions hold, so what history costs is VISIBLE rather than a
+    /// surprise at the next backup.
+    pub version_bytes: i64,
+    /// Keys whose `memory` row is GONE while their history remains. For an orphan the newest version
+    /// IS the content it held, so these are the rows a retention pass must not thin.
+    pub version_orphans: i64,
 }
 
 impl Stats {
@@ -245,6 +254,17 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     // has been. Derived state, but the only place the store reports on its own indexing.
     let queue = encode::counts(conn)?;
 
+    // The version side table, reported so history cannot grow unseen: rows, bytes, and the ORPHANS
+    // (history whose memory is gone, and whose newest version is therefore the only copy of it).
+    let (versions, version_bytes) = version::count(conn)?;
+    let version_orphans: i64 = conn.query_row(
+        "SELECT count(DISTINCT v.key) FROM memory_version v \
+          LEFT JOIN memory m ON m.key = v.key \
+          WHERE m.id IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+
     Ok(Stats {
         memories,
         db_bytes,
@@ -277,6 +297,9 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
         encode_pending: queue.pending,
         encode_failed: queue.failed,
         encode_oldest_s: queue.oldest_s,
+        versions,
+        version_bytes,
+        version_orphans,
     })
 }
 
@@ -387,6 +410,9 @@ mod tests {
             encode_pending: 0,
             encode_failed: 0,
             encode_oldest_s: None,
+            versions: 0,
+            version_bytes: 0,
+            version_orphans: 0,
         }
     }
 

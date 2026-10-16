@@ -46,6 +46,7 @@ pub const TOOLS: &[&str] = &[
     "memory_merge",
     "memory_search",
     "memory_get",
+    "memory_history",
     "memory_backlinks",
     "memory_upvote",
     "memory_stats",
@@ -158,6 +159,21 @@ that earned its keep in one call; under-voting starves the store's own rankings.
 /// the moment of use (cf. the telemetry lesson).
 pub(crate) const GET_NUDGE: &str = "Shaped your task? memory_upvote this key.";
 
+/// `memory_history` description — the read law for history: metadata only, two shapes, and the fact
+/// that a key does not have to exist to have one.
+const HISTORY_DESCRIPTION: &str = "\
+List a memory's versions: the states its DOCUMENT (`title` + `body`) held before each change, oldest \
+first — so `n = 1` is the first state that was replaced, and the state you see in the live row is the \
+one that is NOT here. Bodies are not returned: pick an `n` from this list, then read it with \
+`memory_get version=N`. Omit `key` for the INDEX of every key holding versions, where `orphan` marks \
+keys whose memory is GONE — that history is then the only copy of its content, which is why a delete \
+leaves something findable. A version is reached by ADDRESS and is never embedded: `memory_history KEY` \
+answers for a deleted key exactly as it does for a live one.";
+
+/// Cap on rows returned by a bare `memory_history` call; the reply always states the true total, so a
+/// truncated list is a visible fact rather than a silent one.
+pub(crate) const HISTORY_LIMIT: usize = 100;
+
 /// `memory_dupes` description. A finder for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
 Find duplicate *candidates*: memory pairs whose documents sit closer than a tight `max_distance` \
@@ -264,6 +280,12 @@ pub struct UpsertParams {
         description = "Aspects of the subject, e.g. storage, gotchas. Omit to keep the stored tags; `[]` clears them."
     )]
     pub tags: Option<Vec<String>>,
+    /// Why this change is being made, for the version it supersedes.
+    #[serde(default)]
+    #[schemars(
+        description = "Why THIS change — recorded beside the version this write creates, so a later reader (`memory_history`) learns the intent instead of reconstructing it. Only a change to `title`/`body` creates a version; a note alone does not."
+    )]
+    pub version_note: Option<String>,
 }
 
 impl UpsertParams {
@@ -275,6 +297,7 @@ impl UpsertParams {
             body: self.body,
             source: self.source,
             tags: self.tags,
+            version_note: self.version_note,
         }
     }
 }
@@ -404,6 +427,41 @@ pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
     pub key: String,
+}
+
+/// Parameters for [`MemoryServer::memory_get`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetParams {
+    /// The memory's key.
+    #[schemars(description = "Memory key. Slug.")]
+    pub key: String,
+    /// Read a PAST state instead of the live one.
+    #[schemars(
+        description = "Read version `n` instead of the live row — the state that change replaced. `memory_history KEY` lists them. Counts no `visits`: a past state is not the memory."
+    )]
+    #[serde(default)]
+    pub version: Option<i64>,
+}
+
+/// Parameters for [`MemoryServer::memory_history`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HistoryParams {
+    /// The key whose versions to list; omitted, the reply is the index of every key that has one.
+    #[schemars(
+        description = "Memory key. Slug. OMIT for the index of every key holding versions — which is how a key whose memory is GONE is found at all (`orphan`)."
+    )]
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Index mode only: just the orphans.
+    #[schemars(
+        description = "Index mode only (`key` omitted): return just the keys whose memory is GONE — history that is now the only copy of its content."
+    )]
+    #[serde(default)]
+    pub orphans_only: bool,
+    /// Cap the rows returned.
+    #[schemars(description = "Most rows to return. The reply states the true total regardless.")]
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Parameters for [`MemoryServer::memory_merge`].
@@ -1034,7 +1092,7 @@ impl MemoryServer {
     /// Delete one memory by key.
     #[tool(
         name = "memory_delete",
-        description = "Kill one memory by `key`. No undo. Gone. Use `memory_merge` when another memory should absorb it: a bare delete leaves every `[[key]]` pointing at it dangling, and `memory_stats` will report the store as damaged. Unsure rather than wrong? Reword it instead.",
+        description = "Kill one memory by `key` — gone from search and from `memory_get`, no undo. Nothing is LOST: the delete snapshots the state it removes first, so its VERSIONS remain and the NEWEST of them is the content it held (`memory_history KEY`). `memory_history_erase` is the act that truly destroys. Use `memory_merge` when another memory should absorb it: a bare delete leaves every `[[key]]` pointing at it dangling, and `memory_stats` will report the store as damaged. Unsure rather than wrong? Reword it instead.",
         annotations(
             title = "Delete memory",
             read_only_hint = false,
@@ -1049,14 +1107,25 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let key = p.key;
         let rm_key = key.clone();
-        if self
-            .with_store("memory_delete", move |s| s.rm(&rm_key))
+        // The receipt says what the delete did NOT remove. History outlives the row by design, and a
+        // delete that stays silent about that reads as "gone" when it means "not findable as current".
+        if let Some(remaining) = self
+            .with_store("memory_delete", move |s| {
+                if !s.rm(&rm_key)? {
+                    return Ok(None);
+                }
+                Ok(Some(s.version_count(&rm_key)?))
+            })
             .await?
         {
-            tracing::info!(tool = "memory_delete", key = %key, "memory removed");
-            Ok(json_ok(
-                serde_json::json!({ "status": "removed", "key": key }),
-            ))
+            tracing::info!(tool = "memory_delete", key = %key, versions = remaining, "memory removed");
+            Ok(json_ok(serde_json::json!({
+                "status": "removed",
+                "key": key,
+                // The newest of these IS the state the memory was deleted in, because the delete
+                // snapshots what it removes: the count is a count of recoverable states.
+                "versions_remaining": remaining,
+            })))
         } else {
             tracing::warn!(tool = "memory_delete", key = %key, "no such memory");
             Err(format!("no such memory: {key}"))
@@ -1183,9 +1252,25 @@ impl MemoryServer {
     )]
     async fn memory_get(
         &self,
-        Parameters(p): Parameters<KeyParams>,
+        Parameters(p): Parameters<GetParams>,
     ) -> std::result::Result<String, String> {
         let key = p.key;
+        // A VERSION is reached by address, never resolved through the live row (which need not exist
+        // — its history outlives it), and it counts no visit: `visits` measures the memory, not a
+        // state the memory held.
+        if let Some(n) = p.version {
+            let lookup = key.clone();
+            let past = self
+                .with_read("memory_get", move |s| s.version(&lookup, n))
+                .await?
+                .ok_or_else(|| format!("no version {n} for {key}"))?;
+            let mut v = serde_json::to_value(&past).map_err(|e| e.to_string())?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("version".to_string(), serde_json::json!(n));
+                obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+            }
+            return serde_json::to_string(&v).map_err(|e| e.to_string());
+        }
         let lookup = key.clone();
         let mut mem = self
             .with_read("memory_get", move |s| s.show(&lookup))
@@ -1204,6 +1289,51 @@ impl MemoryServer {
             obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
         }
         serde_json::to_string(&v).map_err(|e| e.to_string())
+    }
+
+    /// List a memory's versions, or the index of every key that holds one.
+    #[tool(
+        name = "memory_history",
+        description = HISTORY_DESCRIPTION,
+        annotations(
+            title = "Memory history",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_history(
+        &self,
+        Parameters(p): Parameters<HistoryParams>,
+    ) -> std::result::Result<String, String> {
+        let cap = p.limit.unwrap_or(HISTORY_LIMIT as u32) as usize;
+        match p.key {
+            Some(key) => {
+                let lookup = key.clone();
+                let rows = self
+                    .with_read("memory_history", move |s| s.versions(&lookup))
+                    .await?;
+                let total = rows.len();
+                tracing::debug!(tool = "memory_history", key = %key, total, "history listed");
+                Ok(json_ok(serde_json::json!({
+                    "key": key,
+                    "count": total,
+                    "versions": rows.into_iter().take(cap).collect::<Vec<_>>(),
+                })))
+            }
+            None => {
+                let orphans = p.orphans_only;
+                let rows = self
+                    .with_read("memory_history", move |s| s.version_index(orphans))
+                    .await?;
+                let total = rows.len();
+                Ok(json_ok(serde_json::json!({
+                    "count": total,
+                    "keys": rows.into_iter().take(cap).collect::<Vec<_>>(),
+                })))
+            }
+        }
     }
 
     /// Bump the `times_useful` counter on a memory that helped the task.
@@ -1553,6 +1683,7 @@ pub fn http_router(
         .route("/health", axum::routing::get(crate::http::health))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
+        .route("/history", axum::routing::get(surface::history))
         .route(
             "/memory/{key}",
             axum::routing::get(surface::memory_get).delete(surface::memory_delete),

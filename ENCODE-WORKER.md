@@ -137,7 +137,6 @@ fn add_impl(
     conn: &Connection,
     spec: &VecSpec,
     mem: &Memory,
-    reset_coherent: bool,
 ) -> Result<(i64, String, bool)>;   // (id, key, queued)
 ```
 
@@ -154,7 +153,7 @@ ON CONFLICT(key) DO UPDATE SET
 ```
 
 and it runs **iff `prepared.needs_embed()`**. That one condition keeps the whole "filing, not
-meaning" class free — a tag-only edit, a `source` change, `mark_coherent`, `record_visit`,
+meaning" class free — a tag-only edit, a `source` change, `record_visit`,
 `record_useful`, a project merge — because none of them move the document, so none of them queue an
 embed.
 
@@ -373,7 +372,7 @@ The suite is the point of the design, so it is specified with it.
 - `encode_one` then `encode_one` again → no work the second time (idempotent).
 - **the guard**: enqueue, rewrite the row, `encode_one` → the queue entry **survives** with the
   newer hash. This is the race the whole design turns on; it gets a written-down assertion.
-- a tag-only write and `mark_coherent`/`record_visit`/`record_useful` enqueue **nothing**.
+- a tag-only write and `record_visit`/`record_useful` enqueue **nothing**.
 - `delete` and `merge_into` drop the queue row; `rename` re-enqueues the new key.
 - priority: a p0 enqueued after a p1 is claimed first.
 - `row_hash(&spec, …)` output is **unchanged** by the Phase 0 refactor (pin it against a literal,

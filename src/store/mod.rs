@@ -57,11 +57,6 @@ pub struct Memory {
     /// Count of explicit "this helped" marks from an agent; runtime counter, never in the embed.
     #[serde(default)]
     pub times_useful: i64,
-    /// Split-review verdict: `Some(true)` = one topic, `Some(false)` = a grab-bag worth
-    /// splitting, `None` = not yet judged. Runtime property, never in the embed; an upsert
-    /// resets it to `None` (the row changed, so re-judge it).
-    #[serde(default)]
-    pub coherent: Option<bool>,
 }
 
 /// One row's index entry: identity and shape, without the body (the `list` surface, SPEC §14).
@@ -143,7 +138,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _) = add_impl(conn, spec, mem, true)?;
+    let (id, key, _) = add_impl(conn, spec, mem)?;
     Ok((id, key))
 }
 
@@ -168,10 +163,8 @@ fn check_body(body: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`add`] with the split-review verdict's fate made explicit. `reset_coherent` is `true` for a
-/// whole-row write — the row's shape may have changed, so re-judge it — and `false` for a merge that
-/// left the title and the body alone. Returns whether the document actually moved (and so whether a
-/// job was queued).
+/// The shared body of [`add`] and [`merge`]. It also reports whether the document actually moved
+/// (and so whether a job was queued), which [`add`]'s own callers do not need.
 ///
 /// **The embed that used to live here is gone**, and with it the encoder: an inference under the
 /// session lock is what made one slow write a store-wide stall. The row and its queue entry are
@@ -182,17 +175,12 @@ fn check_body(body: &str) -> Result<()> {
 /// create it is the code holding a vector ([`crate::store::encode::settle_encoded`], via
 /// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
 /// config said rather than what the encoder actually emits.
-fn add_impl(
-    conn: &Connection,
-    spec: &VecSpec,
-    mem: &Memory,
-    reset_coherent: bool,
-) -> Result<(i64, String, bool)> {
+fn add_impl(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String, bool)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, spec, mem)?;
     let queued = prepared.needs_embed();
     let tx = conn.unchecked_transaction()?;
-    let id = apply(&tx, mem, &prepared, reset_coherent)?;
+    let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
     Ok((id, prepared.key, queued))
 }
@@ -226,17 +214,14 @@ pub struct MergeOutcome {
     /// True when the embedded document changed, so an embed was **queued** (not performed — see
     /// `ENCODE-WORKER.md`). Named for what the store did, which is all it can honestly promise now.
     pub queued: bool,
-    /// True when the split-review verdict was cleared (the title or the body moved).
-    pub coherent_reset: bool,
 }
 
 /// Upsert ONE memory from a partial [`Patch`]: `None` keeps the stored value, `Some` replaces it.
 /// A key with no row is created, and then `title` and `body` are both required — there is nothing
 /// to keep.
 ///
-/// Queues an embed only when the embedded document (`key` + title + body) actually changes, and
-/// clears `coherent` only when the title or the body changes: a tag or a source is *filing*, not
-/// *meaning*, so it must not re-open the split review (SPEC §9).
+/// Queues an embed only when the embedded document (`key` + title + body) actually changes: a tag or
+/// a source is *filing*, not *meaning* (SPEC §9).
 pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOutcome> {
     let probe = Memory {
         key: patch.key.clone().unwrap_or_default(),
@@ -246,7 +231,7 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
     let key = resolve_key(conn, &probe)?;
     let existing = get(conn, &key)?;
 
-    let (mem, reset_coherent, created) = match existing {
+    let (mem, created) = match existing {
         Some(old) => {
             let title = patch.title.clone().unwrap_or_else(|| old.title.clone());
             let body = patch.body.clone().unwrap_or_else(|| old.body.clone());
@@ -260,7 +245,6 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     "`body` cannot be empty; omit it to leave the stored body alone".into(),
                 ));
             }
-            let reset = title != old.title || body != old.body;
             let source = match &patch.source {
                 Some(s) => (!s.trim().is_empty()).then(|| s.clone()),
                 None => old.source.clone(),
@@ -274,7 +258,6 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     source,
                     ..Default::default()
                 },
-                reset,
                 false,
             )
         }
@@ -297,18 +280,16 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
                     ..Default::default()
                 },
-                false,
                 true,
             )
         }
     };
 
-    let (_id, key, queued) = add_impl(conn, spec, &mem, reset_coherent)?;
+    let (_id, key, queued) = add_impl(conn, spec, &mem)?;
     Ok(MergeOutcome {
         key,
         created,
         queued,
-        coherent_reset: reset_coherent,
     })
 }
 
@@ -355,15 +336,10 @@ pub(crate) fn prepare(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result
 /// advance `doc_hash`. That column means "the text whose vector is stored", so it moves with the
 /// vector, in [`crate::store::encode::settle_encoded`]. Moving it here would make a pending row look
 /// indexed, and `needs_embed` would then never fire again.
-pub(crate) fn apply(
-    tx: &Connection,
-    mem: &Memory,
-    prepared: &Prepared,
-    reset_coherent: bool,
-) -> Result<i64> {
+pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Result<i64> {
     let id = match prepared.existing {
         Some((id, _)) => {
-            update_row(tx, id, mem, reset_coherent)?;
+            update_row(tx, id, mem)?;
             id
         }
         None => insert_row(tx, &prepared.key, mem)?,
@@ -375,14 +351,11 @@ pub(crate) fn apply(
     Ok(id)
 }
 
-/// The `UPDATE` half of [`add`]: the key already exists. `reset_coherent` clears the split-review
-/// verdict — right for a whole-row write (the row's shape may have changed), wrong for a merge that
-/// only touched a tag or a source.
-fn update_row(tx: &Connection, id: i64, mem: &Memory, reset_coherent: bool) -> Result<()> {
+/// The `UPDATE` half of [`add`]: the key already exists.
+fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
-                coherent = CASE WHEN ?7 THEN NULL ELSE coherent END,
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -391,8 +364,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, reset_coherent: bool) -> R
             mem.body,
             tags::encode(&mem.tags),
             mem.source,
-            mem.updated,
-            reset_coherent
+            mem.updated
         ],
     )?;
     Ok(())
@@ -475,17 +447,6 @@ pub fn record_useful_many(conn: &Connection, keys: &[String]) -> Result<UsefulSw
     Ok((upvoted, missing))
 }
 
-/// Set the split-review verdict (`Some(true)` coherent, `Some(false)` a grab-bag, `None`
-/// unjudged) for `key`. Returns whether the key existed. Never re-embeds: `coherent` is not
-/// part of the document.
-pub fn set_coherent(conn: &Connection, key: &str, coherent: Option<bool>) -> Result<bool> {
-    let updated = conn.execute(
-        "UPDATE memory SET coherent = ?2 WHERE key = ?1",
-        params![key, coherent],
-    )?;
-    Ok(updated > 0)
-}
-
 /// Increment `column` (`visits` or `times_useful`) for `key` and read it back. `column` is a
 /// hard-coded literal, never user input.
 fn bump(conn: &Connection, key: &str, column: &str) -> Result<i64> {
@@ -518,7 +479,8 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
 }
 
 /// The canonical column list shared by `get_by_id` and `all`.
-const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, doc_hash, created, updated, visits, times_useful, coherent";
+const MEMORY_COLUMNS: &str =
+    "id, key, title, body, tags, source, doc_hash, created, updated, visits, times_useful";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -535,7 +497,6 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         updated: r.get(8)?,
         visits: r.get(9)?,
         times_useful: r.get(10)?,
-        coherent: r.get(11)?,
     })
 }
 

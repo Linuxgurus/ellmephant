@@ -50,6 +50,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0008_encode_queue.sql"),
         "encode queue: the documents that still owe the vector index",
     ),
+    (
+        9,
+        include_str!("../../migrations/0009_drop_coherent.sql"),
+        "drop coherent: the split-review verdict leaves the schema",
+    ),
 ];
 
 /// Current schema version recorded in the file.

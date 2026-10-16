@@ -482,9 +482,8 @@ async fn tools_round_trip_over_http() {
 }
 
 #[tokio::test]
-async fn search_filters_and_coherence_mark_round_trip() {
-    // `memory_search` filters on tags/size/coherence; `memory_coherent` records the verdict,
-    // which an upsert resets, and a `coherent` filter then selects.
+async fn search_filters_round_trip() {
+    // `memory_search` filters on tags and size, intersecting; a lean reply is still key-only.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path()));
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -498,13 +497,6 @@ async fn search_filters_and_coherence_mark_round_trip() {
             .expect("wait");
     });
     let client = ().serve(client_io).await.expect("client handshake");
-
-    async fn hits(client: &Peer<RoleClient>, args: serde_json::Value) -> usize {
-        let r = call(client, "memory_search", args).await;
-        assert!(!r.is_error.unwrap_or(false), "search failed: {}", text(&r));
-        let v: serde_json::Value = serde_json::from_str(&text(&r)).expect("search json");
-        v["hits"].as_array().unwrap().len()
-    }
 
     for (key, body) in [
         ("note-long", "alpha ".repeat(50)),
@@ -531,58 +523,6 @@ async fn search_filters_and_coherence_mark_round_trip() {
     assert_eq!(filtered["cols"], serde_json::json!(["key"]));
     assert_eq!(filtered["hits"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["hits"][0][0], serde_json::json!("note-long"));
-
-    // Both start unjudged (null).
-    assert_eq!(
-        hits(&client, serde_json::json!({ "coherent": "null" })).await,
-        2
-    );
-
-    // Mark the long note a grab-bag: `false` finds it, `null` finds the other, `!true` both.
-    let marked = call(
-        &client,
-        "memory_coherent",
-        serde_json::json!({ "key": "note-long", "coherent": false }),
-    )
-    .await;
-    assert!(!marked.is_error.unwrap_or(false), "{}", text(&marked));
-    assert_eq!(
-        hits(&client, serde_json::json!({ "coherent": "false" })).await,
-        1
-    );
-    assert_eq!(
-        hits(&client, serde_json::json!({ "coherent": "null" })).await,
-        1
-    );
-    assert_eq!(
-        hits(&client, serde_json::json!({ "coherent": "!true" })).await,
-        2
-    );
-
-    // An upsert resets the verdict to unjudged (the row changed, so re-judge it).
-    call(
-        &client,
-        "memory_upsert",
-        serde_json::json!({ "key": "note-long", "title": "note-long", "body": "changed", "tags": ["infra"] }),
-    )
-    .await;
-    assert_eq!(
-        hits(&client, serde_json::json!({ "coherent": "null" })).await,
-        2
-    );
-    assert_eq!(
-        hits(&client, serde_json::json!({ "coherent": "false" })).await,
-        0
-    );
-
-    // An unknown key is a tool error.
-    let bogus = call(
-        &client,
-        "memory_coherent",
-        serde_json::json!({ "key": "ghost", "coherent": true }),
-    )
-    .await;
-    assert_eq!(bogus.is_error, Some(true));
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
@@ -819,15 +759,6 @@ async fn upsert_patches_one_field_over_the_transport() {
     .await;
     let v: serde_json::Value = serde_json::from_str(&text(&created)).expect("json");
     assert_eq!(v["status"], serde_json::json!("created"));
-    assert_eq!(v["coherent_reset"], serde_json::json!(false));
-
-    // A verdict, so we can prove a patch does not un-judge the row.
-    call(
-        &client,
-        "memory_coherent",
-        serde_json::json!({ "key": "note", "coherent": true }),
-    )
-    .await;
 
     // Patch ONE field: the tags are NOT resent, so they must survive. The row is settled first, so
     // that `queued: false` is a fact about the document and not about an un-encoded row.
@@ -845,7 +776,6 @@ async fn upsert_patches_one_field_over_the_transport() {
         serde_json::json!(false),
         "`source` is not part of the document"
     );
-    assert_eq!(v["coherent_reset"], serde_json::json!(false));
 
     let got = call(&client, "memory_get", serde_json::json!({ "key": "note" })).await;
     let g: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
@@ -855,11 +785,6 @@ async fn upsert_patches_one_field_over_the_transport() {
         g["tags"],
         serde_json::json!(["alpha"]),
         "an omitted field keeps its stored value -- tags are not wiped"
-    );
-    assert_eq!(
-        g["coherent"],
-        serde_json::json!(true),
-        "a field write must not re-open the split review"
     );
 
     // Clearing IS expressible: `[]` empties the tags.

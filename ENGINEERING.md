@@ -28,7 +28,7 @@ The decisions the code obeys:
   The embedding strategy can change without losing what
   was written.
 - **A memory is one body of closely related facts**, embedded as one document and matched by
-  meaning — which is what makes voting, ranking and the coherence verdict meaningful.
+  meaning — which is what makes voting and ranking meaningful.
 - **A project is an activity completed over time.** Work with a beginning, a current state and a
   place to stand: identity, fields, and its relations to memories. Listed by field and read whole —
   which is what makes embedding it pointless, so it carries no vector, no votes and no verdict of
@@ -51,7 +51,7 @@ The decisions the code obeys:
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
 - **Keys, not dumps.** A hit is `key` alone — the caller names the extra `fields` it wants
-  (`title`, `tags`, `coherent`, `chars`, `distance`) — so a search can never bloat context, and the
+  (`title`, `tags`, `chars`, `distance`) — so a search can never bloat context, and the
   body is always a deliberate `memory_get` away.
 - **One binary, no runtime.** No interpreter, no service, no shared library.
 
@@ -102,7 +102,7 @@ One SQLite file holds two kinds of thing, and both are truth:
   ordered `mem_preload` list as a column. Its one relation to memories is *preload*; membership is
   not a relation at all — a memory joins a project by carrying the `prj:<key>` tag (v7 dropped the
   `project_memory` table that used to enforce a single home; see SPEC §7.1). A project carries no
-  embedding, no telemetry and no coherence verdict — those belong to facts, the thing matched by
+  embedding and no telemetry — those belong to facts, the thing matched by
   meaning.
 
 Everything else is **derived** from those rows and can be rebuilt at any time:
@@ -160,7 +160,7 @@ it, not `k`. There is no regex/key leg — `key`/`tags` are part of the embedded
 { "query": "portainer-notes-gw" }                       // key/tag tokens are in the embedding
 { "query": "backups", "expand": 1 }                     // + linked neighbours
 { "tags": ["k8s", "gotchas"] }                          // phrase-less: AND filter, all rows
-{ "min_chars": 1000, "coherent": "!true" }              // the §9 split-review queue
+{ "min_chars": 1000 }                                  // the fat rows worth a §9 split review
 ```
 
 Results are ordered by ascending distance. A hit carries no body: the terminal shows

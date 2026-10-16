@@ -10,7 +10,7 @@ use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
 use ellmephant::search::{self, Field, Fields, Hit, MatchMode, Neighbor, Query};
-use ellmephant::store::{self, Memory};
+use ellmephant::store::Memory;
 use rusqlite::Connection;
 
 const DIM: usize = 64;
@@ -41,7 +41,6 @@ fn query(text: Option<&str>) -> Query {
         tags: Vec::new(),
         min_chars: None,
         max_chars: None,
-        coherent: None,
         created_after: None,
         created_before: None,
         updated_after: None,
@@ -220,23 +219,22 @@ fn wire_json_is_positional_with_a_cols_header() {
             key: "k".into(),
             title: "T".into(),
             tags: vec!["a".into(), "b".into()],
-            coherent: Some(true),
             chars: 3,
             distance: Some(0.42),
         }],
         neighbors: vec![],
     };
-    // Every field requested: the full six-column shape, in canonical order.
+    // Every field requested: the full five-column shape, in canonical order.
     let all = Fields::selection(Field::ALL);
     let wire = search::to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "title", "tags", "coherent", "chars", "distance"])
+        serde_json::json!(["key", "title", "tags", "chars", "distance"])
     );
     assert_eq!(
         v["hits"][0],
-        serde_json::json!(["k", "T", ["a", "b"], true, 3, 0.42])
+        serde_json::json!(["k", "T", ["a", "b"], 3, 0.42])
     );
     assert!(
         v.get("neighbors").is_none(),
@@ -257,7 +255,6 @@ fn wire_json_defaults_to_key_only() {
             key: "k".into(),
             title: "T".into(),
             tags: vec!["a".into()],
-            coherent: Some(true),
             chars: 3,
             distance: Some(0.42),
         }],
@@ -339,33 +336,6 @@ fn tag_and_size_filters_intersect() {
         ["long-k8s"]
     );
     assert!(hits[0].chars >= 100, "{}", hits[0].chars);
-}
-
-#[test]
-fn coherent_filter_selects_by_verdict() {
-    let (_dir, paths) = temp_store();
-    let conn = db::open(&paths).expect("open");
-    let embedder = HashEmbedder::new(DIM);
-    seed(&conn, &embedder, "a", "one", &[]);
-    seed(&conn, &embedder, "b", "two", &[]);
-    store::set_coherent(&conn, "a", Some(true)).expect("mark");
-
-    let keys = |c: search::Coherent| {
-        let mut q = query(None);
-        q.coherent = Some(c);
-        search::run(&conn, None, &q)
-            .expect("search")
-            .hits
-            .into_iter()
-            .map(|h| h.key)
-            .collect::<Vec<_>>()
-    };
-
-    assert_eq!(keys(search::Coherent::True), ["a"]);
-    assert_eq!(keys(search::Coherent::Null), ["b"]);
-    assert_eq!(keys(search::Coherent::NotNull), ["a"]);
-    assert_eq!(keys(search::Coherent::NotTrue), ["b"]);
-    assert_eq!(keys(search::Coherent::False), Vec::<String>::new());
 }
 
 /// The keys of a query's hits, in order.

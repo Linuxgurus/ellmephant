@@ -41,7 +41,6 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (id, key) = seed(&conn, &embedder, "probe", "the facts");
-    store::set_coherent(&conn, &key, Some(true)).expect("mark coherent");
 
     let before = store::get(&conn, &key).unwrap().unwrap();
     let vector_before = vec::get(&conn, id).unwrap();
@@ -57,7 +56,6 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
     .expect("merge source");
 
     assert!(!out.queued, "provenance is not part of the document");
-    assert!(!out.coherent_reset, "and it is not meaning either");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.source.as_deref(), Some("cmd: prove /repo"));
     assert_eq!(after.doc_hash, before.doc_hash, "the document did not move");
@@ -70,16 +68,14 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
         after.tags, before.tags,
         "an omitted field keeps its stored value"
     );
-    assert_eq!(after.coherent, Some(true), "the verdict survives");
 }
 
 #[test]
-fn a_title_write_re_embeds_and_re_opens_the_review() {
+fn a_title_write_re_embeds_the_document() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (_id, key) = seed(&conn, &embedder, "probe", "the facts");
-    store::set_coherent(&conn, &key, Some(false)).expect("mark grab-bag");
 
     let out = common::merge_now(
         &conn,
@@ -92,22 +88,19 @@ fn a_title_write_re_embeds_and_re_opens_the_review() {
     .expect("merge title");
 
     assert!(out.queued, "the title is in the document");
-    assert!(out.coherent_reset, "the shape moved, so re-judge it");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.title, "a sharper line");
-    assert_eq!(after.coherent, None, "the verdict is re-opened");
 }
 
 #[test]
-fn a_tags_write_re_embeds_nothing_and_re_opens_nothing() {
+fn a_tags_write_re_embeds_nothing() {
     // Tags are FILING, not MEANING — and not part of the document either. So a tag write moves
-    // neither the vector nor the split-review verdict: retro-tagging a memory is cheap and the
+    // neither the vector nor the document: retro-tagging a memory is cheap and the
     // vector keeps describing what the memory *means*.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (id, key) = seed(&conn, &embedder, "probe", "the facts");
-    store::set_coherent(&conn, &key, Some(true)).expect("mark coherent");
     let hash_before = store::get(&conn, &key).unwrap().unwrap().doc_hash;
 
     let out = common::merge_now(
@@ -121,7 +114,6 @@ fn a_tags_write_re_embeds_nothing_and_re_opens_nothing() {
     .expect("merge tags");
 
     assert!(!out.queued, "tags are not in the document");
-    assert!(!out.coherent_reset, "filing is not meaning");
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.doc_hash, hash_before, "the vector did not move");
     assert_eq!(
@@ -129,7 +121,6 @@ fn a_tags_write_re_embeds_nothing_and_re_opens_nothing() {
         vec!["prj:seaweedfs".to_string(), "storage".to_string()],
         "membership, normalised and sorted like any tag write"
     );
-    assert_eq!(after.coherent, Some(true), "the verdict is untouched");
     assert!(vec::get(&conn, id).unwrap().is_some());
 }
 
@@ -315,15 +306,13 @@ fn key_is_an_address_not_a_field() {
 }
 
 #[test]
-fn a_patch_that_changes_nothing_re_embeds_nothing_and_un_judges_nothing() {
-    // The whole reason the verdict follows a DIFF and not the caller's intent: re-writing the same
-    // text has to be a no-op, so a retry — or any client that echoes every field back — cannot
-    // silently re-open a split review.
+fn a_patch_that_changes_nothing_re_embeds_nothing() {
+    // Re-writing the same text has to be a no-op, so a retry — or any client that echoes every
+    // field back — cannot silently move the document.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (id, key) = seed(&conn, &embedder, "probe", "the facts");
-    store::set_coherent(&conn, &key, Some(true)).expect("mark coherent");
     let before = store::get(&conn, &key).unwrap().unwrap();
     let vector_before = vec::get(&conn, id).unwrap();
 
@@ -340,9 +329,7 @@ fn a_patch_that_changes_nothing_re_embeds_nothing_and_un_judges_nothing() {
     .expect("redundant merge");
 
     assert!(!out.queued, "the document did not move");
-    assert!(!out.coherent_reset, "and neither did the shape");
     let after = store::get(&conn, &key).unwrap().unwrap();
-    assert_eq!(after.coherent, Some(true), "the verdict survives a save");
     assert_eq!(after.doc_hash, before.doc_hash);
     assert_eq!(vec::get(&conn, id).unwrap(), vector_before);
 }

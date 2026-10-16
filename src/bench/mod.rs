@@ -101,7 +101,6 @@ fn case_query(case: &Case, k: usize) -> Query {
         tags: Vec::new(),
         min_chars: None,
         max_chars: None,
-        coherent: None,
         created_after: None,
         created_before: None,
         updated_after: None,

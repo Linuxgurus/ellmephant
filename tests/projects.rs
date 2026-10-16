@@ -461,7 +461,6 @@ fn a_project_tag_is_how_memories_join() {
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             min_chars: None,
             max_chars: None,
-            coherent: None,
             created_after: None,
             created_before: None,
             updated_after: None,

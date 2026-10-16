@@ -40,7 +40,7 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 | `GET /memory/{key}`, `GET /memory/{key}/backlinks` | one memory, body included | **implemented** |
 | `GET /search?q=&k=&tag=` | the query surface | **implemented** |
 | `POST /memory`, `DELETE /memory/{key}`, `POST /memory/{key}/merge` | writes | **implemented** |
-| `POST /memory/{key}/upvote`, `PUT /memory/{key}/coherent`, `POST /project` | writes | **implemented** |
+| `POST /memory/{key}/upvote`, `POST /project` | writes | **implemented** |
 | `POST /reembed` | QUEUES a re-embed (`{queued: N}`) and returns; the worker does the work | **implemented** |
 
 **A write returns before its vector exists.** `POST /memory` upserts the row and *schedules* its
@@ -67,7 +67,7 @@ that cannot be made small, which the caller should choose to spend tokens on.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 
-The MCP surface is 14 tools (`TOOLS` in `src/mcp/mod.rs`). A second door that cannot reach the same
+The MCP surface is 13 tools (`TOOLS` in `src/mcp/mod.rs`). A second door that cannot reach the same
 core is a door with a queue in front of it: boot over HTTP, still write over MCP, and a wedged MCP
 leaves the agent **read-only**. So every tool gets a route over the same `Session` call, and MCP
 becomes a compatibility shim for clients that speak it rather than a dependency of the agent.
@@ -84,7 +84,6 @@ becomes a compatibility shim for clients that speak it rather than a dependency 
 | `memory_delete` | `DELETE /memory/{key}` | **implemented** |
 | `memory_merge` | `POST /memory/{key}/merge` | **implemented** |
 | `memory_upvote` | `POST /memory/{key}/upvote` | **implemented** |
-| `memory_coherent` | `PUT /memory/{key}/coherent` | **implemented** |
 | `project_upsert` | `POST /project` | **implemented** |
 | `memory_reembed` | `POST /reembed` | **implemented** — QUEUES (`{queued: N}`); the worker does the work |
 | — | `GET /health` | **implemented** |
@@ -210,7 +209,7 @@ Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 | GET | `/stats` | `memory_stats` | `?tags=true` |
 | GET | `/memory/{key}` | `memory_get` | counts a `visits` read, exactly as MCP does |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
-| GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&coherent=&fields=a,b&tag=x&tag=y` |
+| GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&fields=a,b&tag=x&tag=y` |
 | GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=` |
 | GET | `/projects` | `project_list` | `?status=&pattern=&mode=&tag=` |
 | GET | `/project/{key}` | `project_get` | `?hydrate=none\|snippet\|full` |
@@ -222,7 +221,6 @@ Writes — **auth-gated by design and OPEN today** (invariant 3; set `ELLMEPHANT
 | POST | `/memory` | `memory_upsert` | text front-matter, or JSON if `Content-Type: application/json` |
 | POST | `/memory/{key}/upvote` | `memory_upvote` | — |
 | POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>`, or a JSON body `{"from","into"}` |
-| PUT | `/memory/{key}/coherent` | `memory_coherent` | `?value=true\|false\|null`, or a JSON body `{"coherent": …}` |
 | DELETE | `/memory/{key}` | `memory_delete` | — |
 | POST | `/project` | `project_upsert` | JSON — a project patch is structured (owner / preload / tags) and front-matter has no grammar for it |
 | POST | `/reembed` | `memory_reembed` | — **last**: heaviest lock holder, and `/health` watches it |
@@ -234,13 +232,11 @@ honest shape. So both are accepted, and the caller picks by `Content-Type`. `?fo
 *response* only.
 
 **And every route that takes an argument takes the MCP tool's own arguments as the body**, with its
-query form as shorthand: `POST /memory/{key}/merge` accepts `{"from","into"}` as well as `?into=`, and
-`PUT /memory/{key}/coherent` accepts `{"coherent": …}` as well as `?value=`. A caller that knows the
-tool should not have to learn a second spelling for the same thing — that is what parity means here.
-`POST /memory` and `POST /project` already took the tool's object, so these two were the whole gap. A
-body field that disagrees with the path (`{"from":"a"}` on `/memory/b/merge`) is a `400` that names
-both, never a silent winner, and an omitted `coherent`/`value` is `null` — the same "unjudged" the
-tool's optional field means.
+query form as shorthand: `POST /memory/{key}/merge` accepts `{"from","into"}` as well as `?into=`. A
+caller that knows the tool should not have to learn a second spelling for the same thing — that is
+what parity means here. `POST /memory` and `POST /project` already took the tool's object. A body
+field that disagrees with the path (`{"from":"a"}` on `/memory/b/merge`) is a `400` that names both,
+never a silent winner.
 
 ### Auth: **no key today.** The seam is there; the gate is not.
 
@@ -322,7 +318,7 @@ notes. So the document answers, in order:
    call away.
 5. **open work** — every project that is not done: status, key, clipped goal.
 6. **style** — how to write here, compressed to three lines.
-7. **the catalogue** — with `?tools=true`, all 14 tools with every argument; without it, a pointer
+7. **the catalogue** — with `?tools=true`, all 13 tools with every argument; without it, a pointer
    that names the size it would cost (measured, not hardcoded).
 
 ```

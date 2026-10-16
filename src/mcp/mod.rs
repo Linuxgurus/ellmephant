@@ -1,7 +1,7 @@
 //! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
 //!
 //! Tools: `memory_upsert`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_coherent`, `memory_upvote`, `memory_stats`,
+//! `memory_get`, `memory_backlinks`, `memory_upvote`, `memory_stats`,
 //! `memory_dupes` — with read-only annotations on the read tools and destructive on `delete`.
 //! The tool descriptions carry the SPEC §9 write policy; that is where memory quality is
 //! actually tuned. `memory_get` counts a `visits` read and carries the upvote cue — both in its
@@ -47,7 +47,6 @@ pub const TOOLS: &[&str] = &[
     "memory_search",
     "memory_get",
     "memory_backlinks",
-    "memory_coherent",
     "memory_upvote",
     "memory_stats",
     "memory_dupes",
@@ -143,8 +142,7 @@ a second. Merge redundant memories by hand: weaker is folded into stronger and `
 Skip facts cheap to derive, live state, or one-off. PATCHING: every field is optional — omit one and \
 the stored value is left alone, so a single field can change without resending the row. Empty is an \
 instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
-empty. A new key needs both a `title` and a `body`. Rewriting `title` or `body` re-opens the split \
-review (`coherent` resets); a tags or source change does not — filing is not meaning. The reply's \
+empty. A new key needs both a `title` and a `body`. The reply's \
 `queued` says whether this write scheduled an embed: a written document is indexed a moment later by \
 the store's encode worker, so a semantic search straight after a write may not see it yet.";
 
@@ -166,10 +164,6 @@ merging. The finder for the merge rule.";
 
 /// Cap on returned dupe pairs for a bare `memory_dupes` call.
 pub(crate) const DUPES_LIMIT: usize = 50;
-
-/// `memory_coherent` description. The split-review law rides here, in its owning tool only.
-const COHERENT_DESCRIPTION: &str = "\
-Record a memory's split-review verdict: `true` = one coherent topic, `false` = a grab-bag worth splitting, omit/`null` = unjudged. Reset to null automatically on the next upsert, so an edit re-opens review. Find the fat tail with `memory_search` (`min_chars`, `coherent`).";
 
 /// `memory_search` description. The read law lives here — the semantic phrase, the literal/regex
 /// leg, the structured filters, the lean `key`-only default, and the narrow-to-wide widen trigger.
@@ -324,10 +318,6 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Maximum embedded-document size, in chars.")]
     pub max_chars: Option<usize>,
-    /// Coherence-verdict filter.
-    #[serde(default)]
-    #[schemars(description = "Split-review verdict: `true`, `false`, `null`, or negate with `!`.")]
-    pub coherent: Option<CoherentFilter>,
     /// Lower bound on `created`.
     #[serde(default)]
     #[schemars(
@@ -367,8 +357,6 @@ pub enum FieldParam {
     Title,
     /// Attached tags.
     Tags,
-    /// Split-review verdict.
-    Coherent,
     /// Embedded-document length (chars).
     Chars,
     /// Cosine distance (semantic ranking only).
@@ -382,7 +370,6 @@ impl FieldParam {
             FieldParam::Key => Field::Key,
             FieldParam::Title => Field::Title,
             FieldParam::Tags => Field::Tags,
-            FieldParam::Coherent => Field::Coherent,
             FieldParam::Chars => Field::Chars,
             FieldParam::Distance => Field::Distance,
         }
@@ -405,45 +392,6 @@ impl MatchModeParam {
         match self {
             MatchModeParam::Literal => MatchMode::Literal,
             MatchModeParam::Regex => MatchMode::Regex,
-        }
-    }
-}
-
-/// The `memory_search` coherence filter — a nullable bool with negation. `!X` reads "not X",
-/// so the six values are the six non-empty proper subsets of `{true, false, null}`.
-#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
-pub enum CoherentFilter {
-    /// `coherent = true` — one topic.
-    #[serde(rename = "true")]
-    True,
-    /// `coherent = false` — a grab-bag.
-    #[serde(rename = "false")]
-    False,
-    /// `coherent IS NULL` — unjudged.
-    #[serde(rename = "null")]
-    Null,
-    /// Not proven coherent (false or null).
-    #[serde(rename = "!true")]
-    NotTrue,
-    /// Not proven a grab-bag (true or null).
-    #[serde(rename = "!false")]
-    NotFalse,
-    /// Judged at all (true or false).
-    #[serde(rename = "!null")]
-    NotNull,
-}
-
-impl CoherentFilter {
-    /// Map the wire enum onto the search-layer predicate.
-    fn to_coherent(self) -> crate::search::Coherent {
-        use crate::search::Coherent;
-        match self {
-            CoherentFilter::True => Coherent::True,
-            CoherentFilter::False => Coherent::False,
-            CoherentFilter::Null => Coherent::Null,
-            CoherentFilter::NotTrue => Coherent::NotTrue,
-            CoherentFilter::NotFalse => Coherent::NotFalse,
-            CoherentFilter::NotNull => Coherent::NotNull,
         }
     }
 }
@@ -505,20 +453,6 @@ pub struct DupesParams {
     #[serde(default)]
     #[schemars(description = "Most pairs to return, nearest first.")]
     pub limit: Option<usize>,
-}
-
-/// Parameters for [`MemoryServer::memory_coherent`].
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CoherentParams {
-    /// The memory's key.
-    #[schemars(description = "Memory key. Slug.")]
-    pub key: String,
-    /// The verdict.
-    #[serde(default)]
-    #[schemars(
-        description = "true = one topic; false = a grab-bag to split; omit/null = unjudged."
-    )]
-    pub coherent: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::project_get`].
@@ -1086,14 +1020,12 @@ impl MemoryServer {
             key = %outcome.key,
             created = outcome.created,
             queued = outcome.queued,
-            coherent_reset = outcome.coherent_reset,
             "memory stored"
         );
         Ok(json_ok(serde_json::json!({
             "status": if outcome.created { "created" } else { "updated" },
             "key": outcome.key,
             "queued": outcome.queued,
-            "coherent_reset": outcome.coherent_reset,
         })))
     }
 
@@ -1194,7 +1126,6 @@ impl MemoryServer {
         let tags = p.tags;
         let min_chars = p.min_chars;
         let max_chars = p.max_chars;
-        let coherent = p.coherent.map(CoherentFilter::to_coherent);
         let created_after = p.created_after;
         let created_before = p.created_before;
         let updated_after = p.updated_after;
@@ -1217,7 +1148,6 @@ impl MemoryServer {
                     tags,
                     min_chars,
                     max_chars,
-                    coherent,
                     created_after,
                     created_before,
                     updated_after,
@@ -1316,35 +1246,6 @@ impl MemoryServer {
             .await?;
         tracing::debug!(tool = "memory_backlinks", key = %key, count = links.len(), "backlinks");
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
-    }
-
-    /// Record a memory's split-review verdict (coherent / grab-bag / unjudged).
-    #[tool(
-        name = "memory_coherent",
-        description = COHERENT_DESCRIPTION,
-        annotations(
-            title = "Mark coherent",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_coherent(
-        &self,
-        Parameters(p): Parameters<CoherentParams>,
-    ) -> std::result::Result<String, String> {
-        let key = p.key;
-        let coherent = p.coherent;
-        let mark = key.clone();
-        self.with_store("memory_coherent", move |s| s.mark_coherent(&mark, coherent))
-            .await?;
-        tracing::info!(tool = "memory_coherent", key = %key, coherent = ?coherent, "marked");
-        Ok(json_ok(serde_json::json!({
-            "status": "marked",
-            "key": key,
-            "coherent": coherent,
-        })))
     }
 
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
@@ -1660,10 +1561,6 @@ pub fn http_router(
         )
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
-        .route(
-            "/memory/{key}/coherent",
-            axum::routing::put(surface::coherent),
-        )
         .route("/memory", axum::routing::post(surface::upsert))
         .route("/search", axum::routing::get(surface::search))
         .route("/dupes", axum::routing::get(surface::dupes))
@@ -1751,9 +1648,6 @@ mod tests {
         assert_eq!(ann("memory_upvote").read_only_hint, Some(false));
         assert_eq!(ann("memory_upvote").destructive_hint, Some(false));
         assert_eq!(ann("memory_upsert").idempotent_hint, Some(true));
-        // The split-review mark writes, non-destructively.
-        assert_eq!(ann("memory_coherent").read_only_hint, Some(false));
-        assert_eq!(ann("memory_coherent").destructive_hint, Some(false));
         // Re-embed writes, but only to the derived index -- nothing it touches is source data.
         assert_eq!(ann("memory_reembed").read_only_hint, Some(false));
         assert_eq!(ann("memory_reembed").destructive_hint, Some(false));
@@ -1878,7 +1772,6 @@ mod tests {
         assert_eq!(
             searchable,
             [
-                "coherent",
                 "created_after",
                 "created_before",
                 "expand",
@@ -1930,7 +1823,7 @@ mod tests {
             .filter_map(|v| v.get("const"))
             .filter_map(|v| v.as_str())
             .collect();
-        for want in ["key", "title", "tags", "coherent", "chars", "distance"] {
+        for want in ["key", "title", "tags", "chars", "distance"] {
             assert!(
                 field_vals.contains(&want),
                 "missing field {want}: {field_vals:?}"

@@ -85,7 +85,7 @@ fn add_writes_row_one_vector_tags_and_links() {
     let got = store::get(&conn, "anchor").unwrap().expect("row");
     assert_eq!(got.id, Some(id));
     assert_eq!(got.tags, vec!["infra".to_string(), "k8s".to_string()]);
-    assert!(!got.doc_hash.is_empty());
+    assert!(!got.encode_hash.is_empty());
 
     // one document vector
     assert_eq!(vec::count(&conn).unwrap(), 1);

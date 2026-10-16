@@ -1,0 +1,21 @@
+-- 0010_rename_doc_hash — the column now says what it IS: this row's embedding state.
+--
+-- `doc_hash` read as "a hash of the document", which is what it stores but not what it MEANS. It
+-- means "the text whose vector is stored", so right after an edit it still names the PREVIOUS text
+-- until the encode worker settles the row. That gap is where a reader (me, 2026-10-16) saw an
+-- unmoved hash and reported a store defect: the store was fine, the read raced the encoder.
+--
+-- THE RENAME IS THE FIX, and the sentinel is the hint. A write that schedules an encode sets
+-- `encode_pending` in this column, so the value explains itself at the moment it is read instead of
+-- needing a legend in a tool description. `<hash>` still means "the vector was built from exactly
+-- this text"; a real hash is never `encode_pending`, so the equality tests that decide `needs_embed`
+-- keep meaning what they say.
+--
+-- Note the DETECTION MOVES with this change: `needs_embed` used to infer pending-ness from a
+-- mismatch between the stored value and the computed hash, which is why the row write was forbidden
+-- from touching the column. It now reads the sentinel directly, so the write path sets it.
+--
+-- Fresh stores run 0001 (which creates `doc_hash`) and then this; the original column stays part of
+-- history because an applied migration is never edited (it is keyed by `PRAGMA user_version`) and
+-- `doctor` would not notice.
+ALTER TABLE memory RENAME COLUMN doc_hash TO encode_hash;

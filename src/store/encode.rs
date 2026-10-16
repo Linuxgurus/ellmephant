@@ -157,7 +157,7 @@ pub struct Claim {
     key: String,
     id: i64,
     doc: String,
-    doc_hash: String,
+    encode_hash: String,
     claimed_hash: String,
     indexed: bool,
 }
@@ -191,7 +191,7 @@ pub fn claim(conn: &Connection, spec: &VecSpec, key: &str) -> Result<Option<Clai
     // what to embed, the second is what to clear.
     let row: Option<(i64, String, String, String, String)> = conn
         .query_row(
-            "SELECT m.id, m.title, m.body, m.doc_hash, q.doc_hash
+            "SELECT m.id, m.title, m.body, m.encode_hash, q.doc_hash
                FROM encode_queue q JOIN memory m ON m.key = q.key
               WHERE q.key = ?1",
             params![key],
@@ -203,18 +203,18 @@ pub fn claim(conn: &Connection, spec: &VecSpec, key: &str) -> Result<Option<Clai
         return Ok(None);
     };
     let doc = projection::embed_document(key, &title, &body);
-    let doc_hash = row_hash(spec, &doc);
-    // `doc_hash` alone is NOT evidence that a vector exists: it survives a torn index — a killed
+    let encode_hash = row_hash(spec, &doc);
+    // `encode_hash` alone is NOT evidence that a vector exists: it survives a torn index — a killed
     // rebuild, a hand-deleted vector — so the index itself is asked as well. That costs one SELECT per
     // job and buys a `needs_embed` that means what it says, which is what lets `reembed` repair a
     // torn index instead of queueing work that then declines to do itself.
-    let indexed = indexed_hash == doc_hash && index::vec::get(conn, id)?.is_some();
+    let indexed = indexed_hash == encode_hash && index::vec::get(conn, id)?.is_some();
     Ok(Some(Claim {
         key: key.to_string(),
         id,
         indexed,
         doc,
-        doc_hash,
+        encode_hash,
         claimed_hash,
     }))
 }
@@ -238,12 +238,13 @@ pub fn settle_encoded(conn: &Connection, claim: &Claim, vector: Option<&[f32]>) 
     index::vec::ensure(conn, vector.len())?;
     let tx = conn.unchecked_transaction()?;
     index::vec::upsert(&tx, claim.id, vector)?;
-    // `doc_hash` advances only HERE, beside the vector it describes: the column means "the text whose
-    // vector is stored", so the row write must never move it — that is what makes a pending row
-    // detectable at all.
+    // The real `encode_hash` advances only HERE, beside the vector it describes — the column means
+    // "the text whose vector is stored", and `encode_pending` is what it says in the meantime. That
+    // is also why the row write only ever sets the sentinel: a real hash reaching the column without
+    // a vector to match would make a pending row look settled.
     tx.execute(
-        "UPDATE memory SET doc_hash = ?2 WHERE id = ?1",
-        params![claim.id, claim.doc_hash],
+        "UPDATE memory SET encode_hash = ?2 WHERE id = ?1",
+        params![claim.id, claim.encode_hash],
     )?;
     settle(&tx, &claim.key, &claim.claimed_hash)?;
     tx.commit()?;
@@ -338,7 +339,7 @@ mod tests {
     use crate::config::Paths;
     use crate::db;
     use crate::embed::HashEmbedder;
-    use crate::store::Memory;
+    use crate::store::{ENCODE_PENDING, Memory};
 
     /// A throwaway store. The queue is a table, so most of its behaviour is only observable through
     /// SQL — and a real file is the only honest way to see the guard behave.
@@ -364,8 +365,8 @@ mod tests {
     }
 
     /// A stored row that OWES a vector. Under the queue that is simply what a write leaves behind:
-    /// `add` schedules the document, embeds nothing, and starts `doc_hash` empty. So this is a real
-    /// write, not a fixture that fakes the pending state.
+    /// `add` schedules the document, embeds nothing, and starts `encode_hash` at [`ENCODE_PENDING`].
+    /// So this is a real write, not a fixture that fakes the pending state.
     fn owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) -> VecSpec {
         let spec = VecSpec::of(embedder);
         crate::store::add(conn, &spec, &mem(key, body)).expect("add");
@@ -381,11 +382,11 @@ mod tests {
 
     fn stored_hash(conn: &Connection, key: &str) -> String {
         conn.query_row(
-            "SELECT doc_hash FROM memory WHERE key = ?1",
+            "SELECT encode_hash FROM memory WHERE key = ?1",
             params![key],
             |r| r.get(0),
         )
-        .expect("doc_hash")
+        .expect("encode_hash")
     }
 
     #[test]
@@ -448,7 +449,7 @@ mod tests {
         assert_eq!(
             stored_hash(&conn, "a"),
             doc("a", "alpha", &spec),
-            "doc_hash advances with the vector, and only then"
+            "encode_hash advances with the vector, and only then"
         );
     }
 
@@ -556,8 +557,11 @@ mod tests {
 
         // But a job that DOES need a vector, settled with `None`, is a caller bug — not a silent
         // stale vector, which is what it would be if the half just wrote nothing.
-        conn.execute("UPDATE memory SET doc_hash = '' WHERE key = 'a'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE memory SET encode_hash = ?1 WHERE key = 'a'",
+            [ENCODE_PENDING],
+        )
+        .unwrap();
         enqueue(&conn, "a", &doc("a", "alpha", &spec), INTERACTIVE).unwrap();
         let owed = claim(&conn, &spec, "a").unwrap().expect("a claim");
         assert!(owed.needs_embed());
@@ -679,8 +683,8 @@ mod tests {
     }
 
     /// The P2 contract in one place: a **write queues the document and writes no vector**, and the
-    /// row's `doc_hash` stays empty — "no vector yet" — because that column means "the text whose
-    /// vector is stored", and storing it is the worker's job, not the write's.
+    /// row's `encode_hash` stays `encode_pending` — "no vector yet" — because that column means "the
+    /// text whose vector is stored", and storing it is the worker's job, not the write's.
     #[test]
     fn a_write_queues_the_document_and_writes_no_vector() {
         let (_d, conn) = store();
@@ -694,7 +698,11 @@ mod tests {
             index::vec::get(&conn, id_of(&conn, "a")).unwrap().is_none(),
             "nothing has been embedded yet"
         );
-        assert_eq!(stored_hash(&conn, "a"), "", "no vector, so no doc_hash");
+        assert_eq!(
+            stored_hash(&conn, "a"),
+            ENCODE_PENDING,
+            "no vector, so the row says it owes one"
+        );
         assert_eq!(
             next(&conn).unwrap().unwrap().doc_hash,
             doc("a", "alpha", &spec),

@@ -21,7 +21,7 @@ fn session(dir: &std::path::Path) -> Session {
     let paths = Paths::from_root(dir);
     paths.ensure().expect("create store root");
     // The config is the WRITE path's view of the vector space — a write has no embedder to ask — so it
-    // has to agree with the fake injected below. Disagree, and `doc_hash` describes a different space
+    // has to agree with the fake injected below. Disagree, and `encode_hash` describes a different space
     // than the stored vectors do, which makes every later write look like a document change.
     let cfg = Config {
         model: HASH_MODEL.to_string(),

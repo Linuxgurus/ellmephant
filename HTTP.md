@@ -45,7 +45,8 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 
 **A write returns before its vector exists.** `POST /memory` upserts the row and *schedules* its
 document; the store's encode worker indexes it a moment later, so a `GET /search` immediately after a
-write may not see it. The write's reply carries `queued: true|false` to say what happened.
+write may not see it. The row's `encode_hash` reads `encode_pending` until the worker settles it. The
+write's reply carries `queued: true|false` to say what happened.
 
 `?wait=true` on `POST /memory` is the exception: the request settles that one document before it
 answers, so the row is searchable the moment it returns. It holds the store lock across the model call

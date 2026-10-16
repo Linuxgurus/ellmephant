@@ -55,6 +55,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0009_drop_coherent.sql"),
         "drop coherent: the split-review verdict leaves the schema",
     ),
+    (
+        10,
+        include_str!("../../migrations/0010_rename_doc_hash.sql"),
+        "rename doc_hash -> encode_hash: the column says it is this row's embedding state",
+    ),
 ];
 
 /// Current schema version recorded in the file.

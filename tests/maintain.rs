@@ -76,15 +76,15 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
         let id = mem.id.unwrap();
         assert_eq!(vec::get(&conn, id).unwrap().unwrap().len(), 16);
         // The row bookkeeping now matches the new model.
-        let doc_hash: String = conn
+        let encode_hash: String = conn
             .query_row(
-                "SELECT doc_hash FROM memory WHERE id = ?1",
+                "SELECT encode_hash FROM memory WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(
-            doc_hash,
+            encode_hash,
             store::row_hash(
                 &ellmephant::embed::VecSpec::of(&wide),
                 &projection::embed_document(&mem.key, &mem.title, &mem.body)
@@ -109,7 +109,7 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     let report = maintain::reembed(&conn, &spec, "").expect("reembed");
     assert!(!report.rebuilt, "same dim keeps the table");
     // ONE row is owed, not two: `b` still carries its vector and its document never moved, and the
-    // producer is precise about that. `a` is owed because it has no vector at all — which `doc_hash`
+    // producer is precise about that. `a` is owed because it has no vector at all — which `encode_hash`
     // cannot see, since the hash still says "indexed".
     assert_eq!(report.queued, 1, "only the row with no vector is owed one");
     common::settle(&conn, &embedder);
@@ -121,7 +121,7 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     assert_eq!(vec::get(&conn, a).unwrap(), before, "vectors are stable");
 }
 
-/// A changed **projection** forces a full re-embed, and `doc_hash` cannot detect it: the hash covers the
+/// A changed **projection** forces a full re-embed, and `encode_hash` cannot detect it: the hash covers the
 /// model, the dimension and the text — never the recipe that assembled them. So every row is queued on
 /// the fingerprint's say-so alone. Without that, a projection change would queue *nothing* and every
 /// vector would keep describing the old recipe in silence — the drift the fingerprint exists to catch.

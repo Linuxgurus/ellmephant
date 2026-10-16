@@ -38,7 +38,7 @@ pub trait Embedder: Send + Sync {
     }
 }
 
-/// The identity of the vector space a row's `doc_hash` is written in.
+/// The identity of the vector space a row's `encode_hash` is written in.
 ///
 /// [`row_hash`](crate::store::row_hash) needs a model id and a dimension to fingerprint a document,
 /// and both are *config* — not a property of loaded weights. Carrying them in a value is what lets
@@ -49,7 +49,7 @@ pub trait Embedder: Send + Sync {
 /// rename — so they need no config plumbed down to them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VecSpec {
-    /// The model id recorded in `meta` and folded into every `doc_hash`.
+    /// The model id recorded in `meta` and folded into every `encode_hash`.
     pub model_id: String,
     /// Vector length; must be stable for a given model.
     pub dim: usize,

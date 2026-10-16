@@ -127,7 +127,7 @@ the encoder changes — a different model, projection or dimension — because t
 is fixed when it is created, and the store refuses to reinterpret stored vectors rather than hand \
 back wrong neighbours. It also re-parses every body to rebuild the `[[link]]` graph, whose edges are \
 computed at write time and so do not follow a parser change on their own. It repairs a torn index \
-too: a row with no vector is queued even when its `doc_hash` still claims it is indexed. The rows \
+too: a row with no vector is queued even when its `encode_hash` still claims it is indexed. The rows \
 (`memory` — keys, tags, titles, bodies; `project` — a project's own fields) are the source of truth; \
 everything this touches is derived, so nothing written can be lost and re-running it is harmless. \
 It is a PRODUCER, not an embedder: it returns immediately with `{queued: N}` and a background worker \
@@ -144,7 +144,9 @@ the stored value is left alone, so a single field can change without resending t
 instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
 empty. A new key needs both a `title` and a `body`. The reply's \
 `queued` says whether this write scheduled an embed: a written document is indexed a moment later by \
-the store's encode worker, so a semantic search straight after a write may not see it yet.";
+the store's encode worker, so a semantic search straight after a write may not see it yet. \
+`encode_hash` is stamped by that WORKER too: a write that scheduled an encode leaves `encode_pending` \
+there, so it never names a text the stored vector does not match.";
 
 /// `memory_upvote` description. The feedback nudge, carried here only.
 const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \
@@ -1170,7 +1172,7 @@ impl MemoryServer {
     /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
-        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it.",
+        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it. `encode_hash` is the hash of the embedded document, or `encode_pending` while the background encode worker still owes one.",
         annotations(
             title = "Get memory",
             read_only_hint = true,

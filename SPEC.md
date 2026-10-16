@@ -190,10 +190,12 @@ embedded.
 **A write schedules its document; it does not embed it.** The upsert and the row's place in
 `encode_queue` are written in one transaction — one file, so the two cannot come apart — and a single
 background worker turns the queue into `memory_vec`, holding the store lock for a row write and
-*nothing* across the model call. `doc_hash` records the text whose vector is **stored**, so a write
-does not advance it; the worker does, when it writes the vector. That is what keeps a pending row
-detectable, and it is why a search posted immediately after a write may not see it yet. The reply's
-`queued` says whether this write scheduled anything. `ENCODE-WORKER.md` is the design.
+*nothing* across the model call. `encode_hash` records the text whose vector is **stored**, so a write
+does not advance it to the real hash; a write that schedules an encode leaves the sentinel
+`encode_pending` there, and the worker stamps the real hash when it writes the vector. That is what
+puts pending-ness in the data a reader sees — no legend needed — and it is why a search posted
+immediately after a write may not see it yet. The reply's `queued` says whether this write scheduled
+anything. `ENCODE-WORKER.md` is the design.
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -207,7 +209,7 @@ CREATE TABLE memory (
   body     TEXT NOT NULL,                     -- smart-caveman fact
   tags     TEXT NOT NULL DEFAULT '',          -- normalised names, comma-joined, sorted
   source   TEXT,                              -- provenance: command/path/repo/quote
-  doc_hash TEXT NOT NULL,                     -- sha256(model|dim|embedded document)
+  encode_hash TEXT NOT NULL,                  -- sha256(model|dim|embedded document), or 'encode_pending'
   created  TEXT NOT NULL DEFAULT (datetime('now')),
   updated  TEXT NOT NULL DEFAULT (datetime('now'))
 );

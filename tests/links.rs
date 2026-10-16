@@ -110,7 +110,7 @@ fn rename_to_the_same_key_is_a_noop() {
 #[test]
 fn rename_queues_a_new_vector_for_the_row_it_moves() {
     // `key` IS in the embed projection, so a rename moves the row's *document* — which is why the row
-    // is QUEUED for a new vector, exactly as a write queues it. Once settled, `doc_hash` (and the
+    // is QUEUED for a new vector, exactly as a write queues it. Once settled, `encode_hash` (and the
     // vector) describe the NEW key; otherwise the vector drifts until something else writes the row.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
@@ -124,7 +124,7 @@ fn rename_queues_a_new_vector_for_the_row_it_moves() {
 
     let stored: String = conn
         .query_row(
-            "SELECT doc_hash FROM memory WHERE key = 'new-name'",
+            "SELECT encode_hash FROM memory WHERE key = 'new-name'",
             [],
             |r| r.get(0),
         )

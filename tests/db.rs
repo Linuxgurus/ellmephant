@@ -29,7 +29,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 
 fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     conn.execute(
-        "INSERT INTO memory (key, title, body, doc_hash) VALUES (?1, ?2, ?3, 'h')",
+        "INSERT INTO memory (key, title, body, encode_hash) VALUES (?1, ?2, ?3, 'h')",
         params![key, title, body],
     )
     .expect("insert memory");
@@ -135,6 +135,12 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         [],
     )
     .unwrap();
+    // And it still spells the column `doc_hash`: 0010 is the rename that fixes that.
+    conn.execute(
+        "ALTER TABLE memory RENAME COLUMN encode_hash TO doc_hash",
+        [],
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -191,6 +197,12 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         [],
     )
     .unwrap();
+    // …and still spells the column `doc_hash`, which 0010 renames.
+    conn.execute(
+        "ALTER TABLE memory RENAME COLUMN encode_hash TO doc_hash",
+        [],
+    )
+    .unwrap();
     drop(conn);
 
     // 0006 interprets the prefix exactly once — while it still means something — and 0007 then
@@ -222,26 +234,26 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
 }
 
 #[test]
-fn memory_keeps_a_doc_hash_tags_and_no_scope_or_type() {
+fn memory_keeps_an_encode_hash_tags_and_no_scope_or_type() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
     conn.execute(
-        "INSERT INTO memory (key, title, body, tags, doc_hash)
+        "INSERT INTO memory (key, title, body, tags, encode_hash)
          VALUES ('a', 'T', 'B', 'k8s,infra', 'dh')",
         [],
     )
     .unwrap();
 
-    let (tags, doc_hash): (String, String) = conn
+    let (tags, encode_hash): (String, String) = conn
         .query_row(
-            "SELECT tags, doc_hash FROM memory WHERE key = 'a'",
+            "SELECT tags, encode_hash FROM memory WHERE key = 'a'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((tags.as_str(), doc_hash.as_str()), ("k8s,infra", "dh"));
+    assert_eq!((tags.as_str(), encode_hash.as_str()), ("k8s,infra", "dh"));
 
-    // `doc_hash` is NOT NULL; `tags` defaults to the empty string.
+    // `encode_hash` is NOT NULL; `tags` defaults to the empty string.
     assert!(
         conn.execute(
             "INSERT INTO memory (key, title, body) VALUES ('b', 'T', 'B')",
@@ -250,7 +262,7 @@ fn memory_keeps_a_doc_hash_tags_and_no_scope_or_type() {
         .is_err()
     );
     conn.execute(
-        "INSERT INTO memory (key, title, body, doc_hash) VALUES ('c', 'T', 'B', 'dh')",
+        "INSERT INTO memory (key, title, body, encode_hash) VALUES ('c', 'T', 'B', 'dh')",
         [],
     )
     .unwrap();
@@ -286,7 +298,7 @@ fn key_is_unique() {
 
     insert(&conn, "dup", "One", "body");
     let err = conn.execute(
-        "INSERT INTO memory (key, title, body, doc_hash) VALUES ('dup', 'Two', 'body', 'h')",
+        "INSERT INTO memory (key, title, body, encode_hash) VALUES ('dup', 'Two', 'body', 'h')",
         [],
     );
     assert!(

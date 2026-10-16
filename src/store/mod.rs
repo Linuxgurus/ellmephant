@@ -21,9 +21,9 @@ use crate::error::{Error, Result};
 use crate::index;
 
 /// One atomic memory: the storage *and* embedding unit. `Default` is the draft baseline the
-/// write path fills in (`id`/`doc_hash`/timestamps are derived on insert).
+/// write path fills in (`id`/`encode_hash`/timestamps are derived on insert).
 ///
-/// `title`, `body` and `tags` are stored literally; `doc_hash` is the re-embed trigger for the
+/// `title`, `body` and `tags` are stored literally; `encode_hash` is the re-embed trigger for the
 /// single document embedding (`key` + `title` + `body` — tags are *filing*, not meaning).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Memory {
@@ -40,8 +40,9 @@ pub struct Memory {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source: Option<String>,
     /// `sha256(model|dim|embed_document)`; re-embed the row only when this changes.
+    /// [`ENCODE_PENDING`] while a queued job still owes this row a vector.
     #[serde(default)]
-    pub doc_hash: String,
+    pub encode_hash: String,
     /// Aspect tags.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -71,11 +72,18 @@ pub struct Summary {
     pub tags: Vec<String>,
 }
 
+/// The value `encode_hash` carries while a queued job still owes this row a vector.
+///
+/// A real hash is never this string, so the equality tests that decide `needs_embed` keep meaning
+/// what they say: `stored != computed` is true while the sentinel is in place, which is exactly the
+/// fact that a job is owed.
+pub const ENCODE_PENDING: &str = "encode_pending";
+
 /// `sha256(model|dim|text)` — the per-field re-embed trigger (SPEC §15 #7).
 ///
 /// Takes a [`VecSpec`] rather than a loaded embedder: both inputs are *config*, so fingerprinting
 /// a document must never be a reason to load 1.2 GB of weights. The bytes hashed are unchanged —
-/// this is a signature change only, so no stored `doc_hash` moves (pinned by
+/// this is a signature change only, so no stored `encode_hash` moves (pinned by
 /// `row_hash_output_is_pinned`).
 pub fn row_hash(spec: &VecSpec, text: &str) -> String {
     let mut h = Sha256::new();
@@ -298,16 +306,19 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
 /// encoder-free.
 pub(crate) struct Prepared {
     pub(crate) key: String,
-    doc_hash: String,
+    encode_hash: String,
     existing: Option<(i64, String)>,
 }
 
 impl Prepared {
     /// Whether the document needs (re-)embedding.
+    ///
+    /// `stored != computed` is true while [`ENCODE_PENDING`] sits in the column, which is exactly the
+    /// fact that a job is owed — so the sentinel needs no special case here.
     pub(crate) fn needs_embed(&self) -> bool {
         self.existing
             .as_ref()
-            .is_none_or(|(_, h)| h != &self.doc_hash)
+            .is_none_or(|(_, h)| h != &self.encode_hash)
     }
 }
 
@@ -315,47 +326,56 @@ impl Prepared {
 pub(crate) fn prepare(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<Prepared> {
     let key = resolve_key(conn, mem)?;
     let doc_text = projection::embed_document(&key, &mem.title, &mem.body);
-    let doc_hash = row_hash(spec, &doc_text);
+    let encode_hash = row_hash(spec, &doc_text);
     let existing: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id, doc_hash FROM memory WHERE key = ?1",
+            "SELECT id, encode_hash FROM memory WHERE key = ?1",
             params![key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     Ok(Prepared {
         key,
-        doc_hash,
+        encode_hash,
         existing,
     })
 }
 
 /// Apply a prepared write inside the caller's transaction.
 ///
-/// It does **not** write the vector, and — the part that is easy to get wrong — it does **not**
-/// advance `doc_hash`. That column means "the text whose vector is stored", so it moves with the
-/// vector, in [`crate::store::encode::settle_encoded`]. Moving it here would make a pending row look
-/// indexed, and `needs_embed` would then never fire again.
+/// It does **not** write the vector, and it does **not** stamp the real `encode_hash`: that happens in
+/// [`crate::store::encode::settle_encoded`], beside the vector it describes. What it DOES do is mark
+/// the row as owing one — a write that schedules a job leaves `ENCODE_PENDING` in the column. So
+/// pending-ness is a STATE a reader can see, not an inference from a hash mismatch, and the value
+/// explains itself at the moment it is read.
 pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Result<i64> {
+    let pending = prepared.needs_embed();
     let id = match prepared.existing {
         Some((id, _)) => {
-            update_row(tx, id, mem)?;
+            update_row(tx, id, mem, pending)?;
             id
         }
         None => insert_row(tx, &prepared.key, mem)?,
     };
     write_links(tx, id, &prepared.key, &mem.body)?;
-    if prepared.needs_embed() {
-        encode::enqueue(tx, &prepared.key, &prepared.doc_hash, encode::INTERACTIVE)?;
+    if pending {
+        encode::enqueue(
+            tx,
+            &prepared.key,
+            &prepared.encode_hash,
+            encode::INTERACTIVE,
+        )?;
     }
     Ok(id)
 }
 
-/// The `UPDATE` half of [`add`]: the key already exists.
-fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
+/// The `UPDATE` half of [`add`]: the key already exists. `pending` leaves [`ENCODE_PENDING`] in
+/// `encode_hash` when this write scheduled a job, and leaves the column alone otherwise.
+fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<()> {
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
+                encode_hash = CASE WHEN ?7 THEN ?8 ELSE encode_hash END,
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -364,7 +384,9 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             mem.body,
             tags::encode(&mem.tags),
             mem.source,
-            mem.updated
+            mem.updated,
+            pending,
+            ENCODE_PENDING
         ],
     )?;
     Ok(())
@@ -372,20 +394,21 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
 
 /// The `INSERT` half of [`add`]: a new key; returns its rowid.
 ///
-/// `doc_hash` starts **empty**, which is "no vector yet" — the row is queued, and the worker fills it
-/// in with the vector it writes.
+/// `encode_hash` starts at [`ENCODE_PENDING`] — a fresh row always owes an encode — and the worker
+/// settles it with the real hash of the vector it writes.
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
-        "INSERT INTO memory (key, title, body, tags, source, doc_hash, created, updated)
-         VALUES (?1, ?2, ?3, ?4, ?5, '',
-                 COALESCE(NULLIF(?6, ''), datetime('now')),
-                 COALESCE(NULLIF(?7, ''), datetime('now')))",
+        "INSERT INTO memory (key, title, body, tags, source, encode_hash, created, updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                 COALESCE(NULLIF(?7, ''), datetime('now')),
+                 COALESCE(NULLIF(?8, ''), datetime('now')))",
         params![
             key,
             mem.title,
             mem.body,
             tags::encode(&mem.tags),
             mem.source,
+            ENCODE_PENDING,
             mem.created,
             mem.updated
         ],
@@ -480,7 +503,7 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
 
 /// The canonical column list shared by `get_by_id` and `all`.
 const MEMORY_COLUMNS: &str =
-    "id, key, title, body, tags, source, doc_hash, created, updated, visits, times_useful";
+    "id, key, title, body, tags, source, encode_hash, created, updated, visits, times_useful";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -492,7 +515,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         body: r.get(3)?,
         tags: tags::decode(&tags),
         source: r.get(5)?,
-        doc_hash: r.get(6)?,
+        encode_hash: r.get(6)?,
         created: r.get(7)?,
         updated: r.get(8)?,
         visits: r.get(9)?,

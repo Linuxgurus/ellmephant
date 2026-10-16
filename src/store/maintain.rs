@@ -3,7 +3,7 @@
 //!
 //! The relational rows are the source of truth, so changing the encoder (or its dimension)
 //! is a *re-embed*, never a migration: walk `memory`, recompute the document projection,
-//! rewrite each row's `doc_hash`, and repopulate `memory_vec`. The `[[link]]` graph is derived
+//! rewrite each row's `encode_hash`, and repopulate `memory_vec`. The `[[link]]` graph is derived
 //! too — its edges are computed at *write* time — so the same pass re-parses every body
 //! ([`links::reparse`]), making "derived and rebuildable" true rather than aspirational. `meta`
 //! records what the vectors now correspond to so `doctor` can tell a swapped model from a corrupt
@@ -15,7 +15,7 @@ use crate::db::meta;
 use crate::embed::{VecSpec, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::{encode, links, row_hash};
+use crate::store::{ENCODE_PENDING, encode, links, row_hash};
 
 /// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
         index::vec::recreate(conn, dim)?;
     }
 
-    // A changed PROJECTION is a full re-embed too, and **`doc_hash` cannot see it**: the hash covers the
+    // A changed PROJECTION is a full re-embed too, and **`encode_hash` cannot see it**: the hash covers the
     // model, the dimension and the text — not the recipe that assembled them. The fingerprint is the
     // signal, and without it a projection change would queue nothing at all while every stored vector
     // quietly kept describing the old recipe. That is the drift the fingerprint exists to catch, and
@@ -60,13 +60,13 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
     // Snapshot the rows first, so the scan is not interleaved with the enqueues.
     let rows: Vec<(i64, String, String, String, String)> = {
         let mut stmt =
-            conn.prepare("SELECT id, key, title, body, doc_hash FROM memory ORDER BY id")?;
+            conn.prepare("SELECT id, key, title, body, encode_hash FROM memory ORDER BY id")?;
         let mapped = stmt.query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    // Which rows actually HAVE a vector, which is not what `doc_hash` records: that column says a
+    // Which rows actually HAVE a vector, which is not what `encode_hash` records: that column says a
     // vector was once written for this text, and it survives a torn index.
     let indexed: std::collections::HashSet<i64> = index::vec::ids(conn)?.into_iter().collect();
 
@@ -81,23 +81,26 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
 
     let mut queued = 0;
     for (id, key, title, body, stored) in rows {
-        let doc_hash = row_hash(spec, &projection::embed_document(&key, &title, &body));
+        let encode_hash = row_hash(spec, &projection::embed_document(&key, &title, &body));
         // A row is owed a vector when the table was rebuilt or the projection moved (every stored
         // vector is the wrong width, or describes the old recipe), when its document changed, or when
-        // it has no vector at all. `doc_hash` cannot see the last two on its own — a killed rebuild
+        // it has no vector at all. `encode_hash` cannot see the last two on its own — a killed rebuild
         // leaves the hash saying "indexed", and the projection was never part of the hash — and a torn
         // or drifted index is exactly what this function exists to repair.
-        if reset || stored != doc_hash || !indexed.contains(&id) {
-            encode::enqueue(&tx, &key, &doc_hash, encode::BACKFILL)?;
+        if reset || stored != encode_hash || !indexed.contains(&id) {
+            encode::enqueue(&tx, &key, &encode_hash, encode::BACKFILL)?;
             if reset {
                 // **Clear the hash, or the work never happens.** A reset means the stored vector was
                 // built with a different recipe (or a different width), so it is not this row's vector
                 // *under the current one* — and the worker would otherwise look at the still-matching
-                // `doc_hash`, find the old vector present, decide `needs_embed = false`, and settle the
-                // entry without embedding anything. The re-embed would report 280 queued and change
-                // nothing at all, silently. `doc_hash = ''` is precisely the store saying "no vector for
-                // this text", so the worker embeds.
-                tx.execute("UPDATE memory SET doc_hash = '' WHERE id = ?1", params![id])?;
+                // `encode_hash`, find the old vector present, decide `needs_embed = false`, and settle
+                // the entry without embedding anything. The re-embed would report 280 queued and change
+                // nothing at all, silently. `encode_hash = 'encode_pending'` is precisely the store
+                // saying "no vector for this text", so the worker embeds.
+                tx.execute(
+                    "UPDATE memory SET encode_hash = ?2 WHERE id = ?1",
+                    params![id, ENCODE_PENDING],
+                )?;
             }
             queued += 1;
         }

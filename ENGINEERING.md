@@ -111,8 +111,9 @@ Everything else is **derived** from those rows and can be rebuilt at any time:
 - `memory_link` — the `[[key]]` link graph, forward edges and backlinks.
 
 A `meta` table mirrors `dim` / `model` / `instruction` for drift detection at startup, and the
-per-row `doc_hash` decides when a row needs re-embedding (any change to the key, tags, title or
-body changes the document). Ids are local; `key` is the stable identity (upsert target and link
+per-row `encode_hash` decides when a row needs re-embedding (any change to the key, tags, title or
+body changes the document; a queued-but-unencoded row holds the `encode_pending` sentinel, which never
+matches a real hash). Ids are local; `key` is the stable identity (upsert target and link
 target). Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate
 `reembed`, not an implicit migration.
 

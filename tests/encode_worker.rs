@@ -240,10 +240,10 @@ fn a_write_landing_mid_embed_is_kept_not_swallowed() {
         &ellmephant::embed::projection::embed_document("a", "a", "gamma"),
     );
     let stored: String = idle
-        .query_row("SELECT doc_hash FROM memory WHERE key = 'a'", [], |r| {
+        .query_row("SELECT encode_hash FROM memory WHERE key = 'a'", [], |r| {
             r.get(0)
         })
-        .expect("doc_hash");
+        .expect("encode_hash");
     assert_eq!(
         stored, expected,
         "the vector describes the CURRENT text, not the one the job first claimed"
@@ -292,7 +292,7 @@ fn a_queued_document_is_durable_before_it_is_ever_embedded() {
 /// A soak: many writers, one worker, and a store that must end up **consistent**, not merely quiet.
 ///
 /// Convergence alone would pass even if the queue silently dropped work. So this asserts the stronger
-/// thing: every row has a vector, and every row's `doc_hash` describes the text the row actually
+/// thing: every row has a vector, and every row's `encode_hash` describes the text the row actually
 /// holds. A swallowed write, or a stale settle, shows up as drift — an index or a hash describing text
 /// that is no longer there — which is exactly the failure with no other symptom.
 ///
@@ -350,7 +350,7 @@ fn many_writers_and_one_worker_converge_without_drift() {
     let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
     let rows: Vec<(String, String, String, String)> = {
         let mut stmt = idle
-            .prepare("SELECT key, title, body, doc_hash FROM memory ORDER BY key")
+            .prepare("SELECT key, title, body, encode_hash FROM memory ORDER BY key")
             .expect("prepare");
         let mapped = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -364,13 +364,13 @@ fn many_writers_and_one_worker_converge_without_drift() {
         expected,
         "every row has a vector: a missing one is a dropped enqueue"
     );
-    for (key, title, body, doc_hash) in rows {
+    for (key, title, body, encode_hash) in rows {
         let want = ellmephant::store::row_hash(
             &spec,
             &ellmephant::embed::projection::embed_document(&key, &title, &body),
         );
         assert_eq!(
-            doc_hash, want,
+            encode_hash, want,
             "{key}: the index describes text the row no longer holds — a write was swallowed"
         );
     }

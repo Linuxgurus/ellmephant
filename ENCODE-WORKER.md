@@ -47,7 +47,7 @@ the write**. The row is the truth; the vector is a cache we happen to have coupl
    │     ........release.......                   │
    │  2. embed              ← NO lock held        │
    │     ........release.......                   │
-   │  3. write vector, set doc_hash, dequeue      │
+   │  3. write vector, set encode_hash, dequeue   │
    │     ← short lock, conditional on doc_hash    │
    │  4. sleep `encode_interval_ms`               │
    └──────────────────────────────────────────────┘
@@ -93,7 +93,7 @@ to one memory costs one embed. `kind` is in from the start — it is the seam th
 `doc_hash` is what makes the worker safe against a concurrent write, and it is not optional:
 
 - the row is enqueued with the hash of the document *as it was written*;
-- the worker embeds the row's **current** text, writes the vector, sets `doc_hash`, then runs
+- the worker embeds the row's **current** text, writes the vector, sets `encode_hash`, then runs
   `DELETE FROM encode_queue WHERE key = ? AND doc_hash = ?`;
 - if a newer write landed while the worker was embedding, its enqueue bumped `doc_hash`, the
   delete **misses**, the row stays queued, and the newer text is embedded on the next pass.
@@ -110,7 +110,7 @@ it, the queue is self-correcting and the worker can be killed at any point.
 this design the write path must never load the encoder, so the hash has to come from `Config`:
 
 ```rust
-/// The identity of the vector space a row's `doc_hash` is written in — everything `row_hash`
+/// The identity of the vector space a row's `encode_hash` is written in — everything `row_hash`
 /// needs that does not require loading the model.
 #[derive(Debug, Clone)]
 pub struct VecSpec {
@@ -163,34 +163,33 @@ the only code that can honestly create it is the code holding a vector, `settle_
 width from config would pin the store to whatever `config.toml` said rather than to what the encoder
 actually emits, and those two are allowed to differ (a test does exactly that).
 
-### `doc_hash` keeps its exact meaning — the part to get right
+### `encode_hash` keeps its exact meaning — the part to get right
 
-Today `apply` always writes `doc_hash` and the vector is written in the same call, so the column
+Today `apply` always writes `encode_hash` and the vector is written in the same call, so the column
 means "the text whose vector is stored" and cannot lie.
 
 Under the queue it must keep meaning exactly that, or `needs_embed` and `projection_stale` silently
 go wrong:
 
-- **the row write does NOT set `doc_hash`** (except when a vector is supplied inline — see
-  `?wait=true`);
-- **the worker sets it**, when it writes the vector, to `row_hash(spec, text_it_embedded)`;
-- a row that has never been embedded carries `doc_hash = ''`.
+- **the worker sets the real hash**, when it writes the vector, to `row_hash(spec, text_it_embedded)`;
+- a row that owes a vector carries the sentinel `encode_pending` (migration 0010).
 
-So empty is "no vector yet" and non-empty is "the vector for *this* text", while `prepare`'s
-`existing doc_hash != new hash` test keeps working untouched. `insert_row` must admit `''` — the
-column is `NOT NULL` today and stays `NOT NULL`.
+So `encode_pending` is "no vector yet" and a real hash is "the vector for *this* text", while
+`prepare`'s `existing encode_hash != new hash` test keeps working untouched — the sentinel is never a
+real hash, so the mismatch is exactly the fact that a job is owed. The column is `NOT NULL` today and
+stays `NOT NULL`.
 
-**But `doc_hash` is not evidence that a vector EXISTS**, and that gap bit twice. A killed rebuild or a
+**But `encode_hash` is not evidence that a vector EXISTS**, and that gap bit twice. A killed rebuild or a
 hand-deleted vector leaves the hash saying "indexed" while the index is torn. So:
 
-- [`claim`](src/store/encode.rs) asks the index as well — `indexed = doc_hash matches && the vector is
+- [`claim`](src/store/encode.rs) asks the index as well — `indexed = encode_hash matches && the vector is
   there` — one extra SELECT per job, buying a `needs_embed` that means what it says;
 - `reembed` compares against `index::vec::ids` rather than trusting the hash when deciding what to
   queue. Without both, a rebuild would queue a torn row whose job then declined to do itself: nothing
   embedded, nothing repaired, and no error anywhere.
 
 The general lesson, and it is the sort that is invisible in review: **a derived index needs a stamp
-that is *derived from the index*, or it will eventually lie about it.** `doc_hash` describes the text;
+that is *derived from the index*, or it will eventually lie about it.** `encode_hash` describes the text;
 it never claimed to describe the presence of the row in `memory_vec`.
 
 ### The edges the queue must also reach
@@ -202,13 +201,13 @@ Every path that moves or kills a key carries its queue row with it, in the same 
 | `store::delete` | `DELETE FROM encode_queue WHERE key = ?` — a dead key must not be embedded |
 | `links::merge_into` (retires `from`) | same, for `from` |
 | `links::rename(old, new)` | re-enqueue `new`: the **key is part of the projection** (`embed_document` embeds it), so a rename moves the vector. Today it re-embeds inline (`links.rs:404`); it becomes an enqueue |
-| `store::maintain::reembed` | becomes a **producer** of enqueues — P4. It rebuilds the `vec0` table on a dim change (the one step that cannot be a swap) and queues every row that owes a vector: rebuilt, moved, **or missing from the index entirely**. `index::vec::ids` is what sees the last case; `doc_hash` cannot |
+| `store::maintain::reembed` | becomes a **producer** of enqueues — P4. It rebuilds the `vec0` table on a dim change (the one step that cannot be a swap) and queues every row that owes a vector: rebuilt, moved, **or missing from the index entirely**. `index::vec::ids` is what sees the last case; `encode_hash` cannot |
 
 ## The job
 
 ```rust
 /// A claimed document: the text to embed, plus the hash to clear when its vector is written.
-pub struct Claim { /* key, id, doc, doc_hash, claimed_hash, indexed */ }
+pub struct Claim { /* key, id, doc, encode_hash, claimed_hash, indexed */ }
 
 impl Claim {
     pub fn doc(&self) -> &str;
@@ -275,7 +274,7 @@ One pass:
 3. **Release.** `embedder.embed_one(claim.doc())` with the lock held *nowhere* in the path. This is
    where the 1.2 GB cold load happens: on the worker's thread, blocking the worker and not a request.
 4. `with_store("memory_encode_write", …)` — a short lock — `encode::settle_encoded`, which writes the
-   vector, advances `doc_hash`, and conditionally dequeues.
+   vector, advances `encode_hash`, and conditionally dequeues.
 5. Sleep `encode_interval_ms`, then look again.
 
 **Deliberately a poll, not a `Notify`.** A lost wake-up is a stall nobody can see, and a read-only
@@ -406,7 +405,7 @@ diff that can be reviewed on its own.
 | --- | --- | --- | --- |
 | **P0** | `row_hash` takes `VecSpec` instead of a loaded `&dyn Embedder` | none | It is the enabler: without it the write path cannot avoid loading the model. Machine-checkable — the hash output must not move. |
 | **P1** | `migrations/0008_encode_queue.sql`, plus `encode_one` + `drain` and their unit tests | none | **A migration ships before the code that needs it**, always: a rollback must not find code expecting a table the old binary never made. Nothing enqueues yet. |
-| **P2** | the write path: `add_impl` enqueues iff `needs_embed`, stops embedding, stops setting `doc_hash`; `insert_row` admits `''`; tests gain `drain` | **the flip** | The one to review hard — and it is small. After this, a write returns without a vector until something drains. |
+| **P2** | the write path: `add_impl` enqueues iff `needs_embed`, stops embedding, stops setting the real `encode_hash`; `insert_row` starts the column at `encode_pending` (migration 0010); tests gain `drain` | **the flip** | The one to review hard — and it is small. After this, a write returns without a vector until something drains. |
 | **P3** | `EncodeWorker` + `spawn_encode_worker` from `serve()`, both transports; `encode_interval_ms`; `?wait=true` | a vector appears ~1 s after a write, from the worker | Only now does the queue drain itself in production. Until P3, `drain` is the only consumer, so the tree is still correct without a thread. |
 | **P4** | `reembed` becomes a producer (`index::vec::recreate` if the dim changed, then enqueue every stale key at p1); `memory_reembed` / `POST /reembed` reply `{queued:N}` | `reembed` stops blocking | The outage actually ends here, and only after P3 exists to consume what it enqueues. |
 | **P5** | docs ride with their commits: `SPEC.md` §7, `HTTP.md` route table, `ENGINEERING.md` "Maintenance". A `PLAN.md` row for the phase history | none | The tool strings in `mcp/mod.rs` are a client's only spec, so they change in P2/P4, not here. |

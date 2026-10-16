@@ -919,8 +919,12 @@ pub async fn memory_delete(
                     "status": "removed",
                     "key": key,
                     "versions_remaining": remaining,
+                    // The count alone would read as "recoverable". It is not (see the MCP tool).
+                    "final_state_kept": false,
                 })),
-                format!("deleted {key} ({remaining} version(s) remain)"),
+                format!(
+                    "deleted {key} ({remaining} earlier version(s) remain; the state it had is gone)"
+                ),
             )
         }
         Ok(None) => error(

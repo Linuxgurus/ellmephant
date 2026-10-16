@@ -1085,7 +1085,7 @@ impl MemoryServer {
     /// Delete one memory by key.
     #[tool(
         name = "memory_delete",
-        description = "Kill one memory by `key` — gone from search and from `memory_get`, no undo. Its VERSIONS remain (`memory_history`), because history is kept on purpose: a delete makes a memory unreachable as current, not unfindable. `memory_history_erase` is the separate act that drops them. Use `memory_merge` when another memory should absorb it: a bare delete leaves every `[[key]]` pointing at it dangling, and `memory_stats` will report the store as damaged. Unsure rather than wrong? Reword it instead.",
+        description = "Kill one memory by `key` — gone from search and from `memory_get`, no undo. Its VERSIONS remain (`memory_history`) — the states earlier edits replaced — but NOT the state it had when deleted, which no write ever superseded: the store versions EDITS, not deletes. `memory_history_erase` is the separate act that drops the history. Use `memory_merge` when another memory should absorb it: a bare delete leaves every `[[key]]` pointing at it dangling, and `memory_stats` will report the store as damaged. Unsure rather than wrong? Reword it instead.",
         annotations(
             title = "Delete memory",
             read_only_hint = false,
@@ -1116,6 +1116,10 @@ impl MemoryServer {
                 "status": "removed",
                 "key": key,
                 "versions_remaining": remaining,
+                // Stated rather than assumed: history holds the states EDITS superseded, so the state
+                // the memory had at the end is NOT among them. A receipt that reported only the count
+                // would read as "your content is recoverable" — the one thing it is not.
+                "final_state_kept": false,
             })))
         } else {
             tracing::warn!(tool = "memory_delete", key = %key, "no such memory");

@@ -1653,6 +1653,8 @@ async fn history_is_reachable_by_address_after_the_row_is_gone() {
     .expect("delete json");
     assert_eq!(receipt["status"], "removed");
     assert_eq!(receipt["versions_remaining"], 1);
+    // The boundary, stated: what remains is the state an EDIT superseded, not the state it had.
+    assert_eq!(receipt["final_state_kept"], false);
 
     // The row is gone from the door...
     let (status, _, _) = request(&app, Method::GET, "/memory/kept", None, None, "").await;

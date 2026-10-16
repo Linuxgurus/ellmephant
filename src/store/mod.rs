@@ -147,7 +147,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _) = add_impl(conn, spec, mem)?;
+    let (id, key, _) = add_impl(conn, spec, mem, None)?;
     Ok((id, key))
 }
 
@@ -184,9 +184,14 @@ fn check_body(body: &str) -> Result<()> {
 /// create it is the code holding a vector ([`crate::store::encode::settle_encoded`], via
 /// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
 /// config said rather than what the encoder actually emits.
-fn add_impl(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String, bool)> {
+fn add_impl(
+    conn: &Connection,
+    spec: &VecSpec,
+    mem: &Memory,
+    note: Option<&str>,
+) -> Result<(i64, String, bool)> {
     check_body(&mem.body)?;
-    let prepared = prepare(conn, spec, mem)?;
+    let prepared = prepare(conn, spec, mem, note)?;
     let queued = prepared.needs_embed();
     let tx = conn.unchecked_transaction()?;
     let id = apply(&tx, mem, &prepared)?;
@@ -211,6 +216,10 @@ pub struct Patch {
     pub source: Option<String>,
     /// New tags. `Some(vec![])` clears them.
     pub tags: Option<Vec<String>>,
+    /// Why THIS change is being made. Not a field of the memory: it rides beside the version the
+    /// write supersedes, so a later reader learns the intent without reconstructing it. It creates
+    /// no version on its own — only a DOCUMENT change does (see `store::version`).
+    pub version_note: Option<String>,
 }
 
 /// What [`merge`] did.
@@ -294,7 +303,7 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
         }
     };
 
-    let (_id, key, queued) = add_impl(conn, spec, &mem)?;
+    let (_id, key, queued) = add_impl(conn, spec, &mem, patch.version_note.as_deref())?;
     Ok(MergeOutcome {
         key,
         created,
@@ -309,6 +318,9 @@ pub(crate) struct Prepared {
     pub(crate) key: String,
     encode_hash: String,
     existing: Option<(i64, String)>,
+    /// Why this write is happening, carried to the snapshot it may take. Not part of the document,
+    /// so it changes no hash and queues no embed.
+    note: Option<String>,
 }
 
 impl Prepared {
@@ -324,7 +336,12 @@ impl Prepared {
 }
 
 /// Resolve a write without opening a transaction (reads only, no model call).
-pub(crate) fn prepare(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<Prepared> {
+pub(crate) fn prepare(
+    conn: &Connection,
+    spec: &VecSpec,
+    mem: &Memory,
+    note: Option<&str>,
+) -> Result<Prepared> {
     let key = resolve_key(conn, mem)?;
     let doc_text = projection::embed_document(&key, &mem.title, &mem.body);
     let encode_hash = row_hash(spec, &doc_text);
@@ -339,6 +356,7 @@ pub(crate) fn prepare(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result
         key,
         encode_hash,
         existing,
+        note: note.map(str::to_string),
     })
 }
 
@@ -358,7 +376,7 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
                 // its history must not be able to disagree (migration 0011). Only a DOCUMENT change
                 // earns a version, which is exactly what `pending` means — a tag-only write is
                 // filing, not meaning.
-                version::snapshot(tx, id, &prepared.key, None)?;
+                version::snapshot(tx, id, &prepared.key, prepared.note.as_deref())?;
             }
             update_row(tx, id, mem, pending)?;
             id

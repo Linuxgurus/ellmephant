@@ -335,11 +335,12 @@ struct FrontMatter {
     title: Option<String>,
     tags: Option<Vec<String>>,
     source: Option<String>,
+    version_note: Option<String>,
     body: String,
 }
 
-/// Parse the front matter: `Key:`/`Title:`/`Tags:`/`Source:` before the first `---`, the body after
-/// it byte-for-byte with a trailing newline trimmed. An unknown field is an error that names it.
+/// Parse the front matter: `Key:`/`Title:`/`Tags:`/`Source:`/`Note:` before the first `---`, the body
+/// after it byte-for-byte with a trailing newline trimmed. An unknown field is an error that names it.
 fn front_matter(text: &str) -> Result<FrontMatter, String> {
     let mut out = FrontMatter::default();
     let mut header_end = text.len();
@@ -368,6 +369,7 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
             "Key" => out.key = Some(value.to_string()),
             "Title" => out.title = Some(value.to_string()),
             "Source" => out.source = Some(value.to_string()),
+            "Note" => out.version_note = Some(value.to_string()),
             "Tags" => {
                 out.tags = Some(
                     value
@@ -396,6 +398,7 @@ fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
         body: Some(fm.body),
         source: fm.source,
         tags: fm.tags,
+        version_note: fm.version_note,
     })
 }
 
@@ -407,6 +410,7 @@ struct MemoryJson {
     body: Option<String>,
     source: Option<String>,
     tags: Option<Vec<String>>,
+    version_note: Option<String>,
 }
 
 /// A `memory_upsert` patch from a JSON body.
@@ -418,6 +422,7 @@ fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
         body: m.body,
         source: m.source,
         tags: m.tags,
+        version_note: m.version_note,
     })
 }
 
@@ -1330,6 +1335,13 @@ fn stats_text(s: &store::stats::Stats) -> String {
         ("dangling", s.dangling.to_string()),
         ("visits", s.visits_total.to_string()),
         ("useful", s.useful_total.to_string()),
+        (
+            "versions",
+            format!(
+                "{} row(s), {} bytes, {} of a deleted key",
+                s.versions, s.version_bytes, s.version_orphans
+            ),
+        ),
         (
             "encode queue",
             match s.encode_oldest_s {

@@ -279,6 +279,7 @@ fn key_is_an_address_not_a_field() {
             body: Some("new facts".into()),
             source: Some("elsewhere".into()),
             tags: Some(vec!["moved".into()]),
+            version_note: None,
         },
     )
     .expect("merge everything");

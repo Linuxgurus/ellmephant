@@ -280,6 +280,12 @@ pub struct UpsertParams {
         description = "Aspects of the subject, e.g. storage, gotchas. Omit to keep the stored tags; `[]` clears them."
     )]
     pub tags: Option<Vec<String>>,
+    /// Why this change is being made, for the version it supersedes.
+    #[serde(default)]
+    #[schemars(
+        description = "Why THIS change — recorded beside the version this write creates, so a later reader (`memory_history`) learns the intent instead of reconstructing it. Only a change to `title`/`body` creates a version; a note alone does not."
+    )]
+    pub version_note: Option<String>,
 }
 
 impl UpsertParams {
@@ -291,6 +297,7 @@ impl UpsertParams {
             body: self.body,
             source: self.source,
             tags: self.tags,
+            version_note: self.version_note,
         }
     }
 }

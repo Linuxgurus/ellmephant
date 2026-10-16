@@ -8,7 +8,7 @@ use super::model::verify_weights;
 use crate::config::{Config, Paths};
 use crate::error::Result;
 use crate::model;
-use crate::store::{links, project, tags};
+use crate::store::{links, project, tags, version};
 use crate::{db, index};
 
 /// Report paths, schema version and derived-index health; `verify` re-hashes the weights.
@@ -111,6 +111,16 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     let projects = project::count(conn)?;
     let project_rot = project::dangling(conn)?.len();
     println!("  projects       {projects} project(s), {project_rot} dangling preload key(s)");
+    // The version side table (migration 0011). It is SOURCE data, not a derived index, so it is
+    // reported like the store's own size rather than checked like a graph — with one number that
+    // matters: how many of those versions belong to a key whose memory is GONE. For an orphan the
+    // newest version IS the content, so a retention pass must never thin those away.
+    let (versions, version_bytes) = version::count(conn)?;
+    let version_orphans = version::index(conn)?.iter().filter(|i| i.orphan).count();
+    println!(
+        "  versions       {versions} row(s), {}, {version_orphans} of a deleted key",
+        human_bytes(version_bytes as u64)
+    );
     println!(
         "  vectors        {} row(s) without a vector",
         (memories - vectors).max(0)

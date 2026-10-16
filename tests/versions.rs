@@ -155,3 +155,37 @@ fn the_index_finds_history_whose_row_is_gone() -> Result<()> {
     assert!(!kept.orphan);
     Ok(())
 }
+
+#[test]
+fn a_version_carries_why_the_change_was_made() -> Result<()> {
+    // The note is not a field of the memory: it is the INTENT of a write, recorded beside the version
+    // that write supersedes, so a later reader learns why instead of reconstructing it from prose.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+
+    common::add_now(&conn, &embedder, &memory("noted", "Noted", "first"))?;
+    let why = "SPEC §7 changed: the old wording promised a guarantee the store does not make";
+    let patch = Patch {
+        key: Some("noted".into()),
+        body: Some("second".into()),
+        version_note: Some(why.into()),
+        ..Default::default()
+    };
+    common::merge_now(&conn, &embedder, &patch)?;
+
+    let hist = store::version::history(&conn, "noted")?;
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].note.as_deref(), Some(why));
+
+    // A note ALONE is not a change: the document did not move, so there is nothing to version, and
+    // the note is simply dropped rather than inventing a version with no state behind it.
+    let note_only = Patch {
+        key: Some("noted".into()),
+        version_note: Some("a note with nothing to version".into()),
+        ..Default::default()
+    };
+    common::merge_now(&conn, &embedder, &note_only)?;
+    assert_eq!(store::version::history(&conn, "noted")?.len(), 1);
+    Ok(())
+}

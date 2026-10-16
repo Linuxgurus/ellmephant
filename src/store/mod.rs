@@ -9,6 +9,7 @@ pub mod project;
 pub mod slug;
 pub mod stats;
 pub mod tags;
+pub mod version;
 
 use std::collections::HashSet;
 
@@ -352,6 +353,13 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     let pending = prepared.needs_embed();
     let id = match prepared.existing {
         Some((id, _)) => {
+            if pending {
+                // Snapshot what this write is about to replace, in the SAME transaction: a row and
+                // its history must not be able to disagree (migration 0011). Only a DOCUMENT change
+                // earns a version, which is exactly what `pending` means — a tag-only write is
+                // filing, not meaning.
+                version::snapshot(tx, id, &prepared.key, None)?;
+            }
             update_row(tx, id, mem, pending)?;
             id
         }

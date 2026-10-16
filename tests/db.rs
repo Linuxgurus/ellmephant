@@ -129,6 +129,9 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         .unwrap();
     // A v4 store predates the encode queue as well.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
+    // ...and predates memory versions, which 0011 recreates: a fake old store has to UNDO what the
+    // newer migrations add, or the migration collides with a table that never went away.
+    conn.execute("DROP TABLE memory_version", []).unwrap();
     // ...and it still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
@@ -191,6 +194,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
+    // ...and predates memory versions (0011), for the same reason as above.
+    conn.execute("DROP TABLE memory_version", []).unwrap();
     // ...and still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",

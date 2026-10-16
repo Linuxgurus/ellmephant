@@ -17,8 +17,8 @@ use crate::config::Paths;
 use crate::db;
 use crate::http::HttpState;
 use crate::mcp::{
-    DUPES_LIMIT, FieldParam, GET_NUDGE, MatchModeParam, MemoryServer, SERVER_NAME, SearchParams,
-    instructions, json_ok, tool_catalog,
+    DUPES_LIMIT, FieldParam, GET_NUDGE, HISTORY_LIMIT, MatchModeParam, MemoryServer, SERVER_NAME,
+    SearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
 use crate::store::{self, encode, links::backlinks_to_wire_json, project, tags};
@@ -62,6 +62,11 @@ pub const ROUTES: &[Route] = &[
         method: "GET",
         path: "/memory/{key}",
         tool: "memory_get",
+    },
+    Route {
+        method: "GET",
+        path: "/history",
+        tool: "memory_history",
     },
     Route {
         method: "GET",
@@ -538,11 +543,40 @@ pub async fn memory_get(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let json = Params::parse(raw.as_deref()).json();
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let version = match params.parse_as::<i64>("version") {
+        Ok(v) => v,
+        Err(msg) => return error(json, StatusCode::BAD_REQUEST, msg),
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
+    // `?version=N` reads a PAST state: by address, so the live row need not exist, and counting no
+    // visit — `visits` measures the memory, not a state the memory held.
+    if let Some(n) = version {
+        let lookup = key.clone();
+        return match server
+            .with_read("memory_get", move |s| s.version(&lookup, n))
+            .await
+        {
+            Ok(Some(past)) => {
+                let mut value = serde_json::to_value(&past).unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("version".to_string(), serde_json::json!(n));
+                    obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+                }
+                render(StatusCode::OK, json, value.to_string(), memory_text(&past))
+            }
+            Ok(None) => error(
+                json,
+                StatusCode::NOT_FOUND,
+                format!("no such version: {key} {n}"),
+            ),
+            Err(e) => error(json, error_status(&e), e),
+        };
+    }
     let lookup = key.clone();
     match server
         .with_read("memory_get", move |s| s.show(&lookup))
@@ -589,6 +623,72 @@ pub async fn backlinks(
             )
         }
         Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /history` — one key's versions (`?key=…`), or the index of every key holding one.
+///
+/// A TOP-LEVEL path on purpose: history is not a sub-resource of a live memory. The case it exists
+/// for — an orphan, whose row is gone — has no `/memory/{key}` to hang from, and a path that implied
+/// the memory still existed would be wrong for exactly the caller who needs it most.
+pub async fn history(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let cap = match params.parse_as::<u32>("limit") {
+        Ok(v) => v.unwrap_or(HISTORY_LIMIT as u32) as usize,
+        Err(msg) => return error(json, StatusCode::BAD_REQUEST, msg),
+    };
+    let orphans_only = params.flag("orphans_only");
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match params.maybe("key") {
+        Some(key) => {
+            let lookup = key.to_string();
+            match server
+                .with_read("memory_history", move |s| s.versions(&lookup))
+                .await
+            {
+                Ok(rows) => {
+                    let total = rows.len();
+                    let wire = serde_json::json!({
+                        "key": key,
+                        "count": total,
+                        "versions": rows.into_iter().take(cap).collect::<Vec<_>>(),
+                    })
+                    .to_string();
+                    render(
+                        StatusCode::OK,
+                        json,
+                        wire.clone(),
+                        list_text("versions", &wire),
+                    )
+                }
+                Err(e) => error(json, error_status(&e), e),
+            }
+        }
+        // No key: the INDEX. Nothing else lists keys that are gone, so this is how an orphan is found.
+        None => match server
+            .with_read("memory_history", move |s| s.version_index(orphans_only))
+            .await
+        {
+            Ok(rows) => {
+                let total = rows.len();
+                let wire = serde_json::json!({
+                    "count": total,
+                    "keys": rows.into_iter().take(cap).collect::<Vec<_>>(),
+                })
+                .to_string();
+                render(
+                    StatusCode::OK,
+                    json,
+                    wire.clone(),
+                    list_text("history", &wire),
+                )
+            }
+            Err(e) => error(json, error_status(&e), e),
+        },
     }
 }
 
@@ -802,19 +902,28 @@ pub async fn memory_delete(
     };
     let lookup = key.clone();
     match server
-        .with_store("memory_delete", move |s| s.rm(&lookup))
+        .with_store("memory_delete", move |s| {
+            if !s.rm(&lookup)? {
+                return Ok(None);
+            }
+            Ok(Some(s.version_count(&lookup)?))
+        })
         .await
     {
-        Ok(true) => {
-            tracing::info!(area = scope.area, key = %key, "memory removed over http");
+        Ok(Some(remaining)) => {
+            tracing::info!(area = scope.area, key = %key, versions = remaining, "memory removed over http");
             render(
                 StatusCode::OK,
                 json,
-                json_ok(serde_json::json!({ "status": "removed", "key": key })),
-                format!("deleted {key}"),
+                json_ok(serde_json::json!({
+                    "status": "removed",
+                    "key": key,
+                    "versions_remaining": remaining,
+                })),
+                format!("deleted {key} ({remaining} version(s) remain)"),
             )
         }
-        Ok(false) => error(
+        Ok(None) => error(
             json,
             StatusCode::NOT_FOUND,
             format!("no such memory: {key}"),

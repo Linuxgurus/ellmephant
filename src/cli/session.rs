@@ -223,6 +223,40 @@ impl Session {
         store::delete(&self.conn, key)
     }
 
+    /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying
+    /// for one (`store::version`). An empty list is a fact and not an error: a key with no history
+    /// reads the same whether it never existed or never changed.
+    ///
+    /// Deliberately by KEY, never resolved through the `memory` row: a key that is GONE still has
+    /// history, and that history is then the only copy of what it said.
+    pub fn versions(&self, key: &str) -> Result<Vec<store::version::Version>> {
+        store::version::history(&self.conn, key)
+    }
+
+    /// One version's snapshot, in the SAME shape as a live memory ([`Memory`]), so a caller handles a
+    /// past state and a present one alike. `None` means no such version; the address need not exist.
+    pub fn version(&self, key: &str, n: i64) -> Result<Option<Memory>> {
+        match store::version::read(&self.conn, key, n)? {
+            Some(snap) => Ok(Some(serde_json::from_value(snap)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The INDEX of history: every key that holds versions, with counts and an `orphan` flag. This is
+    /// how a deleted key is found at all — nothing else in the store lists keys that are gone.
+    pub fn version_index(&self, orphans_only: bool) -> Result<Vec<store::version::HistoryIndex>> {
+        let mut rows = store::version::index(&self.conn)?;
+        if orphans_only {
+            rows.retain(|r| r.orphan);
+        }
+        Ok(rows)
+    }
+
+    /// How many versions one key holds — what a delete does NOT remove.
+    pub fn version_count(&self, key: &str) -> Result<i64> {
+        store::version::count_for(&self.conn, key)
+    }
+
     /// Run a query, borrowing the encoder only when there is a phrase to embed. A read-only session
     /// serves the rows from its own connection, so a search does not wait for a write to finish.
     pub fn search(&self, q: &Query) -> Result<Bundle> {

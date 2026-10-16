@@ -1587,3 +1587,91 @@ async fn wait_true_holds_the_lock_and_health_names_the_holder() {
         "the synchronous door settles it before answering: {body}"
     );
 }
+
+/// History is reachable by ADDRESS from both doors — and a delete says what it did NOT remove.
+///
+/// This is the test the missing-FK decision needs: the row goes, the history stays, and the index
+/// is the only thing in the store that can still name it.
+#[tokio::test]
+async fn history_is_reachable_by_address_after_the_row_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_open(dir.path());
+    seed(&app, "", "kept", "Kept", "first state").await;
+    // A change to the DOCUMENT earns a version (a tag or source write would not).
+    seed(&app, "", "kept", "Kept", "second state").await;
+
+    let peer = mcp_peer(MemoryServer::with_watch(
+        Arc::new(Mutex::new(session(dir.path()))),
+        Arc::new(LockWatch::new()),
+    ))
+    .await;
+
+    // The list is METADATA: enough to choose an `n`, and no bodies.
+    let listed: serde_json::Value = serde_json::from_str(
+        &tool(
+            &peer,
+            "memory_history",
+            serde_json::json!({ "key": "kept" }),
+        )
+        .await,
+    )
+    .expect("history json");
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["versions"][0]["n"], 1);
+    assert!(
+        listed["versions"][0].get("body").is_none(),
+        "the list is metadata; a body is a separate call"
+    );
+
+    // ...and one version reads in the same shape a live memory does.
+    let past: serde_json::Value = serde_json::from_str(
+        &tool(
+            &peer,
+            "memory_get",
+            serde_json::json!({ "key": "kept", "version": 1 }),
+        )
+        .await,
+    )
+    .expect("version json");
+    assert_eq!(past["body"], "first state");
+    assert_eq!(past["version"], 1);
+    assert_eq!(past["title"], "Kept");
+
+    // HTTP answers from a TOP-LEVEL path: history is not a sub-resource of a live memory.
+    let (status, body, _) = request(&app, Method::GET, "/history?key=kept", None, None, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"count\":1"), "{body}");
+    let (status, body, _) =
+        request(&app, Method::GET, "/memory/kept?version=1", None, None, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("first state"), "{body}");
+
+    // The delete's receipt states what remains: history outlives the row by design.
+    let receipt: serde_json::Value = serde_json::from_str(
+        &tool(&peer, "memory_delete", serde_json::json!({ "key": "kept" })).await,
+    )
+    .expect("delete json");
+    assert_eq!(receipt["status"], "removed");
+    assert_eq!(receipt["versions_remaining"], 1);
+
+    // The row is gone from the door...
+    let (status, _, _) = request(&app, Method::GET, "/memory/kept", None, None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // ...but the address still answers, and the INDEX is how it is found at all.
+    let (status, body, _) =
+        request(&app, Method::GET, "/memory/kept?version=1", None, None, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("first state"), "{body}");
+    let idx: serde_json::Value = serde_json::from_str(
+        &tool(
+            &peer,
+            "memory_history",
+            serde_json::json!({ "orphans_only": true }),
+        )
+        .await,
+    )
+    .expect("index json");
+    assert_eq!(idx["count"], 1);
+    assert_eq!(idx["keys"][0]["key"], "kept");
+    assert_eq!(idx["keys"][0]["orphan"], true);
+}

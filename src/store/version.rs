@@ -145,6 +145,15 @@ pub fn count(conn: &Connection) -> Result<(i64, i64)> {
     )?)
 }
 
+/// How many versions one key holds — the question a delete leaves behind: *what did I not remove?*
+pub fn count_for(conn: &Connection, key: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM memory_version WHERE type = ?1 AND key = ?2",
+        params![MEMORY, key],
+        |r| r.get(0),
+    )?)
+}
+
 /// The ERASURE act: drop every version of one key. The row itself is untouched.
 ///
 /// This exists so that "the store keeps a copy of what you asked it to remove" is never true by

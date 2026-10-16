@@ -146,7 +146,10 @@ instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`b
 empty. A new key needs both a `title` and a `body`. Rewriting `title` or `body` re-opens the split \
 review (`coherent` resets); a tags or source change does not — filing is not meaning. The reply's \
 `queued` says whether this write scheduled an embed: a written document is indexed a moment later by \
-the store's encode worker, so a semantic search straight after a write may not see it yet.";
+the store's encode worker, so a semantic search straight after a write may not see it yet. `doc_hash` \
+is stamped by that WORKER too, never by this write — so until the worker runs, the column still names \
+the PREVIOUS text (`''` = no vector yet), and a hash that has not moved is a PENDING ENCODE, not a \
+failed write: `memory_stats`' `encode_pending` says how much is owed.";
 
 /// `memory_upvote` description. The feedback nudge, carried here only.
 const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \
@@ -1240,7 +1243,7 @@ impl MemoryServer {
     /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
-        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it.",
+        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it. `doc_hash` is stamped by the background encode worker, not by the write: right after an edit it still names the PREVIOUS text (`''` = no vector yet), so a hash that has not moved is a PENDING ENCODE, not a failed write.",
         annotations(
             title = "Get memory",
             read_only_hint = true,

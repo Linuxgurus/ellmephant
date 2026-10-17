@@ -103,8 +103,8 @@ pub fn send(
     }
 
     conn.execute(
-        "INSERT INTO mail (sender, recipient, subject, body, encoding, bytes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO mail (sender, recipient, subject, body, encoding, bytes, asserted_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?1)",
         params![
             sender,
             recipient,

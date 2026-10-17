@@ -370,6 +370,7 @@ struct FrontMatter {
     title: Option<String>,
     tags: Option<Vec<String>>,
     source: Option<String>,
+    origin: Option<String>,
     version_note: Option<String>,
     body: String,
 }
@@ -404,6 +405,7 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
             "Key" => out.key = Some(value.to_string()),
             "Title" => out.title = Some(value.to_string()),
             "Source" => out.source = Some(value.to_string()),
+            "Origin" => out.origin = Some(value.to_string()),
             "Note" => out.version_note = Some(value.to_string()),
             "Tags" => {
                 out.tags = Some(
@@ -432,6 +434,9 @@ fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
         title: fm.title,
         body: Some(fm.body),
         source: fm.source,
+        // A text body carries no speaker: the handler stamps `asserted_by` from the request.
+        asserted_by: None,
+        origin: fm.origin,
         tags: fm.tags,
         version_note: fm.version_note,
         expected_version: None,
@@ -445,6 +450,7 @@ struct MemoryJson {
     title: Option<String>,
     body: Option<String>,
     source: Option<String>,
+    origin: Option<String>,
     tags: Option<Vec<String>>,
     version_note: Option<String>,
     /// The CAS token, as `memory_get` returns it.
@@ -459,6 +465,8 @@ fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
         title: m.title,
         body: m.body,
         source: m.source,
+        asserted_by: None,
+        origin: m.origin,
         tags: m.tags,
         version_note: m.version_note,
         expected_version: m.expected_version,

@@ -13,6 +13,7 @@ pub mod error;
 pub mod hex;
 pub mod http;
 pub mod http_surface;
+pub mod identity;
 pub mod index;
 pub mod mcp;
 pub mod model;

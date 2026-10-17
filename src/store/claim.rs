@@ -176,7 +176,15 @@ fn try_acquire(conn: &Connection, name: &str, owner: &str, offset: &str) -> Resu
                  VALUES (?1, ?2, datetime('now'), datetime('now', ?3))
                  ON CONFLICT(name) DO UPDATE SET
                      owner = excluded.owner,
-                     expires_at = excluded.expires_at
+                     -- ★ A RENEWAL MAY EXTEND, NEVER SHORTEN. A live lease keeps the later deadline,
+                     -- so a short probe cannot release a long lock early (measured 2026-10-17: a 60s
+                     -- renewal truncated a 64-minute `finger` lock). A LAPSED lease is a different
+                     -- case — it must take the new window, or it would come back already expired.
+                     expires_at = CASE
+                         WHEN claim.expires_at <= datetime('now') THEN excluded.expires_at
+                         WHEN excluded.expires_at > claim.expires_at THEN excluded.expires_at
+                         ELSE claim.expires_at
+                     END
                  WHERE claim.expires_at <= datetime('now') OR claim.owner = excluded.owner
                  RETURNING {COLUMNS}"
             ),
@@ -265,6 +273,26 @@ mod tests {
         acquire(&conn, "bank", "hand-a", Some(300)).expect("first");
         let out = acquire(&conn, "bank", "hand-a", Some(600)).expect("renew");
         assert!(out.won, "the holder may renew its own lease");
+    }
+
+    #[test]
+    fn a_shorter_renewal_cannot_shorten_a_live_lease() {
+        let (_dir, conn) = store();
+        let long = acquire(&conn, "finger", "hands", Some(3840)).expect("long lease");
+        // The bug this pins: a 60s probe used to truncate a 64-minute lock, releasing it early and
+        // letting a second finger into the same work.
+        let probe = acquire(&conn, "finger", "hands", Some(60)).expect("probe");
+        assert!(probe.won, "the holder may renew");
+        assert_eq!(
+            probe.claim.expires_at, long.claim.expires_at,
+            "a shorter TTL must not move the deadline backwards"
+        );
+        // ...and a longer one still extends it.
+        let longer = acquire(&conn, "finger", "hands", Some(7200)).expect("extend");
+        assert!(
+            longer.claim.expires_at > long.claim.expires_at,
+            "a longer TTL must extend the lease"
+        );
     }
 
     #[test]

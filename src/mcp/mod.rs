@@ -41,6 +41,7 @@ use crate::store::{self, project};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
+    "whoami",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -1210,6 +1211,39 @@ pub(crate) async fn upvote_sweep(
 
 #[tool_router]
 impl MemoryServer {
+    /// WHO this connection speaks for — the name a write would be stamped with, and whether it was
+    /// PROVEN. A read: it changes nothing, and it never returns the secret.
+    #[tool(
+        name = "whoami",
+        description = "Report the identity this connection writes as: `asserted_by` (the `sender`/author a write is stamped with) and `proven` (true when `X-Stet-From` was matched against `X-Stet-Auth`). `proven: false` with `asserted_by: anonymous` means the connection presents no identity, so every write will be attributed to nobody. Use this instead of guessing, and never to test credentials — it does not echo them.",
+        annotations(
+            title = "Who am I",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn whoami(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let body = match identity_of(&ctx) {
+            Ok(Some(name)) => serde_json::json!({ "asserted_by": name, "proven": true }),
+            Ok(None) => {
+                serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false })
+            }
+            // A claim that did not verify still deserves an answer: the caller learns the name it
+            // sent is not the name it has, which is the whole confusion this tool exists to end.
+            Err(forged) => serde_json::json!({
+                "asserted_by": crate::identity::ANONYMOUS,
+                "proven": false,
+                "claimed": forged.0,
+                "problem": "the X-Stet-Auth proof is missing or wrong",
+            }),
+        };
+        Ok(json_ok(body))
+    }
+
     /// Store one atomic memory; upserts by key. See the description for the write law.
     #[tool(
         name = "memory_upsert",
@@ -2112,6 +2146,7 @@ pub fn http_router(
     use crate::http_surface as surface;
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
+        .route("/whoami", axum::routing::get(surface::whoami))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/history", axum::routing::get(surface::history))

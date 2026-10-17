@@ -39,6 +39,11 @@ pub struct Route {
 /// are surfaces of their own, not tools, so they are absent by design).
 pub const ROUTES: &[Route] = &[
     Route {
+        method: "GET",
+        path: "/whoami",
+        tool: "whoami",
+    },
+    Route {
         method: "POST",
         path: "/memory",
         tool: "memory_upsert",
@@ -563,6 +568,43 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| format!("bad json body: {e}"))
+}
+
+/// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
+/// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
+/// same question the model asks instead of guessing from a remembered flag.
+pub async fn whoami(headers: HeaderMap) -> Response {
+    let (doc, text) = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => {
+            let text = format!("{name} (proven)\n");
+            (
+                serde_json::json!({ "asserted_by": name, "proven": true }),
+                text,
+            )
+        }
+        Ok(None) => (
+            serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false }),
+            format!("{} (not proven)\n", crate::identity::ANONYMOUS),
+        ),
+        // A claim that failed verification is still worth reporting: the caller learns the name it
+        // sent is not the name it has. The secret is never echoed.
+        Err(forged) => {
+            let claimed = forged.0;
+            (
+                serde_json::json!({
+                    "asserted_by": crate::identity::ANONYMOUS,
+                    "proven": false,
+                    "claimed": claimed,
+                    "problem": "the X-Stet-Auth proof is missing or wrong",
+                }),
+                format!(
+                    "{} (not proven; claimed `{claimed}`)\n",
+                    crate::identity::ANONYMOUS
+                ),
+            )
+        }
+    };
+    render(StatusCode::OK, true, doc.to_string(), text)
 }
 
 /// `GET /stats` — the whole-store digest (`memory_stats`).

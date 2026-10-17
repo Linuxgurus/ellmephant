@@ -18,7 +18,7 @@ use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, encode, links, maintain, project};
+use crate::store::{self, Memory, claim, encode, links, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -365,6 +365,34 @@ impl Session {
     /// Projects matching `filter`, key order.
     pub fn project_list(&self, filter: &project::Filter) -> Result<Vec<project::Project>> {
         project::list(&self.conn, filter)
+    }
+
+    /// Take or renew an atomic lease over `name` — the cross-machine claim.
+    ///
+    /// `acquire` is one SQL statement (`store::claim::acquire`), so a live lease held by another owner
+    /// is refused and the same owner re-taking it renews. The store's versioning cannot give this: a
+    /// claim built from `memory_get` + `memory_upsert` would be a racy read-modify-write.
+    pub fn claim_acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl_seconds: Option<i64>,
+    ) -> Result<claim::Acquire> {
+        claim::acquire(&self.conn, name, owner, ttl_seconds)
+    }
+
+    /// Release a lease, but only your own. A non-owner is refused and told who holds it.
+    pub fn claim_release(&self, name: &str, owner: &str) -> Result<claim::Release> {
+        claim::release(&self.conn, name, owner)
+    }
+
+    /// The claims a reader can see: one by `name`, or every claim (expired rows included) when `name`
+    /// is `None`. The audit view — an unexplained stale claim must be visible, not hidden.
+    pub fn claims(&self, name: Option<&str>) -> Result<Vec<claim::Claim>> {
+        match name {
+            Some(n) => Ok(claim::get(&self.conn, n)?.into_iter().collect()),
+            None => claim::list(&self.conn),
+        }
     }
 }
 

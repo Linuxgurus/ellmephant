@@ -65,6 +65,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0011_memory_versions.sql"),
         "memory versions: the state a document change replaces",
     ),
+    (
+        12,
+        include_str!("../../migrations/0012_claims.sql"),
+        "claims: an atomic lease over a name",
+    ),
 ];
 
 /// Current schema version recorded in the file.

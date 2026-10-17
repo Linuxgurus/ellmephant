@@ -1,5 +1,6 @@
 //! The write/read path over `memory` and its derived indexes (P4).
 
+pub mod claim;
 pub mod codec;
 pub mod dupes;
 pub mod encode;

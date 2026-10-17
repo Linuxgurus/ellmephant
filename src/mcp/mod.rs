@@ -55,6 +55,9 @@ pub const TOOLS: &[&str] = &[
     "project_upsert",
     "project_get",
     "project_list",
+    "claim_acquire",
+    "claim_release",
+    "claim_list",
 ];
 
 /// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
@@ -501,6 +504,51 @@ pub struct StatsParams {
 /// Parameters for a no-argument tool (e.g. `memory_reembed`).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {}
+
+/// Parameters for [`MemoryServer::claim_acquire`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaimAcquireParams {
+    /// The name to lease.
+    #[schemars(
+        description = "The name to lease — free text, a handle two writers share (a `hands-bank` key, a handoff topic). Trimmed; must not be empty."
+    )]
+    pub name: String,
+    /// Who is taking it.
+    #[schemars(
+        description = "Who is taking it — your own identifier. The SAME owner re-acquiring RENEWS rather than conflicts; a DIFFERENT owner is refused while the lease is live."
+    )]
+    pub owner: String,
+    /// Lease length in seconds.
+    #[serde(default)]
+    #[schemars(
+        description = "Lease length in seconds (default 900, max 86400). The lease EXPIRES on its own, so a crashed holder frees the name without help."
+    )]
+    pub ttl_seconds: Option<i64>,
+}
+
+/// Parameters for [`MemoryServer::claim_release`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaimReleaseParams {
+    /// The name to release.
+    #[schemars(description = "The name the lease is over.")]
+    pub name: String,
+    /// The owner that must match.
+    #[schemars(
+        description = "Who is releasing — must be the current holder. A non-owner is refused and told who holds it; release is not a way to steal a lease."
+    )]
+    pub owner: String,
+}
+
+/// Parameters for [`MemoryServer::claim_list`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaimListParams {
+    /// Limit to one name.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional: one name to inspect. Omit for every claim, EXPIRED rows included — the audit view, so an unexplained stale claim is visible rather than hidden."
+    )]
+    pub name: Option<String>,
+}
 
 /// Parameters for [`MemoryServer::memory_dupes`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1565,6 +1613,99 @@ impl MemoryServer {
         tracing::info!(tool = "project_list", projects = rows.len(), "projects");
         project::list_to_wire_json(&rows).map_err(|e| e.to_string())
     }
+
+    /// Take or renew an atomic lease over a name — the cross-machine claim.
+    #[tool(
+        name = "claim_acquire",
+        description = "Take (or renew) an atomic LEASE over a `name`. This is coordination between TWO writers to one store — the store versions but does not transact, so a bank `debit` (or any read-modify-write) can be lost when two writers interleave. The store owns this primitive because acquiring a client-side lease is itself a read-modify-write, and clocks cannot order the tie-break (two hands skew hours). ONE statement decides and writes: it succeeds when the name is free or the lease has EXPIRED, and is REFUSED while a DIFFERENT owner holds a live lease. The SAME owner re-acquiring is a renewal, not a conflict. Returns `won` and the holder NOW — on a loss, `claim` names who holds it and until when. Hold it only around the critical section (claim → act and debit → `claim_release`), and pass a `ttl_seconds` that outlives the work but not the buyer: a crashed holder EXPIRES out of the way on its own. Not security — both writers are the same self; coordination only.",
+        annotations(
+            title = "Acquire claim",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn claim_acquire(
+        &self,
+        Parameters(p): Parameters<ClaimAcquireParams>,
+    ) -> std::result::Result<String, String> {
+        let ClaimAcquireParams {
+            name,
+            owner,
+            ttl_seconds,
+        } = p;
+        let out = self
+            .with_store("claim_acquire", move |s| {
+                s.claim_acquire(&name, &owner, ttl_seconds)
+            })
+            .await?;
+        tracing::info!(
+            tool = "claim_acquire",
+            name = %out.claim.name,
+            owner = %out.claim.owner,
+            won = out.won,
+            "claim attempted"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// Release a lease — only your own.
+    #[tool(
+        name = "claim_release",
+        description = "Release a lease you hold, so a waiting writer can take it now instead of waiting out the TTL. Only the CURRENT HOLDER may release: a release by anyone else is refused and the reply names the holder, because a lease is not a lock you can steal. A lease that lapses is harmless — this is the tidy path, not a duty. Returns `released` and, when the lease survives, the holder still on it.",
+        annotations(
+            title = "Release claim",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn claim_release(
+        &self,
+        Parameters(p): Parameters<ClaimReleaseParams>,
+    ) -> std::result::Result<String, String> {
+        let ClaimReleaseParams { name, owner } = p;
+        let log_name = name.clone();
+        let log_owner = owner.clone();
+        let out = self
+            .with_store("claim_release", move |s| s.claim_release(&name, &owner))
+            .await?;
+        tracing::info!(
+            tool = "claim_release",
+            name = %log_name,
+            owner = %log_owner,
+            released = out.released,
+            "claim released"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// List the claims — one by name, or every claim, expired rows included.
+    #[tool(
+        name = "claim_list",
+        description = "Read the claims: one by `name`, or EVERY claim when `name` is omitted. Each row carries its `owner`, when it was `acquired_at`, when it `expires_at`, and a derived `live` flag. EXPIRED rows are kept, not swept — an unexplained stale claim is a bug report, and this view is the only place to read it. Use this before blaming a writer for not proceeding: the answer is usually that someone else holds the lease, and the row says who and until when.",
+        annotations(
+            title = "List claims",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn claim_list(
+        &self,
+        Parameters(p): Parameters<ClaimListParams>,
+    ) -> std::result::Result<String, String> {
+        let name = p.name;
+        let lookup = name.clone();
+        let rows = self
+            .with_read("claim_list", move |s| s.claims(lookup.as_deref()))
+            .await?;
+        tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
+        serde_json::to_string(&serde_json::json!({ "claims": rows })).map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler]
@@ -1700,6 +1841,14 @@ pub fn http_router(
         .route("/projects", axum::routing::get(surface::projects))
         .route("/project/{key}", axum::routing::get(surface::project_get))
         .route("/project", axum::routing::post(surface::project_upsert))
+        .route(
+            "/claim",
+            axum::routing::get(surface::claims).post(surface::claim_acquire),
+        )
+        .route(
+            "/claim/{key}/release",
+            axum::routing::post(surface::claim_release),
+        )
         .route("/reembed", axum::routing::post(surface::reembed))
         // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.
         .fallback(surface::not_found)

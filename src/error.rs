@@ -46,6 +46,10 @@ pub enum Error {
     #[error("project error: {0}")]
     Project(String),
 
+    /// A claim-layer rule was violated: an empty name/owner, or a TTL that is not a usable duration.
+    #[error("claim error: {0}")]
+    Claim(String),
+
     /// A malformed search pattern (a regex that will not compile); the message carries the
     /// compiler's complaint.
     #[error("invalid pattern: {0}")]

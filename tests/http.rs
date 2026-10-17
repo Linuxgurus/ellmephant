@@ -1695,3 +1695,84 @@ async fn history_is_reachable_by_address_after_the_row_is_gone() {
     assert_eq!(idx["keys"][0]["key"], "kept");
     assert_eq!(idx["keys"][0]["orphan"], true);
 }
+
+/// The claim routes work end to end: acquire, see it, be refused by a second owner, release, and let
+/// the second owner in. The store-level race is `tests/claims.rs`; this proves the HTTP door.
+#[tokio::test]
+async fn claims_round_trip_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    );
+    let server = MemoryServer::with_watch(Arc::new(Mutex::new(session(dir.path()))), watch);
+    let app = router(server, state);
+    let json_body = Some("application/json");
+
+    // A takes the lease.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/claim?format=json",
+        None,
+        json_body,
+        r#"{"name":"bank","owner":"hand-a","ttl_seconds":300}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["won"], serde_json::json!(true), "{body}");
+    assert_eq!(v["claim"]["owner"], serde_json::json!("hand-a"));
+
+    // B is refused, and the reply names the holder.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/claim?format=json",
+        None,
+        json_body,
+        r#"{"name":"bank","owner":"hand-b","ttl_seconds":300}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["won"], serde_json::json!(false), "{body}");
+    assert_eq!(v["claim"]["owner"], serde_json::json!("hand-a"));
+
+    // The audit view shows it.
+    let (status, body, _) = get(&app, "/claim?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["claims"][0]["name"], serde_json::json!("bank"));
+
+    // A releases it.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/claim/bank/release?format=json",
+        None,
+        json_body,
+        r#"{"owner":"hand-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["released"], serde_json::json!(true), "{body}");
+
+    // And B can now take it.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/claim?format=json",
+        None,
+        json_body,
+        r#"{"name":"bank","owner":"hand-b","ttl_seconds":300}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["won"], serde_json::json!(true), "{body}");
+}

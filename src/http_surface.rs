@@ -108,6 +108,21 @@ pub const ROUTES: &[Route] = &[
         path: "/projects",
         tool: "project_list",
     },
+    Route {
+        method: "POST",
+        path: "/claim",
+        tool: "claim_acquire",
+    },
+    Route {
+        method: "POST",
+        path: "/claim/{key}/release",
+        tool: "claim_release",
+    },
+    Route {
+        method: "GET",
+        path: "/claim",
+        tool: "claim_list",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -811,6 +826,173 @@ pub async fn project_get(
                 json,
                 wire.clone(),
                 list_text("project", &wire),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /claim` — take or renew an atomic lease (`claim_acquire`); JSON body of the tool's args.
+pub async fn claim_acquire(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let name = match doc.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return error(json, StatusCode::BAD_REQUEST, "missing `name`"),
+    };
+    let owner = match doc.get("owner").and_then(|v| v.as_str()) {
+        Some(o) => o.to_string(),
+        None => return error(json, StatusCode::BAD_REQUEST, "missing `owner`"),
+    };
+    let ttl = doc.get("ttl_seconds").and_then(|v| v.as_i64());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("claim_acquire", move |s| {
+            s.claim_acquire(&name, &owner, ttl)
+        })
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(
+                area = scope.area,
+                name = %out.claim.name,
+                owner = %out.claim.owner,
+                won = out.won,
+                "claim over http"
+            );
+            let text = if out.won {
+                format!(
+                    "claimed `{}` for {} until {}",
+                    out.claim.name, out.claim.owner, out.claim.expires_at
+                )
+            } else {
+                format!(
+                    "refused: `{}` held by {} until {}",
+                    out.claim.name, out.claim.owner, out.claim.expires_at
+                )
+            };
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                text,
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /claim/{key}/release` — drop your own lease (`claim_release`). `owner` from body or query.
+pub async fn claim_release(
+    State(state): State<HttpState>,
+    Path(name): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(v) => v,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let owner = doc
+        .as_ref()
+        .and_then(|v| v.get("owner"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| params.maybe("owner").map(str::to_string));
+    let Some(owner) = owner else {
+        return error(json, StatusCode::BAD_REQUEST, "missing `owner`");
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("claim_release", move |s| s.claim_release(&name, &owner))
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(
+                area = scope.area,
+                released = out.released,
+                "claim release over http"
+            );
+            let text = if out.released {
+                "released".to_string()
+            } else {
+                match &out.claim {
+                    Some(c) => format!("refused: held by {} until {}", c.owner, c.expires_at),
+                    None => "refused: no such claim".to_string(),
+                }
+            };
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                text,
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /claim` — every claim, live or expired (`claim_list`).
+pub async fn claims(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let name = params.maybe("name").map(str::to_string);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("claim_list", move |s| s.claims(name.as_deref()))
+        .await
+    {
+        Ok(rows) => {
+            let text = if rows.is_empty() {
+                "no claims".to_string()
+            } else {
+                rows.iter()
+                    .map(|c| {
+                        format!(
+                            "{} {} held by {} (until {})",
+                            if c.live { "live" } else { "expired" },
+                            c.name,
+                            c.owner,
+                            c.expires_at
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&serde_json::json!({ "claims": rows })).unwrap_or_default(),
+                text,
             )
         }
         Err(e) => error(json, error_status(&e), e),

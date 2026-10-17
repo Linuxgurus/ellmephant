@@ -75,6 +75,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0013_mail.sql"),
         "mail: addressed rows, read by the recipient's cursor",
     ),
+    (
+        14,
+        include_str!("../../migrations/0014_provenance.sql"),
+        "provenance: asserted_by (stamped by the store) + origin (declared by the caller)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

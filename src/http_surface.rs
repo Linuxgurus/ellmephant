@@ -123,6 +123,26 @@ pub const ROUTES: &[Route] = &[
         path: "/claim",
         tool: "claim_list",
     },
+    Route {
+        method: "POST",
+        path: "/mail",
+        tool: "mail_send",
+    },
+    Route {
+        method: "GET",
+        path: "/mail",
+        tool: "mail_inbox",
+    },
+    Route {
+        method: "GET",
+        path: "/mail/{seq}",
+        tool: "mail_read",
+    },
+    Route {
+        method: "POST",
+        path: "/mail/prune",
+        tool: "mail_prune",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -2053,4 +2073,168 @@ fn boot_json(view: &BootView, tools: Option<&[BootTool]>) -> serde_json::Value {
         doc["tools"] = serde_json::Value::Array(tools);
     }
     doc
+}
+
+/// `POST /mail` — write one letter (`mail_send`). JSON body; nothing is delivered.
+pub async fn mail_send(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let (Some(sender), Some(recipient), Some(letter)) =
+        (field("sender"), field("recipient"), field("body"))
+    else {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`sender`, `recipient` and `body` are required",
+        );
+    };
+    let subject = field("subject").unwrap_or_default();
+    let encoding = field("encoding").unwrap_or_else(|| "text".to_string());
+    let to = recipient.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("mail_send", move |s| {
+            s.mail_send(&sender, &recipient, &subject, &letter, &encoding)
+        })
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, seq = out.seq, to = %to, "letter over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                format!("letter {} written to `{to}`", out.seq),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `GET /mail?recipient=&since=&limit=` — envelopes after the reader's cursor (`mail_inbox`).
+pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let Some(recipient) = params.maybe("recipient").map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`recipient` is required");
+    };
+    let since = params
+        .maybe("since")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit = params
+        .maybe("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_usize);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("mail_inbox", move |s| {
+            s.mail_inbox(&recipient, since, limit)
+        })
+        .await
+    {
+        Ok(rows) => {
+            let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
+            let text = if rows.is_empty() {
+                format!("no mail after {since}")
+            } else {
+                rows.iter()
+                    .map(|r| {
+                        format!(
+                            "{} {} {} ({} · {} bytes)",
+                            r.seq, r.at, r.sender, r.subject, r.bytes
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "letters": rows, "max_seq": max_seq }).to_string(),
+                text,
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `GET /mail/{seq}` — one letter, body included (`mail_read`).
+pub async fn mail_read(
+    State(state): State<HttpState>,
+    axum::extract::Path(seq): axum::extract::Path<i64>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("mail_read", move |s| s.mail_read(seq))
+        .await
+    {
+        Ok(Some(letter)) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&letter).unwrap_or_default(),
+            letter.body.clone(),
+        ),
+        Ok(None) => error(json, StatusCode::NOT_FOUND, "no such letter"),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `POST /mail/prune?keep_days=7` — drop letters nobody ever read (`mail_prune`).
+pub async fn mail_prune(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let keep_days = params
+        .maybe("keep_days")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14_i64);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("mail_prune", move |s| s.mail_prune(keep_days))
+        .await
+    {
+        Ok(removed) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "removed": removed }).to_string(),
+            format!("pruned {removed} letter(s) older than {keep_days}d"),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
 }

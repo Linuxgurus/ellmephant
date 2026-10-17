@@ -280,6 +280,7 @@ fn key_is_an_address_not_a_field() {
             source: Some("elsewhere".into()),
             tags: Some(vec!["moved".into()]),
             version_note: None,
+            expected_version: None,
         },
     )
     .expect("merge everything");

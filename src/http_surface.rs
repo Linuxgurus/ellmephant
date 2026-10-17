@@ -414,6 +414,7 @@ fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
         source: fm.source,
         tags: fm.tags,
         version_note: fm.version_note,
+        expected_version: None,
     })
 }
 
@@ -426,6 +427,8 @@ struct MemoryJson {
     source: Option<String>,
     tags: Option<Vec<String>>,
     version_note: Option<String>,
+    /// The CAS token, as `memory_get` returns it.
+    expected_version: Option<i64>,
 }
 
 /// A `memory_upsert` patch from a JSON body.
@@ -438,6 +441,7 @@ fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
         source: m.source,
         tags: m.tags,
         version_note: m.version_note,
+        expected_version: m.expected_version,
     })
 }
 

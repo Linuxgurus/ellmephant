@@ -8,6 +8,7 @@ pub mod links;
 pub mod maintain;
 pub mod project;
 pub mod slug;
+pub mod snapshot;
 pub mod stats;
 pub mod tags;
 pub mod version;

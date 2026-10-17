@@ -1891,6 +1891,7 @@ async fn serve_http(
     port: u16,
     state: crate::http::HttpState,
 ) -> crate::error::Result<()> {
+    spawn_snapshotter(state.paths.clone());
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     let addr = listener.local_addr()?;
     tracing::info!(%addr, "ellmephant mcp listening on http://{addr}/mcp");
@@ -1899,6 +1900,39 @@ async fn serve_http(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Write a consistent snapshot on a timer — the QUIESCE that makes the backup trustworthy.
+///
+/// A known place to pause for a moment is worth more than a clever one: this loop is deliberately
+/// dull — open a reader, `VACUUM INTO`, rename, sleep. Its failure is logged and never fatal, because
+/// a store that cannot snapshot is still a store that serves.
+fn spawn_snapshotter(paths: crate::config::Paths) {
+    let Some(every) = crate::store::snapshot::every() else {
+        tracing::info!("snapshotter disabled (ELLMEPHANT_SNAPSHOT_HOURS=0)");
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            let root = paths.clone();
+            let done =
+                tokio::task::spawn_blocking(move || -> crate::error::Result<std::path::PathBuf> {
+                    // ★ A READER, not the writing open: a snapshot must never migrate or take the writer
+                    // lock. VACUUM INTO only READS the store and writes a new file.
+                    let conn = crate::db::open_read_only(&root)?;
+                    crate::store::snapshot::write(&conn, root.root())
+                })
+                .await;
+            match done {
+                Ok(Ok(path)) => {
+                    tracing::info!(path = %path.display(), "consistent snapshot written")
+                }
+                Ok(Err(err)) => tracing::warn!(error = %err, "snapshot failed"),
+                Err(err) => tracing::warn!(error = %err, "snapshot task failed"),
+            }
+            tokio::time::sleep(every).await;
+        }
+    });
 }
 
 /// Resolves when the process is asked to stop, so `axum` can finish open requests.

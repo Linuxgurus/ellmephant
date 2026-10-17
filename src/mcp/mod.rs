@@ -2146,6 +2146,7 @@ pub fn http_router(
     use crate::http_surface as surface;
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
+        .route("/whoami", axum::routing::get(surface::whoami))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/history", axum::routing::get(surface::history))

@@ -289,6 +289,12 @@ pub struct UpsertParams {
         description = "Why THIS change — recorded beside the version this write creates, so a later reader (`memory_history`) learns the intent instead of reconstructing it. Only a change to `title`/`body` creates a version; a note alone does not."
     )]
     pub version_note: Option<String>,
+    /// The CAS token: the `version` a `memory_get` returned.
+    #[serde(default)]
+    #[schemars(
+        description = "Write only if the memory is STILL at this `version` (the field `memory_get` returns). A mismatch writes nothing and returns `status: conflict` with the current version — the safe way to read-modify-write (a bank balance, a counter). `0` means 'this key does not exist yet'. Omit for last-write-wins."
+    )]
+    pub expected_version: Option<i64>,
 }
 
 impl UpsertParams {
@@ -301,6 +307,7 @@ impl UpsertParams {
             source: self.source,
             tags: self.tags,
             version_note: self.version_note,
+            expected_version: self.expected_version,
         }
     }
 }
@@ -1128,8 +1135,19 @@ impl MemoryServer {
             key = %outcome.key,
             created = outcome.created,
             queued = outcome.queued,
+            conflict = ?outcome.conflict,
             "memory stored"
         );
+        // ★ A CONFLICT IS A RESULT, NOT AN ERROR: the caller asked "write if unchanged", the answer is
+        // "it changed", and the current version is what it needs to retry. Reporting it as a tool
+        // error would make a retry look like a failure of the store.
+        if let Some(current) = outcome.conflict {
+            return Ok(json_ok(serde_json::json!({
+                "status": "conflict",
+                "key": outcome.key,
+                "current_version": current,
+            })));
+        }
         Ok(json_ok(serde_json::json!({
             "status": if outcome.created { "created" } else { "updated" },
             "key": outcome.key,

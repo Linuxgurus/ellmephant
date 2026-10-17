@@ -60,6 +60,15 @@ pub struct Memory {
     /// Count of explicit "this helped" marks from an agent; runtime counter, never in the embed.
     #[serde(default)]
     pub times_useful: i64,
+    /// The LIVE state's number: this key's superseded states (`memory_version.n`), plus one. A key
+    /// with no history is `1`; a key that does not exist has no version at all.
+    ///
+    /// ★ THIS IS THE CAS TOKEN. A read-modify-write is unsafe while the store only versions (two
+    /// writers can both read, both write, and last-write-wins loses one silently — the bank bug).
+    /// Pass this back as `expected_version` and the write is REFUSED instead, so the caller retries
+    /// with fresh numbers. Derived on read; never stored on the row.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<i64>,
 }
 
 /// One row's index entry: identity and shape, without the body (the `list` surface, SPEC §14).
@@ -148,7 +157,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _) = add_impl(conn, spec, mem, None)?;
+    let (id, key, _, _) = add_impl(conn, spec, mem, None, None)?;
     Ok((id, key))
 }
 
@@ -190,14 +199,48 @@ fn add_impl(
     spec: &VecSpec,
     mem: &Memory,
     note: Option<&str>,
-) -> Result<(i64, String, bool)> {
+    expected: Option<i64>,
+) -> Result<(i64, String, bool, Option<i64>)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, spec, mem, note)?;
     let queued = prepared.needs_embed();
-    let tx = conn.unchecked_transaction()?;
+    // ★ IMMEDIATE, not the default DEFERRED. A deferred transaction that READS (the compare) and
+    // then WRITES must promote its lock, and in WAL that promotion fails with `SQLITE_BUSY_SNAPSHOT`
+    // whenever a rival committed in between — an error the caller cannot tell apart from a conflict.
+    // Taking the write lock first makes "compare, then write" ONE serialized unit, which is the whole
+    // point of a CAS. Writes are short; the wait is a few milliseconds.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // ★ AND THE COMPARE IS INSIDE THE TRANSACTION, or it is theatre: a check outside would let a
+    // rival commit between the read and the write, which is exactly the lost update this exists to
+    // prevent.
+    if let Some(want) = expected {
+        let current = live_version(&tx, &prepared.key)?;
+        if current != want {
+            return Ok((0, prepared.key, false, Some(current)));
+        }
+    }
     let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
-    Ok((id, prepared.key, queued))
+    Ok((id, prepared.key, queued, None))
+}
+
+/// The LIVE state's version: `MAX(n)` of the superseded states, plus one. A key that does not exist
+/// is `0` — not `1` — so a CREATE can be CAS'd too, and two creators cannot both think they are
+/// writing the first state.
+pub fn live_version(conn: &Connection, key: &str) -> Result<i64> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory WHERE key = ?1)",
+        params![key],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version WHERE type = ?1 AND key = ?2",
+        params![version::MEMORY, key],
+        |r| r.get(0),
+    )?)
 }
 
 /// A **partial** write to one memory: every field is optional and `None` means *leave it alone*.
@@ -221,6 +264,13 @@ pub struct Patch {
     /// write supersedes, so a later reader learns the intent without reconstructing it. It creates
     /// no version on its own — only a DOCUMENT change does (see `store::version`).
     pub version_note: Option<String>,
+    /// ★ THE CAS TOKEN: write only if the memory is still at this version (the `version` field a
+    /// `memory_get` returned). `None` is the old last-write-wins behaviour.
+    ///
+    /// `0` means "I believe this key does not exist yet", so a create can be raced too. A mismatch
+    /// writes NOTHING and reports the current version, which is the difference between a lost update
+    /// and a retry.
+    pub expected_version: Option<i64>,
 }
 
 /// What [`merge`] did.
@@ -233,6 +283,9 @@ pub struct MergeOutcome {
     /// True when the embedded document changed, so an embed was **queued** (not performed — see
     /// `ENCODE-WORKER.md`). Named for what the store did, which is all it can honestly promise now.
     pub queued: bool,
+    /// `Some(current)` means the write was REFUSED because `expected_version` did not match — nothing
+    /// was written, and `current` is the version to re-read and retry against.
+    pub conflict: Option<i64>,
 }
 
 /// Upsert ONE memory from a partial [`Patch`]: `None` keeps the stored value, `Some` replaces it.
@@ -304,11 +357,19 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
         }
     };
 
-    let (_id, key, queued) = add_impl(conn, spec, &mem, patch.version_note.as_deref())?;
+    let (_id, key, queued, conflict) = add_impl(
+        conn,
+        spec,
+        &mem,
+        patch.version_note.as_deref(),
+        patch.expected_version,
+    )?;
     Ok(MergeOutcome {
         key,
-        created,
+        // A refused write created nothing, whatever the pre-write read believed.
+        created: created && conflict.is_none(),
         queued,
+        conflict,
     })
 }
 
@@ -533,9 +594,13 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
     }
 }
 
-/// The canonical column list shared by `get_by_id` and `all`.
-const MEMORY_COLUMNS: &str =
-    "id, key, title, body, tags, source, encode_hash, created, updated, visits, times_useful";
+/// The canonical column list shared by `get_by_id` and `all`. `version` is DERIVED, not stored: the
+/// count of states this key has superseded, plus one — the token a caller passes back as
+/// `expected_version` (see [`Patch::expected_version`]).
+const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, encode_hash, created, updated, \
+     visits, times_useful, \
+     (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
+       WHERE type = 'memory' AND key = memory.key) AS version";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -552,6 +617,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         updated: r.get(8)?,
         visits: r.get(9)?,
         times_useful: r.get(10)?,
+        version: Some(r.get(11)?),
     })
 }
 

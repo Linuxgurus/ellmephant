@@ -281,6 +281,12 @@ pub struct UpsertParams {
         description = "Proof stone: command/path/repo that derive this. Never live state. Omit to keep it; an empty string clears it."
     )]
     pub source: Option<String>,
+    /// Where the information came from, when it is not the speaker.
+    #[serde(default)]
+    #[schemars(
+        description = "Where this came from, when it is NOT you: a URL, a file, a command, `my inference`. Recorded BESIDE the store-stamped `asserted_by` (who spoke), so relaying a fact never makes you its source. Omit when you are the origin."
+    )]
+    pub origin: Option<String>,
     /// Aspect tags.
     #[serde(default)]
     #[schemars(
@@ -309,6 +315,10 @@ impl UpsertParams {
             title: self.title,
             body: self.body,
             source: self.source,
+            // Stamped by the caller of `into_patch` from the connection's PROVEN identity — the
+            // request payload cannot set it, because `asserted_by` is not a param.
+            asserted_by: None,
+            origin: self.origin,
             tags: self.tags,
             version_note: self.version_note,
             expected_version: self.expected_version,
@@ -764,6 +774,20 @@ pub struct ProjectListParams {
     pub mode: Option<MatchModeParam>,
 }
 
+/// The caller's PROVEN identity, read from the HTTP request that carried this call.
+///
+/// `Ok(None)` means nothing was claimed — a stdio transport has no HTTP request, and a client that
+/// sends no headers has claimed nothing. `Err` means a name was claimed and could not be proved, and
+/// it is REFUSED rather than downgraded to `anonymous`: an unproven name is a lie with a signature.
+fn identity_of(
+    ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+) -> Result<Option<String>, crate::identity::Forged> {
+    let Some(parts) = ctx.extensions.get::<axum::http::request::Parts>() else {
+        return Ok(None);
+    };
+    crate::identity::resolve(&parts.headers)
+}
+
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
 #[derive(Clone)]
@@ -1200,9 +1224,17 @@ impl MemoryServer {
     )]
     async fn memory_upsert(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
-        let patch = p.into_patch();
+        let mut patch = p.into_patch();
+        // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
+        // rather than silently becoming `anonymous`, because a lie with a signature is worse than
+        // no signature at all.
+        patch.asserted_by = match identity_of(&ctx) {
+            Ok(name) => name,
+            Err(forged) => return Err(forged.to_string()),
+        };
         let outcome = self
             .with_store("memory_upsert", move |s| s.memory_merge(&patch))
             .await?;
@@ -1815,6 +1847,7 @@ impl MemoryServer {
     )]
     async fn mail_send(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailSendParams>,
     ) -> std::result::Result<String, String> {
         let MailSendParams {
@@ -1824,6 +1857,13 @@ impl MemoryServer {
             body,
             encoding,
         } = p;
+        // A PROVEN identity outranks the argument. `sender` is asserted text — the one field a chat
+        // could use to speak as someone else — so the header pair, when it verifies, decides it.
+        let sender = match identity_of(&ctx) {
+            Ok(Some(proven)) => proven,
+            Ok(None) => sender,
+            Err(forged) => return Err(forged.to_string()),
+        };
         let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
         let out = self
             .with_store("mail_send", move |s| {

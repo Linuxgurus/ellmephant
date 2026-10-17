@@ -43,6 +43,15 @@ pub struct Memory {
     /// Provenance: command/path/repo/quote.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source: Option<String>,
+    /// WHO asserted this row's current state, as the store resolved it — never as the caller typed
+    /// it. `anonymous` when the connection proved nothing. Stamped, not an argument.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub asserted_by: Option<String>,
+    /// WHERE the information came from, as the caller DECLARED it: a URL, a file, a command,
+    /// "my inference". A promise, not a proof — which is why it is a separate column from
+    /// `asserted_by`: a relayer names the truth's home without becoming the truth.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub origin: Option<String>,
     /// `sha256(model|dim|embed_document)`; re-embed the row only when this changes.
     /// [`ENCODE_PENDING`] while a queued job still owes this row a vector.
     #[serde(default)]
@@ -260,6 +269,10 @@ pub struct Patch {
     pub body: Option<String>,
     /// New provenance. `Some("")` clears it — empty is a fact here.
     pub source: Option<String>,
+    /// The store stamps this from the connection's proven identity; a caller may not set it.
+    pub asserted_by: Option<String>,
+    /// Where the information came from, declared by the caller. `None` leaves the stored value.
+    pub origin: Option<String>,
     /// New tags. `Some(vec![])` clears them.
     pub tags: Option<Vec<String>>,
     /// Why THIS change is being made. Not a field of the memory: it rides beside the version the
@@ -330,6 +343,13 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     body,
                     tags: patch.tags.clone().unwrap_or_else(|| old.tags.clone()),
                     source,
+                    // The writer is this connection, not whoever wrote it last; `None` keeps the
+                    // stored attribution so an internal write cannot launder it into anonymity.
+                    asserted_by: patch
+                        .asserted_by
+                        .clone()
+                        .or_else(|| old.asserted_by.clone()),
+                    origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     ..Default::default()
                 },
                 false,
@@ -352,6 +372,8 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     body,
                     tags: patch.tags.clone().unwrap_or_default(),
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
+                    asserted_by: patch.asserted_by.clone(),
+                    origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
                     ..Default::default()
                 },
                 true,
@@ -465,6 +487,8 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
+                asserted_by = COALESCE(?9, asserted_by),
+                origin = COALESCE(?10, origin),
                 encode_hash = CASE WHEN ?7 THEN ?8 ELSE encode_hash END,
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
@@ -476,7 +500,9 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
             mem.source,
             mem.updated,
             pending,
-            ENCODE_PENDING
+            ENCODE_PENDING,
+            mem.asserted_by,
+            mem.origin
         ],
     )?;
     Ok(())
@@ -488,10 +514,11 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
 /// settles it with the real hash of the vector it writes.
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
-        "INSERT INTO memory (key, title, body, tags, source, encode_hash, created, updated)
+        "INSERT INTO memory (key, title, body, tags, source, encode_hash, created, updated, asserted_by, origin)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                  COALESCE(NULLIF(?7, ''), datetime('now')),
-                 COALESCE(NULLIF(?8, ''), datetime('now')))",
+                 COALESCE(NULLIF(?8, ''), datetime('now')),
+                 COALESCE(?9, 'anonymous'), ?10)",
         params![
             key,
             mem.title,
@@ -500,7 +527,9 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.source,
             ENCODE_PENDING,
             mem.created,
-            mem.updated
+            mem.updated,
+            mem.asserted_by,
+            mem.origin
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -602,7 +631,8 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
 const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, encode_hash, created, updated, \
      visits, times_useful, \
      (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
-       WHERE type = 'memory' AND key = memory.key) AS version";
+       WHERE type = 'memory' AND key = memory.key) AS version, \
+     asserted_by, origin";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -620,6 +650,8 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         visits: r.get(9)?,
         times_useful: r.get(10)?,
         version: Some(r.get(11)?),
+        asserted_by: r.get(12)?,
+        origin: r.get(13)?,
     })
 }
 

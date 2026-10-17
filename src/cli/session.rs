@@ -18,7 +18,7 @@ use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, claim, encode, links, maintain, project};
+use crate::store::{self, Memory, claim, encode, links, mail, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -393,6 +393,43 @@ impl Session {
             Some(n) => Ok(claim::get(&self.conn, n)?.into_iter().collect()),
             None => claim::list(&self.conn),
         }
+    }
+
+    /// Write one letter into `recipient`'s box. Nothing is delivered: this is the whole event.
+    pub fn mail_send(
+        &self,
+        sender: &str,
+        recipient: &str,
+        subject: &str,
+        body: &str,
+        encoding: &str,
+    ) -> Result<mail::Envelope> {
+        mail::send(&self.conn, sender, recipient, subject, body, encoding)
+    }
+
+    /// Everything in `recipient`'s box after `since`, oldest first, bodies omitted.
+    pub fn mail_inbox(
+        &self,
+        recipient: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<mail::Envelope>> {
+        mail::inbox(&self.conn, recipient, since, limit)
+    }
+
+    /// The newest `seq` in a box, 0 when empty — the free "is anything there?" a hand's tick asks.
+    pub fn mail_head(&self, recipient: &str) -> Result<i64> {
+        mail::head(&self.conn, recipient)
+    }
+
+    /// One letter whole.
+    pub fn mail_read(&self, seq: i64) -> Result<Option<mail::Letter>> {
+        mail::read(&self.conn, seq)
+    }
+
+    /// Drop letters nobody ever read. ★ Letters expire; memories do not.
+    pub fn mail_prune(&self, keep_days: i64) -> Result<usize> {
+        mail::prune(&self.conn, keep_days)
     }
 }
 

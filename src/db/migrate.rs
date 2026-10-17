@@ -70,6 +70,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0012_claims.sql"),
         "claims: an atomic lease over a name",
     ),
+    (
+        13,
+        include_str!("../../migrations/0013_mail.sql"),
+        "mail: addressed rows, read by the recipient's cursor",
+    ),
 ];
 
 /// Current schema version recorded in the file.

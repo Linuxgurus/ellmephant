@@ -134,6 +134,9 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute("DROP TABLE memory_version", []).unwrap();
     // ...and predates claims (0012), for the same reason.
     conn.execute("DROP TABLE claim", []).unwrap();
+    // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
+    // migrations add, or the migration collides with a table that never went away.
+    conn.execute("DROP TABLE mail", []).unwrap();
     // ...and it still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
@@ -200,6 +203,9 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute("DROP TABLE memory_version", []).unwrap();
     // ...and predates claims (0012), for the same reason.
     conn.execute("DROP TABLE claim", []).unwrap();
+    // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
+    // migrations add, or the migration collides with a table that never went away.
+    conn.execute("DROP TABLE mail", []).unwrap();
     // ...and still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",

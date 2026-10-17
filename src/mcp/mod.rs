@@ -58,6 +58,10 @@ pub const TOOLS: &[&str] = &[
     "claim_acquire",
     "claim_release",
     "claim_list",
+    "mail_send",
+    "mail_inbox",
+    "mail_read",
+    "mail_prune",
 ];
 
 /// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
@@ -555,6 +559,78 @@ pub struct ClaimListParams {
         description = "Optional: one name to inspect. Omit for every claim, EXPIRED rows included — the audit view, so an unexplained stale claim is visible rather than hidden."
     )]
     pub name: Option<String>,
+}
+
+/// Parameters for [`MemoryServer::mail_send`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailSendParams {
+    /// Who is writing.
+    #[schemars(
+        description = "Who is writing: `stet` for the self, or `stet/finger-<id>` for one of its fingers. ASSERTED by the caller, not authenticated by the store."
+    )]
+    pub sender: String,
+    /// The self the letter is addressed to.
+    #[schemars(
+        description = "The SELF the letter is addressed to (`stet`, `twine`). Never a finger: a finger is how a self ANSWERS mail, not who receives it."
+    )]
+    pub recipient: String,
+    /// One line.
+    #[serde(default)]
+    #[schemars(description = "One line, so an inbox can be scanned without fetching bodies.")]
+    pub subject: Option<String>,
+    /// The letter itself.
+    #[schemars(
+        description = "The letter. Free text — no verbs, no priority, no task fields. If you want something done, ASK, and let the reader decide."
+    )]
+    pub body: String,
+    /// How to read the body.
+    #[serde(default)]
+    #[schemars(
+        description = "How the body is encoded: `text` (default), `json`, `gzip+base64`. Declared so the reader does not spend a finger decoding gibberish."
+    )]
+    pub encoding: Option<String>,
+}
+
+/// Parameters for [`MemoryServer::mail_inbox`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailInboxParams {
+    /// Whose box to read.
+    #[schemars(description = "Whose box: the self whose mail this is (`stet`, `twine`).")]
+    pub recipient: String,
+    /// The reader's cursor.
+    #[serde(default)]
+    #[schemars(
+        description = "Your cursor: the highest `seq` you have already dealt with (0 for everything). Keep it in YOUR store as `mail-last-read` and advance it only AFTER handling the letters — the advance is the commit."
+    )]
+    pub since: Option<i64>,
+    /// Long-poll.
+    #[serde(default)]
+    #[schemars(
+        description = "Block up to this many seconds (max 25) and return the moment a letter lands. This is how a hand waits for mail without polling; omit it to check and return immediately."
+    )]
+    pub wait_seconds: Option<u64>,
+    /// Page size.
+    #[serde(default)]
+    #[schemars(description = "Most envelopes to return (default 50, max 500).")]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for [`MemoryServer::mail_read`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailReadParams {
+    /// Which letter.
+    #[schemars(description = "The `seq` from `mail_inbox`.")]
+    pub seq: i64,
+}
+
+/// Parameters for [`MemoryServer::mail_prune`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailPruneParams {
+    /// Retention window.
+    #[schemars(
+        description = "Delete letters older than this many days. ★ Letters expire because they are kept for a reader, not for the truth; memories have no such path."
+    )]
+    pub keep_days: i64,
 }
 
 /// Parameters for [`MemoryServer::memory_dupes`].
@@ -1724,6 +1800,151 @@ impl MemoryServer {
         tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
         serde_json::to_string(&serde_json::json!({ "claims": rows })).map_err(|e| e.to_string())
     }
+
+    /// Write one letter into a self's box.
+    #[tool(
+        name = "mail_send",
+        description = "Write ONE letter into another self's box. This is a MAILBOX, not a message bus: the row is the whole event — nothing is delivered, no door is rung, and the sender NEVER learns whether it was read. ★ A letter is a CLAIM, NOT AN ORDER: it may be ignored, and there is deliberately no priority field and no verb in the schema — if you want something done, ASK in prose and let the reader decide. Address a SELF (`stet`, `twine`); a finger answers mail, it never receives it. Bodies may be large but stay under 1 MiB — put a real artifact in object storage and send a link plus a checksum. Returns the letter's `seq`, which the reader uses as its cursor.",
+        annotations(
+            title = "Send mail",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_send(
+        &self,
+        Parameters(p): Parameters<MailSendParams>,
+    ) -> std::result::Result<String, String> {
+        let MailSendParams {
+            sender,
+            recipient,
+            subject,
+            body,
+            encoding,
+        } = p;
+        let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
+        let out = self
+            .with_store("mail_send", move |s| {
+                s.mail_send(
+                    &sender,
+                    &recipient,
+                    subject.as_deref().unwrap_or(""),
+                    &body,
+                    encoding.as_deref().unwrap_or("text"),
+                )
+            })
+            .await?;
+        tracing::info!(
+            tool = "mail_send",
+            sender = %log_sender,
+            recipient = %log_recipient,
+            seq = out.seq,
+            bytes = out.bytes,
+            "letter written"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// What is in a box after a cursor. Bodies omitted; `wait_seconds` long-polls.
+    #[tool(
+        name = "mail_inbox",
+        description = "What is in `recipient`'s box AFTER `since` — envelopes only (seq, at, sender, subject, encoding, bytes), oldest first, bodies omitted so you can decide whether a body is worth fetching (`mail_read`). ★ `since` is your own cursor: keep it in YOUR store as `mail-last-read` and advance it ONLY after you have dealt with the letters — the advance is the commit, so a processor that dies first leaves them unread and sees them again. `wait_seconds` LONG-POLLS: the call blocks up to 25s and returns the moment a letter lands, which is how a hand waits for mail without polling. No receipt is ever sent to the sender.",
+        annotations(
+            title = "Read inbox",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_inbox(
+        &self,
+        Parameters(p): Parameters<MailInboxParams>,
+    ) -> std::result::Result<String, String> {
+        let MailInboxParams {
+            recipient,
+            since,
+            wait_seconds,
+            limit,
+        } = p;
+        let since = since.unwrap_or(0);
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let wait = wait_seconds
+            .unwrap_or(0)
+            .min(crate::store::mail::MAX_WAIT_SECONDS);
+
+        // ★ THE LONG POLL IS THE RECIPIENT'S OWN: the reader holds the connection open and nobody
+        // pushes into its room. That keeps "a letter is a claim" true at the transport level too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+        loop {
+            let who = recipient.clone();
+            let rows = self
+                .with_read("mail_inbox", move |s| s.mail_inbox(&who, since, limit))
+                .await?;
+            if !rows.is_empty() || std::time::Instant::now() >= deadline {
+                let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
+                return serde_json::to_string(&serde_json::json!({
+                    "letters": rows,
+                    "max_seq": max_seq,
+                    "waited": wait > 0 && rows.is_empty(),
+                }))
+                .map_err(|e| e.to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// One letter, body included.
+    #[tool(
+        name = "mail_read",
+        description = "Fetch ONE letter whole, body included, by `seq`. Read the envelope in `mail_inbox` first: `bytes` and `encoding` are there so you can decide whether the body is worth the context, and how to interpret it (`text`, `json`, `gzip+base64`). `none` means that seq is gone — pruned, or never written; letters expire, memories do not.",
+        annotations(
+            title = "Read letter",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_read(
+        &self,
+        Parameters(p): Parameters<MailReadParams>,
+    ) -> std::result::Result<String, String> {
+        let seq = p.seq;
+        let found = self
+            .with_read("mail_read", move |s| s.mail_read(seq))
+            .await?;
+        match found {
+            Some(letter) => serde_json::to_string(&letter).map_err(|e| e.to_string()),
+            None => Ok(serde_json::json!({ "letter": null, "seq": seq }).to_string()),
+        }
+    }
+
+    /// Drop letters nobody ever read.
+    #[tool(
+        name = "mail_prune",
+        description = "Delete letters older than `keep_days`, returning how many went. ★ THIS IS WHAT MAKES A MAILBOX NOT A MEMORY STORE: a memory is kept because it is TRUE, a letter is kept because NOBODY HAS READ IT YET — so once nobody plausibly will, it should go. Memories have no such path. Run it from a bell; there is no automatic expiry.",
+        annotations(
+            title = "Prune mail",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_prune(
+        &self,
+        Parameters(p): Parameters<MailPruneParams>,
+    ) -> std::result::Result<String, String> {
+        let keep_days = p.keep_days;
+        let removed = self
+            .with_store("mail_prune", move |s| s.mail_prune(keep_days))
+            .await?;
+        tracing::info!(tool = "mail_prune", keep_days, removed, "letters pruned");
+        Ok(serde_json::json!({ "removed": removed, "keep_days": keep_days }).to_string())
+    }
 }
 
 #[tool_handler]
@@ -1867,6 +2088,13 @@ pub fn http_router(
             "/claim/{key}/release",
             axum::routing::post(surface::claim_release),
         )
+        // The mailbox. Same rule as the tools: a letter is a claim, not an order.
+        .route(
+            "/mail",
+            axum::routing::get(surface::mail_inbox).post(surface::mail_send),
+        )
+        .route("/mail/prune", axum::routing::post(surface::mail_prune))
+        .route("/mail/{seq}", axum::routing::get(surface::mail_read))
         .route("/reembed", axum::routing::post(surface::reembed))
         // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.
         .fallback(surface::not_found)

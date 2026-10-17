@@ -5,6 +5,7 @@ pub mod codec;
 pub mod dupes;
 pub mod encode;
 pub mod links;
+pub mod mail;
 pub mod maintain;
 pub mod project;
 pub mod slug;

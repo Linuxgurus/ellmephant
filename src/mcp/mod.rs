@@ -1754,6 +1754,7 @@ impl MemoryServer {
     )]
     async fn claim_acquire(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimAcquireParams>,
     ) -> std::result::Result<String, String> {
         let ClaimAcquireParams {
@@ -1761,6 +1762,16 @@ impl MemoryServer {
             owner,
             ttl_seconds,
         } = p;
+        // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
+        // terminal, never a browser chat. Without it, this stays open exactly as it was.
+        let proven = match identity_of(&ctx) {
+            Ok(name) => name,
+            Err(forged) => return Err(forged.to_string()),
+        };
+        crate::identity::may_lease(proven.as_deref())?;
+        // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
+        // someone else's name; an unproven caller's assertion stands, as before.
+        let owner = proven.unwrap_or(owner);
         let out = self
             .with_store("claim_acquire", move |s| {
                 s.claim_acquire(&name, &owner, ttl_seconds)

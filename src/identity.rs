@@ -87,6 +87,44 @@ pub fn resolve(headers: &HeaderMap) -> Result<Option<String>, Forged> {
     Err(Forged(claimed.to_string()))
 }
 
+/// The identities allowed to take a LEASE, from `ELLMEPHANT_LEASERS` (comma-separated names).
+///
+/// ★ UNSET MEANS OPEN. A lease is how the hands do ordinary work, so refusing every lease the
+/// moment the code lands would stop the mail hand dead. Configure the list and it becomes a
+/// control; leave it empty and it stays exactly as it was.
+fn leasers() -> Vec<String> {
+    let Ok(raw) = std::env::var("ELLMEPHANT_LEASERS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether this identity may take a lease at all.
+///
+/// `PROTECTED` is only a control if the people it protects against cannot take the lease out from
+/// under it — otherwise an injected model simply claims the key, writes, and releases, and the audit
+/// trail reads like a legitimate edit.
+pub fn may_lease(name: Option<&str>) -> Result<(), String> {
+    let leasers = leasers();
+    if leasers.is_empty() {
+        return Ok(());
+    }
+    match name {
+        Some(n) if leasers.iter().any(|l| l.eq_ignore_ascii_case(n)) => Ok(()),
+        Some(n) => Err(format!(
+            "`{n}` may not take a lease: `ELLMEPHANT_LEASERS` does not name it."
+        )),
+        None => Err(
+            "a lease needs a PROVEN identity: send `X-Stet-From` and `X-Stet-Auth` together."
+                .to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

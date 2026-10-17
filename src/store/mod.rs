@@ -309,6 +309,75 @@ pub struct MergeOutcome {
 ///
 /// Queues an embed only when the embedded document (`key` + title + body) actually changes: a tag or
 /// a source is *filing*, not *meaning* (SPEC §9).
+/// The tag that makes a memory writable only under a LIVE LEASE.
+pub const PROTECTED: &str = "protected";
+
+fn is_protected(tags: &[String]) -> bool {
+    tags.iter().any(|t| t.eq_ignore_ascii_case(PROTECTED))
+}
+
+/// ★ THE LEASE IS THE CONTROL; THE TAG SAYS WHICH ROWS NEED ONE.
+///
+/// A `protected` memory is writable only by a caller holding a live lease on its key. A write that
+/// would ADD or REMOVE the tag passes the same gate, so a stranger can neither ratchet a memory shut
+/// nor quietly unlock one.
+///
+/// The lease must be taken deliberately (`claim_acquire`), which is what makes an edit visible
+/// afterwards: the claim table is the write audit for the memories that matter. Pair this with
+/// `ELLMEPHANT_LEASERS`, or a persuaded model simply leases the key itself and the gate is theatre.
+fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) -> Result<()> {
+    let becomes = patch.tags.as_ref().is_some_and(|t| is_protected(t));
+    if !is_protected(was) && !becomes {
+        return Ok(());
+    }
+    let Some(claim) = crate::store::claim::get(conn, key)? else {
+        return Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED: take the lease first (`claim_acquire name={key}`), write, then \
+             release. A protected memory is writable only under a live lease."
+        )));
+    };
+    if !claim.live {
+        return Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED and its lease lapsed at {} (held by `{}`). Take it again.",
+            claim.expires_at, claim.owner
+        )));
+    }
+    // A PROVEN writer must BE the holder. An unproven one cannot be told from any other client, and
+    // the lease it holds is already the strongest statement available: someone took it on purpose.
+    if let Some(writer) = patch
+        .asserted_by
+        .as_deref()
+        .filter(|w| !claim.owner.eq_ignore_ascii_case(w))
+    {
+        return Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED and leased by `{}` until {}; `{writer}` does not hold it.",
+            claim.owner, claim.expires_at
+        )));
+    }
+    Ok(())
+}
+
+/// A delete has no patch to inspect, so it only asks: is a live lease held on this key?
+fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
+    let Some(mem) = get(conn, key)? else {
+        return Ok(());
+    };
+    if !is_protected(&mem.tags) {
+        return Ok(());
+    }
+    match crate::store::claim::get(conn, key)? {
+        Some(claim) if claim.live => Ok(()),
+        Some(claim) => Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED and its lease lapsed at {} (held by `{}`). Take it again.",
+            claim.expires_at, claim.owner
+        ))),
+        None => Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED: take the lease first (`claim_acquire name={key}`), delete, then \
+             release."
+        ))),
+    }
+}
+
 pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOutcome> {
     let probe = Memory {
         key: patch.key.clone().unwrap_or_default(),
@@ -317,6 +386,12 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
     };
     let key = resolve_key(conn, &probe)?;
     let existing = get(conn, &key)?;
+    // A `protected` row (or a write that would make one) needs a live lease on its own key.
+    let was_tags = existing
+        .as_ref()
+        .map(|m| m.tags.clone())
+        .unwrap_or_default();
+    guard_protected(conn, &key, &was_tags, patch)?;
 
     let (mem, created) = match existing {
         Some(old) => {
@@ -538,6 +613,7 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
+    guard_protected_delete(conn, key)?;
     let tx = conn.unchecked_transaction()?;
     // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only

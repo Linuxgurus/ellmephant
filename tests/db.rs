@@ -137,6 +137,14 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
     // migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE mail", []).unwrap();
+    // ...and predates PROVENANCE (0014): undo its columns, index first — SQLite refuses to drop an
+    // indexed column.
+    conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN origin", [])
+        .unwrap();
     // ...and it still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
@@ -206,6 +214,13 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
     // migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE mail", []).unwrap();
+    // ...and predates PROVENANCE (0014), for the same reason.
+    conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN origin", [])
+        .unwrap();
     // ...and still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",

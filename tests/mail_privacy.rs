@@ -83,9 +83,7 @@ async fn call(
 ) -> (StatusCode, String) {
     let mut req = Request::builder().method(method).uri(uri);
     if let Some((who, proof)) = pen {
-        req = req
-            .header("X-Stet-From", who)
-            .header("X-Stet-Auth", proof);
+        req = req.header("X-Stet-From", who).header("X-Stet-Auth", proof);
     }
     let req = if let Some(body) = body {
         req.header(header::CONTENT_TYPE, "application/json")
@@ -201,8 +199,14 @@ async fn a_proven_stranger_is_refused_and_a_declared_surrogate_is_not() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(body.contains("may not read"), "{body}");
 
-    let (status, body) =
-        call(&app, Method::GET, &format!("/mail/{seq}"), Some(("james", "j1")), None).await;
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        &format!("/mail/{seq}"),
+        Some(("james", "j1")),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
     // The hand is the declared surrogate for the box it serves.

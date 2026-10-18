@@ -903,9 +903,10 @@ impl MemoryServer {
         if who.eq_ignore_ascii_case(requested) {
             return Ok(who.to_string());
         }
-        let allowed = self.surrogates.iter().any(|(from, to)| {
-            from.eq_ignore_ascii_case(who) && to.eq_ignore_ascii_case(requested)
-        });
+        let allowed = self
+            .surrogates
+            .iter()
+            .any(|(from, to)| from.eq_ignore_ascii_case(who) && to.eq_ignore_ascii_case(requested));
         if allowed {
             return Ok(who.to_string());
         }

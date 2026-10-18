@@ -2143,13 +2143,11 @@ pub async fn mail_send(
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
     let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    let (Some(sender), Some(recipient), Some(letter)) =
-        (field("sender"), field("recipient"), field("body"))
-    else {
+    let (Some(recipient), Some(letter)) = (field("recipient"), field("body")) else {
         return error(
             json,
             StatusCode::BAD_REQUEST,
-            "`sender`, `recipient` and `body` are required",
+            "`recipient` and `body` are required",
         );
     };
     let subject = field("subject").unwrap_or_default();
@@ -2158,6 +2156,13 @@ pub async fn mail_send(
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
+    };
+    // ★ THE PEN DECIDES THE SENDER, exactly as it does over MCP: `sender` is asserted text — the one
+    // field a caller could use to speak as someone else — so a proven identity outranks it, and no
+    // identity means no letter.
+    let sender = match server.pen_for_headers(&headers) {
+        Ok(who) => who,
+        Err(msg) => return error(json, StatusCode::FORBIDDEN, msg),
     };
     match server
         .with_store("mail_send", move |s| {
@@ -2179,7 +2184,11 @@ pub async fn mail_send(
 }
 
 /// `GET /mail?recipient=&since=&limit=` — envelopes after the reader's cursor (`mail_inbox`).
-pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn mail_inbox(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let Some(recipient) = params.maybe("recipient").map(str::to_string) else {
@@ -2197,6 +2206,11 @@ pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery)
         Ok(s) => s,
         Err(r) => return r,
     };
+    // ★ ONLY THE RECIPIENT READS ITS MAIL — the same rule as the MCP tool, on this door too. Without
+    // it the refusal is theatre: `bin/mail` is a REST client, so the CLI would walk around the gate.
+    if let Err(msg) = server.mail_box_for_headers(&headers, &recipient) {
+        return error(json, StatusCode::FORBIDDEN, msg);
+    }
     match server
         .with_read("mail_inbox", move |s| {
             s.mail_inbox(&recipient, since, limit)
@@ -2234,6 +2248,7 @@ pub async fn mail_read(
     State(state): State<HttpState>,
     axum::extract::Path(seq): axum::extract::Path<i64>,
     RawQuery(raw): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -2245,12 +2260,16 @@ pub async fn mail_read(
         .with_read("mail_read", move |s| s.mail_read(seq))
         .await
     {
-        Ok(Some(letter)) => render(
-            StatusCode::OK,
-            json,
-            serde_json::to_string(&letter).unwrap_or_default(),
-            letter.body.clone(),
-        ),
+        // ★ THE LETTER decides, not an argument the caller chose — the same rule as the MCP tool.
+        Ok(Some(letter)) => match server.mail_box_for_headers(&headers, &letter.recipient) {
+            Ok(_) => render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&letter).unwrap_or_default(),
+                letter.body.clone(),
+            ),
+            Err(msg) => error(json, StatusCode::FORBIDDEN, msg),
+        },
         Ok(None) => error(json, StatusCode::NOT_FOUND, "no such letter"),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
     }
@@ -2267,14 +2286,18 @@ pub async fn mail_prune(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let keep_days = params
-        .maybe("keep_days")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(14_i64);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
+    // Dropping letters is a WRITE, and every write needs a pen — anonymous is read-only, everywhere.
+    if let Err(msg) = server.pen_for_headers(&headers) {
+        return error(json, StatusCode::FORBIDDEN, msg);
+    }
+    let keep_days = params
+        .maybe("keep_days")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14_i64);
     match server
         .with_store("mail_prune", move |s| s.mail_prune(keep_days))
         .await

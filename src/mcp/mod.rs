@@ -888,18 +888,51 @@ impl MemoryServer {
         requested: &str,
     ) -> std::result::Result<String, String> {
         let who = pen_name(ctx, self.declared.as_deref())?;
+        self.mail_box_owner(&who, requested)
+    }
+
+    /// The rule itself, pen in hand — shared by both doors so they cannot drift. `who` must BE the
+    /// box's owner, or be a name the surrogate map hands that box to.
+    fn mail_box_owner(&self, who: &str, requested: &str) -> std::result::Result<String, String> {
         if who.eq_ignore_ascii_case(requested) {
-            return Ok(who);
+            return Ok(who.to_string());
         }
         let allowed = self.surrogates.iter().any(|(from, to)| {
-            from.eq_ignore_ascii_case(&who) && to.eq_ignore_ascii_case(requested)
+            from.eq_ignore_ascii_case(who) && to.eq_ignore_ascii_case(requested)
         });
         if allowed {
-            return Ok(who);
+            return Ok(who.to_string());
         }
         Err(format!(
             "refused: `{who}` may not read `{requested}`'s mail — only the recipient, or a declared surrogate, may"
         ))
+    }
+
+    /// The same rule for a plain-HTTP request. ★ ITS HEADERS ARE THE ONLY CLAIM THERE IS: a
+    /// `declared` pen belongs to a transport that carries no request, so letting it stand in here
+    /// would hand any anonymous caller the box of whatever process declared one.
+    pub fn mail_box_for_headers(
+        &self,
+        headers: &axum::http::HeaderMap,
+        requested: &str,
+    ) -> std::result::Result<String, String> {
+        let who = self.pen_for_headers(headers)?;
+        self.mail_box_owner(&who, requested)
+    }
+
+    /// The PROVEN pen on a plain-HTTP request, or the refusal. The send and read routes both use
+    /// this, so the HTTP door cannot enforce half a rule.
+    pub fn pen_for_headers(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> std::result::Result<String, String> {
+        match crate::identity::resolve(headers) {
+            Ok(Some(who)) => Ok(who),
+            Ok(None) => Err(
+                "refused: this route needs a PROVEN identity — send `X-Stet-From` and `X-Stet-Auth`. `whoami` reports what this request is.".to_string(),
+            ),
+            Err(forged) => Err(forged.to_string()),
+        }
     }
 
     /// Declare the pen for a transport with no HTTP request (stdio / in-process). Writes are then

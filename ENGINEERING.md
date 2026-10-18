@@ -51,8 +51,8 @@ The decisions the code obeys:
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
 - **Keys, not dumps.** A hit is `key` alone — the caller names the extra `fields` it wants
-  (`title`, `tags`, `chars`, `distance`) — so a search can never bloat context, and the
-  body is always a deliberate `memory_get` away.
+  (`title`, `tags`, `chars`, `visits`, `times_useful`, `distance`) — so a search can never bloat
+  context, and the body is always a deliberate `memory_get` away.
 - **One binary, no runtime.** No interpreter, no service, no shared library.
 
 ## Architecture

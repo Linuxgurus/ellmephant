@@ -432,7 +432,8 @@ plus a pattern keeps the semantic ranking and merely drops the rows the pattern 
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
 - **Returns:** `key` **alone by default** — **never the body** (fetch it with `memory_get`/`show`).
-  The caller names any extra `fields` it wants (`title`, `tags`, `chars`, `distance`);
+  The caller names any extra `fields` it wants (`title`, `tags`, `chars`, `visits`,
+  `times_useful`, `distance`);
   they are added in that **canonical order**, `key` always leading. So a hit says *which* memory,
   and nothing more unless asked — the lean default keeps a search from bloating context. Over MCP
   this is emitted as **positional JSON**: a top-level `cols` header names the returned fields and

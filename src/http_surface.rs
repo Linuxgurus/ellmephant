@@ -1514,6 +1514,8 @@ fn field_param(name: &str) -> Option<FieldParam> {
         "title" => Some(FieldParam::Title),
         "tags" => Some(FieldParam::Tags),
         "chars" => Some(FieldParam::Chars),
+        "visits" => Some(FieldParam::Visits),
+        "times_useful" => Some(FieldParam::TimesUseful),
         "distance" => Some(FieldParam::Distance),
         _ => None,
     }

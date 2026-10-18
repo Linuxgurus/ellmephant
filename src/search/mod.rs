@@ -87,7 +87,7 @@ impl Query {
     }
 }
 
-/// One hydrated hit: `key`/`title`/`tags` and (semantic only) `distance`. No body.
+/// One hydrated hit: `key`/`title`/`tags`, the usage counters, and (semantic only) `distance`. No body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
     /// `memory.id` (local; not serialized).
@@ -104,6 +104,12 @@ pub struct Hit {
     /// filters key on. Lets a caller sort the fat tail itself (no server-side sort).
     #[serde(default)]
     pub chars: usize,
+    /// Reads of this row whole — as stored; listing one counts nothing.
+    #[serde(default)]
+    pub visits: i64,
+    /// "This helped" marks for this row — as stored; listing one counts nothing.
+    #[serde(default)]
+    pub times_useful: i64,
     /// Vector distance when the semantic leg ranked this hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f32>,
@@ -142,27 +148,36 @@ pub enum Field {
     Tags,
     /// Embedded-document length (chars).
     Chars,
+    /// Reads recorded for the row (`visits`).
+    Visits,
+    /// "This helped" marks recorded for the row (`times_useful`).
+    TimesUseful,
     /// Cosine distance (semantic ranking only).
     Distance,
 }
 
 impl Field {
-    /// Every field, in canonical wire order.
-    pub const ALL: [Field; 5] = [
+    /// Every field, in canonical wire order: the row's own shape first, then usage (diagnostics
+    /// next to the other diagnostics), and `distance` last because only a semantic leg has one.
+    pub const ALL: [Field; 7] = [
         Field::Key,
         Field::Title,
         Field::Tags,
         Field::Chars,
+        Field::Visits,
+        Field::TimesUseful,
         Field::Distance,
     ];
 
-    /// The wire name (a `cols` header entry).
+    /// The wire name (a `cols` header entry) — the row's own field name, never a synonym.
     pub fn name(self) -> &'static str {
         match self {
             Field::Key => "key",
             Field::Title => "title",
             Field::Tags => "tags",
             Field::Chars => "chars",
+            Field::Visits => "visits",
+            Field::TimesUseful => "times_useful",
             Field::Distance => "distance",
         }
     }
@@ -214,6 +229,8 @@ impl Fields {
             Field::Title => serde_json::json!(h.title),
             Field::Tags => serde_json::json!(h.tags),
             Field::Chars => serde_json::json!(h.chars),
+            Field::Visits => serde_json::json!(h.visits),
+            Field::TimesUseful => serde_json::json!(h.times_useful),
             Field::Distance => serde_json::json!(h.distance.map(wire_distance)),
         }
     }
@@ -304,6 +321,8 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
             title: mem.title,
             tags: mem.tags,
             chars,
+            visits: mem.visits,
+            times_useful: mem.times_useful,
             distance,
         });
     }

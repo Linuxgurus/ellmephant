@@ -409,6 +409,10 @@ pub enum FieldParam {
     Tags,
     /// Embedded-document length (chars).
     Chars,
+    /// Reads of the row whole (`memory_get`/`show` counted them).
+    Visits,
+    /// Explicit "this helped" marks (`memory_upvote` counted them).
+    TimesUseful,
     /// Cosine distance (semantic ranking only).
     Distance,
 }
@@ -421,6 +425,8 @@ impl FieldParam {
             FieldParam::Title => Field::Title,
             FieldParam::Tags => Field::Tags,
             FieldParam::Chars => Field::Chars,
+            FieldParam::Visits => Field::Visits,
+            FieldParam::TimesUseful => Field::TimesUseful,
             FieldParam::Distance => Field::Distance,
         }
     }
@@ -2598,7 +2604,15 @@ mod tests {
             .filter_map(|v| v.get("const"))
             .filter_map(|v| v.as_str())
             .collect();
-        for want in ["key", "title", "tags", "chars", "distance"] {
+        for want in [
+            "key",
+            "title",
+            "tags",
+            "chars",
+            "visits",
+            "times_useful",
+            "distance",
+        ] {
             assert!(
                 field_vals.contains(&want),
                 "missing field {want}: {field_vals:?}"

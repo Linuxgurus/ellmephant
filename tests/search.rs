@@ -10,7 +10,7 @@ use common::temp_store;
 use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
 use ellmephant::search::{self, Field, Fields, Hit, MatchMode, Neighbor, Query};
-use ellmephant::store::Memory;
+use ellmephant::store::{self, Memory};
 use rusqlite::Connection;
 
 const DIM: usize = 64;
@@ -220,21 +220,31 @@ fn wire_json_is_positional_with_a_cols_header() {
             title: "T".into(),
             tags: vec!["a".into(), "b".into()],
             chars: 3,
+            visits: 7,
+            times_useful: 2,
             distance: Some(0.42),
         }],
         neighbors: vec![],
     };
-    // Every field requested: the full five-column shape, in canonical order.
+    // Every field requested: the full seven-column shape, in canonical order.
     let all = Fields::selection(Field::ALL);
     let wire = search::to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "title", "tags", "chars", "distance"])
+        serde_json::json!([
+            "key",
+            "title",
+            "tags",
+            "chars",
+            "visits",
+            "times_useful",
+            "distance"
+        ])
     );
     assert_eq!(
         v["hits"][0],
-        serde_json::json!(["k", "T", ["a", "b"], 3, 0.42])
+        serde_json::json!(["k", "T", ["a", "b"], 3, 7, 2, 0.42])
     );
     assert!(
         v.get("neighbors").is_none(),
@@ -256,6 +266,8 @@ fn wire_json_defaults_to_key_only() {
             title: "T".into(),
             tags: vec!["a".into()],
             chars: 3,
+            visits: 0,
+            times_useful: 0,
             distance: Some(0.42),
         }],
         neighbors: vec![],
@@ -508,4 +520,129 @@ fn time_bounds_filter_created_and_updated() {
             .collect::<Vec<_>>(),
         ["old"]
     );
+}
+
+#[test]
+fn a_full_listing_sums_to_the_stats_totals() {
+    // The check that catches the hole this closed: usage was reachable in bulk ONLY through
+    // `memory_get`, which counts a visit — so "which memories earn their keep" moved the answer.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    for key in ["a-note", "b-note", "c-note"] {
+        seed(&conn, &embedder, key, "a fact", &[]);
+    }
+    for (key, visits, useful) in [("a-note", 2, 0), ("b-note", 1, 1), ("c-note", 0, 1)] {
+        for _ in 0..visits {
+            store::record_visit(&conn, key).expect("visit");
+        }
+        for _ in 0..useful {
+            store::record_useful(&conn, key).expect("useful");
+        }
+    }
+
+    // One read, every row.
+    let hits = search::run(&conn, None, &query(None)).expect("search").hits;
+    let stats = store::stats::compute(&conn).expect("stats");
+    assert_eq!(
+        hits.len() as i64,
+        stats.memories,
+        "the listing is the store"
+    );
+    assert_eq!(
+        hits.iter().map(|h| h.visits).sum::<i64>(),
+        stats.visits_total,
+        "a listing's `visits` must sum to `visits_total`"
+    );
+    assert_eq!(
+        hits.iter().map(|h| h.times_useful).sum::<i64>(),
+        stats.useful_total,
+        "a listing's `times_useful` must sum to `useful_total`"
+    );
+
+    // And the listing counted nothing: the counters are as the fixture left them.
+    let a = store::get(&conn, "a-note").expect("get").expect("a-note");
+    assert_eq!((a.visits, a.times_useful), (2, 0));
+}
+
+#[test]
+fn the_usage_fields_project_the_rows_own_counters() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "a-note", "one fact", &[]);
+    seed(&conn, &embedder, "b-note", "two fact", &[]);
+    for _ in 0..3 {
+        store::record_visit(&conn, "a-note").expect("visit");
+    }
+    store::record_useful(&conn, "a-note").expect("useful");
+    store::record_useful(&conn, "b-note").expect("useful");
+
+    let bundle = search::run(&conn, None, &query(None)).expect("search");
+    let fields = Fields::selection([Field::Visits, Field::TimesUseful]);
+    let wire = search::to_wire_json(&bundle, &fields).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    assert_eq!(
+        v["cols"],
+        serde_json::json!(["key", "visits", "times_useful"])
+    );
+    assert_eq!(v["hits"][0], serde_json::json!(["a-note", 3, 1]));
+    assert_eq!(v["hits"][1], serde_json::json!(["b-note", 0, 1]));
+
+    // Asking for nothing extra still yields the old one-column shape — usage is opt-in, like
+    // every other field (SPEC §10: a hit says *which* memory and nothing more).
+    let lean = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&lean).expect("json");
+    assert_eq!(v["cols"], serde_json::json!(["key"]));
+    assert_eq!(v["hits"][0], serde_json::json!(["a-note"]));
+}
+
+#[test]
+fn the_header_and_the_rows_keep_the_same_field_order() {
+    // The text listing renders these same `cols`/rows positionally (`list_text`), so one order owns
+    // both: a field added to `Field::ALL` lands in the header and in every row at the same index.
+    let hit = Hit {
+        id: 1,
+        key: "k".into(),
+        title: "T".into(),
+        tags: vec!["a".into()],
+        chars: 3,
+        visits: 7,
+        times_useful: 2,
+        distance: Some(0.42),
+    };
+    let bundle = search::Bundle {
+        hits: vec![hit],
+        neighbors: vec![],
+    };
+    let fields = Fields::selection(Field::ALL);
+    let wire = search::to_wire_json(&bundle, &fields).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    let cols: Vec<&str> = v["cols"]
+        .as_array()
+        .expect("cols")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(cols, fields.names().collect::<Vec<_>>());
+    assert_eq!(cols, Field::ALL.map(Field::name).to_vec());
+    assert_eq!(
+        v["hits"][0],
+        serde_json::json!(["k", "T", ["a"], 3, 7, 2, 0.42]),
+        "each cell sits under its own name, in the order the text listing prints"
+    );
+
+    // A semantic-less row has no distance: the cell stays, so the columns still line up (`-` in
+    // text, the same placeholder `distance` always had).
+    let mut unranked = bundle.hits[0].clone();
+    unranked.distance = None;
+    let bundle = search::Bundle {
+        hits: vec![unranked],
+        neighbors: vec![],
+    };
+    let wire = search::to_wire_json(&bundle, &fields).expect("wire");
+    let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
+    let row = v["hits"][0].as_array().expect("row");
+    assert_eq!(row.len(), Field::ALL.len(), "one cell per column: {wire}");
+    assert_eq!(row[row.len() - 1], serde_json::Value::Null);
 }

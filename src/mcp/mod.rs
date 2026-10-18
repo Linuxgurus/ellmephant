@@ -789,6 +789,22 @@ fn identity_of(
     crate::identity::resolve(&parts.headers)
 }
 
+/// ★ A WRITE REQUIRES A PEN. Reads are open to anyone; a write with NO proven identity is REFUSED,
+/// not stamped `anonymous`. Anonymous is an honest answer to "who spoke", but the store has no
+/// reason to accept an unsigned hand: an anonymous write is indistinguishable from one nobody meant,
+/// and it cannot be held to anything. Every refusal costs one header pair to fix; `whoami` says what
+/// this connection currently is.
+fn pen_name(
+    ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+) -> std::result::Result<String, String> {
+    match identity_of(ctx) {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err("refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is."
+            .to_string()),
+        Err(forged) => Err(forged.to_string()),
+    }
+}
+
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
 #[derive(Clone)]
@@ -1215,7 +1231,7 @@ impl MemoryServer {
     /// PROVEN. A read: it changes nothing, and it never returns the secret.
     #[tool(
         name = "whoami",
-        description = "Report the identity this connection writes as: `asserted_by` (the `sender`/author a write is stamped with) and `proven` (true when `X-Stet-From` was matched against `X-Stet-Auth`). `proven: false` with `asserted_by: anonymous` means the connection presents no identity, so every write will be attributed to nobody. Use this instead of guessing, and never to test credentials — it does not echo them.",
+        description = "Report the identity this connection writes as: `asserted_by` (the `sender`/author a write is stamped with) and `proven` (true when `X-Stet-From` was matched against `X-Stet-Auth`). `proven: false` with `asserted_by: anonymous` means the connection presents no identity, so every write will be REFUSED (reads need no identity). Use this instead of guessing, and never to test credentials — it does not echo them.",
         annotations(
             title = "Who am I",
             read_only_hint = true,
@@ -1265,10 +1281,7 @@ impl MemoryServer {
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
         // no signature at all.
-        patch.asserted_by = match identity_of(&ctx) {
-            Ok(name) => name,
-            Err(forged) => return Err(forged.to_string()),
-        };
+        patch.asserted_by = Some(pen_name(&ctx)?);
         let outcome = self
             .with_store("memory_upsert", move |s| s.memory_merge(&patch))
             .await?;
@@ -1311,8 +1324,10 @@ impl MemoryServer {
     )]
     async fn memory_delete(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
@@ -1354,8 +1369,10 @@ impl MemoryServer {
     )]
     async fn memory_merge(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
@@ -1558,8 +1575,10 @@ impl MemoryServer {
     )]
     async fn memory_upvote(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         upvote_sweep(self, p.keys).await
     }
 
@@ -1657,8 +1676,10 @@ impl MemoryServer {
     )]
     async fn memory_reembed(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reembed", move |s| s.reembed())
             .await?;
@@ -1694,8 +1715,10 @@ impl MemoryServer {
     )]
     async fn project_upsert(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| s.project_merge(&patch))
@@ -1798,10 +1821,7 @@ impl MemoryServer {
         } = p;
         // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
         // terminal, never a browser chat. Without it, this stays open exactly as it was.
-        let proven = match identity_of(&ctx) {
-            Ok(name) => name,
-            Err(forged) => return Err(forged.to_string()),
-        };
+        let proven = Some(pen_name(&ctx)?);
         crate::identity::may_lease(proven.as_deref())?;
         // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
         // someone else's name; an unproven caller's assertion stands, as before.
@@ -1835,8 +1855,10 @@ impl MemoryServer {
     )]
     async fn claim_release(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimReleaseParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         let ClaimReleaseParams { name, owner } = p;
         let log_name = name.clone();
         let log_owner = owner.clone();
@@ -1904,11 +1926,8 @@ impl MemoryServer {
         } = p;
         // A PROVEN identity outranks the argument. `sender` is asserted text — the one field a chat
         // could use to speak as someone else — so the header pair, when it verifies, decides it.
-        let sender = match identity_of(&ctx) {
-            Ok(Some(proven)) => proven,
-            Ok(None) => sender,
-            Err(forged) => return Err(forged.to_string()),
-        };
+        let _asserted_sender = sender; // the argument is history; the pen decides
+        let sender = pen_name(&ctx)?;
         let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
         let out = self
             .with_store("mail_send", move |s| {
@@ -2021,8 +2040,10 @@ impl MemoryServer {
     )]
     async fn mail_prune(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailPruneParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx)?; // writes are signed; anonymous is read-only
         let keep_days = p.keep_days;
         let removed = self
             .with_store("mail_prune", move |s| s.mail_prune(keep_days))

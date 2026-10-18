@@ -229,3 +229,60 @@ async fn a_proven_stranger_is_refused_and_a_declared_surrogate_is_not() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
+
+/// ★ A LETTER TO YOUR OWN BOX IS NEVER DELIVERY (seq 26): the guard lives in the store, so the REST
+/// door refuses it exactly as the MCP tool does. A proven `James` pen addressing `james` is the
+/// misfiling that sat unread in every boot; the hand's answer path (`hands` -> `stet`) stays open.
+#[tokio::test]
+async fn a_pen_cannot_send_to_its_own_box() {
+    let _guard = env_lock();
+    install(TABLE, "hands=stet");
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(dir.path());
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/mail?format=json",
+        Some(("james", "j1")),
+        Some(r#"{"recipient":"james","subject":"handoff","body":"for the next me"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("never delivery"), "{body}");
+
+    // Nothing was written: the box is still empty.
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/mail?recipient=james&format=json",
+        Some(("james", "j1")),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["letters"].as_array().map(Vec::len), Some(0), "{body}");
+
+    // A self's own pen is refused too — the rule is about the box, not about being human.
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/mail?format=json",
+        Some(("stet", "s1")),
+        Some(r#"{"recipient":"stet","body":"a note to myself"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The hand serves `stet` without BEING `stet`: that answer is delivery, not a self-send.
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/mail?format=json",
+        Some(("hands", "h1")),
+        Some(r#"{"recipient":"stet","subject":"result","body":"the guard is in"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

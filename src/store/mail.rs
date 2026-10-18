@@ -91,6 +91,16 @@ pub fn send(
             "`recipient` cannot be empty: address a SELF (`stet`, `twine`), never a finger".into(),
         ));
     }
+    // ★ A LETTER TO YOUR OWN BOX IS NEVER DELIVERY (seq 26, 2026-10-18): a handoff written FOR Stet's
+    // next context was sent with the human's pen into the human's own box and sat unread in every
+    // session. Refuse it in the STORE so every door inherits the rule — MCP, REST and the CLI. A
+    // finger is `stet/finger-<id>`, so a finger answering its self is still allowed.
+    if sender.eq_ignore_ascii_case(&recipient) {
+        return Err(Error::Invalid(format!(
+            "refused: `{sender}` is the box this pen already is — a letter to yourself is never \
+             delivery; address the SELF that should read it"
+        )));
+    }
     if body.trim().is_empty() {
         return Err(Error::Invalid("`body` cannot be empty".into()));
     }

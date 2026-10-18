@@ -96,6 +96,35 @@ fn the_body_is_fetched_on_demand_never_copied_into_an_envelope() -> Result<()> {
     Ok(())
 }
 
+/// ★ A LETTER TO YOUR OWN BOX IS NEVER DELIVERY (seq 26): the pen that writes and the box it writes
+/// into must be two different selves. A handoff for the next context goes to the SELF's box; a finger
+/// (`stet/finger-<id>`) answering its self is not a self-send.
+#[test]
+fn a_letter_to_your_own_box_is_refused() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+
+    let err = mail::send(&conn, "James", "james", "handoff", "for the next me", "text")
+        .expect_err("James addressing james is self-addressed");
+    assert!(
+        err.to_string().contains("never delivery"),
+        "the refusal says why: {err}"
+    );
+    assert_eq!(mail::head(&conn, "james")?, 0, "nothing was written");
+
+    // The box is one name however it is typed.
+    assert!(
+        mail::send(&conn, "stet", " Stet ", "s", "b", "text").is_err(),
+        "a box is case- and whitespace-insensitive"
+    );
+
+    // A finger answers its self through the self's box; that is not a self-send.
+    let sent = mail::send(&conn, "stet/finger-1", "stet", "report", "done", "text")?;
+    assert_eq!(sent.sender, "stet/finger-1");
+    assert_eq!(sent.seq, 1, "the refused letter left no row");
+    Ok(())
+}
+
 #[test]
 fn a_letter_is_refused_when_it_is_not_a_letter() -> Result<()> {
     let (_dir, paths) = temp_store();

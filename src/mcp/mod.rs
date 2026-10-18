@@ -1821,11 +1821,12 @@ impl MemoryServer {
         } = p;
         // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
         // terminal, never a browser chat. Without it, this stays open exactly as it was.
-        let proven = Some(pen_name(&ctx)?);
-        crate::identity::may_lease(proven.as_deref())?;
+        let proven = pen_name(&ctx)?;
+        crate::identity::may_lease(Some(&proven))?;
         // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
         // someone else's name; an unproven caller's assertion stands, as before.
-        let owner = proven.unwrap_or(owner);
+        let _asserted_owner = owner; // the pen decides; the argument is history
+        let owner = proven;
         let out = self
             .with_store("claim_acquire", move |s| {
                 s.claim_acquire(&name, &owner, ttl_seconds)

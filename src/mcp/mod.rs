@@ -829,6 +829,22 @@ pub struct MemoryServer {
     /// construction; every write it makes is stamped with that name instead of being refused as
     /// anonymous. HTTP transports ignore this — their headers decide.
     declared: Option<String>,
+    /// ★ WHO MAY READ WHOSE MAIL, stated out loud: `(from, to)` pairs from
+    /// `ELLMEPHANT_MAIL_SURROGATES=hands=stet`. The hand that serves `stet` authenticates as `hands`,
+    /// so without a declared surrogate the recipient-only rule would lock my own hand out of the
+    /// mail it exists to read. Every exception is written here instead of being implied.
+    surrogates: Vec<(String, String)>,
+}
+
+/// Parse `a=b,c=d` into pairs. Blank or malformed entries are dropped rather than guessed at.
+fn parse_surrogates(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (from, to) = pair.split_once('=')?;
+            let (from, to) = (from.trim(), to.trim());
+            (!from.is_empty() && !to.is_empty()).then(|| (from.to_string(), to.to_string()))
+        })
+        .collect()
 }
 
 impl MemoryServer {
@@ -857,7 +873,33 @@ impl MemoryServer {
             cfg,
             encoder,
             declared: None,
+            surrogates: parse_surrogates(
+                &std::env::var("ELLMEPHANT_MAIL_SURROGATES").unwrap_or_default(),
+            ),
         }
+    }
+
+    /// ★ ONLY THE RECIPIENT READS ITS MAIL. `mail_inbox` takes a recipient as an argument, so without
+    /// this any caller could read any box. A proven identity reads its own box, or a box an explicit
+    /// surrogate map hands it; anonymous is refused before the box is even considered.
+    fn mail_box_for(
+        &self,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        requested: &str,
+    ) -> std::result::Result<String, String> {
+        let who = pen_name(ctx, self.declared.as_deref())?;
+        if who.eq_ignore_ascii_case(requested) {
+            return Ok(who);
+        }
+        let allowed = self.surrogates.iter().any(|(from, to)| {
+            from.eq_ignore_ascii_case(&who) && to.eq_ignore_ascii_case(requested)
+        });
+        if allowed {
+            return Ok(who);
+        }
+        Err(format!(
+            "refused: `{who}` may not read `{requested}`'s mail — only the recipient, or a declared surrogate, may"
+        ))
     }
 
     /// Declare the pen for a transport with no HTTP request (stdio / in-process). Writes are then
@@ -1986,6 +2028,7 @@ impl MemoryServer {
     )]
     async fn mail_inbox(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailInboxParams>,
     ) -> std::result::Result<String, String> {
         let MailInboxParams {
@@ -1994,6 +2037,9 @@ impl MemoryServer {
             wait_seconds,
             limit,
         } = p;
+        // ★ THE BOX IS CHECKED BEFORE THE LONG POLL: waiting 25 seconds to be told you may not read
+        // it is a worse answer than being told now.
+        self.mail_box_for(&ctx, &recipient)?;
         let since = since.unwrap_or(0);
         let limit = limit.unwrap_or(50).clamp(1, 500);
         let wait = wait_seconds
@@ -2035,12 +2081,18 @@ impl MemoryServer {
     )]
     async fn mail_read(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailReadParams>,
     ) -> std::result::Result<String, String> {
         let seq = p.seq;
         let found = self
             .with_read("mail_read", move |s| s.mail_read(seq))
             .await?;
+        // ★ A LETTER IS PRIVATE CORRESPONDENCE: the box it is addressed to decides who may read it,
+        // and the check happens on the LETTER, not on an argument the caller chose.
+        if let Some(letter) = &found {
+            self.mail_box_for(&ctx, &letter.recipient)?;
+        }
         match found {
             Some(letter) => serde_json::to_string(&letter).map_err(|e| e.to_string()),
             None => Ok(serde_json::json!({ "letter": null, "seq": seq }).to_string()),

@@ -796,11 +796,18 @@ fn identity_of(
 /// this connection currently is.
 fn pen_name(
     ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    declared: Option<&str>,
 ) -> std::result::Result<String, String> {
     match identity_of(ctx) {
         Ok(Some(name)) => Ok(name),
-        Ok(None) => Err("refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is."
-            .to_string()),
+        // ★ A TRANSPORT WITH NO REQUEST MAY DECLARE ITS PEN ONCE, at construction: a stdio or
+        // in-process server is started BY a process and is as trusted as that process. HTTP
+        // transports ignore this — their headers decide, and an unproven header is still refused.
+        Ok(None) => match declared {
+            Some(name) => Ok(name.to_string()),
+            None => Err("refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is."
+                .to_string()),
+        },
         Err(forged) => Err(forged.to_string()),
     }
 }
@@ -817,6 +824,11 @@ pub struct MemoryServer {
     paths: crate::config::Paths,
     cfg: crate::config::Config,
     encoder: Arc<super::cli::session::Encoder>,
+    /// ★ A DECLARED PEN, for transports that carry no HTTP request (stdio, in-process). A server
+    /// started BY a process is as trusted as that process, so it may say who it is once, at
+    /// construction; every write it makes is stamped with that name instead of being refused as
+    /// anonymous. HTTP transports ignore this — their headers decide.
+    declared: Option<String>,
 }
 
 impl MemoryServer {
@@ -844,7 +856,15 @@ impl MemoryServer {
             paths,
             cfg,
             encoder,
+            declared: None,
         }
+    }
+
+    /// Declare the pen for a transport with no HTTP request (stdio / in-process). Writes are then
+    /// stamped with this name; without it they are REFUSED, because anonymous is read-only.
+    pub fn with_identity(mut self, name: impl Into<String>) -> Self {
+        self.declared = Some(name.into());
+        self
     }
 
     /// The writer witness this server marks while a tool holds the store lock.
@@ -1281,7 +1301,7 @@ impl MemoryServer {
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
         // no signature at all.
-        patch.asserted_by = Some(pen_name(&ctx)?);
+        patch.asserted_by = Some(pen_name(&ctx, self.declared.as_deref())?);
         let outcome = self
             .with_store("memory_upsert", move |s| s.memory_merge(&patch))
             .await?;
@@ -1327,7 +1347,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
@@ -1372,7 +1392,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
@@ -1578,7 +1598,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         upvote_sweep(self, p.keys).await
     }
 
@@ -1679,7 +1699,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reembed", move |s| s.reembed())
             .await?;
@@ -1718,7 +1738,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| s.project_merge(&patch))
@@ -1821,7 +1841,7 @@ impl MemoryServer {
         } = p;
         // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
         // terminal, never a browser chat. Without it, this stays open exactly as it was.
-        let proven = pen_name(&ctx)?;
+        let proven = pen_name(&ctx, self.declared.as_deref())?;
         crate::identity::may_lease(Some(&proven))?;
         // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
         // someone else's name; an unproven caller's assertion stands, as before.
@@ -1859,7 +1879,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimReleaseParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let ClaimReleaseParams { name, owner } = p;
         let log_name = name.clone();
         let log_owner = owner.clone();
@@ -1928,7 +1948,7 @@ impl MemoryServer {
         // A PROVEN identity outranks the argument. `sender` is asserted text — the one field a chat
         // could use to speak as someone else — so the header pair, when it verifies, decides it.
         let _asserted_sender = sender; // the argument is history; the pen decides
-        let sender = pen_name(&ctx)?;
+        let sender = pen_name(&ctx, self.declared.as_deref())?;
         let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
         let out = self
             .with_store("mail_send", move |s| {
@@ -2044,7 +2064,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailPruneParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let keep_days = p.keep_days;
         let removed = self
             .with_store("mail_prune", move |s| s.mail_prune(keep_days))

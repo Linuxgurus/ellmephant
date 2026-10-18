@@ -373,6 +373,10 @@ async fn request(
 /// An in-process MCP peer over the same session — the other door, for parity. The service must be
 /// kept alive by the caller (dropping it closes the pipe).
 async fn mcp_peer(server: MemoryServer) -> rmcp::service::RunningService<RoleClient, ()> {
+    // This peer is IN-PROCESS: there is no HTTP request, so no headers, so no proven identity.
+    // A transport with no request declares its pen once, at construction — which is exactly what
+    // `with_identity` is for (anonymous writes are refused by design).
+    let server = server.with_identity("tester");
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         server

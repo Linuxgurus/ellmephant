@@ -1,0 +1,27 @@
+name: test
+
+# THE GATE `main` never had (issue #43): run the repository's own `make test` on every change.
+#
+# `make test` exists and is documented as "unit + integration tests (offline, no model)" -- no
+# workflow called it. `publish.yml` reads the version and publishes; `publish-dev.yml` is the dev
+# branch's publish path; `smoke.yml` tests the RUNNER, not the code. This file needs no registry
+# login, no secret and no cluster, so it can only fail when the CODE is wrong.
+#
+# `ubuntu-latest` is the docker-executor label this repo's three workflows already use
+# (catthehacker/ubuntu:act-22.04). That image carries node, git, bash and the docker CLI and NO
+# cargo (measured for soma/spine on this runner, 2026-10-19), so the toolchain comes from a
+# container -- the same shape as this repo's dev-branch gate (b507d7d). `Dockerfile.test` is
+# standalone (no Harbor, no secrets), so it behaves identically on a push and on a pull request.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make test (in the Rust image)
+        run: docker build --platform linux/amd64 -f Dockerfile.test -t ellmephant-test .

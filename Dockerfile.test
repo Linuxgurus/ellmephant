@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+#
+# The CI gate for `main`: run the repository's OWN test target -- `make test` -- in a Rust image.
+#
+# Built, never run, by `.forgejo/workflows/test.yml`. The runner image
+# (`catthehacker/ubuntu:act-22.04`) has the docker CLI and NO cargo, so a toolchain has to come
+# from a container, and `docker build` is the path this repository already depends on
+# (publish.yml, publish-dev.yml). A bind-mounted `docker run -v "$PWD":/src` would not work here:
+# the daemon cannot see the job's path, whereas `docker build` streams the context.
+#
+# STANDALONE on purpose -- no Harbor, no secrets -- so a pull request from a branch that cannot
+# read the private registry runs the same gate. That costs a fresh dependency compile; in exchange
+# the gate always starts, and it can only fail when the code is wrong.
+FROM rust:1-bookworm
+
+WORKDIR /src
+# `.dockerignore` keeps target/, .git/ and local databases out of the context.
+COPY . .
+
+# `target/` and the cargo registry are CACHE MOUNTS, not image layers: artifacts stay in the
+# BuildKit cache between runs instead of being exported into a throwaway image (measured on this
+# runner: without the target mount, ~3 GB and minutes of layer export).
+RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch --locked
+# Exactly the Makefile's `test` target: `cargo test --locked`.
+RUN --mount=type=cache,target=/src/target --mount=type=cache,target=/usr/local/cargo/registry make test

@@ -19,7 +19,7 @@ fn missing_config_file_yields_the_documented_defaults() {
     assert_eq!(cfg.revision, "main");
     assert_eq!(cfg.cache_dir, "");
     assert!(!cfg.offline);
-    assert_eq!(cfg.dim, 1024);
+    assert_eq!(cfg.dim, 1025); // TEMPORARY: prove the gate bites
     assert_eq!(cfg.precision, "bf16");
     assert_eq!(cfg.device, "cpu");
     assert_eq!(cfg.default_k, 5);

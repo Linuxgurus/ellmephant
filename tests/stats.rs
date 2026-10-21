@@ -93,10 +93,10 @@ fn the_digest_carries_the_encode_queue() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = ellmephant::embed::VecSpec::of(&embedder);
+    let _spec = ellmephant::embed::VecSpec::of(&embedder);
 
     // `store::add` and NOT `add_now`: the point is the unsettled document a write leaves behind.
-    store::add(&conn, &spec, &memory("queued", "owed a vector", &["k8s"])).expect("add");
+    store::add(&conn, &memory("queued", "owed a vector", &["k8s"])).expect("add");
     let s = stats::compute(&conn).expect("stats");
     assert_eq!(s.encode_pending, 1, "the write scheduled its document");
     assert_eq!(s.encode_failed, 0, "and nothing has failed");
@@ -106,7 +106,7 @@ fn the_digest_carries_the_encode_queue() {
     );
 
     // Settle it: the queue empties, and with it the age.
-    let processed = ellmephant::store::encode::drain(&conn, &embedder, &spec, 10).expect("drain");
+    let processed = ellmephant::store::encode::drain(&conn, &embedder, 10).expect("drain");
     assert_eq!(processed, 1);
     let s = stats::compute(&conn).expect("stats");
     assert_eq!(s.encode_pending, 0);

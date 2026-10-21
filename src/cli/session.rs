@@ -172,7 +172,7 @@ impl Session {
     /// **No encoder.** The document is queued, not embedded (`ENCODE-WORKER.md`), so a write holds
     /// nothing slower than a row insert — that coupling is what this whole design removes.
     pub fn memory_merge(&self, patch: &store::Patch) -> Result<store::MergeOutcome> {
-        store::merge(&self.conn, &self.vec_spec(), patch)
+        store::merge(&self.conn, patch)
     }
 
     /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
@@ -305,7 +305,7 @@ impl Session {
     /// Split from [`settle_encode`](Self::settle_encode) on purpose — the worker drops the store lock
     /// between the two, so the model call runs holding nothing at all. `ENCODE-WORKER.md` is the why.
     pub fn claim_encode(&self, keyslug: &str) -> Result<Option<encode::Claim>> {
-        encode::claim(&self.conn, &self.vec_spec(), keyslug)
+        encode::claim(&self.conn, keyslug)
     }
 
     /// Store a claim's vector and settle its queue entry: the write half of a job.
@@ -352,7 +352,7 @@ impl Session {
     pub fn encode_document(&self, key: &str) -> Result<bool> {
         let keyslug = crate::store::links::Kind::Memory.keyslug(key);
         self.encoder
-            .with(|e| encode::encode_one(&self.conn, e, &self.vec_spec(), &keyslug))
+            .with(|e| encode::encode_one(&self.conn, e, &keyslug))
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.

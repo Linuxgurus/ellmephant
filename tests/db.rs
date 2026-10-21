@@ -30,7 +30,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 
 fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     conn.execute(
-        "INSERT INTO memory (key, title, body, encode_hash) VALUES (?1, ?2, ?3, 'h')",
+        "INSERT INTO memory (key, title, body) VALUES (?1, ?2, ?3)",
         params![key, title, body],
     )
     .expect("insert memory");
@@ -152,9 +152,11 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         [],
     )
     .unwrap();
-    // And it still spells the column `doc_hash`: 0010 is the rename that fixes that.
+    // And it still spells the column `doc_hash`: 0010 is the rename that fixes that, and 0016 is the
+    // migration that removes it entirely — so the OLD store is built by ADDING the old spelling, not
+    // by renaming a column this schema no longer has.
     conn.execute(
-        "ALTER TABLE memory RENAME COLUMN encode_hash TO doc_hash",
+        "ALTER TABLE memory ADD COLUMN doc_hash TEXT NOT NULL DEFAULT ''",
         [],
     )
     .unwrap();
@@ -228,9 +230,9 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         [],
     )
     .unwrap();
-    // …and still spells the column `doc_hash`, which 0010 renames.
+    // …and still carries the old `doc_hash` spelling, which 0010 renames and 0016 removes.
     conn.execute(
-        "ALTER TABLE memory RENAME COLUMN encode_hash TO doc_hash",
+        "ALTER TABLE memory ADD COLUMN doc_hash TEXT NOT NULL DEFAULT ''",
         [],
     )
     .unwrap();
@@ -265,35 +267,29 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
 }
 
 #[test]
-fn memory_keeps_an_encode_hash_tags_and_no_scope_or_type() {
+fn memory_keeps_tags_and_no_scope_or_type() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
     conn.execute(
-        "INSERT INTO memory (key, title, body, tags, encode_hash)
-         VALUES ('a', 'T', 'B', 'k8s,infra', 'dh')",
+        "INSERT INTO memory (key, title, body, tags) VALUES ('a', 'T', 'B', 'k8s,infra')",
         [],
     )
     .unwrap();
 
-    let (tags, encode_hash): (String, String) = conn
-        .query_row(
-            "SELECT tags, encode_hash FROM memory WHERE key = 'a'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let tags: String = conn
+        .query_row("SELECT tags FROM memory WHERE key = 'a'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!((tags.as_str(), encode_hash.as_str()), ("k8s,infra", "dh"));
+    assert_eq!(tags, "k8s,infra");
 
-    // `encode_hash` is NOT NULL; `tags` defaults to the empty string.
+    // ★ NO ENCODING STATE ON THE ROW (0016): a document records what it IS, never whether its vector
+    // exists. The queue and the index answer that, and a stamp here was the bug.
     assert!(
-        conn.execute(
-            "INSERT INTO memory (key, title, body) VALUES ('b', 'T', 'B')",
-            [],
-        )
-        .is_err()
+        !column_exists(&conn, "memory", "encode_hash"),
+        "the truth table carries no derived stamp"
     );
+    // `tags` defaults to the empty string.
     conn.execute(
-        "INSERT INTO memory (key, title, body, encode_hash) VALUES ('c', 'T', 'B', 'dh')",
+        "INSERT INTO memory (key, title, body) VALUES ('c', 'T', 'B')",
         [],
     )
     .unwrap();
@@ -329,7 +325,7 @@ fn key_is_unique() {
 
     insert(&conn, "dup", "One", "body");
     let err = conn.execute(
-        "INSERT INTO memory (key, title, body, encode_hash) VALUES ('dup', 'Two', 'body', 'h')",
+        "INSERT INTO memory (key, title, body) VALUES ('dup', 'Two', 'body')",
         [],
     );
     assert!(

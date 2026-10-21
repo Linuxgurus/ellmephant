@@ -8,7 +8,7 @@ mod common;
 
 use common::temp_store;
 use ellmephant::db;
-use ellmephant::embed::{HashEmbedder, VecSpec};
+use ellmephant::embed::{Embedder, HashEmbedder, VecSpec};
 use ellmephant::store::{self, Memory, links, project};
 use rusqlite::Connection;
 
@@ -119,28 +119,31 @@ fn rename_queues_a_new_vector_for_the_row_it_moves() {
     links::rename(&conn, "old-name", "new-name").expect("rename");
     common::settle(&conn, &embedder);
 
-    let stored: String = conn
-        .query_row(
-            "SELECT encode_hash FROM memory WHERE key = 'new-name'",
-            [],
-            |r| r.get(0),
-        )
+    // ★ THE VECTOR IS THE EVIDENCE (2026-10-21), because the row keeps no stamp: the stored vector
+    // must be the one for the document rendered under the NEW key, not the old one.
+    let id: i64 = conn
+        .query_row("SELECT id FROM memory WHERE key = 'new-name'", [], |r| {
+            r.get(0)
+        })
         .expect("row moved");
-    let fresh = store::row_hash(
-        &ellmephant::embed::VecSpec::of(&embedder),
-        &ellmephant::embed::projection::embed_document("new-name", "old-name", "the body"),
-    );
+    let stored = ellmephant::index::vec::get(&conn, id)
+        .expect("get")
+        .expect("the moved row has a vector");
+    let fresh = embedder
+        .embed_one(&ellmephant::embed::projection::embed_document(
+            "new-name", "old-name", "the body",
+        ))
+        .expect("fresh vector");
     assert_eq!(
         stored, fresh,
         "the row's vector was rebuilt under its new key, not left describing the old one"
     );
-
-    // The pre-fix hash (documented under the OLD key) must NOT match — that drift is the bug.
-    let stale = store::row_hash(
-        &ellmephant::embed::VecSpec::of(&embedder),
-        &ellmephant::embed::projection::embed_document("old-name", "old-name", "the body"),
-    );
-    assert_ne!(stored, stale, "the stale, old-key hash was replaced");
+    let stale = embedder
+        .embed_one(&ellmephant::embed::projection::embed_document(
+            "old-name", "old-name", "the body",
+        ))
+        .expect("stale vector");
+    assert_ne!(stored, stale, "the stale, old-key vector was replaced");
 }
 
 #[test]

@@ -85,6 +85,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0015_multi_kind_queue.sql"),
         "the queue keys on a keyslug and carries the rendered text: no hash, no kind column, no retries",
     ),
+    (
+        16,
+        include_str!("../../migrations/0016_drop_encode_hash.sql"),
+        "drop memory.encode_hash: the stamp describing a derived index leaves the truth row",
+    ),
 ];
 
 /// Current schema version recorded in the file.

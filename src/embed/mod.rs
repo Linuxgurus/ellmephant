@@ -38,9 +38,9 @@ pub trait Embedder: Send + Sync {
     }
 }
 
-/// The identity of the vector space a row's `encode_hash` is written in.
+/// The identity of the vector space a row's vector is written in.
 ///
-/// [`row_hash`](crate::store::row_hash) needs a model id and a dimension to fingerprint a document,
+/// The projection fingerprint needs a model id and a dimension to describe a vector space,
 /// and both are *config* — not a property of loaded weights. Carrying them in a value is what lets
 /// the write path hash a document **without loading 1.2 GB of encoder**, which is what the encode
 /// worker is built on (see `ENCODE-WORKER.md`).
@@ -49,7 +49,7 @@ pub trait Embedder: Send + Sync {
 /// rename — so they need no config plumbed down to them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VecSpec {
-    /// The model id recorded in `meta` and folded into every `encode_hash`.
+    /// The model id recorded in `meta`, and part of the projection fingerprint.
     pub model_id: String,
     /// Vector length; must be stable for a given model.
     pub dim: usize,

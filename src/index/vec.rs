@@ -325,7 +325,7 @@ pub fn count(conn: &Connection) -> Result<i64> {
 
 /// Every `memory_id` that has a stored vector. Empty when the table has not been created.
 ///
-/// `encode_hash` says "this row was indexed", which is not the same as "this row HAS a vector": a killed
+/// A stamp saying "this row was indexed" is not the same as "this row HAS a vector": a killed
 /// rebuild or a hand-deleted vector leaves the hash intact and the index torn. `reembed` uses this to
 /// see the difference.
 pub fn ids(conn: &Connection) -> Result<Vec<i64>> {

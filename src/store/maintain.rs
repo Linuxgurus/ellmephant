@@ -9,13 +9,13 @@
 //! records what the vectors now correspond to so `doctor` can tell a swapped model from a corrupt
 //! one.
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::db::meta;
 use crate::embed::{VecSpec, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::{ENCODE_PENDING, encode, links};
+use crate::store::{encode, links};
 
 /// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.
 #[derive(Debug, Clone)]
@@ -51,19 +51,15 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
         index::vec::recreate(conn, dim)?;
     }
 
-    // A changed PROJECTION is a full re-embed too, and **`encode_hash` cannot see it**: the hash covers the
-    // model, the dimension and the text — not the recipe that assembled them. The fingerprint is the
-    // signal, and without it a projection change would queue nothing at all while every stored vector
-    // quietly kept describing the old recipe. That is the drift the fingerprint exists to catch, and
-    // this is the one place it is acted on.
-    let reset = rebuilt || index::vec::projection_stale(conn)?;
+    // ★ A changed PROJECTION is a full re-embed, and the fingerprint is what says so — but it no
+    // longer decides *whether* anything is queued: a rebuild is always-full (see below), because with
+    // no per-row stamp there is nothing to compare a row against. `projection_stale` is still read
+    // below by `/health` and `doctor`, and the new fingerprint is recorded here.
+    let _was_stale = rebuilt || index::vec::projection_stale(conn)?;
     // Snapshot the rows first, so the scan is not interleaved with the enqueues.
-    let rows: Vec<(i64, String, String, String, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT id, key, title, body, encode_hash FROM memory ORDER BY id")?;
-        let mapped = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT key, title, body FROM memory ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let tx = conn.unchecked_transaction()?;
@@ -81,17 +77,8 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
     // a full re-encode cannot hold up an edit — and the index keeps answering throughout, because
     // nothing is deleted until (and unless) a dimension change forces it.
     let mut queued = 0;
-    for (id, key, title, body, _stored) in rows {
+    for (key, title, body) in rows {
         encode::enqueue_memory(&tx, &key, &title, &body, encode::PRIORITY_BULK)?;
-        if reset {
-            // The stored vector was built with a different recipe (or width), so under the current one
-            // this row owes a vector. The column says so until the worker writes the real hash beside
-            // the vector it stores — nothing reads it for correctness, but a reader must not be lied to.
-            tx.execute(
-                "UPDATE memory SET encode_hash = ?2 WHERE id = ?1",
-                params![id, ENCODE_PENDING],
-            )?;
-        }
         queued += 1;
     }
     tx.commit()?;

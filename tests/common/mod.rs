@@ -30,8 +30,8 @@ pub fn count(conn: &Connection, sql: &str) -> i64 {
 /// detection or `stats` must settle first, and this is the one call that says so. `ENCODE-WORKER.md`
 /// is the design; this is the test-side door.
 pub fn settle(conn: &Connection, embedder: &dyn Embedder) {
-    let spec = VecSpec::of(embedder);
-    while store::encode::drain(conn, embedder, &spec, 64).expect("drain") > 0 {}
+    let _spec = VecSpec::of(embedder);
+    while store::encode::drain(conn, embedder, 64).expect("drain") > 0 {}
 }
 
 /// Write a memory and settle it: the synchronous shape a test wants, and the honest one for a
@@ -42,8 +42,8 @@ pub fn add_now(
     embedder: &dyn Embedder,
     mem: &Memory,
 ) -> Result<(i64, String), ellmephant::error::Error> {
-    let spec = VecSpec::of(embedder);
-    let out = store::add(conn, &spec, mem)?;
+    let _spec = VecSpec::of(embedder);
+    let out = store::add(conn, mem)?;
     settle(conn, embedder);
     Ok(out)
 }
@@ -54,8 +54,8 @@ pub fn merge_now(
     embedder: &dyn Embedder,
     patch: &store::Patch,
 ) -> Result<store::MergeOutcome, ellmephant::error::Error> {
-    let spec = VecSpec::of(embedder);
-    let out = store::merge(conn, &spec, patch)?;
+    let _spec = VecSpec::of(embedder);
+    let out = store::merge(conn, patch)?;
     settle(conn, embedder);
     Ok(out)
 }

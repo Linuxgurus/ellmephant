@@ -25,6 +25,7 @@ don't have to remember the exact words you used.
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
 - [For the curious and the engineers](#for-the-curious-and-the-engineers)
+- [Licence](#licence)
 
 ---
 

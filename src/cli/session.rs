@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::{Config, Paths};
 use crate::db;
@@ -255,6 +255,20 @@ impl Session {
     /// How many versions one key holds — what a delete does NOT remove.
     pub fn version_count(&self, key: &str) -> Result<i64> {
         store::version::count_for(&self.conn, key)
+    }
+
+    /// Does this connection see a row for `key`? One boolean, and on a miss it is the one that splits
+    /// the space in half: reader-only blindness (WAL, snapshot, path) versus the store not having it.
+    pub fn exists(&self, key: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM memory WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// The facts a MISS needs to be evidence rather than an assertion (soma/ellmephant#57).

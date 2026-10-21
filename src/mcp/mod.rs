@@ -2265,19 +2265,43 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             newest = ?facts.newest,
             "memory_get miss"
         );
+        // ★ THE ONE BIT THAT HALVES THE SEARCH (#57): does the process's own WRITER connection see the
+        // row? Reader-blind-only means a WAL/snapshot/path divergence; both blind means the store
+        // genuinely does not hold it. Timed, because a miss must not queue behind a long encode.
+        let writer_sees = {
+            let k = key.to_string();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.with_store("memory_get", move |s| s.exists(&k)),
+            )
+            .await
+            {
+                Ok(Ok(true)) => "writer-sees-it",
+                Ok(Ok(false)) => "writer-agrees-absent",
+                Ok(Err(_)) => "writer-check-failed",
+                Err(_) => "writer-check-timed-out",
+            }
+        };
+        tracing::warn!(tool = "memory_get", key = %key, writer_sees, "memory_get miss: writer check");
+        let divergence = if writer_sees == "writer-sees-it" {
+            " ★ THIS PROCESS'S WRITER CONNECTION CAN SEE THIS ROW, so the read is lying about a row the process itself can prove: report the store and this sentence, do not re-write the memory."
+        } else {
+            ""
+        };
         if facts.versions > 0 {
             format!(
-                "no such memory: {key} — but {} holds {} memories (schema {}) and {} version(s) for this key, newest {}. So this is a DELETED row with history, or a reader looking at the wrong store; `memory_history` lists the versions and `memory_get` with `version=N` fetches one. Do not treat this as 'never existed'.",
+                "no such memory: {key} — but {} holds {} memories (schema {}) and {} version(s) for this key, newest {}. So this is a DELETED row with history, or a reader looking at the wrong store; `memory_history` lists the versions and `memory_get` with `version=N` fetches one. Do not treat this as 'never existed'. [{}]{divergence}",
                 facts.store,
                 facts.memories,
                 facts.schema,
                 facts.versions,
-                facts.newest.as_deref().unwrap_or("unknown")
+                facts.newest.as_deref().unwrap_or("unknown"),
+                writer_sees
             )
         } else {
             format!(
-                "no such memory: {key} — {} holds {} memories (schema {}) and has no history for this key, so it has never existed THERE. If you believe it does, the store that holds it is not this one.",
-                facts.store, facts.memories, facts.schema
+                "no such memory: {key} — {} holds {} memories (schema {}) and has no history for this key, so it has never existed THERE. If you believe it does, the store that holds it is not this one. [{}]{divergence}",
+                facts.store, facts.memories, facts.schema, writer_sees
             )
         }
     }

@@ -38,7 +38,65 @@ env:
   BUILDER_PROFILE: rust-lean
 
 jobs:
+  # ★ THE GATE (issue #45, decided 2026-10-21: option (b)). `test.yml` records a status on the commit,
+  # but a SEPARATE workflow starts independently and cannot fail this one — so publishing waited on
+  # nothing. This job WAITS for that status instead: it polls until the test run for THIS commit is no
+  # longer pending, then passes only if it is green.
+  #
+  # Why option (b) rather than merging the tests in here: releases stay fast (the test runs in
+  # parallel, gated only on its result), and the test stays a workflow anyone can read without reading
+  # the release path. The cost is this guard: it is code, and anyone editing this file can remove it.
+  # The trade is stated here on purpose — the next reader should not have to re-derive it.
+  #
+  # ★ FAIL LOUDLY ON ABSENCE. A commit with NO test status is not "green": it means the test never ran
+  # (a broken `test.yml`, a commit pushed before this gate existed). Treating absence as success is
+  # exactly how a gate gates nothing, so it exits non-zero with a message that says which it was.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the test status on this commit
+        env:
+          TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}
+        run: |
+          set -eu
+          [ -n "${TOKEN:-}" ] || { echo "no GITHUB_TOKEN: cannot read commit statuses"; exit 1; }
+          deadline=$(( $(date +%s) + 2400 ))   # 40 min: a cold dependency build is minutes, not seconds
+          # ABSENCE IS NOT PENDING. A commit with no test status at all will never grow one, so waiting
+          # the full deadline for it is 40 minutes of pretending. Two minutes of nothing = say so.
+          missing=0
+          while :; do
+            body=$(curl -fsS -H "Authorization: token $TOKEN" \
+              "$API/api/v1/repos/$REPO/commits/$SHA/status") || {
+              echo "could not read the status for $SHA"; exit 1; }
+            state=$(printf '%s' "$body" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+            test_state=$(printf '%s' "$body" | tr '}' '\n' \
+              | grep '"context":"test / test' | sed -n 's/.*"status":"\([a-z]*\)".*/\1/p' | head -1)
+            echo "combined=$state test=${test_state:-<none>} at $SHA"
+            case "${test_state:-}" in
+              success) echo "the test gate passed"; exit 0 ;;
+              failure|error) echo "the test gate FAILED: refusing to publish"; exit 1 ;;
+              "")
+                missing=$((missing + 1))
+                if [ "$missing" -ge 8 ]; then
+                  echo "no test status for $SHA after $((missing * 15))s: the test never ran on this"
+                  echo "commit. Is .forgejo/workflows/test.yml present on this branch, and does it"
+                  echo "trigger for this event? Refusing to publish on an unproven commit."
+                  exit 1
+                fi ;;
+              *) missing=0 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "timed out waiting for the test status (test=${test_state:-<none>}, combined=$state)"
+              exit 1
+            fi
+            sleep 15
+          done
+
   publish:
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

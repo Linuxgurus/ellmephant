@@ -6,6 +6,7 @@ mod common;
 
 use common::{count, temp_store};
 use ellmephant::db;
+use ellmephant::db::migrate;
 use rusqlite::{Connection, params};
 
 fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
@@ -316,25 +317,55 @@ fn key_is_unique() {
     );
 }
 
-/// A store whose schema version this binary does not know must REFUSE to open, not open anyway.
+/// A store whose schema version is MISSING from this binary's list must REFUSE to open, and no
+/// override may soften it.
 ///
 /// The failure this exists for: `user_version` is a bare counter and the runner treats `v <= current`
-/// as "already applied". A v14 store against a binary whose list runs 1..12, 15 therefore skips a
-/// migration forever, and — worse — `/health`'s `schema >= encode::SCHEMA` gate would pass on a schema
-/// the binary cannot query. Version-not-in-my-list is the complete signature of that state, so it is
-/// the check: one membership test, and a silent no-op becomes a refusal.
+/// as "already applied", so a migration numbered below the store's version never runs. The signature
+/// is a version the binary does not know. That is the *skipped migration* case — distinct from a
+/// rollback, and refused unconditionally.
 #[test]
-fn a_store_at_a_version_this_binary_does_not_know_is_refused() {
+fn a_store_with_a_skipped_migration_is_refused_with_no_override() {
     let (_dir, paths) = temp_store();
     {
         let conn = db::open(&paths).unwrap();
-        // Simulate a store written by a branch that used 13 and 14 (the mailbox / provenance pair).
+        // A version below the binary's highest, but not one it knows: a hole in the list.
         conn.pragma_update(None, "user_version", 14).unwrap();
     }
-    let err = db::open(&paths).expect_err("v14 is not a version this binary knows");
+    for allow_ahead in [false, true] {
+        let err = migrate::run_with(&Connection::open(paths.db()).unwrap(), allow_ahead)
+            .expect_err("a hole in the migration list must be refused, override or not");
+        let text = format!("{err}");
+        assert!(
+            text.contains("skipped") && text.contains("no override"),
+            "the refusal must say what it is and that it cannot be stepped over: {text}"
+        );
+    }
+}
+
+/// The opposite state: the STORE IS NEWER than this binary, which is what a rollback looks like.
+/// Refusing here would make a bad deploy unrecoverable, so it is allowed — but only deliberately.
+#[test]
+fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
+    let (_dir, paths) = temp_store();
+    {
+        let conn = db::open(&paths).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+    }
+
+    let conn = Connection::open(paths.db()).unwrap();
+    let err = migrate::run_with(&conn, false).expect_err("a rollback must be refused by default");
     let text = format!("{err}");
     assert!(
-        text.contains("schema v14") && text.contains("does not know"),
-        "the refusal must name the version and the reason: {text}"
+        text.contains("STORE IS NEWER") && text.contains("ROLLBACK") || text.contains("rollback"),
+        "the refusal must name the direction, not just the number: {text}"
     );
+    assert!(
+        text.contains(migrate::ALLOW_STORE_AHEAD),
+        "and it must name the escape: {text}"
+    );
+
+    // The deliberate override proceeds, and applies nothing (the store is already beyond this list).
+    migrate::run_with(&conn, true).expect("the rollback override must work");
+    assert_eq!(migrate::version(&conn).unwrap(), 99, "untouched");
 }

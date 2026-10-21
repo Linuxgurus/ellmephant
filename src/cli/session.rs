@@ -293,8 +293,11 @@ impl Session {
     }
 
     /// The head of the encode queue, or `None` when nothing is waiting to be embedded.
-    pub fn next_encode(&self) -> Result<Option<encode::Entry>> {
-        encode::next(&self.conn)
+    pub fn next_encode(
+        &self,
+        skip: &std::collections::HashSet<String>,
+    ) -> Result<Option<encode::Entry>> {
+        encode::next(&self.conn, skip)
     }
 
     /// Take one queued document **without embedding anything**: the read half of a job.
@@ -308,12 +311,6 @@ impl Session {
     /// Store a claim's vector and settle its queue entry: the write half of a job.
     pub fn settle_encode(&self, claim: &encode::Claim, vector: &[f32]) -> Result<()> {
         encode::settle_encoded(&self.conn, claim, vector)
-    }
-
-    /// Drop an entry whose embed failed. The queue keeps no failure history: the worker holds the
-    /// recently-failed keyslugs in memory and the refill rule is the retry.
-    pub fn discard_encode(&self, keyslug: &str) -> Result<bool> {
-        encode::discard(&self.conn, keyslug)
     }
 
     /// Queue every document that has no vector, at bulk priority, skipping the keyslugs a caller has

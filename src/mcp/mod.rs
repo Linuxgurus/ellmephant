@@ -907,7 +907,8 @@ fn pass(
     skipped.retain(|_, at| at.elapsed().as_secs() < SKIP_SECS);
     // 1. The head, on a read-only connection: no store lock, so an empty queue costs one indexed
     //    SELECT and contends with no one.
-    let entry = match crate::store::encode::next(idle)? {
+    let skip_now: std::collections::HashSet<String> = skipped.keys().cloned().collect();
+    let entry = match crate::store::encode::next(idle, &skip_now)? {
         Some(entry) => entry,
         None => {
             // The refill rule, and the only producer this queue has: nothing is queued, so ask what
@@ -926,7 +927,7 @@ fn pass(
                     "encode worker: refilled the queue from what has no vector"
                 );
             }
-            match crate::store::encode::next(idle)? {
+            match crate::store::encode::next(idle, &skip_now)? {
                 Some(entry) => entry,
                 None => return Ok(false),
             }
@@ -949,13 +950,12 @@ fn pass(
     let vector = match encoder.with(|e| e.embed_one(&captured)) {
         Ok(vector) => vector,
         Err(err) => {
-            // Drop the entry and remember the keyslug for a while. The queue keeps no failure
-            // history: the refill rule is the retry, and the skip list is what stops that retry from
-            // becoming a hot loop over a document that cannot be embedded at all.
-            {
-                let session = lock(session)?;
-                session.discard_encode(&entry.keyslug)?;
-            }
+            // KEEP the entry. It is the record that this document's vector is owed: deleting it
+            // would leave a row whose vector describes text that is no longer there, with nothing
+            // left to say so — `missing()` could not see it either, because a vector exists. So the
+            // cost of a failure is a backlog that does not drain, which is visible; the skip list
+            // only stops the retry from becoming a hot loop, and it lives in memory so a restart
+            // tries again immediately.
             skipped.insert(entry.keyslug.clone(), std::time::Instant::now());
             tracing::warn!(
                 keyslug = %entry.keyslug,

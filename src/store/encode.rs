@@ -84,22 +84,29 @@ pub fn enqueue_memory(
 ///
 /// No `ORDER BY rowid`: the timestamp is the order, and it is the only order the queue claims. Ties
 /// inside a second are arbitrary, which is fine — the two came at about the same time.
-pub fn next(conn: &Connection) -> Result<Option<Entry>> {
-    Ok(conn
-        .query_row(
-            "SELECT keyslug, content, priority FROM encode_queue
-              ORDER BY priority, queued_at
-              LIMIT 1",
-            [],
-            |r| {
-                Ok(Entry {
-                    keyslug: r.get(0)?,
-                    content: r.get(1)?,
-                    priority: r.get(2)?,
-                })
-            },
-        )
-        .optional()?)
+/// `skip` names documents the caller has just seen fail. They are *stepped over*, not removed:
+/// **an entry is the record that its document's vector is owed**, and deleting it on failure would
+/// leave a row whose vector describes text that is no longer there, with nothing left to say so.
+/// Keeping it means a stale vector stays visible — as a backlog that does not drain — until it is
+/// settled. The skip is what stops that becoming a hot loop; it lives in the caller's memory, so a
+/// restart retries immediately.
+pub fn next(conn: &Connection, skip: &std::collections::HashSet<String>) -> Result<Option<Entry>> {
+    let mut stmt = conn.prepare(
+        "SELECT keyslug, content, priority FROM encode_queue
+          ORDER BY priority, queued_at",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let entry = Entry {
+            keyslug: row.get(0)?,
+            content: row.get(1)?,
+            priority: row.get(2)?,
+        };
+        if !skip.contains(&entry.keyslug) {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
 }
 
 /// Drop a document's entry. Called when the row it names is gone — a deleted memory, or one merged
@@ -110,19 +117,6 @@ pub fn forget(conn: &Connection, keyslug: &str) -> Result<()> {
         params![keyslug],
     )?;
     Ok(())
-}
-
-/// Drop an entry whose embed failed.
-///
-/// Deliberate: the queue keeps no failure history. It is re-queued by the worker's refill rule (which
-/// is also the repair path), so a transient failure costs a re-embed and a permanent one costs the
-/// document its freshness — never a hot loop, because the worker holds recently-failed keyslugs in
-/// memory and skips them. Returning whether a row went lets a caller say so out loud.
-pub fn discard(conn: &Connection, keyslug: &str) -> Result<bool> {
-    Ok(conn.execute(
-        "DELETE FROM encode_queue WHERE keyslug = ?1",
-        params![keyslug],
-    )? > 0)
 }
 
 /// A claimed document: everything needed to embed it, and to write the result back.
@@ -268,13 +262,16 @@ pub fn drain(
     limit: usize,
 ) -> Result<usize> {
     let mut done = 0;
+    let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
     while done < limit {
-        let Some(entry) = next(conn)? else { break };
+        // A document that failed in THIS pass is stepped over, not removed: its entry is the record
+        // that it still owes a vector.
+        let Some(entry) = next(conn, &failed)? else {
+            break;
+        };
         if let Err(err) = encode_one(conn, embedder, spec, &entry.keyslug) {
-            // One bad document must not stop the queue: it is dropped, and the refill rule decides
-            // whether it is worth another try. Logged here so the failure is not silent.
-            discard(conn, &entry.keyslug)?;
-            tracing::warn!(keyslug = %entry.keyslug, error = %err, "encode: embed failed, entry dropped");
+            failed.insert(entry.keyslug.clone());
+            tracing::warn!(keyslug = %entry.keyslug, error = %err, "encode: embed failed, entry kept");
         }
         done += 1;
     }
@@ -387,6 +384,11 @@ mod tests {
         Kind::Memory.keyslug(key)
     }
 
+    /// Nothing is skipped: the common case for a queue's tests.
+    fn none() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     /// A stored row that OWES a vector. Under the queue that is simply what a write leaves behind:
     /// `add` schedules the document and embeds nothing. A real write, not a fixture that fakes it.
     fn owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) -> VecSpec {
@@ -438,7 +440,7 @@ mod tests {
             1,
             "a re-enqueue is not a second job"
         );
-        let entry = next(&conn).unwrap().expect("an entry");
+        let entry = next(&conn, &none()).unwrap().expect("an entry");
         assert_eq!(entry.keyslug, slug("a"));
         assert_eq!(
             entry.content, "doc-2",
@@ -452,14 +454,14 @@ mod tests {
         enqueue(&conn, &slug("bulk"), "doc", PRIORITY_BULK).unwrap();
         enqueue(&conn, &slug("live"), "doc", PRIORITY_LIVE).unwrap();
         assert_eq!(
-            next(&conn).unwrap().unwrap().keyslug,
+            next(&conn, &none()).unwrap().unwrap().keyslug,
             slug("live"),
             "a live write goes first"
         );
 
         // A bulk re-encode sweeping up a document a human is waiting on must not push it back.
         enqueue(&conn, &slug("live"), "doc-2", PRIORITY_BULK).unwrap();
-        let live = next(&conn).unwrap().unwrap();
+        let live = next(&conn, &none()).unwrap().unwrap();
         assert_eq!(live.keyslug, slug("live"));
         assert_eq!(live.priority, PRIORITY_LIVE, "priority is never demoted");
         assert_eq!(live.content, "doc-2", "but the text is the newest one");
@@ -515,7 +517,7 @@ mod tests {
 
         settle(&conn, &slug("a"), &claimed_content).unwrap();
         assert_eq!(pending(&conn).unwrap(), 1, "the newer text is still owed");
-        assert_eq!(next(&conn).unwrap().unwrap().content, "newer text");
+        assert_eq!(next(&conn, &none()).unwrap().unwrap().content, "newer text");
 
         settle(&conn, &slug("a"), "newer text").unwrap();
         assert_eq!(pending(&conn).unwrap(), 0);
@@ -579,10 +581,11 @@ mod tests {
         assert!(index::vec::get(&conn, id_of(&conn, "a")).unwrap().is_some());
     }
 
-    /// A document that cannot be embedded must not wedge the queue or spin: the entry is dropped, and
-    /// it is the refill rule that decides whether to offer it again.
+    /// **An entry is the record that a vector is owed.** So a failure keeps it: deleting it would
+    /// leave the row with an OLD vector and nothing left to say so, and `missing()` could not catch
+    /// it either — a vector exists. That is the silent-staleness hole a per-row hash used to cover.
     #[test]
-    fn a_failing_document_is_dropped_rather_than_retried_in_a_loop() {
+    fn a_failed_embed_keeps_its_entry_so_the_staleness_stays_visible() {
         struct Broken;
         impl Embedder for Broken {
             fn dim(&self) -> usize {
@@ -599,15 +602,57 @@ mod tests {
         let (_d, conn) = store();
         let real = HashEmbedder::new(8);
         let spec = owed(&conn, &real, "a", "alpha");
+        let id = id_of(&conn, "a");
+        drain(&conn, &real, &spec, 10).unwrap();
+        let current = index::vec::get(&conn, id).unwrap().expect("indexed");
+        assert_eq!(missing(&conn).unwrap().len(), 0, "nothing is missing");
 
-        assert_eq!(drain(&conn, &Broken, &spec, 1).unwrap(), 1);
-        assert_eq!(pending(&conn).unwrap(), 0, "the entry is gone, not stuck");
-        assert!(index::vec::get(&conn, id_of(&conn, "a")).unwrap().is_none());
+        // The document moves on, and the embed for the new text fails.
+        crate::store::add(&conn, &spec, &mem("a", "alpha, revised")).unwrap();
+        assert_eq!(drain(&conn, &Broken, &spec, 10).unwrap(), 1);
 
-        // And the refill rule will offer it again, which is the retry.
-        let missing = missing(&conn).unwrap();
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].0, slug("a"));
+        // The vector is now STALE, and nothing about the index would say so: the vector exists, so
+        // `missing` is empty. The QUEUE is the only record of the debt — which is the whole point.
+        assert_eq!(
+            index::vec::get(&conn, id).unwrap().unwrap(),
+            current,
+            "the vector still describes the previous text"
+        );
+        assert_eq!(
+            missing(&conn).unwrap().len(),
+            0,
+            "and the refill rule cannot see it, because a vector exists"
+        );
+        assert_eq!(pending(&conn).unwrap(), 1, "the debt stays on the books");
+        assert_eq!(
+            next(&conn, &none()).unwrap().unwrap().content,
+            projection::embed_document("a", "a", "alpha, revised"),
+            "the entry names the text that is owed"
+        );
+
+        // A working embedder settles it, and the staleness goes.
+        assert_eq!(drain(&conn, &real, &spec, 10).unwrap(), 1);
+        assert_eq!(pending(&conn).unwrap(), 0);
+        assert_ne!(index::vec::get(&conn, id).unwrap().unwrap(), current);
+    }
+
+    /// A document that keeps failing must not wedge the queue: the worker steps over what it has just
+    /// seen fail, so the next document is still served. The skip lives in the caller, so a restart
+    /// tries again at once.
+    #[test]
+    fn the_queue_steps_over_a_document_that_has_just_failed() {
+        let (_d, conn) = store();
+        let embedder = HashEmbedder::new(8);
+        let spec = owed(&conn, &embedder, "a", "alpha");
+        owed(&conn, &embedder, "b", "beta");
+
+        let head = next(&conn, &none()).unwrap().unwrap();
+        let mut skip = std::collections::HashSet::new();
+        skip.insert(head.keyslug.clone());
+        let after = next(&conn, &skip).unwrap().expect("the next document");
+        assert_ne!(after.keyslug, head.keyslug);
+        assert_eq!(pending(&conn).unwrap(), 2, "nothing was removed");
+        assert_eq!(drain(&conn, &embedder, &spec, 10).unwrap(), 2);
     }
 
     /// The two numbers a queue has to answer with — how much, and is it stuck — from one aggregate.
@@ -684,7 +729,7 @@ mod tests {
             "nothing has been embedded yet"
         );
         assert_eq!(
-            next(&conn).unwrap().unwrap().keyslug,
+            next(&conn, &none()).unwrap().unwrap().keyslug,
             slug("a"),
             "and the entry is for exactly this document"
         );

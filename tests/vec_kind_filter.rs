@@ -132,16 +132,21 @@ fn keyslug_is_derivable_in_sql() {
 }
 
 #[test]
-fn asks_the_global_k_question() {
+fn an_unfiltered_k_is_global_not_per_partition() {
     let conn = partition_table();
-    // Does k apply GLOBALLY when no partition is named, or per partition? The answer decides
-    // whether a cross-kind search can trust `k`.
+    // k applies GLOBALLY when no partition is named — the opposite of the filtered case above. That is
+    // why an unfiltered search has to be built per-kind and merged: with a global k the kind with more
+    // rows takes every slot, and on a real store memories would bury projects entirely.
     let hits = knn(
         &conn,
         "SELECT type, key, distance FROM v WHERE embedding MATCH ? AND k = ? ORDER BY distance",
         2,
     );
-    println!("UNFILTERED k=2 returned {} rows: {hits:?}", hits.len());
+    assert_eq!(hits.len(), 2, "a global k returns k rows, not k per kind");
+    assert!(
+        hits.iter().all(|(t, _, _)| t == "memory"),
+        "on this fixture both are memories — exactly the domination the design avoids: {hits:?}"
+    );
 }
 
 #[test]

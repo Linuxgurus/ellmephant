@@ -51,7 +51,8 @@ INSERT INTO encode_queue(keyslug, content, priority) VALUES(?1, ?2, ?3)
 ON CONFLICT(keyslug) DO UPDATE
   SET content   = excluded.content,
       priority  = min(priority, excluded.priority),
-      queued_at = datetime('now');
+      -- age = "last asked for"; but identical text moves nothing, so it must not move the row
+      queued_at = CASE WHEN content = excluded.content THEN queued_at ELSE datetime('now') END;
 
 -- pop: live work before bulk work, oldest first inside each class
 SELECT keyslug, content FROM encode_queue ORDER BY priority, queued_at LIMIT 1;
@@ -195,7 +196,8 @@ rebuild.
 - **Live before bulk, oldest first inside a class.** A rebuild may dump every missing document into
   the queue at `PRIORITY_BULK`; live writes at `PRIORITY_LIVE` still go first, so nothing is held up
   and no batch size is needed.
-- **Nothing owns the backfill — the worker does, statelessly.** One rule: *when the queue is empty,
+- **Nothing owns the *backfill* — the worker does, statelessly.** (Three things enqueue work: a write,
+  a rebuild, and this rule. This is the only one that asks the index what is owed.) One rule: *when the queue is empty,
   find documents with no vector and queue all of them at bulk priority.* A rebuild is therefore
   **delete that type's vectors**; the drain loop refills and stops on its own when nothing is
   missing. No cursor, no saved position, no resume logic: a crash or a restore just looks again and
@@ -371,15 +373,25 @@ No re-embedding, no hour of backfill, no window where search is wrong. The only 
 store must be **quiesced** for the duration (one write lock; the copy of ~300 vectors is
 milliseconds).
 
-★ **Take the number clash; never take a gap.** 0013 collides with the unmerged mailbox branch
-(`0013_mail.sql`); whoever lands second renumbers. Skipping to 0015 to be polite would be worse: the
-store would jump to 15 and #13/#14 would never apply, silently and permanently. A clash is visible and
-renumberable; a gap is not.
+★ **A skipped migration is a SILENT NO-OP, not a clash** — corrected 2026-10-21 by stet's finger, and
+it overturns what this doc said an hour earlier. `migrate::run` reads `if *version <= current {
+continue }` over a compiled array, so "a clash" is not a merge conflict anybody ever sees: on a store
+already at 14 (the unmerged mailbox/provenance pair) a migration numbered 13 **never executes**, the
+queue keeps its old columns, and every query then fails against a table the binary believes it
+migrated. No error at migration time; none at startup.
 
-★ **And make a gap loud (stet, 2026-10-21).** `user_version` is currently the only record of what ran —
-a counter with no independent check. A `schema_applied(version, label, applied_at)` table, written in
-the same transaction as each migration and backfilled for 1..12 as "assumed", lets a startup assertion
-say *"version N implies N rows, contiguous"*. Follow-up, not this work: it is migration machinery, not
+So: the migration is **0015**, `encode::SCHEMA` moves with it — it gates `/health`'s queue line, and
+leaving it behind prints a plausible backlog read from a table the binary cannot use (the health lie) —
+and **`migrate::run` refuses a store whose version is not one this binary knows.** Version-not-in-list
+is the complete signature of "a migration was skipped, or this binary is older than the store"; it
+costs one membership test and turns the silent no-op into a refusal that names the version. A store at
+12 opens; one at 14 is refused until the binary knows 14.
+
+★ **And make a gap *named* (stet, 2026-10-21).** The membership refusal catches the state, not the
+provenance: `user_version` remains the only record of *which* migrations ran. A
+`schema_applied(version, label, applied_at)` table — written in the same transaction as each migration,
+old stores backfilled as "assumed" — would let startup say *"version N implies these labels"*, so a
+skipped migration becomes a named gap instead of an inference. Follow-up: migration machinery, not
 embeddings.
 
 ## API change (deliberate, not incidental)
@@ -471,6 +483,9 @@ an hour of background work because someone edited a format string.
 - **`tests/`**, the failure contract: `a_failed_embed_keeps_its_entry_so_the_staleness_stays_visible`
   pins the vector unchanged, `missing()` **empty** (so the refill cannot mask it) and the debt still
   queued; `the_queue_steps_over_a_document_that_has_just_failed` pins that skipping removes nothing.
+- **`tests/vec_kind_filter.rs`**, the k rule: `an_unfiltered_k_is_global_not_per_partition` **asserts**
+  that a global `k` returns `k` rows and that they can all be one kind — the domination the per-kind
+  rule exists to prevent. (It used to print and assert nothing, which made "Verified" a demonstration.)
 - **`tests/vec_kind_filter.rs`**, tombstone move: copy to `gone` + `DELETE FROM live` leaves the live
   KNN with one hit (the survivor) and the tombstone KNN with the deleted one, `deleted_at` readable as
   an auxiliary column. So a delete can be a move, and "search the deleted" is a real query.

@@ -910,7 +910,8 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         ellmephant::index::vec::delete(&conn, id).expect("tear the index");
     }
 
-    // `memory_reembed` takes no arguments: it QUEUES every document that owes a vector and rebuilds the
+    // `memory_reembed` takes no arguments: it QUEUES every document (`queued` is therefore the row
+    // count, not "the ones that look owed" — there is no stamp to judge that with) and rebuilds the
     // parts that take no model. It embeds nothing itself — the worker does that.
     let re = call(&client, "memory_reembed", serde_json::json!({})).await;
     assert!(!re.is_error.unwrap_or(false), "{}", text(&re));
@@ -918,8 +919,8 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
     assert_eq!(r["status"], serde_json::json!("queued"));
     assert_eq!(
         r["queued"],
-        serde_json::json!(1),
-        "the torn row is owed a vector; the intact one is not"
+        serde_json::json!(2),
+        "a rebuild is always-full: the torn row is repaired, the intact one is re-embedded"
     );
     assert!(r["dim"].as_u64().expect("dim") > 0);
 

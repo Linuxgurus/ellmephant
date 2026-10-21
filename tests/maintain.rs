@@ -108,17 +108,24 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     let spec = VecSpec::of(&embedder);
     let report = maintain::reembed(&conn, &spec, "").expect("reembed");
     assert!(!report.rebuilt, "same dim keeps the table");
-    // ONE row is owed, not two: `b` still carries its vector and its document never moved, and the
-    // producer is precise about that. `a` is owed because it has no vector at all — which `encode_hash`
-    // cannot see, since the hash still says "indexed".
-    assert_eq!(report.queued, 1, "only the row with no vector is owed one");
+    // EVERY row, deliberately: with no per-row stamp there is no "nothing changed" to skip, and a
+    // rebuild queues rather than deletes, so nothing here is destructive. `a` is repaired by the same
+    // pass that re-embeds `b` for nothing.
+    assert_eq!(report.queued, 2, "a rebuild is always-full");
     common::settle(&conn, &embedder);
     assert_eq!(vec::count(&conn).unwrap(), 2, "the missing vector is back");
 
     let before = vec::get(&conn, a).unwrap();
     let again = maintain::reembed(&conn, &spec, "").expect("reembed again");
-    assert_eq!(again.queued, 0, "a settled store owes nothing");
-    assert_eq!(vec::get(&conn, a).unwrap(), before, "vectors are stable");
+    assert_eq!(
+        again.queued, 2,
+        "and it is full every time — that is the cost"
+    );
+    assert_eq!(
+        vec::get(&conn, a).unwrap(),
+        before,
+        "the same text embeds to the same vector, so a rebuild is stable"
+    );
 }
 
 /// A changed **projection** forces a full re-embed, and `encode_hash` cannot detect it: the hash covers the
@@ -134,8 +141,9 @@ fn reembed_requeues_everything_when_the_projection_changed() {
     add(&conn, &embedder, "b", "beta", &[]);
     let spec = VecSpec::of(&embedder);
 
-    // A settled store owes nothing.
-    assert_eq!(maintain::reembed(&conn, &spec, "").unwrap().queued, 0);
+    // A rebuild queues every row whatever the fingerprint says — the fingerprint no longer decides
+    // WHETHER to rebuild, only whether the store is out of step afterwards.
+    assert_eq!(maintain::reembed(&conn, &spec, "").unwrap().queued, 2);
     assert!(!vec::projection_stale(&conn).unwrap());
 
     // Now the projection moves underneath it, which is what a code change to `embed_document` looks

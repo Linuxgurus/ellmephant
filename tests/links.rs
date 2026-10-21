@@ -40,13 +40,13 @@ fn rename_rewrites_bodies_and_repoints_edges() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "target", "the target itself");
     seed(&conn, &embedder, "a", "see [[target]] first");
     seed(&conn, &embedder, "b", "also [[target]] here");
 
-    let outcome = links::rename(&conn, &spec, "target", "renamed").expect("rename");
+    let outcome = links::rename(&conn, "target", "renamed").expect("rename");
     assert_eq!(outcome.key, "renamed");
     assert_eq!(outcome.bodies, 2, "both bodies carried the token");
     assert_eq!(outcome.edges, 2, "both edges repointed");
@@ -81,15 +81,12 @@ fn rename_refuses_missing_and_colliding_keys() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "one", "first");
     seed(&conn, &embedder, "two", "second");
 
-    assert!(
-        links::rename(&conn, &spec, "ghost", "new").is_err(),
-        "missing old"
-    );
-    let err = links::rename(&conn, &spec, "one", "two").unwrap_err();
+    assert!(links::rename(&conn, "ghost", "new").is_err(), "missing old");
+    let err = links::rename(&conn, "one", "two").unwrap_err();
     assert!(format!("{err}").contains("already exists"), "{err}");
     assert!(store::get(&conn, "one").unwrap().is_some(), "unchanged");
 }
@@ -99,10 +96,10 @@ fn rename_to_the_same_key_is_a_noop() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "one", "body");
 
-    let outcome = links::rename(&conn, &spec, "one", "one").expect("rename");
+    let outcome = links::rename(&conn, "one", "one").expect("rename");
     assert_eq!((outcome.bodies, outcome.edges), (0, 0));
     assert!(store::get(&conn, "one").unwrap().is_some());
 }
@@ -115,11 +112,11 @@ fn rename_queues_a_new_vector_for_the_row_it_moves() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     // `memory()` uses the key as the title too, so the title stays put across the rename.
     seed(&conn, &embedder, "old-name", "the body");
 
-    links::rename(&conn, &spec, "old-name", "new-name").expect("rename");
+    links::rename(&conn, "old-name", "new-name").expect("rename");
     common::settle(&conn, &embedder);
 
     let stored: String = conn
@@ -177,7 +174,7 @@ fn renaming_clears_a_dangling_edge() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
 
     // `a` references a key that does not exist yet — a forward reference.
     seed(&conn, &embedder, "a", "forward [[later]]");
@@ -185,7 +182,7 @@ fn renaming_clears_a_dangling_edge() {
 
     // Renaming an unrelated memory into `later` resolves it (no edge repoint needed).
     seed(&conn, &embedder, "stub", "placeholder");
-    links::rename(&conn, &spec, "stub", "later").expect("rename");
+    links::rename(&conn, "stub", "later").expect("rename");
     assert!(links::dangling(&conn).unwrap().is_empty());
 }
 
@@ -225,7 +222,7 @@ fn merge_into_repoints_every_reference_and_deletes_the_source() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "old", "the deleted facts");
     // The caller folded it FIRST, so nothing is missing and this is nothing to integrate.
@@ -239,7 +236,7 @@ fn merge_into_repoints_every_reference_and_deletes_the_source() {
     seed(&conn, &embedder, "b", "also [[old]] here");
     let target_body = store::get(&conn, "new").unwrap().unwrap().body;
 
-    let out = links::merge_into(&conn, &spec, "old", "new").expect("merge");
+    let out = links::merge_into(&conn, "old", "new").expect("merge");
     assert_eq!(out.bodies, 2, "both referrers were rewritten");
     assert!(
         out.integrated.is_empty(),
@@ -276,14 +273,14 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "old", "deleted");
     seed(&conn, &embedder, "new", "survivor, now carrying: deleted");
     project::upsert(&conn, &project_fixture("p"), Some(&["old".to_string()])).expect("project");
     // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
     seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
 
-    let out = links::merge_into(&conn, &spec, "old", "new").expect("merge");
+    let out = links::merge_into(&conn, "old", "new").expect("merge");
     assert_eq!(out.preloads, 1, "the project preload was repointed");
     let refs = project::preload(&conn, "p", project::Hydrate::None).unwrap();
     assert_eq!(refs.len(), 1);
@@ -307,12 +304,12 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "old", "deleted");
     // `new` already carries `old`'s prose, so there is nothing to integrate.
     seed(&conn, &embedder, "new", "see [[old]] — and deleted");
 
-    links::merge_into(&conn, &spec, "old", "new").expect("merge");
+    links::merge_into(&conn, "old", "new").expect("merge");
     let edges: i64 = conn
         .query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))
         .unwrap();
@@ -328,7 +325,7 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "old", "alpha fact.\nbeta fact.");
     seed(
@@ -337,7 +334,7 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
         "new",
         "survivor line.\nalpha fact.\nan inserted line.\nbeta fact.",
     );
-    let out = links::merge_into(&conn, &spec, "old", "new").expect("an interleaved fold is a fold");
+    let out = links::merge_into(&conn, "old", "new").expect("an interleaved fold is a fold");
     assert!(out.integrated.is_empty(), "every line was already carried");
     assert!(
         store::get(&conn, "old").unwrap().is_none(),
@@ -359,8 +356,8 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
         "alpha fact.\nthe line only the twin carries.",
     );
     let before = store::get(&conn, "new").unwrap().unwrap().body;
-    let out = links::merge_into(&conn, &spec, "twin", "new")
-        .expect("a missing line is integrated, not refused");
+    let out =
+        links::merge_into(&conn, "twin", "new").expect("a missing line is integrated, not refused");
     assert_eq!(
         out.integrated,
         vec!["the line only the twin carries.".to_string()],
@@ -387,22 +384,19 @@ fn merge_into_refuses_a_missing_target_and_a_self_merge() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "a", "x");
     seed(&conn, &embedder, "b", "y");
 
     assert!(
-        links::merge_into(&conn, &spec, "ghost", "a").is_err(),
+        links::merge_into(&conn, "ghost", "a").is_err(),
         "source must exist"
     );
     assert!(
-        links::merge_into(&conn, &spec, "a", "ghost").is_err(),
+        links::merge_into(&conn, "a", "ghost").is_err(),
         "a merge into a typo must not destroy the source"
     );
-    assert!(
-        links::merge_into(&conn, &spec, "a", "a").is_err(),
-        "self-merge"
-    );
+    assert!(links::merge_into(&conn, "a", "a").is_err(), "self-merge");
 
     // A refused merge destroyed nothing.
     assert!(store::get(&conn, "a").unwrap().is_some());

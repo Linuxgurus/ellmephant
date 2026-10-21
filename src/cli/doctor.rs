@@ -82,9 +82,24 @@ fn print_index_health(conn: &Connection) -> Result<()> {
         Some(_) => index::vec::count(conn)?,
         None => 0,
     };
+    // Per type, because one total can no longer answer "is everything indexed" — the index holds more
+    // than one kind of document now, and a project could be entirely missing while the total looks
+    // healthy. Tombstones are counted separately: they are deleted, not owed.
+    let per_type = if dim.is_some() {
+        let mut parts: Vec<String> = Vec::new();
+        let mem = index::vec::count_of(conn, "memory")?;
+        parts.push(format!("memory {mem}/{memories}"));
+        let deleted = index::vec::count_deleted(conn)?;
+        if deleted > 0 {
+            parts.push(format!("tombstoned {deleted}"));
+        }
+        parts.join(", ")
+    } else {
+        format!("memory 0/{memories}")
+    };
     let vec_status = match dim {
-        Some(dim) => format!("vec0 dim={dim}, {vectors}/{memories} vectors"),
-        None => format!("vec0 dim=? ({vectors}/{memories} vectors)"),
+        Some(dim) => format!("vec0 dim={dim}, {vectors} vector(s) — {per_type}"),
+        None => format!("vec0 dim=? (no index yet) — {per_type}"),
     };
     println!("  vec0           {vec_status}");
 

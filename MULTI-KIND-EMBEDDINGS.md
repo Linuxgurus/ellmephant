@@ -163,6 +163,22 @@ Measured semantics, all four checked:
   since a keyslug's kind never changes. A row that must change kind is deleted and re-inserted.
 - The keyslug is derivable in SQL, `type || ':' || key`, so the table stores no redundant identity.
 
+**Identity: derived, not counted.** ★ Measured 2026-10-21 against the pinned 0.1.9, in answer to
+stet's objection that "a counter in `meta` is a second record of a fact the table already holds":
+
+| question | answer |
+|---|---|
+| does vec0 assign `vector_id` when the caller omits it? | **yes** |
+| is `max(vector_id)` a legal read? | **yes** |
+| does `rowid` exist on a vec0 table? | **no** (`no such column: rowid`) |
+| can an aux column be filtered outside a KNN? | **yes** — `WHERE type=? AND key=?` returns the right id per kind |
+
+So there is **no companion table and no counter**: a keyslug resolves to its vector with a plain
+select on the aux column, and allocation is `max(vector_id) + 1` in the same transaction (one writer,
+so no race). A counter would have been reproducible-after-restore only by luck; a derived maximum
+cannot disagree with the table it is read from. The measurements live in `tests/vec_kind_filter.rs`
+as assertions.
+
 One vec0 table = **one dimension and one distance metric**. A per-kind *renderer* does not force a
 second table — same width, same metric, same model — so **one live table is the default**, plus its
 tombstone sibling (same width, same metric; the split is liveness, not kind).

@@ -167,3 +167,41 @@ fn an_encoded_body_keeps_its_encoding() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_short_page_reports_its_own_top_not_the_boxs() -> Result<()> {
+    // ★ THE CONFLATION THAT COST TWO READERS AN HOUR (2026-10-21). `mail_inbox` answered with a
+    // single `max_seq`, which reads as "the newest letter that exists" and meant "the highest seq in
+    // this page". Ask for ten of forty and it reported the tenth — a real answer to a different
+    // question, and stet and I each built a theory on it before anyone asked what the field meant.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+
+    for n in 0..40 {
+        mail::send(
+            &conn,
+            "james",
+            "stet",
+            &format!("letter {n}"),
+            "body",
+            "text",
+        )?;
+    }
+
+    let page = mail::inbox(&conn, "stet", 0, 10)?;
+    let page_top = page.iter().map(|e| e.seq).max().expect("a full page");
+    let box_top = mail::head(&conn, "stet")?;
+
+    assert_eq!(page.len(), 10, "a page is a page");
+    assert!(
+        page_top < box_top,
+        "the page's top ({page_top}) is NOT the box's top ({box_top}) — reporting one as the other \
+         is the defect, and the answer now carries both"
+    );
+    assert_eq!(page_top, page[9].seq, "the page top is its last letter");
+    assert_eq!(
+        box_top, 40,
+        "the box top is every letter ever addressed to it"
+    );
+    Ok(())
+}

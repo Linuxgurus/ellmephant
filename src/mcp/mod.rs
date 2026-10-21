@@ -2207,14 +2207,21 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
         loop {
             let who = recipient.clone();
-            let rows = self
-                .with_read("mail_inbox", move |s| s.mail_inbox(&who, since, limit))
+            let (rows, newest) = self
+                .with_read("mail_inbox", move |s| {
+                    // Two facts, and they were being conflated: the top of THIS PAGE and the top of
+                    // the BOX. `max_seq` was read as "newest letter that exists" while it meant
+                    // "highest seq returned" — which cost two readers an hour of theorising about a
+                    // 273-letter discrepancy that never existed (measured 2026-10-21).
+                    Ok((s.mail_inbox(&who, since, limit)?, s.mail_head(&who)?))
+                })
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
                 let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
                 return serde_json::to_string(&serde_json::json!({
                     "letters": rows,
                     "max_seq": max_seq,
+                    "newest_available": newest,
                     "waited": wait > 0 && rows.is_empty(),
                 }))
                 .map_err(|e| e.to_string());

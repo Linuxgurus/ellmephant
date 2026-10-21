@@ -269,6 +269,21 @@ documents are still owed, it survives a crash, and the same "nothing removes an 
 successful settle" rule that keeps a failed embed visible is what makes a half-finished rebuild
 *resumable* rather than a second purge on restart.
 
+★ **The precondition, stated rather than assumed** (stet, 2026-10-21): running the purge at `db::open`
+is a guarantee about **one process's ordering**, not about the database. It holds while
+
+1. **there is one writer process** — today the brain is **1 replica** and the only pod mounting
+   `stet-brain-data`; the hand and the spine each have their own volume (measured 2026-10-21). A
+   second replica, or a second read-write opener, could race the detection against the purge, and the
+   fix would then have to be sqlite's write lock held across the whole operation rather than process
+   order;
+2. **nothing opens the store read-write except `db::open`** — a repair script or a `sqlite3` shell
+   writing vectors sidesteps every guarantee here.
+
+Both are properties of a deployment, not of this code, and no test in the repo can catch their loss:
+the tests are single-process by construction. If the topology changes, this mechanism is wrong
+quietly — so the topology is part of the design, not an operational footnote.
+
 What stops a permanent failure from spinning: the caller keeps the failed keyslugs **in memory** and
 skips them (`next(conn, skip)` steps over them), so a restart retries at once and a hot loop is
 impossible. `attempts`/`last_error` still do not exist: the cost of a failure is a backlog that will

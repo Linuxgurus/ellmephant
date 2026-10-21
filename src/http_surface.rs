@@ -2248,11 +2248,15 @@ pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery)
     };
     match server
         .with_read("mail_inbox", move |s| {
-            s.mail_inbox(&recipient, since, limit)
+            // The box's top and the page's top are different facts; see `mail_inbox` in `mcp`.
+            Ok((
+                s.mail_inbox(&recipient, since, limit)?,
+                s.mail_head(&recipient)?,
+            ))
         })
         .await
     {
-        Ok(rows) => {
+        Ok((rows, newest)) => {
             let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
             let text = if rows.is_empty() {
                 format!("no mail after {since}")
@@ -2270,7 +2274,8 @@ pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery)
             render(
                 StatusCode::OK,
                 json,
-                serde_json::json!({ "letters": rows, "max_seq": max_seq }).to_string(),
+                serde_json::json!({ "letters": rows, "max_seq": max_seq, "newest_available": newest })
+                    .to_string(),
                 text,
             )
         }

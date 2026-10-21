@@ -19,6 +19,15 @@ pub fn open(paths: &Paths) -> Result<Connection> {
     let conn = Connection::open(paths.db())?;
     configure(&conn)?;
     migrate::run(&conn)?;
+    // ★ EAGER INDEX, NOT LAZY (2026-10-21): the vec0 tables used to appear on the first *embed*, which
+    // meant a rolled store served an EMPTY semantic index until somebody happened to write — and said
+    // nothing about why. Worse for the shape change that moved `memory_vec` into the partitioned
+    // `document_vec`: the migration lived in `ensure`, so a store with a quiet queue never migrated and
+    // simply searched nothing. Creating (and migrating) the derived index at open makes "the store is
+    // up" and "the index exists" the same event. A reader still opens read-only and touches no DDL.
+    if let Some(dim) = crate::index::vec::stored_dim(&conn)? {
+        crate::index::vec::ensure(&conn, dim)?;
+    }
     Ok(conn)
 }
 

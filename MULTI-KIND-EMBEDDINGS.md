@@ -295,18 +295,21 @@ moved to the tombstone index rather than dropped.
 **Retention is declared per kind, and PURGE is the default for anything a person expects gone.**
 ★ Strengthened 2026-10-21 after review (stet): *"deleted" must mean unreachable by meaning, not merely
 absent from a default view* — and disclosure is the worse failure, because an unrecoverable delete is
-visible while a disclosure is not. So:
+visible while a disclosure is not. ★ Refined the same day (James): unreachable means **unreachable
+without asking**. The rule therefore has three tiers, and every kind must sit in one of them:
 
-- `memory` → **tombstone**: its content may be wanted as history, and the store already refuses to
-  lose what it deletes (versions, snapshots).
+- `memory` → **tombstone, reachable by an explicit deleted search**: its content may be wanted as
+  history, the store already refuses to lose what it deletes (versions, snapshots), and recovery being
+  one search away is what makes deleting it a responsible act rather than an irreversible one.
 - `mail` → **purge** (vector, queue row, log line): a letter's deletion is a promise to the person,
   not a filing decision.
 - `project` → undeclared until it has a delete path; the default until then is **purge**, because a
   kind that has not argued for retention has not earned it.
 
 A tombstone must be unreachable by meaning through every normal path — the sibling table guarantees
-that structurally, since no default query touches it — and reachable only by asking for deleted
-results explicitly.
+that structurally, since no default query touches it — and reachable only by asking, through a verb
+that says what it is. The tombstone chain also has a deliberate end: `memory_history_erase` is the act
+that truly destroys, so "gone" has a name and it is not a side effect of deleting.
 
 ## What dies
 
@@ -341,7 +344,7 @@ in spine. The work, by file:
 | `src/embed/projection.rs` | becomes the **memory** renderer behind a `Document` trait; `fingerprint()` takes a kind |
 | `src/store/project.rs` | the **project** renderer — no `status`, no `owner`, no dates, no `preload` |
 | `src/index/vec.rs` | `document_vec` + `document_vec_deleted`, both `type` partition key + `+key`; copy/move path; per-type counts |
-| `src/search/mod.rs` | KNN with an optional `type`; per-type `max_distance`; `include_deleted` reads the tombstone table |
+| `src/search/mod.rs` | KNN with an optional `type`; per-type `max_distance`; `deleted` queries the tombstone table alone |
 | `src/store/mod.rs` | drop `ENCODE_PENDING` and `row_hash`; the delete path **moves** the vector to the tombstone index in the same tx |
 | `src/cli/doctor.rs`, `src/http.rs` | per-type vectors vs documents; per-type projection staleness; queue backlog/age |
 | `tests/` | `vec_kind_filter.rs` (kept — it is the contract with sqlite-vec), plus `search`, `store`, `merge`, `dupes` updated for keyslugs |
@@ -387,12 +390,23 @@ owes one"*. That field goes and **nothing replaces it**: `[document]_get` answer
 whether a vector exists is a question for `doctor` / `/health`. It also removes a lookup from every
 read.
 
-**`semantic_search(query, type?, include_deleted?)`** is a new tool; `type` is optional and absent
-means all kinds (the index answers both, measured: `k` is per-partition with a type, global without).
-`include_deleted` (default `false`) searches the **tombstone index** instead — the "what did this
-store once know" question, and the reason a delete does not erase a vector. Result rows carry `type`,
-`key`, `title`, `distance` (and `deleted_at` for tombstones) — the fields every kind has, so no kind's
-shape leaks into the output.
+**`semantic_search(query, type?, deleted?)`** is a new tool; `type` is optional and absent means
+per-kind `k` merged by distance (see *Search* above). `deleted = true` (default `false`) searches the
+**tombstone index** and nothing else — it is never merged with live results, so the flag cannot quietly
+pollute a normal search.
+
+Deleted hits are **keys, not bodies**: `type`, `key`, `distance`, `deleted_at`. That is deliberate and
+it is what makes the recovery honest — the tombstone's job is to turn *"I remember something about X"*
+into *"the key was `foo`"*, and **`memory_history foo` already holds the body**, because the delete
+snapshots the state it removes. Two mechanisms, each keeping its own fact: the vector is *how you find
+it when you have forgotten the name*, the version is *what it said*.
+
+★ **Refined 2026-10-21 (James): "unreachable" means unreachable WITHOUT ASKING, not unreachable.**
+A deleted document must never appear in a normal search, and must never appear in another reader's
+results at all. But the model that deleted it may legitimately need it back — missing information it
+knows it once had and can no longer name. Keeping it one explicit search away is what makes deleting
+*responsible*: a reversible-by-meaning act rather than a leap. The boundary that does not move: where
+deletion is a promise to a **different** person (`mail`), there is no deleted search at all — it purges.
 
 `memory_search` stays **permanently** as a thin alias for `semantic_search(type = "memory")` —
 removing a tool that callers depend on buys nothing and breaks them.

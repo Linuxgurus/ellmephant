@@ -162,7 +162,7 @@ config:
     precision = "bf16"
     device = "cpu"
     default_k = 5
-    default_max_distance = 0.6
+    default_max_distance = 0.52
     instruction = "Given a question, retrieve relevant memories"
 
 # Never open a socket; a cold weights cache is then a hard error (SPEC §6.4).

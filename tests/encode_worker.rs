@@ -79,7 +79,10 @@ impl Embedder for Gate {
                 .unwrap()
                 .recv_timeout(Duration::from_secs(3));
         }
-        Ok(vec![vec![0.0; DIM]; texts.len()])
+        // ★ TEXT-SENSITIVE, not zeros (2026-10-21): with `encode_hash` gone, a test proves "the vector
+        // describes the CURRENT text" by comparing vectors. A fake that returns the same vector for
+        // every text makes that assertion vacuous, so the gate parks the call and then embeds honestly.
+        ellmephant::embed::HashEmbedder::new(DIM).embed(texts)
     }
 }
 
@@ -234,18 +237,27 @@ fn a_write_landing_mid_embed_is_kept_not_swallowed() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // And the vector describes the text actually in the row, which is the whole point.
-    let expected = ellmephant::store::row_hash(
-        &ellmephant::embed::VecSpec::new(MODEL, DIM),
-        &ellmephant::embed::projection::embed_document("a", "a", "gamma"),
-    );
-    let stored: String = idle
-        .query_row("SELECT encode_hash FROM memory WHERE key = 'a'", [], |r| {
-            r.get(0)
-        })
-        .expect("encode_hash");
+    // ★ THE PROOF IS THE VECTOR, NOT A STAMP (2026-10-21): the row records no encoding state, so the
+    // question "does the index describe this text?" is answered by the index. `Gate` embeds the text
+    // it is given, so the stored vector must be the one for the row's CURRENT text ("gamma"); the
+    // stale settle that named "alpha" would leave a different one.
+    let (id, title, body): (i64, String, String) = idle
+        .query_row(
+            "SELECT id, title, body FROM memory WHERE key = 'a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("row");
+    let want = ellmephant::embed::HashEmbedder::new(DIM)
+        .embed_one(&ellmephant::embed::projection::embed_document(
+            "a", &title, &body,
+        ))
+        .expect("expected vector");
     assert_eq!(
-        stored, expected,
+        ellmephant::index::vec::get(&idle, id)
+            .expect("get")
+            .expect("vector"),
+        want,
         "the vector describes the CURRENT text, not the one the job first claimed"
     );
     worker.stop();
@@ -257,9 +269,9 @@ fn a_write_landing_mid_embed_is_kept_not_swallowed() {
 fn a_queued_document_is_durable_before_it_is_ever_embedded() {
     let (_dir, paths) = common::temp_store();
     let conn = db::open(&paths).expect("open store");
-    let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
+    let _spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
 
-    ellmephant::store::add(&conn, &spec, &memory("a", "alpha")).expect("write");
+    ellmephant::store::add(&conn, &memory("a", "alpha")).expect("write");
     assert_eq!(ellmephant::store::encode::pending(&conn).unwrap(), 1);
     assert_eq!(
         ellmephant::index::vec::count(&conn).unwrap(),
@@ -280,9 +292,9 @@ fn a_queued_document_is_durable_before_it_is_ever_embedded() {
 
     // The same code the worker runs indexes it, and the queue empties.
     let embedder = ellmephant::embed::HashEmbedder::new(DIM);
-    let spec = ellmephant::embed::VecSpec::of(&embedder);
+    let _spec = ellmephant::embed::VecSpec::of(&embedder);
     assert_eq!(
-        ellmephant::store::encode::drain(&conn, &embedder, &spec, 16).expect("drain"),
+        ellmephant::store::encode::drain(&conn, &embedder, 16).expect("drain"),
         1
     );
     assert_eq!(ellmephant::store::encode::pending(&conn).unwrap(), 0);
@@ -347,10 +359,9 @@ fn many_writers_and_one_worker_converge_without_drift() {
     }
     worker.stop();
 
-    let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
-    let rows: Vec<(String, String, String, String)> = {
+    let rows: Vec<(i64, String, String, String)> = {
         let mut stmt = idle
-            .prepare("SELECT key, title, body, encode_hash FROM memory ORDER BY key")
+            .prepare("SELECT id, key, title, body FROM memory ORDER BY key")
             .expect("prepare");
         let mapped = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -364,13 +375,20 @@ fn many_writers_and_one_worker_converge_without_drift() {
         expected,
         "every row has a vector: a missing one is a dropped enqueue"
     );
-    for (key, title, body, encode_hash) in rows {
-        let want = ellmephant::store::row_hash(
-            &spec,
-            &ellmephant::embed::projection::embed_document(&key, &title, &body),
-        );
+    // ★ THE INDEX IS THE EVIDENCE (2026-10-21): with no stamp on the row, "does the vector describe
+    // the current text?" is a comparison against the index itself.
+    let embedder = ellmephant::embed::HashEmbedder::new(DIM);
+    for (id, key, title, body) in rows {
+        let want = embedder
+            .embed_one(&ellmephant::embed::projection::embed_document(
+                &key, &title, &body,
+            ))
+            .expect("expected vector");
         assert_eq!(
-            encode_hash, want,
+            ellmephant::index::vec::get(&idle, id)
+                .expect("get")
+                .expect("vector"),
+            want,
             "{key}: the index describes text the row no longer holds — a write was swallowed"
         );
     }
@@ -543,7 +561,7 @@ fn stop_joins_the_worker_and_no_further_work_is_picked_up() {
 fn a_deleted_key_leaves_no_queue_entry() {
     let (_dir, paths) = common::temp_store();
     let conn = db::open(&paths).expect("open store");
-    let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
+    let _spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
     let queued = |conn: &rusqlite::Connection| -> Vec<String> {
         let mut stmt = conn
             .prepare("SELECT keyslug FROM encode_queue ORDER BY keyslug")
@@ -553,8 +571,8 @@ fn a_deleted_key_leaves_no_queue_entry() {
             .expect("keyslugs")
     };
 
-    ellmephant::store::add(&conn, &spec, &memory("gone", "never to be embedded")).expect("write");
-    ellmephant::store::add(&conn, &spec, &memory("kept", "still owed a vector")).expect("write");
+    ellmephant::store::add(&conn, &memory("gone", "never to be embedded")).expect("write");
+    ellmephant::store::add(&conn, &memory("kept", "still owed a vector")).expect("write");
     assert_eq!(queued(&conn), ["memory:gone", "memory:kept"]);
 
     // Delete: the entry goes in the same transaction as the row.
@@ -567,13 +585,9 @@ fn a_deleted_key_leaves_no_queue_entry() {
 
     // Retire one key into another. `new` already carries `old`'s prose, so nothing is integrated and
     // the only queue movement is the deleted key's entry going with its row.
-    ellmephant::store::add(&conn, &spec, &memory("old", "deleted")).expect("write");
-    ellmephant::store::add(
-        &conn,
-        &spec,
-        &memory("new", "survivor, now carrying: deleted"),
-    )
-    .expect("write");
+    ellmephant::store::add(&conn, &memory("old", "deleted")).expect("write");
+    ellmephant::store::add(&conn, &memory("new", "survivor, now carrying: deleted"))
+        .expect("write");
     assert_eq!(queued(&conn), ["memory:kept", "memory:new", "memory:old"]);
     ellmephant::store::links::merge_into(&conn, "old", "new").expect("merge");
     assert_eq!(

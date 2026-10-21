@@ -3,19 +3,63 @@
 //!
 //! The relational rows are the source of truth, so changing the encoder (or its dimension)
 //! is a *re-embed*, never a migration: walk `memory`, recompute the document projection,
-//! rewrite each row's `encode_hash`, and repopulate `memory_vec`. The `[[link]]` graph is derived
+//! queue every document at bulk priority, and rebuild the `[[link]]` graph, which is derived
 //! too — its edges are computed at *write* time — so the same pass re-parses every body
 //! ([`links::reparse`]), making "derived and rebuildable" true rather than aspirational. `meta`
 //! records what the vectors now correspond to so `doctor` can tell a swapped model from a corrupt
 //! one.
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::db::meta;
 use crate::embed::{VecSpec, projection};
 use crate::error::Result;
 use crate::index;
-use crate::store::{ENCODE_PENDING, encode, links};
+use crate::store::{encode, links};
+
+/// A changed projection is a **purge and a full rebuild**, never a refill — and it happens at open.
+///
+/// The stamp this design deleted was per-row, so a stale row could only be found by comparing it to
+/// something. `meta.PROJECTION` is a *global*, and a global cannot say which rows were built under
+/// which recipe. The failure it hides, measured by stet (2026-10-21):
+///
+/// 1. the model changes and the fingerprint moves;
+/// 2. a write lands before the rebuild — its text is new, so it enqueues and is embedded with the
+///    **new** model, beside old-model vectors;
+/// 3. a refill walks "what has no vector" and **skips that row, because it has one**.
+///
+/// Permanently mixed, and silent: the queue is empty, nothing names the rows, and the invariant
+/// reports "current". Distances across two models are not slightly wrong, they are meaningless — a
+/// mixed index ranks garbage confidently, which is worse than an empty one.
+///
+/// So projection change ⇒ **delete every vector, including the tombstones, and queue every document**,
+/// all in ONE transaction with the fingerprint. Atomicity is the requirement, not a nicety: no read
+/// sees a half-purged index, and no write can slip a new-model vector into an old-model index between
+/// the detection and the purge. While the queue is non-empty the index is *incomplete*, which is
+/// honest; `/health` and `doctor` report the non-empty queue as REBUILDING
+/// ([`crate::store::encode::pending`]).
+pub fn reindex_if_stale(conn: &Connection) -> Result<Option<usize>> {
+    if !index::vec::projection_stale(conn)? {
+        return Ok(None);
+    }
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT key, title, body FROM memory ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    index::vec::clear_all(&tx)?;
+    meta::set(&tx, meta::PROJECTION, &projection::fingerprint())?;
+    for (key, title, body) in &rows {
+        encode::enqueue_memory(&tx, key, title, body, encode::PRIORITY_BULK)?;
+    }
+    tx.commit()?;
+    tracing::warn!(
+        "index: projection changed — purged every vector (tombstones included) and queued {} document(s) for a full rebuild",
+        rows.len()
+    );
+    Ok(Some(rows.len()))
+}
 
 /// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.
 #[derive(Debug, Clone)]
@@ -51,19 +95,15 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
         index::vec::recreate(conn, dim)?;
     }
 
-    // A changed PROJECTION is a full re-embed too, and **`encode_hash` cannot see it**: the hash covers the
-    // model, the dimension and the text — not the recipe that assembled them. The fingerprint is the
-    // signal, and without it a projection change would queue nothing at all while every stored vector
-    // quietly kept describing the old recipe. That is the drift the fingerprint exists to catch, and
-    // this is the one place it is acted on.
-    let reset = rebuilt || index::vec::projection_stale(conn)?;
+    // ★ A changed PROJECTION is a full re-embed, and the fingerprint is what says so — but it no
+    // longer decides *whether* anything is queued: a rebuild is always-full (see below), because with
+    // no per-row stamp there is nothing to compare a row against. `projection_stale` is still read
+    // below by `/health` and `doctor`, and the new fingerprint is recorded here.
+    let _was_stale = rebuilt || index::vec::projection_stale(conn)?;
     // Snapshot the rows first, so the scan is not interleaved with the enqueues.
-    let rows: Vec<(i64, String, String, String, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT id, key, title, body, encode_hash FROM memory ORDER BY id")?;
-        let mapped = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT key, title, body FROM memory ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let tx = conn.unchecked_transaction()?;
@@ -81,17 +121,8 @@ pub fn reembed(conn: &Connection, spec: &VecSpec, instruction: &str) -> Result<R
     // a full re-encode cannot hold up an edit — and the index keeps answering throughout, because
     // nothing is deleted until (and unless) a dimension change forces it.
     let mut queued = 0;
-    for (id, key, title, body, _stored) in rows {
+    for (key, title, body) in rows {
         encode::enqueue_memory(&tx, &key, &title, &body, encode::PRIORITY_BULK)?;
-        if reset {
-            // The stored vector was built with a different recipe (or width), so under the current one
-            // this row owes a vector. The column says so until the worker writes the real hash beside
-            // the vector it stores — nothing reads it for correctness, but a reader must not be lied to.
-            tx.execute(
-                "UPDATE memory SET encode_hash = ?2 WHERE id = ?1",
-                params![id, ENCODE_PENDING],
-            )?;
-        }
         queued += 1;
     }
     tx.commit()?;

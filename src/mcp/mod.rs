@@ -46,6 +46,7 @@ pub const TOOLS: &[&str] = &[
     "memory_delete",
     "memory_merge",
     "memory_search",
+    "semantic_search",
     "memory_get",
     "memory_history",
     "memory_backlinks",
@@ -136,7 +137,8 @@ the encoder changes — a different model, projection or dimension — because t
 is fixed when it is created, and the store refuses to reinterpret stored vectors rather than hand \
 back wrong neighbours. It also re-parses every body to rebuild the `[[link]]` graph, whose edges are \
 computed at write time and so do not follow a parser change on their own. It repairs a torn index \
-too: a row with no vector is queued even when its `encode_hash` still claims it is indexed. The rows \
+too: a document with no vector is queued, and the index is what says so — nothing on the row claims \
+it was indexed. The rows \
 (`memory` — keys, tags, titles, bodies; `project` — a project's own fields) are the source of truth; \
 everything this touches is derived, so nothing written can be lost and re-running it is harmless. \
 It is a PRODUCER, not an embedder: it returns immediately with `{queued: N}` and a background worker \
@@ -153,9 +155,8 @@ the stored value is left alone, so a single field can change without resending t
 instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
 empty. A new key needs both a `title` and a `body`. The reply's \
 `queued` says whether this write scheduled an embed: a written document is indexed a moment later by \
-the store's encode worker, so a semantic search straight after a write may not see it yet. \
-`encode_hash` is stamped by that WORKER too: a write that scheduled an encode leaves `encode_pending` \
-there, so it never names a text the stored vector does not match.";
+the store's encode worker, so a semantic search straight after a write may not see it yet. Nothing on \
+the ROW records encoding state — the queue holds the work and the index holds the result, by design.";
 
 /// `memory_upvote` description. The feedback nudge, carried here only.
 const UPVOTE_DESCRIPTION: &str = "Upvote the memories that shaped this task — one that changed a \
@@ -325,6 +326,50 @@ impl UpsertParams {
             expected_version: self.expected_version,
         }
     }
+}
+
+/// `semantic_search` description: the store-wide search, and the graveyard behind a flag.
+const SEMANTIC_SEARCH_DESCRIPTION: &str = "\
+Search the whole store by meaning: every document type that has vectors, one `type` if you name it, \
+or the GRAVEYARD of deleted documents when `deleted` is true. Live and deleted results are never \
+merged — a tombstone hit gives `type`/`key`/`distance`/`deleted_at` and no body, because a deleted \
+document is a name to look up rather than text to read (`memory_history KEY` holds what it said). \
+`memory_search` remains the memory-only alias.";
+
+/// Parameters for `semantic_search` — the store-wide search, with the two knobs `memory_search`
+/// deliberately does not have.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SemanticSearchParams {
+    /// The phrase to match.
+    #[serde(default)]
+    #[schemars(description = "Phrase to hunt with, matched against each document's embedding.")]
+    pub query: Option<String>,
+    /// Restrict to one document type.
+    #[serde(default)]
+    #[schemars(
+        description = "Restrict to one document type (`memory`, `project`). Absent = every type that has vectors."
+    )]
+    pub kind: Option<String>,
+    /// Search deleted documents instead of live ones.
+    #[serde(default)]
+    #[schemars(
+        description = "Search the GRAVEYARD: documents that were deleted. Never merged with live hits — it is a different index. Returns keys and `deleted_at`, never bodies."
+    )]
+    pub deleted: Option<bool>,
+    /// Result count.
+    #[serde(default)]
+    #[schemars(description = "Most hits to bring back (default = configured k).")]
+    pub k: Option<usize>,
+    /// Cosine-distance ceiling.
+    #[serde(default)]
+    #[schemars(description = "Cosine-distance ceiling (0-2). Smaller = closer.")]
+    pub max_distance: Option<f32>,
+    /// Extra hit fields.
+    #[serde(default)]
+    #[schemars(
+        description = "Extra hit fields for live hits (tombstones always return `type`, `key`, `distance`, `deleted_at`)."
+    )]
+    pub fields: Vec<FieldParam>,
 }
 
 /// Parameters for [`MemoryServer::memory_search`].
@@ -1472,6 +1517,98 @@ impl MemoryServer {
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
+    /// Semantic phrase search across every document type, with the graveyard behind a flag.
+    #[tool(
+        name = "semantic_search",
+        description = SEMANTIC_SEARCH_DESCRIPTION,
+        annotations(
+            title = "Semantic search (all types)",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn semantic_search(
+        &self,
+        Parameters(p): Parameters<SemanticSearchParams>,
+    ) -> std::result::Result<String, String> {
+        self.run_semantic(p).await
+    }
+
+    /// The `semantic_search` body, shared by the tool and `GET /semantic` so the two doors cannot drift.
+    pub(crate) async fn run_semantic(
+        &self,
+        p: SemanticSearchParams,
+    ) -> std::result::Result<String, String> {
+        let query = p.query.unwrap_or_default();
+        if query.trim().is_empty() {
+            return Err("semantic_search needs a `query`".to_string());
+        }
+        let k = p.k.unwrap_or(5).max(1);
+        let log_query = query.clone();
+        if p.deleted.unwrap_or(false) {
+            let md = p.max_distance;
+            let hits = self
+                .with_read("semantic_search", move |s| s.search_deleted(&query, k, md))
+                .await?;
+            let hits: Vec<serde_json::Value> = hits
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": t.kind,
+                        "key": t.key,
+                        "distance": t.distance,
+                        "deleted_at": t.deleted_at,
+                    })
+                })
+                .collect();
+            tracing::info!(
+                tool = "semantic_search",
+                deleted = true,
+                hits = hits.len(),
+                "graveyard searched"
+            );
+            return serde_json::to_string(&serde_json::json!({ "deleted": true, "hits": hits }))
+                .map_err(|e| e.to_string());
+        }
+        // A live search: one type if asked, otherwise the whole store. Today only memories are
+        // enqueued, so a request for another type must SAY that rather than return a quiet empty.
+        if let Some(kind) = p.kind.as_deref() {
+            let kind = kind.trim().to_string();
+            if kind != "memory" {
+                let probe = kind.clone();
+                let n = self
+                    .with_read("semantic_search", move |s| s.vectors_of(&probe))
+                    .await?;
+                if n == 0 {
+                    return Err(format!(
+                        "no `{kind}` documents are indexed yet — this store can only search by \
+meaning over the kinds that have vectors (memory does). Ask for one, or omit `type`."
+                    ));
+                }
+            }
+        }
+        let _ = log_query;
+        let params = SearchParams {
+            query: Some(query),
+            pattern: None,
+            mode: None,
+            k: Some(k),
+            max_distance: p.max_distance,
+            expand: None,
+            tags: Vec::new(),
+            min_chars: None,
+            max_chars: None,
+            created_after: None,
+            created_before: None,
+            updated_after: None,
+            updated_before: None,
+            fields: p.fields,
+        };
+        self.run_search(params).await
+    }
+
     /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
@@ -1547,7 +1684,7 @@ impl MemoryServer {
     /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
-        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it. `encode_hash` is the hash of the embedded document, or `encode_pending` while the background encode worker still owes one.",
+        description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it.",
         annotations(
             title = "Get memory",
             read_only_hint = true,
@@ -1691,7 +1828,7 @@ impl MemoryServer {
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
     #[tool(
         name = "memory_stats",
-        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age, and the ENCODE QUEUE (`encode_pending` documents still owing a vector, `encode_failed` those the encoder gave up on, `encode_oldest_s` how long the oldest has waited). A non-empty `encode_pending` is normal — a write schedules its document and returns; `encode_failed` above 0 is a defect, and a growing `encode_oldest_s` means the worker is not keeping up.",
+        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age, and the ENCODE QUEUE (`encode_pending` documents still owing a vector, `encode_failed` those the encoder gave up on, `encode_oldest_s` how long the oldest has waited). A non-empty `encode_pending` is normal — a write schedules its document and returns; a growing `encode_oldest_s` means the worker is not keeping up.",
         annotations(
             title = "Store stats",
             read_only_hint = true,

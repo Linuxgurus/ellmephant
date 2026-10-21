@@ -361,13 +361,6 @@ fn read_store(paths: &Paths, report: &mut HealthReport) -> crate::error::Result<
         None => 0,
     };
     let stale = index::vec::projection_stale(&conn)?;
-    report.projection = if stale {
-        "STALE — run `reembed`".to_string()
-    } else if db::meta::get(&conn, db::meta::PROJECTION)?.is_some() {
-        "current".to_string()
-    } else {
-        "unrecorded".to_string()
-    };
     report.links = conn.query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))?;
     report.links_dangling = links::dangling(&conn)?.len();
     report.tags = tags::list(&conn)?.len();
@@ -380,6 +373,23 @@ fn read_store(paths: &Paths, report: &mut HealthReport) -> crate::error::Result<
         report.encode_pending = queue.pending;
         report.encode_oldest_s = queue.oldest_s;
     }
+    // ★ "current" is a claim about EVERY vector, so an unfinished rebuild must not make it. A changed
+    // projection purges the index at open (leaving the queue full), so the moment the fingerprint
+    // matches is exactly the moment the index is EMPTY: reporting `current` there would be the same
+    // silent lie in a smaller place. Vectors still missing ⇒ REBUILDING, whatever the fingerprint says.
+    let rebuilding = report.encode_pending > 0 && report.vectors < report.memories;
+    report.projection = if stale {
+        "STALE — run `reembed`".to_string()
+    } else if rebuilding {
+        format!(
+            "REBUILDING — {} of {} document(s) indexed, {} queued",
+            report.vectors, report.memories, report.encode_pending
+        )
+    } else if db::meta::get(&conn, db::meta::PROJECTION)?.is_some() {
+        "current".to_string()
+    } else {
+        "unrecorded".to_string()
+    };
     Ok(stale)
 }
 

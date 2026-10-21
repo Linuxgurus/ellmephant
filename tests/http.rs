@@ -428,8 +428,8 @@ fn settle(dir: &std::path::Path) {
     ellmephant::index::vec::register_extension();
     let conn = ellmephant::db::open(&Paths::from_root(dir)).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    let spec = ellmephant::embed::VecSpec::of(&embedder);
-    while ellmephant::store::encode::drain(&conn, &embedder, &spec, 64).expect("drain") > 0 {}
+    let _spec = ellmephant::embed::VecSpec::of(&embedder);
+    while ellmephant::store::encode::drain(&conn, &embedder, 64).expect("drain") > 0 {}
 }
 
 /// Seed one memory over HTTP.

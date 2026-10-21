@@ -122,7 +122,11 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
     // `embed_document` emits is *detected* rather than silently leaving every vector describing the
     // old recipe. Only set when absent: a stored fingerprint is the baseline a mismatch is measured
     // against, and a mere open must never overwrite it.
-    if meta::get(conn, meta::PROJECTION)?.is_none() {
+    // ★ ONLY AN EMPTY STORE IS STAMPED. Stamping an unrecorded store that already holds vectors
+    // would ASSERT the vectors match the current recipe — exactly the silent "current" that
+    // [`projection_stale`] refuses to claim. Absent fingerprint + vectors means "cannot be proven",
+    // and the open path answers that with a rebuild ([`crate::store::maintain::reindex_if_stale`]).
+    if meta::get(conn, meta::PROJECTION)?.is_none() && count(conn)? == 0 {
         meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
     }
     conn.execute_batch(&create_sql(dim, TABLE))?;
@@ -325,7 +329,7 @@ pub fn count(conn: &Connection) -> Result<i64> {
 
 /// Every `memory_id` that has a stored vector. Empty when the table has not been created.
 ///
-/// `encode_hash` says "this row was indexed", which is not the same as "this row HAS a vector": a killed
+/// A stamp saying "this row was indexed" is not the same as "this row HAS a vector": a killed
 /// rebuild or a hand-deleted vector leaves the hash intact and the index torn. `reembed` uses this to
 /// see the difference.
 pub fn ids(conn: &Connection) -> Result<Vec<i64>> {
@@ -432,6 +436,15 @@ pub fn knn(
 /// Empty the table so a full re-embed repopulates it from scratch (same dimension).
 pub fn clear(conn: &Connection) -> Result<()> {
     conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
+    Ok(())
+}
+
+/// Empty BOTH tables — live and tombstones. A projection change makes every vector meaningless,
+/// including the ones behind `deleted=true`: a tombstone is searched with the same query vector, so
+/// leaving them behind mixes two models in the graveyard instead of the live index.
+pub fn clear_all(conn: &Connection) -> Result<()> {
+    conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
+    conn.execute(&format!("DELETE FROM {DELETED_TABLE}"), [])?;
     Ok(())
 }
 
@@ -597,4 +610,52 @@ mod tests {
             "ensure never overwrites a recorded fingerprint"
         );
     }
+}
+
+/// A tombstoned document: what the store once knew, without the text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tombstone {
+    pub kind: String,
+    pub key: String,
+    pub distance: f32,
+    pub deleted_at: String,
+}
+
+/// KNN over the **tombstone** index — deleted documents, reachable only by asking for them.
+///
+/// This is the one query that touches `document_vec_deleted`, and it is a different table rather than
+/// a filtered view: no normal search can reach these rows because no normal search names their table.
+pub fn knn_deleted(conn: &Connection, query: &[f32], hint: &Knn) -> Result<Vec<Tombstone>> {
+    if query.is_empty() {
+        return Err(Error::Config("empty query vector".into()));
+    }
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![DELETED_TABLE],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    let k = i64::try_from(hint.k).map_err(|_| Error::Config("k too large".into()))?;
+    let sql = format!(
+        "SELECT type, key, distance, deleted_at FROM {DELETED_TABLE} \
+         WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![to_blob(query), k])?;
+    let mut out: Vec<Tombstone> = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Tombstone {
+            kind: row.get(0)?,
+            key: row.get(1)?,
+            distance: row.get(2)?,
+            deleted_at: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        });
+    }
+    drop(rows);
+    if let Some(max) = hint.max_distance {
+        out.retain(|t| t.distance <= max);
+    }
+    Ok(out)
 }

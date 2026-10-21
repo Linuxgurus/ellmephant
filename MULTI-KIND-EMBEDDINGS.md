@@ -245,6 +245,30 @@ So: **nothing removes an entry except a successful settle**, and the invariant i
 **a document's vector is current iff no queue entry names it**. That is stronger than the hash it
 replaces, because it survives a torn index too — the index loses a vector, the refill rule re-names it.
 
+★ **The invariant carries TWO claims, and one of them is enforced globally (stet, 2026-10-21).** At
+the time this doc was written only "text" was guaranteed per row: the queue knows a document's
+*content*, never which *recipe* built its vector, because the recipe is a global fact
+(`meta.PROJECTION`). A global cannot say which rows were built under which model, so a projection
+change cannot be repaired by a refill — the refill skips a row that has a vector even though that
+vector is from another model. The sequence that produces it is one write wide: model changes → a
+write lands → it is embedded with the new model beside old ones → the rebuild asks "what has no
+vector" and skips it. **Mixed, empty-queue, and reported as current.**
+
+So the projection claim is enforced **by construction, at open, in one transaction**: a changed (or
+unprovable) fingerprint **purges every vector — tombstones included — and queues every document**.
+There is then no state in which one index holds two models; the index is either wholly old, wholly
+rebuilt, or empty-and-rebuilding. Distances across two models are not slightly wrong, they are
+meaningless: a mixed index ranks garbage confidently, which is worse than an empty one.
+`/health` and `doctor` call a non-empty queue with missing vectors **REBUILDING**, never `current`,
+because "current" is a claim about every vector and an unfinished rebuild has not earned it.
+
+★ **The purge is atomic; the rebuild is not — the QUEUE is the resume point** (stet, 2026-10-21). One
+transaction covers the delete, the fingerprint and the enqueues; the embedding that follows takes an
+hour and cannot be one transaction. That is the design, not a gap: the queue is the record of which
+documents are still owed, it survives a crash, and the same "nothing removes an entry except a
+successful settle" rule that keeps a failed embed visible is what makes a half-finished rebuild
+*resumable* rather than a second purge on restart.
+
 What stops a permanent failure from spinning: the caller keeps the failed keyslugs **in memory** and
 skips them (`next(conn, skip)` steps over them), so a restart retries at once and a hot loop is
 impossible. `attempts`/`last_error` still do not exist: the cost of a failure is a backlog that will

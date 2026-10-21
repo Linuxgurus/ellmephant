@@ -59,7 +59,8 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
     let after = store::get(&conn, &key).unwrap().unwrap();
     assert_eq!(after.source.as_deref(), Some("cmd: prove /repo"));
     assert_eq!(
-        after.encode_hash, before.encode_hash,
+        (after.title.as_str(), after.body.as_str()),
+        (before.title.as_str(), before.body.as_str()),
         "the document did not move"
     );
     assert_eq!(
@@ -104,7 +105,7 @@ fn a_tags_write_re_embeds_nothing() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (id, key) = seed(&conn, &embedder, "probe", "the facts");
-    let hash_before = store::get(&conn, &key).unwrap().unwrap().encode_hash;
+    let before_row = store::get(&conn, &key).unwrap().unwrap();
 
     let out = common::merge_now(
         &conn,
@@ -118,7 +119,11 @@ fn a_tags_write_re_embeds_nothing() {
 
     assert!(!out.queued, "tags are not in the document");
     let after = store::get(&conn, &key).unwrap().unwrap();
-    assert_eq!(after.encode_hash, hash_before, "the vector did not move");
+    assert_eq!(
+        (after.title.as_str(), after.body.as_str()),
+        (before_row.title.as_str(), before_row.body.as_str()),
+        "the document did not move"
+    );
     assert_eq!(
         after.tags,
         vec!["prj:seaweedfs".to_string(), "storage".to_string()],
@@ -353,6 +358,10 @@ fn a_patch_that_changes_nothing_re_embeds_nothing() {
 
     assert!(!out.queued, "the document did not move");
     let after = store::get(&conn, &key).unwrap().unwrap();
-    assert_eq!(after.encode_hash, before.encode_hash);
+    assert_eq!(
+        (after.title.as_str(), after.body.as_str()),
+        (before.title.as_str(), before.body.as_str()),
+        "the document did not move"
+    );
     assert_eq!(vec::get(&conn, id).unwrap(), vector_before);
 }

@@ -18,17 +18,15 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::embed::{VecSpec, projection};
 use crate::error::{Error, Result};
 use crate::index;
 
 /// One atomic memory: the storage *and* embedding unit. `Default` is the draft baseline the
-/// write path fills in (`id`/`encode_hash`/timestamps are derived on insert).
+/// write path fills in (`id`/timestamps are derived on insert).
 ///
-/// `title`, `body` and `tags` are stored literally; `encode_hash` is the re-embed trigger for the
-/// single document embedding (`key` + `title` + `body` — tags are *filing*, not meaning).
+/// `title`, `body` and `tags` are stored literally; a change to title or body is what queues a single
+/// document embedding (`key` + `title` + `body` — tags are *filing*, not meaning).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Memory {
     /// Rowid; `None` before insert and omitted from serialized output (local/derived).
@@ -52,10 +50,6 @@ pub struct Memory {
     /// `asserted_by`: a relayer names the truth's home without becoming the truth.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub origin: Option<String>,
-    /// `sha256(model|dim|embed_document)`; re-embed the row only when this changes.
-    /// [`ENCODE_PENDING`] while a queued job still owes this row a vector.
-    #[serde(default)]
-    pub encode_hash: String,
     /// Aspect tags.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -92,29 +86,6 @@ pub struct Summary {
     /// Attached tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-}
-
-/// The value `encode_hash` carries while a queued job still owes this row a vector.
-///
-/// A real hash is never this string, so the equality tests that decide `needs_embed` keep meaning
-/// what they say: `stored != computed` is true while the sentinel is in place, which is exactly the
-/// fact that a job is owed.
-pub const ENCODE_PENDING: &str = "encode_pending";
-
-/// `sha256(model|dim|text)` — the per-field re-embed trigger (SPEC §15 #7).
-///
-/// Takes a [`VecSpec`] rather than a loaded embedder: both inputs are *config*, so fingerprinting
-/// a document must never be a reason to load 1.2 GB of weights. The bytes hashed are unchanged —
-/// this is a signature change only, so no stored `encode_hash` moves (pinned by
-/// `row_hash_output_is_pinned`).
-pub fn row_hash(spec: &VecSpec, text: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(spec.model_id.as_bytes());
-    h.update(b"|");
-    h.update(spec.dim.to_string().as_bytes());
-    h.update(b"|");
-    h.update(text.as_bytes());
-    crate::hex::encode(&h.finalize())
 }
 
 /// Keys that share `base` as a prefix (for slug collision avoidance). `base` is `[a-z0-9-]`,
@@ -167,8 +138,8 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 ///
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
-pub fn add(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _, _) = add_impl(conn, spec, mem, None, None)?;
+pub fn add(conn: &Connection, mem: &Memory) -> Result<(i64, String)> {
+    let (id, key, _, _) = add_impl(conn, mem, None, None)?;
     Ok((id, key))
 }
 
@@ -207,14 +178,13 @@ fn check_body(body: &str) -> Result<()> {
 /// config said rather than what the encoder actually emits.
 fn add_impl(
     conn: &Connection,
-    spec: &VecSpec,
     mem: &Memory,
     note: Option<&str>,
     expected: Option<i64>,
 ) -> Result<(i64, String, bool, Option<i64>)> {
     check_body(&mem.body)?;
-    let prepared = prepare(conn, spec, mem, note)?;
-    let queued = prepared.needs_embed();
+    let prepared = prepare(conn, mem, note)?;
+    let queued = prepared.changes_document(mem);
     // ★ IMMEDIATE, not the default DEFERRED. A deferred transaction that READS (the compare) and
     // then WRITES must promote its lock, and in WAL that promotion fails with `SQLITE_BUSY_SNAPSHOT`
     // whenever a rival committed in between — an error the caller cannot tell apart from a conflict.
@@ -378,7 +348,7 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
     }
 }
 
-pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOutcome> {
+pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     let probe = Memory {
         key: patch.key.clone().unwrap_or_default(),
         title: patch.title.clone().unwrap_or_default(),
@@ -458,7 +428,6 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
 
     let (_id, key, queued, conflict) = add_impl(
         conn,
-        spec,
         &mem,
         patch.version_note.as_deref(),
         patch.expected_version,
@@ -472,50 +441,47 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
     })
 }
 
-/// A write resolved *outside* the transaction: the key, the document's hash, and the existing row it
-/// will upsert. Resolving the key and the hash without a model call is what keeps the write path
-/// encoder-free.
+/// A write resolved *outside* the transaction: the key, and the existing document it will upsert.
+///
+/// ★ NO HASH (2026-10-21). The old `encode_hash` was a stamp describing a DERIVED index, stored on a
+/// truth row — and it is what produced two silent no-ops (a reset queue that drained embedding
+/// nothing; a hash claiming "indexed" over a torn index). The queue now holds the rendered text and
+/// its own settle guard, so the row needs no encoding state at all: "is this a document change?" is
+/// answered by comparing the stored title/body, which is the question an embed actually depends on.
 pub(crate) struct Prepared {
     pub(crate) key: String,
-    encode_hash: String,
-    existing: Option<(i64, String)>,
+    existing: Option<(i64, String, String)>,
     /// Why this write is happening, carried to the snapshot it may take. Not part of the document,
     /// so it changes no hash and queues no embed.
     note: Option<String>,
 }
 
 impl Prepared {
-    /// Whether the document needs (re-)embedding.
+    /// Whether this write changes the DOCUMENT — i.e. whether a vector is owed.
     ///
-    /// `stored != computed` is true while [`ENCODE_PENDING`] sits in the column, which is exactly the
-    /// fact that a job is owed — so the sentinel needs no special case here.
-    pub(crate) fn needs_embed(&self) -> bool {
-        self.existing
-            .as_ref()
-            .is_none_or(|(_, h)| h != &self.encode_hash)
+    /// A tag or source edit is filing, not meaning, so it queues nothing. Comparison is against the
+    /// stored title and body, which is exactly what the renderer reads (plus the key, which cannot
+    /// change under an upsert).
+    pub(crate) fn changes_document(&self, mem: &Memory) -> bool {
+        match &self.existing {
+            None => true,
+            Some((_, title, body)) => title != &mem.title || body != &mem.body,
+        }
     }
 }
 
 /// Resolve a write without opening a transaction (reads only, no model call).
-pub(crate) fn prepare(
-    conn: &Connection,
-    spec: &VecSpec,
-    mem: &Memory,
-    note: Option<&str>,
-) -> Result<Prepared> {
+pub(crate) fn prepare(conn: &Connection, mem: &Memory, note: Option<&str>) -> Result<Prepared> {
     let key = resolve_key(conn, mem)?;
-    let doc_text = projection::embed_document(&key, &mem.title, &mem.body);
-    let encode_hash = row_hash(spec, &doc_text);
-    let existing: Option<(i64, String)> = conn
+    let existing: Option<(i64, String, String)> = conn
         .query_row(
-            "SELECT id, encode_hash FROM memory WHERE key = ?1",
+            "SELECT id, title, body FROM memory WHERE key = ?1",
             params![key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     Ok(Prepared {
         key,
-        encode_hash,
         existing,
         note: note.map(str::to_string),
     })
@@ -529,9 +495,9 @@ pub(crate) fn prepare(
 /// pending-ness is a STATE a reader can see, not an inference from a hash mismatch, and the value
 /// explains itself at the moment it is read.
 pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Result<i64> {
-    let pending = prepared.needs_embed();
+    let pending = prepared.changes_document(mem);
     let id = match prepared.existing {
-        Some((id, _)) => {
+        Some((id, _, _)) => {
             if pending {
                 // Snapshot what this write is about to replace, in the SAME transaction: a row and
                 // its history must not be able to disagree (migration 0011). Only a DOCUMENT change
@@ -539,7 +505,7 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
                 // filing, not meaning.
                 version::snapshot(tx, id, &prepared.key, prepared.note.as_deref())?;
             }
-            update_row(tx, id, mem, pending)?;
+            update_row(tx, id, mem)?;
             id
         }
         None => insert_row(tx, &prepared.key, mem)?,
@@ -561,13 +527,12 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
 
 /// The `UPDATE` half of [`add`]: the key already exists. `pending` leaves [`ENCODE_PENDING`] in
 /// `encode_hash` when this write scheduled a job, and leaves the column alone otherwise.
-fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<()> {
+fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
-                asserted_by = COALESCE(?9, asserted_by),
-                origin = COALESCE(?10, origin),
-                encode_hash = CASE WHEN ?7 THEN ?8 ELSE encode_hash END,
+                asserted_by = COALESCE(?7, asserted_by),
+                origin = COALESCE(?8, origin),
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -577,8 +542,6 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
             tags::encode(&mem.tags),
             mem.source,
             mem.updated,
-            pending,
-            ENCODE_PENDING,
             mem.asserted_by,
             mem.origin
         ],
@@ -592,18 +555,17 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
 /// settles it with the real hash of the vector it writes.
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
-        "INSERT INTO memory (key, title, body, tags, source, encode_hash, created, updated, asserted_by, origin)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+        "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5,
+                 COALESCE(NULLIF(?6, ''), datetime('now')),
                  COALESCE(NULLIF(?7, ''), datetime('now')),
-                 COALESCE(NULLIF(?8, ''), datetime('now')),
-                 COALESCE(?9, 'anonymous'), ?10)",
+                 COALESCE(?8, 'anonymous'), ?9)",
         params![
             key,
             mem.title,
             mem.body,
             tags::encode(&mem.tags),
             mem.source,
-            ENCODE_PENDING,
             mem.created,
             mem.updated,
             mem.asserted_by,
@@ -707,7 +669,7 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
 /// The canonical column list shared by `get_by_id` and `all`. `version` is DERIVED, not stored: the
 /// count of states this key has superseded, plus one — the token a caller passes back as
 /// `expected_version` (see [`Patch::expected_version`]).
-const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, encode_hash, created, updated, \
+const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, created, updated, \
      visits, times_useful, \
      (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
        WHERE type = 'memory' AND key = memory.key) AS version, \
@@ -723,14 +685,13 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         body: r.get(3)?,
         tags: tags::decode(&tags),
         source: r.get(5)?,
-        encode_hash: r.get(6)?,
-        created: r.get(7)?,
-        updated: r.get(8)?,
-        visits: r.get(9)?,
-        times_useful: r.get(10)?,
-        version: Some(r.get(11)?),
-        asserted_by: r.get(12)?,
-        origin: r.get(13)?,
+        created: r.get(6)?,
+        updated: r.get(7)?,
+        visits: r.get(8)?,
+        times_useful: r.get(9)?,
+        version: Some(r.get(10)?),
+        asserted_by: r.get(11)?,
+        origin: r.get(12)?,
     })
 }
 
@@ -773,33 +734,4 @@ pub fn summaries(conn: &Connection) -> Result<Vec<Summary>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hash_changes_with_model_dim_and_text() {
-        let a = VecSpec::new("model-a", 8);
-        let b = VecSpec::new("model-b", 8);
-        let wide = VecSpec::new("model-a", 16);
-        assert_ne!(row_hash(&a, "x"), row_hash(&wide, "x"), "dim must matter");
-        assert_ne!(row_hash(&a, "x"), row_hash(&b, "x"), "model must matter");
-        assert_ne!(row_hash(&a, "x"), row_hash(&a, "y"), "text must matter");
-        assert_eq!(row_hash(&a, "x"), row_hash(&a, "x"), "must be stable");
-        assert_eq!(row_hash(&a, "x").len(), 64, "sha256 hex is 64 chars");
-    }
-
-    /// `row_hash` takes a [`VecSpec`] now instead of a loaded embedder. The hash is written into
-    /// every row of a live store, so a changed value would re-embed all of it — silently, and visible
-    /// only as a slow rebuild. This pins the exact bytes the old `sha256(model|dim|text)` produced
-    /// (`printf 'm|3|x' | shasum -a 256`), so the refactor cannot move it.
-    #[test]
-    fn row_hash_output_is_pinned() {
-        assert_eq!(
-            row_hash(&VecSpec::new("m", 3), "x"),
-            "37ea0bd227f4e7bd235c7f93353dfb9d87c811d7a6d4017a43c089cdda3dd26f"
-        );
-    }
 }

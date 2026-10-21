@@ -172,7 +172,7 @@ impl Session {
     /// **No encoder.** The document is queued, not embedded (`ENCODE-WORKER.md`), so a write holds
     /// nothing slower than a row insert — that coupling is what this whole design removes.
     pub fn memory_merge(&self, patch: &store::Patch) -> Result<store::MergeOutcome> {
-        store::merge(&self.conn, &self.vec_spec(), patch)
+        store::merge(&self.conn, patch)
     }
 
     /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
@@ -259,6 +259,32 @@ impl Session {
 
     /// Run a query, borrowing the encoder only when there is a phrase to embed. A read-only session
     /// serves the rows from its own connection, so a search does not wait for a write to finish.
+    /// Vectors held for one document type — what `semantic_search` checks before promising a type.
+    pub fn vectors_of(&self, kind: &str) -> Result<i64> {
+        crate::index::vec::count_of(&self.conn, kind)
+    }
+
+    /// Search the **tombstone** index: deleted documents, by meaning.
+    ///
+    /// A different table rather than a filtered view, which is what makes "unreachable by a normal
+    /// search" structural: no ordinary query names this table, so no hit can leak into one, and the
+    /// `k` a caller asks for is exactly the `k` they get.
+    pub fn search_deleted(
+        &self,
+        text: &str,
+        k: usize,
+        max_distance: Option<f32>,
+    ) -> Result<Vec<crate::index::vec::Tombstone>> {
+        self.encoder.with(|e| {
+            let vector = e.embed_query(text)?;
+            crate::index::vec::knn_deleted(
+                &self.conn,
+                &vector,
+                &crate::index::vec::Knn { k, max_distance },
+            )
+        })
+    }
+
     pub fn search(&self, q: &Query) -> Result<Bundle> {
         let needs_embedder = q
             .text
@@ -305,7 +331,7 @@ impl Session {
     /// Split from [`settle_encode`](Self::settle_encode) on purpose — the worker drops the store lock
     /// between the two, so the model call runs holding nothing at all. `ENCODE-WORKER.md` is the why.
     pub fn claim_encode(&self, keyslug: &str) -> Result<Option<encode::Claim>> {
-        encode::claim(&self.conn, &self.vec_spec(), keyslug)
+        encode::claim(&self.conn, keyslug)
     }
 
     /// Store a claim's vector and settle its queue entry: the write half of a job.
@@ -352,7 +378,7 @@ impl Session {
     pub fn encode_document(&self, key: &str) -> Result<bool> {
         let keyslug = crate::store::links::Kind::Memory.keyslug(key);
         self.encoder
-            .with(|e| encode::encode_one(&self.conn, e, &self.vec_spec(), &keyslug))
+            .with(|e| encode::encode_one(&self.conn, e, &keyslug))
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.

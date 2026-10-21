@@ -412,7 +412,7 @@ pub struct RenameOutcome {
 ///
 /// Keys are near-immutable, so this is deliberate rather than routine. **`key` IS in the embed
 /// projection**, so a rename changes the renamed row's document — and the row is **queued** for a new
-/// vector, the same path a write takes. `encode_hash` is deliberately left alone here for the worker to
+/// vector, the same path a write takes. Nothing on the row is stamped here for the worker to
 /// advance, which is what keeps it meaning "the text whose vector is stored".
 ///
 /// The rows whose bodies had `[[old]]` rewritten do **not** need it: `[[…]]` is stripped from the

@@ -75,20 +75,15 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
         let mem = store::get(&conn, key).unwrap().unwrap();
         let id = mem.id.unwrap();
         assert_eq!(vec::get(&conn, id).unwrap().unwrap().len(), 16);
-        // The row bookkeeping now matches the new model.
-        let encode_hash: String = conn
-            .query_row(
-                "SELECT encode_hash FROM memory WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .unwrap();
+        // ★ THE ROW KEEPS NO BOOKKEEPING (0016), so the proof is the vector: it must be the one for
+        // this document under the WIDE model, at the new width.
+        let want = wide
+            .embed_one(&projection::embed_document(&mem.key, &mem.title, &mem.body))
+            .expect("wide vector");
         assert_eq!(
-            encode_hash,
-            store::row_hash(
-                &ellmephant::embed::VecSpec::of(&wide),
-                &projection::embed_document(&mem.key, &mem.title, &mem.body)
-            )
+            vec::get(&conn, id).unwrap().unwrap(),
+            want,
+            "the re-embed wrote the wide model's vector for this document"
         );
     }
 }
@@ -258,8 +253,8 @@ fn the_legacy_index_is_copied_not_reembedded() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
-    let spec = VecSpec::of(&embedder);
-    let id = store::add(&conn, &spec, &memory("a", "alpha", &[]))
+    let _spec = VecSpec::of(&embedder);
+    let id = store::add(&conn, &memory("a", "alpha", &[]))
         .expect("write")
         .0;
 
@@ -315,8 +310,8 @@ fn a_delete_moves_the_vector_to_the_tombstone_index() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
-    let spec = VecSpec::of(&embedder);
-    let (id, _) = store::add(&conn, &spec, &memory("gone", "to be deleted", &[])).expect("write");
+    let _spec = VecSpec::of(&embedder);
+    let (id, _) = store::add(&conn, &memory("gone", "to be deleted", &[])).expect("write");
     common::settle(&conn, &embedder);
     assert!(vec::get(&conn, id).expect("get").is_some(), "indexed");
 
@@ -345,11 +340,11 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
-    let spec = VecSpec::of(&embedder);
-    let a = store::add(&conn, &spec, &memory("a", "alpha", &[]))
+    let _spec = VecSpec::of(&embedder);
+    let a = store::add(&conn, &memory("a", "alpha", &[]))
         .expect("write")
         .0;
-    let b = store::add(&conn, &spec, &memory("b", "beta", &[]))
+    let b = store::add(&conn, &memory("b", "beta", &[]))
         .expect("write")
         .0;
 
@@ -414,10 +409,10 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
 fn opening_the_store_migrates_the_index_without_any_write() {
     let (_dir, paths) = temp_store();
     let embedder = HashEmbedder::new(4);
-    let spec = VecSpec::of(&embedder);
+    let _spec = VecSpec::of(&embedder);
     let id = {
         let conn = db::open(&paths).expect("open");
-        let (id, _) = store::add(&conn, &spec, &memory("a", "alpha", &[])).expect("write");
+        let (id, _) = store::add(&conn, &memory("a", "alpha", &[])).expect("write");
         common::settle(&conn, &embedder);
         // Put the store back into the OLD shape: no partitioned table, a populated `memory_vec`.
         conn.execute_batch(
@@ -454,4 +449,62 @@ fn opening_the_store_migrates_the_index_without_any_write() {
         vec!["a"],
         "and knows which document it belongs to"
     );
+}
+
+/// ★ THE GRAVEYARD IS REACHABLE, AND ONLY BY ASKING (2026-10-21).
+///
+/// A delete MOVES the vector into `document_vec_deleted`, so the document stops being findable by a
+/// normal search — not because a filter hides it, but because no normal query names that table. The
+/// deleted-search is the way back, and it returns a NAME, never a body.
+#[test]
+fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let (id, _) = store::add(
+        &conn,
+        &memory("buried", "the velero restore rehearsal notes", &[]),
+    )
+    .expect("write");
+    common::settle(&conn, &embedder);
+
+    let query = embedder
+        .embed_one(&projection::embed_document(
+            "buried",
+            "buried",
+            "the velero restore rehearsal notes",
+        ))
+        .expect("query vector");
+    let hint = vec::Knn {
+        k: 5,
+        max_distance: None,
+    };
+
+    // Nothing is buried yet.
+    assert!(
+        vec::knn_deleted(&conn, &query, &hint)
+            .expect("graveyard")
+            .is_empty(),
+        "no tombstones before a delete"
+    );
+
+    assert!(store::delete(&conn, "buried").expect("delete"));
+
+    // The LIVE index no longer answers, and the vector count says so.
+    assert_eq!(
+        vec::count(&conn).expect("live"),
+        0,
+        "gone from the live index"
+    );
+    assert!(
+        vec::get(&conn, id).expect("get").is_none(),
+        "no live vector for the id"
+    );
+
+    // The GRAVEYARD does — as a name with a date, never a body.
+    let buried = vec::knn_deleted(&conn, &query, &hint).expect("graveyard");
+    assert_eq!(buried.len(), 1, "the graveyard finds it");
+    assert_eq!(buried[0].key, "buried");
+    assert_eq!(buried[0].kind, "memory");
+    assert!(!buried[0].deleted_at.is_empty(), "and says when it went");
 }

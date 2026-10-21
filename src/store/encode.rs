@@ -23,11 +23,10 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::embed::{Embedder, VecSpec, projection};
+use crate::embed::{Embedder, projection};
 use crate::error::{Error, Result};
 use crate::index;
 use crate::store::links::Kind;
-use crate::store::row_hash;
 
 /// A write a human is waiting on: a fresh `memory_upsert`, an edit. Sorts ahead of bulk work.
 pub const PRIORITY_LIVE: i32 = 3;
@@ -134,9 +133,6 @@ pub struct Claim {
     id: i64,
     doc: String,
     claimed_content: String,
-    /// Interim, until `encode_hash` is dropped: the hash of the text being embedded, written beside
-    /// the vector so a reader of that column is never told something false.
-    encode_hash: String,
 }
 
 impl Claim {
@@ -164,7 +160,7 @@ impl Claim {
 ///
 /// `None` when nothing is queued — or when the keyslug names no row (deleted, merged away, or a kind
 /// that cannot be encoded yet), in which case the entry is dropped rather than left to haunt the queue.
-pub fn claim(conn: &Connection, spec: &VecSpec, keyslug: &str) -> Result<Option<Claim>> {
+pub fn claim(conn: &Connection, keyslug: &str) -> Result<Option<Claim>> {
     let content: Option<String> = conn
         .query_row(
             "SELECT content FROM encode_queue WHERE keyslug = ?1",
@@ -194,13 +190,11 @@ pub fn claim(conn: &Connection, spec: &VecSpec, keyslug: &str) -> Result<Option<
         forget(conn, keyslug)?;
         return Ok(None);
     };
-    let encode_hash = row_hash(spec, &claimed_content);
     Ok(Some(Claim {
         keyslug: keyslug.to_string(),
         id,
         doc: claimed_content.clone(),
         claimed_content,
-        encode_hash,
     }))
 }
 
@@ -219,13 +213,9 @@ pub fn settle_encoded(conn: &Connection, claim: &Claim, vector: &[f32]) -> Resul
         ))
     })?;
     index::vec::upsert(&tx, claim.id, kind.as_str(), key, vector)?;
-    // Interim, until a later migration drops the column: keep `encode_hash` describing the text whose
-    // vector was just written, so a reader is never told something false. Nothing READS it for
-    // correctness any more — `claim` asks the index, and the queue asks its own content.
-    tx.execute(
-        "UPDATE memory SET encode_hash = ?2 WHERE id = ?1",
-        params![claim.id, claim.encode_hash],
-    )?;
+    // ★ NOTHING IS STAMPED ON THE ROW (2026-10-21). The vector lands and the queue entry goes; the
+    // document itself records no encoding state, because a stamp describing a derived index is the
+    // bug this whole refactor removes. "Is this current?" = "does any queue entry name it?".
     settle(&tx, &claim.keyslug, &claim.claimed_content)?;
     tx.commit()?;
     Ok(())
@@ -237,13 +227,8 @@ pub fn settle_encoded(conn: &Connection, claim: &Claim, vector: &[f32]) -> Resul
 /// store lock: tests, and the synchronous `?wait=true` door. A caller that holds the lock (the
 /// worker) must not use this, or it holds the lock across the embed; it calls the two halves with the
 /// embed in between.
-pub fn encode_one(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-    spec: &VecSpec,
-    keyslug: &str,
-) -> Result<bool> {
-    let Some(claimed) = claim(conn, spec, keyslug)? else {
+pub fn encode_one(conn: &Connection, embedder: &dyn Embedder, keyslug: &str) -> Result<bool> {
+    let Some(claimed) = claim(conn, keyslug)? else {
         return Ok(false);
     };
     let vector = embedder.embed_one(claimed.doc())?;
@@ -269,12 +254,7 @@ fn settle(conn: &Connection, keyslug: &str, claimed_content: &str) -> Result<()>
 /// The synchronous door — `?wait=true` on a write, and every test that needs a vector *now*. The
 /// worker does **not** use this: it composes [`claim`] and [`settle_encoded`] itself so it can drop
 /// the store lock across the embed.
-pub fn drain(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-    spec: &VecSpec,
-    limit: usize,
-) -> Result<usize> {
+pub fn drain(conn: &Connection, embedder: &dyn Embedder, limit: usize) -> Result<usize> {
     let mut done = 0;
     let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
     while done < limit {
@@ -283,7 +263,7 @@ pub fn drain(
         let Some(entry) = next(conn, &failed)? else {
             break;
         };
-        if let Err(err) = encode_one(conn, embedder, spec, &entry.keyslug) {
+        if let Err(err) = encode_one(conn, embedder, &entry.keyslug) {
             failed.insert(entry.keyslug.clone());
             tracing::warn!(keyslug = %entry.keyslug, error = %err, "encode: embed failed, entry kept");
         }
@@ -374,7 +354,7 @@ mod tests {
     use crate::db;
     use crate::embed::HashEmbedder;
     use crate::error::Error;
-    use crate::store::{ENCODE_PENDING, Memory};
+    use crate::store::Memory;
 
     /// A throwaway store. The queue is a table, so most of its behaviour is only observable through
     /// SQL — and a real file is the only honest way to see the guard behave.
@@ -405,10 +385,9 @@ mod tests {
 
     /// A stored row that OWES a vector. Under the queue that is simply what a write leaves behind:
     /// `add` schedules the document and embeds nothing. A real write, not a fixture that fakes it.
-    fn owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) -> VecSpec {
-        let spec = VecSpec::of(embedder);
-        crate::store::add(conn, &spec, &mem(key, body)).expect("add");
-        spec
+    fn owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) {
+        let _ = embedder; // the write no longer needs a model: it queues rendered text
+        crate::store::add(conn, &mem(key, body)).expect("add");
     }
 
     fn id_of(conn: &Connection, key: &str) -> i64 {
@@ -485,14 +464,14 @@ mod tests {
     fn encode_one_writes_the_vector_and_settles_the_entry() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = owed(&conn, &embedder, "a", "alpha");
+        owed(&conn, &embedder, "a", "alpha");
         let id = id_of(&conn, "a");
         assert!(
             index::vec::get(&conn, id).unwrap().is_none(),
             "precondition"
         );
 
-        assert!(encode_one(&conn, &embedder, &spec, &slug("a")).unwrap());
+        assert!(encode_one(&conn, &embedder, &slug("a")).unwrap());
 
         assert_eq!(pending(&conn).unwrap(), 0, "the entry settled");
         assert!(
@@ -505,14 +484,14 @@ mod tests {
     fn encode_one_reports_no_work_for_an_unknown_or_settled_keyslug() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = owed(&conn, &embedder, "a", "alpha");
+        owed(&conn, &embedder, "a", "alpha");
 
-        assert!(encode_one(&conn, &embedder, &spec, &slug("a")).unwrap());
+        assert!(encode_one(&conn, &embedder, &slug("a")).unwrap());
         assert!(
-            !encode_one(&conn, &embedder, &spec, &slug("a")).unwrap(),
+            !encode_one(&conn, &embedder, &slug("a")).unwrap(),
             "the entry is gone, so there is nothing to do"
         );
-        assert!(!encode_one(&conn, &embedder, &spec, &slug("never-queued")).unwrap());
+        assert!(!encode_one(&conn, &embedder, &slug("never-queued")).unwrap());
         assert_eq!(pending(&conn).unwrap(), 0);
     }
 
@@ -522,8 +501,8 @@ mod tests {
     fn an_entry_that_moved_on_is_not_settled_by_the_job_that_claimed_it() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = owed(&conn, &embedder, "a", "alpha");
-        let claimed = claim(&conn, &spec, &slug("a")).unwrap().expect("a claim");
+        owed(&conn, &embedder, "a", "alpha");
+        let claimed = claim(&conn, &slug("a")).unwrap().expect("a claim");
         let claimed_content = claimed.doc().to_string();
 
         // A write lands after the claim: the row's text moved.
@@ -541,10 +520,9 @@ mod tests {
     fn an_entry_whose_row_is_gone_is_dropped_rather_than_left_haunting_the_queue() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = VecSpec::of(&embedder);
         enqueue(&conn, &slug("ghost"), "nothing", PRIORITY_LIVE).unwrap();
 
-        assert!(!encode_one(&conn, &embedder, &spec, &slug("ghost")).unwrap());
+        assert!(!encode_one(&conn, &embedder, &slug("ghost")).unwrap());
         assert_eq!(pending(&conn).unwrap(), 0, "nothing to embed, nothing owed");
     }
 
@@ -552,10 +530,9 @@ mod tests {
     fn an_unaddressable_keyslug_is_dropped() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = VecSpec::of(&embedder);
         enqueue(&conn, "rubbish", "nothing", PRIORITY_LIVE).unwrap();
 
-        assert!(!encode_one(&conn, &embedder, &spec, "rubbish").unwrap());
+        assert!(!encode_one(&conn, &embedder, "rubbish").unwrap());
         assert_eq!(pending(&conn).unwrap(), 0);
     }
 
@@ -563,12 +540,12 @@ mod tests {
     fn drain_empties_the_queue_and_reports_how_much_it_did() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = owed(&conn, &embedder, "a", "alpha");
+        owed(&conn, &embedder, "a", "alpha");
         owed(&conn, &embedder, "b", "beta");
         owed(&conn, &embedder, "c", "gamma");
 
         assert_eq!(pending(&conn).unwrap(), 3);
-        assert_eq!(drain(&conn, &embedder, &spec, 10).unwrap(), 3);
+        assert_eq!(drain(&conn, &embedder, 10).unwrap(), 3);
         assert_eq!(pending(&conn).unwrap(), 0);
         for key in ["a", "b", "c"] {
             assert!(
@@ -577,7 +554,7 @@ mod tests {
             );
         }
         // A drain on an empty queue is a no-op, not an error.
-        assert_eq!(drain(&conn, &embedder, &spec, 10).unwrap(), 0);
+        assert_eq!(drain(&conn, &embedder, 10).unwrap(), 0);
     }
 
     /// The two halves are the worker's contract: a caller holding the store lock claims, drops the
@@ -586,9 +563,9 @@ mod tests {
     fn claim_and_settle_carry_a_job_across_the_embed() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = owed(&conn, &embedder, "a", "alpha");
+        owed(&conn, &embedder, "a", "alpha");
 
-        let claimed = claim(&conn, &spec, &slug("a")).unwrap().expect("a claim");
+        let claimed = claim(&conn, &slug("a")).unwrap().expect("a claim");
         let vector = embedder.embed_one(claimed.doc()).unwrap();
         settle_encoded(&conn, &claimed, &vector).unwrap();
         assert_eq!(pending(&conn).unwrap(), 0);
@@ -615,15 +592,15 @@ mod tests {
 
         let (_d, conn) = store();
         let real = HashEmbedder::new(8);
-        let spec = owed(&conn, &real, "a", "alpha");
+        owed(&conn, &real, "a", "alpha");
         let id = id_of(&conn, "a");
-        drain(&conn, &real, &spec, 10).unwrap();
+        drain(&conn, &real, 10).unwrap();
         let current = index::vec::get(&conn, id).unwrap().expect("indexed");
         assert_eq!(missing(&conn).unwrap().len(), 0, "nothing is missing");
 
         // The document moves on, and the embed for the new text fails.
-        crate::store::add(&conn, &spec, &mem("a", "alpha, revised")).unwrap();
-        assert_eq!(drain(&conn, &Broken, &spec, 10).unwrap(), 1);
+        crate::store::add(&conn, &mem("a", "alpha, revised")).unwrap();
+        assert_eq!(drain(&conn, &Broken, 10).unwrap(), 1);
 
         // The vector is now STALE, and nothing about the index would say so: the vector exists, so
         // `missing` is empty. The QUEUE is the only record of the debt — which is the whole point.
@@ -645,7 +622,7 @@ mod tests {
         );
 
         // A working embedder settles it, and the staleness goes.
-        assert_eq!(drain(&conn, &real, &spec, 10).unwrap(), 1);
+        assert_eq!(drain(&conn, &real, 10).unwrap(), 1);
         assert_eq!(pending(&conn).unwrap(), 0);
         assert_ne!(index::vec::get(&conn, id).unwrap().unwrap(), current);
     }
@@ -657,7 +634,7 @@ mod tests {
     fn the_queue_steps_over_a_document_that_has_just_failed() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = owed(&conn, &embedder, "a", "alpha");
+        owed(&conn, &embedder, "a", "alpha");
         owed(&conn, &embedder, "b", "beta");
 
         let head = next(&conn, &none()).unwrap().unwrap();
@@ -666,15 +643,14 @@ mod tests {
         let after = next(&conn, &skip).unwrap().expect("the next document");
         assert_ne!(after.keyslug, head.keyslug);
         assert_eq!(pending(&conn).unwrap(), 2, "nothing was removed");
-        assert_eq!(drain(&conn, &embedder, &spec, 10).unwrap(), 2);
+        assert_eq!(drain(&conn, &embedder, 10).unwrap(), 2);
     }
 
     /// The two numbers a queue has to answer with — how much, and is it stuck — from one aggregate.
     #[test]
     fn counts_reports_the_backlog_and_the_oldest_wait() {
         let (_d, conn) = store();
-        let embedder = HashEmbedder::new(8);
-        let spec = VecSpec::of(&embedder);
+        let _embedder = HashEmbedder::new(8);
 
         assert_eq!(
             counts(&conn).unwrap(),
@@ -682,7 +658,7 @@ mod tests {
             "an empty queue is zeroes and no age at all"
         );
 
-        crate::store::add(&conn, &spec, &mem("a", "alpha")).unwrap();
+        crate::store::add(&conn, &mem("a", "alpha")).unwrap();
         let c = counts(&conn).unwrap();
         assert_eq!(c.pending, 1);
         assert_eq!(
@@ -699,18 +675,17 @@ mod tests {
     fn missing_names_the_documents_that_have_no_vector() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = VecSpec::of(&embedder);
 
         // Written but not yet embedded: no vector, so it is missing — with no index at all, which is
         // the same answer `ids` gives for a table that has never been created.
-        crate::store::add(&conn, &spec, &mem("a", "alpha")).unwrap();
+        crate::store::add(&conn, &mem("a", "alpha")).unwrap();
         assert_eq!(
             missing(&conn).unwrap().len(),
             1,
             "written and not embedded is missing, index or no index"
         );
 
-        drain(&conn, &embedder, &spec, 10).unwrap();
+        drain(&conn, &embedder, 10).unwrap();
         assert_eq!(missing(&conn).unwrap().len(), 0, "all indexed");
 
         // A vector removed by hand is exactly the shape of a torn index.
@@ -733,9 +708,8 @@ mod tests {
     fn a_write_queues_the_document_and_writes_no_vector() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        let spec = VecSpec::of(&embedder);
 
-        crate::store::add(&conn, &spec, &mem("a", "alpha")).unwrap();
+        crate::store::add(&conn, &mem("a", "alpha")).unwrap();
 
         assert_eq!(pending(&conn).unwrap(), 1, "the write queued a document");
         assert!(
@@ -750,10 +724,9 @@ mod tests {
 
         // Honestly embedded now, so a tag-only edit can be judged at all: a tag is FILING, not
         // meaning, so it moves no document and therefore queues nothing (SPEC §6/§9).
-        drain(&conn, &embedder, &spec, 10).unwrap();
+        drain(&conn, &embedder, 10).unwrap();
         let tagged = crate::store::merge(
             &conn,
-            &spec,
             &crate::store::Patch {
                 key: Some("a".into()),
                 tags: Some(vec!["k8s".into()]),
@@ -767,7 +740,6 @@ mod tests {
         // The body IS the document, so that one queues.
         let edited = crate::store::merge(
             &conn,
-            &spec,
             &crate::store::Patch {
                 key: Some("a".into()),
                 body: Some("changed".into()),
@@ -777,13 +749,8 @@ mod tests {
         .unwrap();
         assert!(edited.queued, "the body is the document");
         assert_eq!(pending(&conn).unwrap(), 1);
-        assert_eq!(
-            conn.query_row("SELECT encode_hash FROM memory WHERE key = 'a'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .unwrap(),
-            ENCODE_PENDING,
-            "interim: the column still says a vector is owed"
-        );
+        // ★ AND THE ROW SAYS NOTHING ABOUT IT (2026-10-21): the queue is the only record that a vector
+        // is owed. There is no `encode_hash` column to read, by design — a stamp describing a derived
+        // index does not belong on the document.
     }
 }

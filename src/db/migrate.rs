@@ -71,8 +71,8 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         "claims: an atomic lease over a name",
     ),
     (
-        13,
-        include_str!("../../migrations/0013_multi_kind_queue.sql"),
+        15,
+        include_str!("../../migrations/0015_multi_kind_queue.sql"),
         "the queue keys on a keyslug and carries the rendered text: no hash, no kind column, no retries",
     ),
 ];
@@ -82,9 +82,33 @@ pub fn version(conn: &Connection) -> Result<i32> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
+/// Refuse a store whose version this binary does not know.
+///
+/// `user_version` is a bare counter, and the loop below takes "newer than me" on trust: a store at v14
+/// against a binary whose list runs 1..12, 15 would **skip nothing and apply nothing** — the v15
+/// statement never runs because 15 > 14 is false? No: it runs, but a *lower*-numbered migration that
+/// the store never applied is skipped forever, because `v <= current` reads it as done. The signature
+/// of that is simple and total: the store's version is not one of the versions this binary knows. So
+/// the check costs one membership test, and it turns a silent no-op into a refusal at startup.
+fn known_version(current: i32) -> bool {
+    MIGRATIONS.iter().any(|(v, _, _)| *v == current)
+}
+
 /// Apply every migration newer than the file's `user_version`.
 pub fn run(conn: &Connection) -> Result<()> {
     let mut current = version(conn)?;
+    if current != 0 && !known_version(current) {
+        return Err(crate::error::Error::Config(format!(
+            "store is at schema v{current}, which this binary does not know (it knows {}). Either this \
+             binary is older than the store, or a migration was skipped and never applied — refusing \
+             to run rather than read a schema it cannot honour.",
+            MIGRATIONS
+                .iter()
+                .map(|(v, _, _)| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )));
+    }
     for (version, sql, _label) in MIGRATIONS {
         if *version <= current {
             continue;

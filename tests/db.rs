@@ -315,3 +315,26 @@ fn key_is_unique() {
         "duplicate keys must be rejected by the UNIQUE constraint"
     );
 }
+
+/// A store whose schema version this binary does not know must REFUSE to open, not open anyway.
+///
+/// The failure this exists for: `user_version` is a bare counter and the runner treats `v <= current`
+/// as "already applied". A v14 store against a binary whose list runs 1..12, 15 therefore skips a
+/// migration forever, and — worse — `/health`'s `schema >= encode::SCHEMA` gate would pass on a schema
+/// the binary cannot query. Version-not-in-my-list is the complete signature of that state, so it is
+/// the check: one membership test, and a silent no-op becomes a refusal.
+#[test]
+fn a_store_at_a_version_this_binary_does_not_know_is_refused() {
+    let (_dir, paths) = temp_store();
+    {
+        let conn = db::open(&paths).unwrap();
+        // Simulate a store written by a branch that used 13 and 14 (the mailbox / provenance pair).
+        conn.pragma_update(None, "user_version", 14).unwrap();
+    }
+    let err = db::open(&paths).expect_err("v14 is not a version this binary knows");
+    let text = format!("{err}");
+    assert!(
+        text.contains("schema v14") && text.contains("does not know"),
+        "the refusal must name the version and the reason: {text}"
+    );
+}

@@ -10,6 +10,10 @@
 //! what lets one queue serve a memory, a project, or anything else that becomes worth embedding —
 //! the worker never needs to know what a document *is*.
 //!
+//! **Failure keeps the entry.** It is the only record that a vector is owed: `missing()` asks whether
+//! a vector EXISTS, and one describing older text does. So nothing removes an entry except a
+//! successful settle; a caller steps over what it has just seen fail.
+//!
 //! **There is no stamp.** The dequeue guard is content equality: a write landing mid-embed replaces
 //! the row's content, so the old job's DELETE misses and the newer text stays queued. That is the
 //! same protection a hash gave, without a per-row copy of a fact about a derived index.
@@ -36,7 +40,7 @@ pub const PRIORITY_BULK: i32 = 5;
 /// The schema version that introduced this table. A reader of an older store (the health probe, on a
 /// half-migrated or rolled-back store) must not query it: a missing table would answer the question
 /// "why is this store not ready?" with `no such table: encode_queue` instead of "schema behind binary".
-pub const SCHEMA: i32 = 13;
+pub const SCHEMA: i32 = 15;
 
 /// One pending document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +56,8 @@ pub struct Entry {
 /// Schedule a document for embedding, by its rendered text.
 ///
 /// Idempotent: one row per keyslug, so a burst of edits to one document is one embed of its latest
-/// text. The priority is never DEMOTED — a live document swept up by a bulk re-encode stays live —
+/// text. This is also the write path, so it is not the queue's "only producer" — a rebuild and the
+/// refill rule are the other two. The priority is never DEMOTED — a live document swept up by a bulk re-encode stays live —
 /// which is why this is an upsert with `min(priority, …)` and not `INSERT OR REPLACE` (REPLACE
 /// resets every column it is not given, and would push a waiting write to the back).
 pub fn enqueue(conn: &Connection, keyslug: &str, content: &str, priority: i32) -> Result<()> {
@@ -61,7 +66,10 @@ pub fn enqueue(conn: &Connection, keyslug: &str, content: &str, priority: i32) -
          ON CONFLICT(keyslug) DO UPDATE SET
              content   = excluded.content,
              priority  = min(priority, excluded.priority),
-             queued_at = datetime('now')",
+             -- AGE MEANS \"the last time this document was ASKED for\", not \"first enqueued\": a
+             -- re-request refreshes it. But a re-request carrying IDENTICAL text moves nothing, so it
+             -- must not send the row to the back of its class either.
+             queued_at = CASE WHEN content = excluded.content THEN queued_at ELSE datetime('now') END",
         params![keyslug, content, priority],
     )?;
     Ok(())

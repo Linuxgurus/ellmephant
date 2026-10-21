@@ -31,11 +31,22 @@ pub const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
 /// Largest embedding dimension MRL allows (SPEC §6); the frozen `vec0` width.
 pub const MAX_DIM: usize = 1024;
 
-/// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance`
-/// (SPEC §10). Calibrated on the sample store: the rank-1 hit for a relevant query sits
-/// ≲0.6 while the noise floor is ≳0.63, so 0.6 keeps every genuine hit (even a sloppy
-/// paraphrase) and still drops the chaff. High-precision callers can tighten toward 0.5.
-pub const DEFAULT_MAX_DISTANCE: f32 = 0.6;
+/// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance` (SPEC §10).
+///
+/// ★ RE-CALIBRATED 2026-10-21 on the live store (Qwen3-Embedding-0.6B, dim 1024), because the old
+/// 0.6 was measured on a different model and admitted every nonsense hit on this one:
+///
+/// | query | rank-1 | rank-5 |
+/// |---|---|---|
+/// | a relevant phrase | 0.338 | 0.483 |
+/// | a vague-but-real phrase | 0.455 | 0.489 |
+/// | four nonsense phrases | 0.529 | 0.591 |
+///
+/// So the separation is 0.489 -> 0.529 and **0.52** sits in it: every measured genuine hit survives,
+/// nothing measured as noise does. The old comment's "noise floor ≳0.63" was false here. High-precision
+/// callers can still pass `max_distance` per call (≈0.45 for confident-only). A single number cannot
+/// separate "nothing similar" from "cut by the threshold" — a `match` verdict is the follow-up (#59).
+pub const DEFAULT_MAX_DISTANCE: f32 = 0.52;
 
 /// Resolved on-disk locations. `ELLMEPHANT_HOME` wins over `$HOME/.ellmephant`, which
 /// keeps tests hermetic without touching the real store.

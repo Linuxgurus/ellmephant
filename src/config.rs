@@ -138,6 +138,22 @@ pub struct Config {
     /// a *semantic* search — one number, because a separate "between jobs" and "idle" interval would
     /// be a knob nobody can set correctly.
     pub encode_interval_ms: u64,
+    /// The largest AUTOMATIC rebuild (a changed projection at open) this store will start, counted in
+    /// documents. A rebuild is unbounded work started by a config change, so it is asked to fit a
+    /// budget before it purges anything (soma/ellmephant#76).
+    ///
+    /// The cost of one document embed is measured at 5–11.5 s (see #62's rationale), so the default
+    /// 2000 is ≈6.4 h at the slow end: today's 756-document store fits with headroom, and a
+    /// hundredfold store does not. A refused rebuild writes nothing and leaves the index STALE, which
+    /// is the state the store already has a name for.
+    ///
+    /// ★ This is a DOCUMENT proxy, not the money wallet: the daily spend ceiling lives in the spine,
+    /// which ellmephant cannot read. The honest local question is "is this rebuild affordable", and
+    /// the honest local unit is the work it will do.
+    pub rebuild_max_documents: u64,
+    /// Proceed with a rebuild that exceeds [`Config::rebuild_max_documents`], deliberately. Config,
+    /// never a caller: an over-budget rebuild is a decision, and a request cannot make it.
+    pub rebuild_allow_over_budget: bool,
 }
 
 impl Default for Config {
@@ -155,6 +171,8 @@ impl Default for Config {
             default_max_distance: Some(DEFAULT_MAX_DISTANCE),
             port: DEFAULT_PORT,
             encode_interval_ms: 1_000,
+            rebuild_max_documents: 2_000,
+            rebuild_allow_over_budget: false,
         }
     }
 }

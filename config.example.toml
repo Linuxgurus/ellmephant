@@ -17,3 +17,13 @@ port = 8888                            # MCP HTTP port (`mcp --stdio` ignores it
 # interval, so it bounds how long a freshly written memory stays invisible to a *semantic* search
 # (a write queues its document; the worker indexes it). See ENCODE-WORKER.md.
 encode_interval_ms = 1000
+
+# The largest AUTOMATIC rebuild (a changed projection at open) this store will start, in documents.
+# A rebuild is unbounded work started by a config change, so it is priced BEFORE anything is purged:
+# at the measured 5-11.5 s/document, 2000 documents is ~6.4 h at the slow end. A refused rebuild
+# leaves every vector untouched and the index STALE (and the encoder holds its queue), so the
+# recovery is a decision — raise this, roll the config back, or run `memory_reembed`.
+rebuild_max_documents = 2000
+
+# Proceed with a rebuild that exceeds the ceiling above, deliberately. Config, never a caller.
+rebuild_allow_over_budget = false

@@ -103,7 +103,7 @@ pub struct Session {
 impl Session {
     /// Open (creating if needed) the store and hold the connection.
     pub fn open(paths: Paths, cfg: Config, spec: model::Spec) -> Result<Self> {
-        let conn = db::open(&paths)?;
+        let conn = db::open_with(&paths, &cfg)?;
         let encoder = Encoder::new(spec, cfg.clone());
         Ok(Self {
             paths,
@@ -415,6 +415,11 @@ impl Session {
     pub fn backlinks(&self, key: &str) -> Result<Vec<links::Backlink>> {
         let mem = store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))?;
         links::backlinks(&self.conn, &mem.key)
+    }
+
+    /// Close the books on a rebuild: the actual duration, beside the estimate (`#76`).
+    pub fn note_rebuild_finished(&self) -> Result<()> {
+        maintain::note_rebuild_finished(&self.conn)
     }
 
     /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a

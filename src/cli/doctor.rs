@@ -8,13 +8,13 @@ use super::model::verify_weights;
 use crate::config::{Config, Paths};
 use crate::error::Result;
 use crate::model;
-use crate::store::{links, project, tags, version};
+use crate::store::{links, maintain, project, tags, version};
 use crate::{db, index};
 
 /// Report paths, schema version and derived-index health; `verify` re-hashes the weights.
 pub fn run(paths: &Paths, cfg: &Config, spec: &model::Spec, verify: bool) -> Result<()> {
     paths.ensure()?;
-    let conn = db::open(paths)?;
+    let conn = db::open_with(paths, cfg)?;
     let schema = db::migrate::version(&conn)?;
     let objects: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view','trigger')",
@@ -111,6 +111,12 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
     let verdict = crate::store::encode::projection(conn)?;
     println!("  projection     {}", verdict.verdict(vectors, memories));
+    // The last rebuild's books (soma/ellmephant#76): the estimate before it started, the REFUSAL if
+    // it never did, and the actual once the queue drained. This is the line that makes "the rebuild
+    // cost X" answerable after the fact.
+    if let Some(record) = db::meta::get(conn, maintain::REBUILD)? {
+        println!("  rebuild        {record}");
+    }
 
     // Derived-index health (PLAN §6 P9): a dangling `[[key]]` is a lost rename target, a
     // missing vector is a `reembed` job.

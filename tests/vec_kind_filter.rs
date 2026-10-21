@@ -338,3 +338,57 @@ fn probes_a_plain_lookup_by_partition_and_aux_column() {
     );
     println!("PLAIN LOOKUP (memory): {mem:?}");
 }
+
+/// Can a vec0 table carry TWO partition keys — `type` and the author pen — so that a KNN can be
+/// restricted to "my private documents of this kind" instead of over-fetching and sifting?
+#[test]
+fn probes_two_partition_keys() {
+    register();
+    let conn = Connection::open_in_memory().expect("open");
+    let created = conn.execute_batch(
+        "CREATE VIRTUAL TABLE v USING vec0(
+           vector_id INTEGER PRIMARY KEY,
+           embedding float[4] distance_metric=cosine,
+           type text PARTITION KEY,
+           pen  text PARTITION KEY,
+           +key TEXT
+         );",
+    );
+    println!("TWO PARTITION KEYS: {created:?}");
+    if created.is_err() {
+        return;
+    }
+    for (id, e, ty, pen, key) in [
+        (1, [1.0, 0.0, 0.0, 0.0], "memory", "stet", "mine"), // same pen, same type
+        (2, [0.9, 0.1, 0.0, 0.0], "memory", "stet", "mine2"),
+        (3, [0.8, 0.2, 0.0, 0.0], "memory", "james", "theirs"),
+        (4, [0.1, 0.9, 0.0, 0.0], "project", "stet", "other-type"),
+    ] {
+        conn.execute(
+            "INSERT INTO v(vector_id, embedding, type, pen, key) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![id, blob(e), ty, pen, key],
+        )
+        .expect("insert");
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, distance FROM v
+              WHERE embedding MATCH ?1 AND k = ?2 AND type = 'memory' AND pen = 'stet'
+              ORDER BY distance",
+        )
+        .expect("prepare two-partition knn");
+    let hits: Vec<(String, f64)> = stmt
+        .query_map(rusqlite::params![blob([1.0, 0.0, 0.0, 0.0]), 10i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    println!("KNN type=memory pen=stet k=10: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        2,
+        "k is per partition pair: only my own memories"
+    );
+}

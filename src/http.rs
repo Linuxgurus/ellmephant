@@ -376,20 +376,10 @@ fn read_store(paths: &Paths, report: &mut HealthReport) -> crate::error::Result<
     // ★ "current" is a claim about EVERY vector, so an unfinished rebuild must not make it. A changed
     // projection purges the index at open (leaving the queue full), so the moment the fingerprint
     // matches is exactly the moment the index is EMPTY: reporting `current` there would be the same
-    // silent lie in a smaller place. Vectors still missing ⇒ REBUILDING, whatever the fingerprint says.
-    let rebuilding = report.encode_pending > 0 && report.vectors < report.memories;
-    report.projection = if stale {
-        "STALE — run `reembed`".to_string()
-    } else if rebuilding {
-        format!(
-            "REBUILDING — {} of {} document(s) indexed, {} queued",
-            report.vectors, report.memories, report.encode_pending
-        )
-    } else if db::meta::get(&conn, db::meta::PROJECTION)?.is_some() {
-        "current".to_string()
-    } else {
-        "unrecorded".to_string()
-    };
+    // silent lie in a smaller place. What counts as still-owed is `encode::owed`, never
+    // `vectors < documents` — the ONE definition lives with the kind (soma/ellmephant#77).
+    let verdict = encode::projection(&conn)?;
+    report.projection = verdict.verdict(report.vectors, report.memories);
     Ok(stale)
 }
 

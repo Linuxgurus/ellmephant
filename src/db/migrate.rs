@@ -90,6 +90,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0016_drop_encode_hash.sql"),
         "drop memory.encode_hash: the stamp describing a derived index leaves the truth row",
     ),
+    (
+        17,
+        include_str!("../../migrations/0017_memory_fts.sql"),
+        "the word index: FTS5 over key/title/body, with all three triggers (soma/ellmephant#62)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

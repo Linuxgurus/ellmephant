@@ -57,8 +57,15 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
         !object_exists(&conn, "table", "project_memory"),
         "project_memory should have been dropped by 0007"
     );
-    // v2 keeps one embedding per row: guard against a BM25/tag table being reintroduced.
-    for name in ["memory_fts", "tag", "memory_tag"] {
+    // ★ THE v2 DECISION IS REVERSED FOR THE WORD INDEX (soma/ellmephant#62, 2026-10-22): a single
+    // semantic phrase could not find a name-shaped query — the right memory ranked FIFTH at 0.5945
+    // behind an unrelated 0.5795 — so `memory_fts` is now INTENDED, and its absence would be the bug.
+    // The tag tables stay absent: a tag is a column, and a join table for it was never right.
+    assert!(
+        object_exists(&conn, "table", "memory_fts"),
+        "the word index is now part of the schema (0017)"
+    );
+    for name in ["tag", "memory_tag"] {
         assert!(
             !object_exists(&conn, "table", name),
             "{name} should not exist"
@@ -160,6 +167,13 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         [],
     )
     .unwrap();
+    // ...and predates the WORD INDEX (0017): drop its triggers BEFORE the table, or a trigger body
+    // survives naming a table that no longer exists and every later write fails.
+    for t in ["memory_fts_ai", "memory_fts_ad", "memory_fts_au"] {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {t}"), [])
+            .unwrap();
+    }
+    conn.execute("DROP TABLE memory_fts", []).unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -207,6 +221,13 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         params![from_id],
     )
     .unwrap();
+    // ...and predates the WORD INDEX (0017): drop its triggers BEFORE the table, or a trigger body
+    // survives naming a table that no longer exists and every later write fails.
+    for t in ["memory_fts_ai", "memory_fts_ad", "memory_fts_au"] {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {t}"), [])
+            .unwrap();
+    }
+    conn.execute("DROP TABLE memory_fts", []).unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();

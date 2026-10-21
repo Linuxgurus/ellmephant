@@ -262,6 +262,13 @@ meaningless: a mixed index ranks garbage confidently, which is worse than an emp
 `/health` and `doctor` call a non-empty queue with missing vectors **REBUILDING**, never `current`,
 because "current" is a claim about every vector and an unfinished rebuild has not earned it.
 
+★ **The purge is atomic; the rebuild is not — the QUEUE is the resume point** (stet, 2026-10-21). One
+transaction covers the delete, the fingerprint and the enqueues; the embedding that follows takes an
+hour and cannot be one transaction. That is the design, not a gap: the queue is the record of which
+documents are still owed, it survives a crash, and the same "nothing removes an entry except a
+successful settle" rule that keeps a failed embed visible is what makes a half-finished rebuild
+*resumable* rather than a second purge on restart.
+
 What stops a permanent failure from spinning: the caller keeps the failed keyslugs **in memory** and
 skips them (`next(conn, skip)` steps over them), so a restart retries at once and a hot loop is
 impossible. `attempts`/`last_error` still do not exist: the cost of a failure is a backlog that will

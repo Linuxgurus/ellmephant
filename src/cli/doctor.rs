@@ -105,8 +105,15 @@ fn print_index_health(conn: &Connection) -> Result<()> {
 
     // The embed projection is fingerprinted in `meta`; a mismatch means the stored vectors were
     // built from a different document than the code now emits — a `reembed` job, not corruption.
+    // A verdict about every vector may not be given while some are still owed: after a projection
+    // change the index is purged and the queue does the rebuild, so "the fingerprint matches" no
+    // longer implies "the vectors are there".
+    let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+    let queue = crate::store::encode::pending(conn).unwrap_or(0);
     let projection = if index::vec::projection_stale(conn)? {
         "STALE — run `reembed`".to_string()
+    } else if queue > 0 && vectors < memories {
+        format!("REBUILDING — {vectors} of {memories} indexed, {queue} queued")
     } else if db::meta::get(conn, db::meta::PROJECTION)?.is_some() {
         "current".to_string()
     } else {

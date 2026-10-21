@@ -122,7 +122,11 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
     // `embed_document` emits is *detected* rather than silently leaving every vector describing the
     // old recipe. Only set when absent: a stored fingerprint is the baseline a mismatch is measured
     // against, and a mere open must never overwrite it.
-    if meta::get(conn, meta::PROJECTION)?.is_none() {
+    // ★ ONLY AN EMPTY STORE IS STAMPED. Stamping an unrecorded store that already holds vectors
+    // would ASSERT the vectors match the current recipe — exactly the silent "current" that
+    // [`projection_stale`] refuses to claim. Absent fingerprint + vectors means "cannot be proven",
+    // and the open path answers that with a rebuild ([`crate::store::maintain::reindex_if_stale`]).
+    if meta::get(conn, meta::PROJECTION)?.is_none() && count(conn)? == 0 {
         meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
     }
     conn.execute_batch(&create_sql(dim, TABLE))?;
@@ -432,6 +436,15 @@ pub fn knn(
 /// Empty the table so a full re-embed repopulates it from scratch (same dimension).
 pub fn clear(conn: &Connection) -> Result<()> {
     conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
+    Ok(())
+}
+
+/// Empty BOTH tables — live and tombstones. A projection change makes every vector meaningless,
+/// including the ones behind `deleted=true`: a tombstone is searched with the same query vector, so
+/// leaving them behind mixes two models in the graveyard instead of the live index.
+pub fn clear_all(conn: &Connection) -> Result<()> {
+    conn.execute(&format!("DELETE FROM {TABLE}"), [])?;
+    conn.execute(&format!("DELETE FROM {DELETED_TABLE}"), [])?;
     Ok(())
 }
 

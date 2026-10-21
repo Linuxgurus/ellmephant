@@ -17,6 +17,50 @@ use crate::error::Result;
 use crate::index;
 use crate::store::{encode, links};
 
+/// A changed projection is a **purge and a full rebuild**, never a refill — and it happens at open.
+///
+/// The stamp this design deleted was per-row, so a stale row could only be found by comparing it to
+/// something. `meta.PROJECTION` is a *global*, and a global cannot say which rows were built under
+/// which recipe. The failure it hides, measured by stet (2026-10-21):
+///
+/// 1. the model changes and the fingerprint moves;
+/// 2. a write lands before the rebuild — its text is new, so it enqueues and is embedded with the
+///    **new** model, beside old-model vectors;
+/// 3. a refill walks "what has no vector" and **skips that row, because it has one**.
+///
+/// Permanently mixed, and silent: the queue is empty, nothing names the rows, and the invariant
+/// reports "current". Distances across two models are not slightly wrong, they are meaningless — a
+/// mixed index ranks garbage confidently, which is worse than an empty one.
+///
+/// So projection change ⇒ **delete every vector, including the tombstones, and queue every document**,
+/// all in ONE transaction with the fingerprint. Atomicity is the requirement, not a nicety: no read
+/// sees a half-purged index, and no write can slip a new-model vector into an old-model index between
+/// the detection and the purge. While the queue is non-empty the index is *incomplete*, which is
+/// honest; `/health` and `doctor` report the non-empty queue as REBUILDING
+/// ([`crate::store::encode::pending`]).
+pub fn reindex_if_stale(conn: &Connection) -> Result<Option<usize>> {
+    if !index::vec::projection_stale(conn)? {
+        return Ok(None);
+    }
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT key, title, body FROM memory ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    index::vec::clear_all(&tx)?;
+    meta::set(&tx, meta::PROJECTION, &projection::fingerprint())?;
+    for (key, title, body) in &rows {
+        encode::enqueue_memory(&tx, key, title, body, encode::PRIORITY_BULK)?;
+    }
+    tx.commit()?;
+    tracing::warn!(
+        "index: projection changed — purged every vector (tombstones included) and queued {} document(s) for a full rebuild",
+        rows.len()
+    );
+    Ok(Some(rows.len()))
+}
+
 /// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.
 #[derive(Debug, Clone)]
 pub struct Report {

@@ -27,6 +27,11 @@ pub fn open(paths: &Paths) -> Result<Connection> {
     // up" and "the index exists" the same event. A reader still opens read-only and touches no DDL.
     if let Some(dim) = crate::index::vec::stored_dim(&conn)? {
         crate::index::vec::ensure(&conn, dim)?;
+        // ★ AND A CHANGED PROJECTION PURGES HERE, before this connection can serve a write. A refill
+        // cannot fix a mixed index (a row with a vector is skipped even though its vector is from
+        // another model), so the only safe answer is: no vectors at all, every document queued, one
+        // transaction. See `maintain::reindex_if_stale` for the sequence that motivated it.
+        crate::store::maintain::reindex_if_stale(&conn)?;
     }
     Ok(conn)
 }

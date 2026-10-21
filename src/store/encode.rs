@@ -60,6 +60,15 @@ pub struct Entry {
 /// which is why this is an upsert with `min(priority, …)` and not `INSERT OR REPLACE` (REPLACE
 /// resets every column it is not given, and would push a waiting write to the back).
 pub fn enqueue(conn: &Connection, keyslug: &str, content: &str, priority: i32) -> Result<()> {
+    // ★ THE ONE DEFINITION (soma/ellmephant#77): a document whose kind owes no vector must never
+    // enter the queue. Queuing it would make the backlog report work that no worker can finish.
+    if !is_embeddable(keyslug) {
+        tracing::debug!(
+            keyslug,
+            "encode: this kind owes no vector by design — not queued"
+        );
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO encode_queue (keyslug, content, priority) VALUES (?1, ?2, ?3)
          ON CONFLICT(keyslug) DO UPDATE SET
@@ -324,6 +333,70 @@ pub struct Counts {
     pub oldest_s: Option<i64>,
 }
 
+/// Whether a keyslug names a document that owes a vector — the queue's side of the ONE definition
+/// ([`Kind::is_embeddable`]). An unaddressable keyslug is not a document: the claim drops it.
+pub fn is_embeddable(keyslug: &str) -> bool {
+    match Kind::from_keyslug(keyslug) {
+        Some((kind, _)) => kind.is_embeddable(),
+        None => true, // not addressable, so not ours to judge; `claim` forgets it
+    }
+}
+
+/// How many queued documents genuinely OWE a vector.
+///
+/// This is the health predicate's question, and it is not `count(*)`: a queued document whose kind is
+/// not embeddable owes nothing, so counting the row would report a rebuild that no amount of work can
+/// finish. The other half of the old answer — `vectors < documents` — is worse, because it treats a
+/// lexical-only or non-embedded document as permanently owed. See [`Kind::is_embeddable`].
+pub fn owed(conn: &Connection) -> Result<i64> {
+    let mut stmt = conn.prepare("SELECT keyslug FROM encode_queue")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .filter(|slug| is_embeddable(slug))
+        .count() as i64)
+}
+
+/// The one verdict on the vector index, computed in one place for `/health` and `doctor` — they had
+/// two copies of this chain and could drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projection {
+    /// The stored vectors were built from a different projection and must be re-embedded.
+    pub stale: bool,
+    /// Queued documents that actually owe a vector ([`owed`]).
+    pub owed: i64,
+    /// A projection fingerprint has been recorded at all.
+    pub recorded: bool,
+}
+
+impl Projection {
+    /// The verdict, in the words both surfaces print. `vectors` and `documents` are for the
+    /// REBUILDING message only — never for the decision.
+    pub fn verdict(&self, vectors: i64, documents: i64) -> String {
+        if self.stale {
+            "STALE — run `reembed`".to_string()
+        } else if self.owed > 0 {
+            format!(
+                "REBUILDING — {vectors} of {documents} document(s) indexed, {} queued",
+                self.owed
+            )
+        } else if self.recorded {
+            "current".to_string()
+        } else {
+            "unrecorded".to_string()
+        }
+    }
+}
+
+/// Read the index's verdict. `stale` is the fingerprint comparison; `owed` is the queue's real debt.
+pub fn projection(conn: &Connection) -> Result<Projection> {
+    Ok(Projection {
+        stale: index::vec::projection_stale(conn)?,
+        owed: owed(conn)?,
+        recorded: crate::db::meta::get(conn, crate::db::meta::PROJECTION)?.is_some(),
+    })
+}
+
 /// Read the queue's shape in one aggregate, so a caller cannot get a count that disagrees with
 /// another.
 pub fn counts(conn: &Connection) -> Result<Counts> {
@@ -385,7 +458,7 @@ mod tests {
 
     /// A stored row that OWES a vector. Under the queue that is simply what a write leaves behind:
     /// `add` schedules the document and embeds nothing. A real write, not a fixture that fakes it.
-    fn owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) {
+    fn queue_owed(conn: &Connection, embedder: &dyn Embedder, key: &str, body: &str) {
         let _ = embedder; // the write no longer needs a model: it queues rendered text
         crate::store::add(conn, &mem(key, body)).expect("add");
     }
@@ -464,7 +537,7 @@ mod tests {
     fn encode_one_writes_the_vector_and_settles_the_entry() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        owed(&conn, &embedder, "a", "alpha");
+        queue_owed(&conn, &embedder, "a", "alpha");
         let id = id_of(&conn, "a");
         assert!(
             index::vec::get(&conn, id).unwrap().is_none(),
@@ -484,7 +557,7 @@ mod tests {
     fn encode_one_reports_no_work_for_an_unknown_or_settled_keyslug() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        owed(&conn, &embedder, "a", "alpha");
+        queue_owed(&conn, &embedder, "a", "alpha");
 
         assert!(encode_one(&conn, &embedder, &slug("a")).unwrap());
         assert!(
@@ -501,7 +574,7 @@ mod tests {
     fn an_entry_that_moved_on_is_not_settled_by_the_job_that_claimed_it() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        owed(&conn, &embedder, "a", "alpha");
+        queue_owed(&conn, &embedder, "a", "alpha");
         let claimed = claim(&conn, &slug("a")).unwrap().expect("a claim");
         let claimed_content = claimed.doc().to_string();
 
@@ -526,6 +599,45 @@ mod tests {
         assert_eq!(pending(&conn).unwrap(), 0, "nothing to embed, nothing owed");
     }
 
+    /// ★ soma/ellmephant#77: the ONE definition, and the reason it is not `count(*)`. A project is a
+    /// structure and owes no vector (0005, and `claim` drops its work), so a queued project is a row
+    /// in the backlog that no worker can ever finish. `owed` must not count it, and `enqueue` must
+    /// not create it — otherwise `/health` reports a rebuild that will never clear.
+    #[test]
+    fn a_kind_that_owes_no_vector_is_neither_queued_nor_owed() {
+        let (_d, conn) = store();
+        // A legacy/foreign row of the non-embeddable kind.
+        conn.execute(
+            "INSERT INTO encode_queue (keyslug, content, priority) VALUES ('project:sessions', 'x', 3)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(pending(&conn).unwrap(), 1, "it is in the queue, as a row");
+        assert_eq!(owed(&conn).unwrap(), 0, "but it owes nothing");
+
+        // The writer refuses to add another: the definition is shared, not re-derived.
+        enqueue(&conn, "project:sessions", "y", PRIORITY_LIVE).unwrap();
+        assert_eq!(pending(&conn).unwrap(), 1, "still one row, and unchanged");
+
+        enqueue(&conn, &slug("a"), "doc", PRIORITY_LIVE).unwrap();
+        assert_eq!(owed(&conn).unwrap(), 1, "a memory IS owed");
+
+        // A drained queue over documents that mostly cannot be embedded is `current`, not
+        // REBUILDING — the acceptance in #77.
+        let p = Projection {
+            stale: false,
+            owed: 0,
+            recorded: true,
+        };
+        assert_eq!(p.verdict(1, 40), "current");
+        let p = Projection {
+            stale: false,
+            owed: 0,
+            recorded: false,
+        };
+        assert_eq!(p.verdict(0, 0), "unrecorded");
+    }
+
     #[test]
     fn an_unaddressable_keyslug_is_dropped() {
         let (_d, conn) = store();
@@ -540,9 +652,9 @@ mod tests {
     fn drain_empties_the_queue_and_reports_how_much_it_did() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        owed(&conn, &embedder, "a", "alpha");
-        owed(&conn, &embedder, "b", "beta");
-        owed(&conn, &embedder, "c", "gamma");
+        queue_owed(&conn, &embedder, "a", "alpha");
+        queue_owed(&conn, &embedder, "b", "beta");
+        queue_owed(&conn, &embedder, "c", "gamma");
 
         assert_eq!(pending(&conn).unwrap(), 3);
         assert_eq!(drain(&conn, &embedder, 10).unwrap(), 3);
@@ -563,7 +675,7 @@ mod tests {
     fn claim_and_settle_carry_a_job_across_the_embed() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        owed(&conn, &embedder, "a", "alpha");
+        queue_owed(&conn, &embedder, "a", "alpha");
 
         let claimed = claim(&conn, &slug("a")).unwrap().expect("a claim");
         let vector = embedder.embed_one(claimed.doc()).unwrap();
@@ -592,7 +704,7 @@ mod tests {
 
         let (_d, conn) = store();
         let real = HashEmbedder::new(8);
-        owed(&conn, &real, "a", "alpha");
+        queue_owed(&conn, &real, "a", "alpha");
         let id = id_of(&conn, "a");
         drain(&conn, &real, 10).unwrap();
         let current = index::vec::get(&conn, id).unwrap().expect("indexed");
@@ -634,8 +746,8 @@ mod tests {
     fn the_queue_steps_over_a_document_that_has_just_failed() {
         let (_d, conn) = store();
         let embedder = HashEmbedder::new(8);
-        owed(&conn, &embedder, "a", "alpha");
-        owed(&conn, &embedder, "b", "beta");
+        queue_owed(&conn, &embedder, "a", "alpha");
+        queue_owed(&conn, &embedder, "b", "beta");
 
         let head = next(&conn, &none()).unwrap().unwrap();
         let mut skip = std::collections::HashSet::new();

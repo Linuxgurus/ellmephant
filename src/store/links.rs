@@ -96,6 +96,23 @@ impl Kind {
         };
         Some((kind, key))
     }
+
+    /// ★ THE ONE DEFINITION of "this document owes a vector" (soma/ellmephant#77). Both the queue
+    /// writer ([`crate::store::encode::enqueue`]) and the health verdict
+    /// ([`crate::store::encode::projection`]) call this and nothing else.
+    ///
+    /// It is a property of the KIND, not of the row and not of `vectors < documents`. A project is a
+    /// structure and is not matched by meaning (`0005`, and [`crate::store::encode::claim`] drops its
+    /// queued work for the same reason), and a lexical-only document — the day #62 lands — will
+    /// never have a vector by design. Counting documents against vectors would call every such
+    /// document a permanent rebuild: an alarm that never clears is worse than no alarm, because it
+    /// teaches everyone to ignore the field.
+    pub fn is_embeddable(self) -> bool {
+        match self {
+            Kind::Memory => true,
+            Kind::Project => false,
+        }
+    }
 }
 
 /// The marker that names a **project** in a link token: `[[prj:chronos]]`.

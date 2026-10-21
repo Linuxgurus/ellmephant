@@ -109,17 +109,8 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     // change the index is purged and the queue does the rebuild, so "the fingerprint matches" no
     // longer implies "the vectors are there".
     let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
-    let queue = crate::store::encode::pending(conn).unwrap_or(0);
-    let projection = if index::vec::projection_stale(conn)? {
-        "STALE — run `reembed`".to_string()
-    } else if queue > 0 && vectors < memories {
-        format!("REBUILDING — {vectors} of {memories} indexed, {queue} queued")
-    } else if db::meta::get(conn, db::meta::PROJECTION)?.is_some() {
-        "current".to_string()
-    } else {
-        "unrecorded (reembed to record)".to_string()
-    };
-    println!("  projection     {projection}");
+    let verdict = crate::store::encode::projection(conn)?;
+    println!("  projection     {}", verdict.verdict(vectors, memories));
 
     // Derived-index health (PLAN §6 P9): a dangling `[[key]]` is a lost rename target, a
     // missing vector is a `reembed` job.

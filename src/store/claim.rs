@@ -38,9 +38,9 @@ pub const MAX_TTL_SECONDS: i64 = 86_400;
 pub struct Claim {
     /// The name the lease is over — free text (a bank key, a handoff topic, anything two writers share).
     pub name: String,
-    /// Who holds it.
+    /// Who holds it — lowercased, so one identity cannot wear two spellings.
     pub owner: String,
-    /// When this holder took it.
+    /// When this holder FIRST took it — renewals do not reset it, so "how long held" stays answerable.
     pub acquired_at: String,
     /// When it lapses on its own.
     pub expires_at: String,
@@ -81,17 +81,20 @@ fn row_to_claim(r: &rusqlite::Row<'_>) -> rusqlite::Result<Claim> {
     })
 }
 
-/// Normalize a lease name: trimmed, non-empty. Free text (NOT slugified) — a name is a lookup handle,
-/// not a document key, so punctuation is allowed.
+/// Normalize a lease name: trimmed, lowercased, non-empty. Free text (NOT slugified) — a name is a
+/// lookup handle, not a document key, so punctuation is allowed. Case is folded because `Bank` and
+/// `bank` must be one lease: identity is the point of the row, and a spelling is not a holder.
 fn normalize_name(raw: &str) -> Result<String> {
     let name = raw.trim();
     if name.is_empty() {
         return Err(Error::Claim("a claim needs a non-empty `name`".to_string()));
     }
-    Ok(name.to_string())
+    Ok(name.to_lowercase())
 }
 
-/// Normalize an owner: trimmed, non-empty.
+/// Normalize an owner: trimmed, lowercased, non-empty. Folding case matters more here than for the
+/// name: `Hand-A` renewing a lease it took as `hand-a` would otherwise be refused — deadlocking a hand
+/// on its own lease.
 fn normalize_owner(raw: &str) -> Result<String> {
     let owner = raw.trim();
     if owner.is_empty() {
@@ -99,7 +102,7 @@ fn normalize_owner(raw: &str) -> Result<String> {
             "a claim needs a non-empty `owner`".to_string(),
         ));
     }
-    Ok(owner.to_string())
+    Ok(owner.to_lowercase())
 }
 
 /// Normalize a TTL: the default when unstated, and bounded so a lease cannot be forever.
@@ -123,11 +126,16 @@ fn normalize_ttl(ttl_seconds: Option<i64>) -> Result<i64> {
 /// **Atomic by construction:** one statement decides and writes. The `WHERE` on the upsert lets the
 /// write through only when the held lease has EXPIRED or `owner` already holds it — so a live lease
 /// held by someone else is refused, and the same owner re-taking it is a RENEWAL (idempotent), not a
-/// conflict. `RETURNING` hands back the row this statement wrote, so a win is reported from the write
-/// itself and never from a second read another writer could have moved.
+/// conflict. A renewal moves the deadline but keeps the FIRST `acquired_at`, so the age of the lease
+/// stays readable. `RETURNING` hands back the row this statement wrote, so a win is reported from the
+/// write itself and never from a second read another writer could have moved.
 ///
 /// The caller learns *whether* it won and *who holds the name now*: a `won: false` reply carries the
-/// holder, because "you lost" without "to whom, until when" is not actionable.
+/// holder, because "you lost" without "to whom, until when" is not actionable. A loss is resolved by
+/// reading the row — and when that row has VANISHED (the holder released between our failed write and
+/// our read), the acquire is retried ONCE: the name just became free, so the honest answer is a win,
+/// not an error. The error survives only as the last resort, when the retry loses and the row vanishes
+/// again.
 pub fn acquire(
     conn: &Connection,
     name: &str,
@@ -139,33 +147,51 @@ pub fn acquire(
     let ttl = normalize_ttl(ttl_seconds)?;
     let offset = format!("+{ttl} seconds");
 
-    let won = conn
+    if let Some(claim) = try_acquire(conn, &name, &owner, &offset)? {
+        return Ok(Acquire { won: true, claim });
+    }
+    // The only way to get here: a live lease held by a DIFFERENT owner. Report it — unless it is gone.
+    match get(conn, &name)? {
+        Some(claim) => Ok(Acquire { won: false, claim }),
+        // Vanished between write and read: the name is free NOW, so try the write again once.
+        None => match try_acquire(conn, &name, &owner, &offset)? {
+            Some(claim) => Ok(Acquire { won: true, claim }),
+            None => {
+                let claim = get(conn, &name)?.ok_or_else(|| {
+                    Error::Claim(format!("claim `{name}` vanished between write and read"))
+                })?;
+                Ok(Acquire { won: false, claim })
+            }
+        },
+    }
+}
+
+/// The one-statement attempt: `Some` when the write won, `None` when a live lease by another refused
+/// it. Never a second read — the win comes from `RETURNING`, i.e. from the write.
+fn try_acquire(conn: &Connection, name: &str, owner: &str, offset: &str) -> Result<Option<Claim>> {
+    Ok(conn
         .query_row(
             &format!(
                 "INSERT INTO claim (name, owner, acquired_at, expires_at)
                  VALUES (?1, ?2, datetime('now'), datetime('now', ?3))
                  ON CONFLICT(name) DO UPDATE SET
                      owner = excluded.owner,
-                     acquired_at = excluded.acquired_at,
-                     expires_at = excluded.expires_at
+                     -- ★ A RENEWAL MAY EXTEND, NEVER SHORTEN. A live lease keeps the later deadline,
+                     -- so a short probe cannot release a long lock early (measured 2026-10-17: a 60s
+                     -- renewal truncated a 64-minute `finger` lock). A LAPSED lease is a different
+                     -- case — it must take the new window, or it would come back already expired.
+                     expires_at = CASE
+                         WHEN claim.expires_at <= datetime('now') THEN excluded.expires_at
+                         WHEN excluded.expires_at > claim.expires_at THEN excluded.expires_at
+                         ELSE claim.expires_at
+                     END
                  WHERE claim.expires_at <= datetime('now') OR claim.owner = excluded.owner
                  RETURNING {COLUMNS}"
             ),
             params![name, owner, offset],
             row_to_claim,
         )
-        .optional()?;
-
-    match won {
-        Some(claim) => Ok(Acquire { won: true, claim }),
-        None => {
-            // The only way to reach here: a live lease held by a DIFFERENT owner. Report it.
-            let claim = get(conn, &name)?.ok_or_else(|| {
-                Error::Claim(format!("claim `{name}` vanished between write and read"))
-            })?;
-            Ok(Acquire { won: false, claim })
-        }
-    }
+        .optional()?)
 }
 
 /// Release a lease — only your own. A release by a non-owner is refused, and the reply (when one
@@ -189,8 +215,10 @@ pub fn release(conn: &Connection, name: &str, owner: &str) -> Result<Release> {
     })
 }
 
-/// One claim by name, or `None` when no row exists (a never-claimed name).
+/// One claim by name, or `None` when no row exists (a never-claimed name). The lookup folds case the
+/// same way [`acquire`] does, so `claims(Some("Bank"))` finds the lease stored as `bank`.
 pub fn get(conn: &Connection, name: &str) -> Result<Option<Claim>> {
+    let name = name.trim().to_lowercase();
     Ok(conn
         .query_row(
             &format!("SELECT {COLUMNS} FROM claim WHERE name = ?1"),
@@ -245,6 +273,26 @@ mod tests {
         acquire(&conn, "bank", "hand-a", Some(300)).expect("first");
         let out = acquire(&conn, "bank", "hand-a", Some(600)).expect("renew");
         assert!(out.won, "the holder may renew its own lease");
+    }
+
+    #[test]
+    fn a_shorter_renewal_cannot_shorten_a_live_lease() {
+        let (_dir, conn) = store();
+        let long = acquire(&conn, "finger", "hands", Some(3840)).expect("long lease");
+        // The bug this pins: a 60s probe used to truncate a 64-minute lock, releasing it early and
+        // letting a second finger into the same work.
+        let probe = acquire(&conn, "finger", "hands", Some(60)).expect("probe");
+        assert!(probe.won, "the holder may renew");
+        assert_eq!(
+            probe.claim.expires_at, long.claim.expires_at,
+            "a shorter TTL must not move the deadline backwards"
+        );
+        // ...and a longer one still extends it.
+        let longer = acquire(&conn, "finger", "hands", Some(7200)).expect("extend");
+        assert!(
+            longer.claim.expires_at > long.claim.expires_at,
+            "a longer TTL must extend the lease"
+        );
     }
 
     #[test]

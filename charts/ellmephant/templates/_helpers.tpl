@@ -133,7 +133,7 @@ caller controls indentation. Flags/env override `config.toml` (SPEC §12).
       optional: true
 {{- end }}
 {{- with .Values.env }}
-{{- toYaml . }}
+{{ toYaml . }}
 {{- end }}
 {{- end }}
 

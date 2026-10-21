@@ -5,9 +5,11 @@ pub mod codec;
 pub mod dupes;
 pub mod encode;
 pub mod links;
+pub mod mail;
 pub mod maintain;
 pub mod project;
 pub mod slug;
+pub mod snapshot;
 pub mod stats;
 pub mod tags;
 pub mod version;
@@ -41,6 +43,15 @@ pub struct Memory {
     /// Provenance: command/path/repo/quote.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source: Option<String>,
+    /// WHO asserted this row's current state, as the store resolved it — never as the caller typed
+    /// it. `anonymous` when the connection proved nothing. Stamped, not an argument.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub asserted_by: Option<String>,
+    /// WHERE the information came from, as the caller DECLARED it: a URL, a file, a command,
+    /// "my inference". A promise, not a proof — which is why it is a separate column from
+    /// `asserted_by`: a relayer names the truth's home without becoming the truth.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub origin: Option<String>,
     /// `sha256(model|dim|embed_document)`; re-embed the row only when this changes.
     /// [`ENCODE_PENDING`] while a queued job still owes this row a vector.
     #[serde(default)]
@@ -60,6 +71,15 @@ pub struct Memory {
     /// Count of explicit "this helped" marks from an agent; runtime counter, never in the embed.
     #[serde(default)]
     pub times_useful: i64,
+    /// The LIVE state's number: this key's superseded states (`memory_version.n`), plus one. A key
+    /// with no history is `1`; a key that does not exist has no version at all.
+    ///
+    /// ★ THIS IS THE CAS TOKEN. A read-modify-write is unsafe while the store only versions (two
+    /// writers can both read, both write, and last-write-wins loses one silently — the bank bug).
+    /// Pass this back as `expected_version` and the write is REFUSED instead, so the caller retries
+    /// with fresh numbers. Derived on read; never stored on the row.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<i64>,
 }
 
 /// One row's index entry: identity and shape, without the body (the `list` surface, SPEC §14).
@@ -148,7 +168,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, spec: &VecSpec, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _) = add_impl(conn, spec, mem, None)?;
+    let (id, key, _, _) = add_impl(conn, spec, mem, None, None)?;
     Ok((id, key))
 }
 
@@ -190,14 +210,48 @@ fn add_impl(
     spec: &VecSpec,
     mem: &Memory,
     note: Option<&str>,
-) -> Result<(i64, String, bool)> {
+    expected: Option<i64>,
+) -> Result<(i64, String, bool, Option<i64>)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, spec, mem, note)?;
     let queued = prepared.needs_embed();
-    let tx = conn.unchecked_transaction()?;
+    // ★ IMMEDIATE, not the default DEFERRED. A deferred transaction that READS (the compare) and
+    // then WRITES must promote its lock, and in WAL that promotion fails with `SQLITE_BUSY_SNAPSHOT`
+    // whenever a rival committed in between — an error the caller cannot tell apart from a conflict.
+    // Taking the write lock first makes "compare, then write" ONE serialized unit, which is the whole
+    // point of a CAS. Writes are short; the wait is a few milliseconds.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // ★ AND THE COMPARE IS INSIDE THE TRANSACTION, or it is theatre: a check outside would let a
+    // rival commit between the read and the write, which is exactly the lost update this exists to
+    // prevent.
+    if let Some(want) = expected {
+        let current = live_version(&tx, &prepared.key)?;
+        if current != want {
+            return Ok((0, prepared.key, false, Some(current)));
+        }
+    }
     let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
-    Ok((id, prepared.key, queued))
+    Ok((id, prepared.key, queued, None))
+}
+
+/// The LIVE state's version: `MAX(n)` of the superseded states, plus one. A key that does not exist
+/// is `0` — not `1` — so a CREATE can be CAS'd too, and two creators cannot both think they are
+/// writing the first state.
+pub fn live_version(conn: &Connection, key: &str) -> Result<i64> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory WHERE key = ?1)",
+        params![key],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version WHERE type = ?1 AND key = ?2",
+        params![version::MEMORY, key],
+        |r| r.get(0),
+    )?)
 }
 
 /// A **partial** write to one memory: every field is optional and `None` means *leave it alone*.
@@ -215,12 +269,23 @@ pub struct Patch {
     pub body: Option<String>,
     /// New provenance. `Some("")` clears it — empty is a fact here.
     pub source: Option<String>,
+    /// The store stamps this from the connection's proven identity; a caller may not set it.
+    pub asserted_by: Option<String>,
+    /// Where the information came from, declared by the caller. `None` leaves the stored value.
+    pub origin: Option<String>,
     /// New tags. `Some(vec![])` clears them.
     pub tags: Option<Vec<String>>,
     /// Why THIS change is being made. Not a field of the memory: it rides beside the version the
     /// write supersedes, so a later reader learns the intent without reconstructing it. It creates
     /// no version on its own — only a DOCUMENT change does (see `store::version`).
     pub version_note: Option<String>,
+    /// ★ THE CAS TOKEN: write only if the memory is still at this version (the `version` field a
+    /// `memory_get` returned). `None` is the old last-write-wins behaviour.
+    ///
+    /// `0` means "I believe this key does not exist yet", so a create can be raced too. A mismatch
+    /// writes NOTHING and reports the current version, which is the difference between a lost update
+    /// and a retry.
+    pub expected_version: Option<i64>,
 }
 
 /// What [`merge`] did.
@@ -233,6 +298,9 @@ pub struct MergeOutcome {
     /// True when the embedded document changed, so an embed was **queued** (not performed — see
     /// `ENCODE-WORKER.md`). Named for what the store did, which is all it can honestly promise now.
     pub queued: bool,
+    /// `Some(current)` means the write was REFUSED because `expected_version` did not match — nothing
+    /// was written, and `current` is the version to re-read and retry against.
+    pub conflict: Option<i64>,
 }
 
 /// Upsert ONE memory from a partial [`Patch`]: `None` keeps the stored value, `Some` replaces it.
@@ -241,6 +309,75 @@ pub struct MergeOutcome {
 ///
 /// Queues an embed only when the embedded document (`key` + title + body) actually changes: a tag or
 /// a source is *filing*, not *meaning* (SPEC §9).
+/// The tag that makes a memory writable only under a LIVE LEASE.
+pub const PROTECTED: &str = "protected";
+
+fn is_protected(tags: &[String]) -> bool {
+    tags.iter().any(|t| t.eq_ignore_ascii_case(PROTECTED))
+}
+
+/// ★ THE LEASE IS THE CONTROL; THE TAG SAYS WHICH ROWS NEED ONE.
+///
+/// A `protected` memory is writable only by a caller holding a live lease on its key. A write that
+/// would ADD or REMOVE the tag passes the same gate, so a stranger can neither ratchet a memory shut
+/// nor quietly unlock one.
+///
+/// The lease must be taken deliberately (`claim_acquire`), which is what makes an edit visible
+/// afterwards: the claim table is the write audit for the memories that matter. Pair this with
+/// `ELLMEPHANT_LEASERS`, or a persuaded model simply leases the key itself and the gate is theatre.
+fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) -> Result<()> {
+    let becomes = patch.tags.as_ref().is_some_and(|t| is_protected(t));
+    if !is_protected(was) && !becomes {
+        return Ok(());
+    }
+    let Some(claim) = crate::store::claim::get(conn, key)? else {
+        return Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED: take the lease first (`claim_acquire name={key}`), write, then \
+             release. A protected memory is writable only under a live lease."
+        )));
+    };
+    if !claim.live {
+        return Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED and its lease lapsed at {} (held by `{}`). Take it again.",
+            claim.expires_at, claim.owner
+        )));
+    }
+    // A PROVEN writer must BE the holder. An unproven one cannot be told from any other client, and
+    // the lease it holds is already the strongest statement available: someone took it on purpose.
+    if let Some(writer) = patch
+        .asserted_by
+        .as_deref()
+        .filter(|w| !claim.owner.eq_ignore_ascii_case(w))
+    {
+        return Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED and leased by `{}` until {}; `{writer}` does not hold it.",
+            claim.owner, claim.expires_at
+        )));
+    }
+    Ok(())
+}
+
+/// A delete has no patch to inspect, so it only asks: is a live lease held on this key?
+fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
+    let Some(mem) = get(conn, key)? else {
+        return Ok(());
+    };
+    if !is_protected(&mem.tags) {
+        return Ok(());
+    }
+    match crate::store::claim::get(conn, key)? {
+        Some(claim) if claim.live => Ok(()),
+        Some(claim) => Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED and its lease lapsed at {} (held by `{}`). Take it again.",
+            claim.expires_at, claim.owner
+        ))),
+        None => Err(Error::Invalid(format!(
+            "`{key}` is PROTECTED: take the lease first (`claim_acquire name={key}`), delete, then \
+             release."
+        ))),
+    }
+}
+
 pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOutcome> {
     let probe = Memory {
         key: patch.key.clone().unwrap_or_default(),
@@ -249,6 +386,12 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
     };
     let key = resolve_key(conn, &probe)?;
     let existing = get(conn, &key)?;
+    // A `protected` row (or a write that would make one) needs a live lease on its own key.
+    let was_tags = existing
+        .as_ref()
+        .map(|m| m.tags.clone())
+        .unwrap_or_default();
+    guard_protected(conn, &key, &was_tags, patch)?;
 
     let (mem, created) = match existing {
         Some(old) => {
@@ -275,6 +418,13 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     body,
                     tags: patch.tags.clone().unwrap_or_else(|| old.tags.clone()),
                     source,
+                    // The writer is this connection, not whoever wrote it last; `None` keeps the
+                    // stored attribution so an internal write cannot launder it into anonymity.
+                    asserted_by: patch
+                        .asserted_by
+                        .clone()
+                        .or_else(|| old.asserted_by.clone()),
+                    origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     ..Default::default()
                 },
                 false,
@@ -297,6 +447,8 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
                     body,
                     tags: patch.tags.clone().unwrap_or_default(),
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
+                    asserted_by: patch.asserted_by.clone(),
+                    origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
                     ..Default::default()
                 },
                 true,
@@ -304,11 +456,19 @@ pub fn merge(conn: &Connection, spec: &VecSpec, patch: &Patch) -> Result<MergeOu
         }
     };
 
-    let (_id, key, queued) = add_impl(conn, spec, &mem, patch.version_note.as_deref())?;
+    let (_id, key, queued, conflict) = add_impl(
+        conn,
+        spec,
+        &mem,
+        patch.version_note.as_deref(),
+        patch.expected_version,
+    )?;
     Ok(MergeOutcome {
         key,
-        created,
+        // A refused write created nothing, whatever the pre-write read believed.
+        created: created && conflict.is_none(),
         queued,
+        conflict,
     })
 }
 
@@ -405,6 +565,8 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
+                asserted_by = COALESCE(?9, asserted_by),
+                origin = COALESCE(?10, origin),
                 encode_hash = CASE WHEN ?7 THEN ?8 ELSE encode_hash END,
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
@@ -416,7 +578,9 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
             mem.source,
             mem.updated,
             pending,
-            ENCODE_PENDING
+            ENCODE_PENDING,
+            mem.asserted_by,
+            mem.origin
         ],
     )?;
     Ok(())
@@ -428,10 +592,11 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory, pending: bool) -> Result<(
 /// settles it with the real hash of the vector it writes.
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
-        "INSERT INTO memory (key, title, body, tags, source, encode_hash, created, updated)
+        "INSERT INTO memory (key, title, body, tags, source, encode_hash, created, updated, asserted_by, origin)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                  COALESCE(NULLIF(?7, ''), datetime('now')),
-                 COALESCE(NULLIF(?8, ''), datetime('now')))",
+                 COALESCE(NULLIF(?8, ''), datetime('now')),
+                 COALESCE(?9, 'anonymous'), ?10)",
         params![
             key,
             mem.title,
@@ -440,7 +605,9 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.source,
             ENCODE_PENDING,
             mem.created,
-            mem.updated
+            mem.updated,
+            mem.asserted_by,
+            mem.origin
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -449,6 +616,7 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
+    guard_protected_delete(conn, key)?;
     let tx = conn.unchecked_transaction()?;
     // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
@@ -536,9 +704,14 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Memory>> {
     }
 }
 
-/// The canonical column list shared by `get_by_id` and `all`.
-const MEMORY_COLUMNS: &str =
-    "id, key, title, body, tags, source, encode_hash, created, updated, visits, times_useful";
+/// The canonical column list shared by `get_by_id` and `all`. `version` is DERIVED, not stored: the
+/// count of states this key has superseded, plus one — the token a caller passes back as
+/// `expected_version` (see [`Patch::expected_version`]).
+const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, encode_hash, created, updated, \
+     visits, times_useful, \
+     (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
+       WHERE type = 'memory' AND key = memory.key) AS version, \
+     asserted_by, origin";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -555,6 +728,9 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         updated: r.get(8)?,
         visits: r.get(9)?,
         times_useful: r.get(10)?,
+        version: Some(r.get(11)?),
+        asserted_by: r.get(12)?,
+        origin: r.get(13)?,
     })
 }
 

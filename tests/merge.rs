@@ -278,11 +278,30 @@ fn key_is_an_address_not_a_field() {
             title: Some("a new title".into()),
             body: Some("new facts".into()),
             source: Some("elsewhere".into()),
+            asserted_by: Some("James".into()),
+            origin: Some("https://example.com/record".into()),
             tags: Some(vec!["moved".into()]),
             version_note: None,
+            expected_version: None,
         },
     )
     .expect("merge everything");
+
+    // PROVENANCE is part of the row now: who asserted this version, and where it came from, kept as
+    // separate facts — a relayer names the truth's home without becoming the truth.
+    let (asserted, origin): (String, Option<String>) = conn
+        .query_row(
+            "SELECT asserted_by, origin FROM memory WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("provenance stored");
+    assert_eq!(asserted, "James", "a write is attributed to its writer");
+    assert_eq!(
+        origin.as_deref(),
+        Some("https://example.com/record"),
+        "origin is the caller's declaration, not the writer"
+    );
 
     let stored: String = conn
         .query_row("SELECT key FROM memory WHERE id = ?1", [id], |r| r.get(0))

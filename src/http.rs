@@ -167,6 +167,11 @@ pub(crate) struct HealthReport {
     pub(crate) encode_failed: i64,
     /// Age of the oldest pending document in seconds, `None` when the queue is empty.
     pub(crate) encode_oldest_s: Option<i64>,
+    /// Age of the newest consistent snapshot (`snapshot/memory.db`) in seconds, `None` when none has
+    /// been written. ★ THIS IS THE QUIESCE, MADE LEGIBLE: a backup of a live SQLite file is not
+    /// atomic, so "how old is the consistent copy?" is a question a bell can answer without kubectl
+    /// and without a cross-namespace grant.
+    pub(crate) snapshot_age_s: Option<i64>,
     pub(crate) ready: bool,
     pub(crate) reason: Option<String>,
 }
@@ -197,6 +202,7 @@ impl HealthReport {
             encode_pending: 0,
             encode_failed: 0,
             encode_oldest_s: None,
+            snapshot_age_s: None,
             ready: false,
             reason: Some(reason.to_string()),
         }
@@ -241,6 +247,11 @@ impl HealthReport {
             format!("{} pending", self.encode_pending)
         };
         out.push_str(&format!("  {:<12}{queue}\n", "encode"));
+        let snap = match self.snapshot_age_s {
+            Some(age) => format!("{age}s ago"),
+            None => "none yet — the backup is copying a LIVE database".to_string(),
+        };
+        out.push_str(&format!("  {:<12}{snap}\n", "snapshot"));
         if let Some(reason) = &self.reason {
             out.push_str(&format!("  {:<12}false: {reason}\n", "ready"));
         }
@@ -270,6 +281,9 @@ impl HealthReport {
             "encode_pending": self.encode_pending,
             "encode_failed": self.encode_failed,
             "encode_oldest_s": self.encode_oldest_s,
+            // The quiesce: how old the newest CONSISTENT copy is. `null` means none has been written,
+            // which is a fact worth surfacing rather than a zero.
+            "snapshot_age_s": self.snapshot_age_s,
         })
     }
 }
@@ -295,9 +309,14 @@ pub(crate) fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> Healt
         encode_pending: 0,
         encode_failed: 0,
         encode_oldest_s: None,
+        snapshot_age_s: None,
         ready: false,
         reason: None,
     };
+    // The quiesce is a property of the DIRECTORY, not of the open database: report it even when the
+    // store is missing or unreadable, because "how old is my last consistent copy?" matters most
+    // exactly then.
+    report.snapshot_age_s = crate::store::snapshot::age_seconds(paths.root());
     // The probe must not create the file, so a missing store short-circuits before any open.
     if !paths.db().exists() {
         report.reason = Some("store missing".to_string());

@@ -135,6 +135,17 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute("DROP TABLE memory_version", []).unwrap();
     // ...and predates claims (0012), for the same reason.
     conn.execute("DROP TABLE claim", []).unwrap();
+    // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
+    // migrations add, or the migration collides with a table that never went away.
+    conn.execute("DROP TABLE mail", []).unwrap();
+    // ...and predates PROVENANCE (0014): undo its columns, index first — SQLite refuses to drop an
+    // indexed column.
+    conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN origin", [])
+        .unwrap();
     // ...and it still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
@@ -201,6 +212,16 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute("DROP TABLE memory_version", []).unwrap();
     // ...and predates claims (0012), for the same reason.
     conn.execute("DROP TABLE claim", []).unwrap();
+    // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
+    // migrations add, or the migration collides with a table that never went away.
+    conn.execute("DROP TABLE mail", []).unwrap();
+    // ...and predates PROVENANCE (0014), for the same reason.
+    conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN asserted_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN origin", [])
+        .unwrap();
     // ...and still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
@@ -317,31 +338,10 @@ fn key_is_unique() {
     );
 }
 
-/// A store whose schema version is MISSING from this binary's list must REFUSE to open, and no
-/// override may soften it.
-///
-/// The failure this exists for: `user_version` is a bare counter and the runner treats `v <= current`
-/// as "already applied", so a migration numbered below the store's version never runs. The signature
-/// is a version the binary does not know. That is the *skipped migration* case — distinct from a
-/// rollback, and refused unconditionally.
-#[test]
-fn a_store_with_a_skipped_migration_is_refused_with_no_override() {
-    let (_dir, paths) = temp_store();
-    {
-        let conn = db::open(&paths).unwrap();
-        // A version below the binary's highest, but not one it knows: a hole in the list.
-        conn.pragma_update(None, "user_version", 14).unwrap();
-    }
-    for allow_ahead in [false, true] {
-        let err = migrate::run_with(&Connection::open(paths.db()).unwrap(), allow_ahead)
-            .expect_err("a hole in the migration list must be refused, override or not");
-        let text = format!("{err}");
-        assert!(
-            text.contains("skipped") && text.contains("no override"),
-            "the refusal must say what it is and that it cannot be stepped over: {text}"
-        );
-    }
-}
+// The skipped-migration (hole in the list) case is unit-tested in `src/db/migrate.rs`, because a
+// store at a version *below* the binary's highest and *unknown to it* cannot be built against a
+// contiguous list: with 1..15 present, every lower version is known. The synthetic-list test is the
+// honest way to exercise it.
 
 /// The opposite state: the STORE IS NEWER than this binary, which is what a rollback looks like.
 /// Refusing here would make a bad deploy unrecoverable, so it is allowed — but only deliberately.

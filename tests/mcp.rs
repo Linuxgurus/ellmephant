@@ -79,7 +79,7 @@ fn text(result: &CallToolResult) -> String {
 #[tokio::test]
 async fn tools_round_trip_over_the_transport() {
     let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move {
@@ -417,7 +417,13 @@ async fn tools_round_trip_over_http() {
         std::sync::Arc::new(ellmephant::http::LockWatch::new()),
         std::time::Instant::now(),
     );
-    let app = http_router(MemoryServer::new(session(dir.path())), "127.0.0.1", state);
+    // This router is driven in-process with no headers, so the server declares its pen (anonymous
+    // writes are refused by design). The header -> identity path is covered by the provenance tests.
+    let app = http_router(
+        MemoryServer::new(session(dir.path())).with_identity("tester"),
+        "127.0.0.1",
+        state,
+    );
 
     // initialize issues a session id.
     let (status, session, body) = post(
@@ -485,7 +491,7 @@ async fn tools_round_trip_over_http() {
 async fn search_filters_round_trip() {
     // `memory_search` filters on tags and size, intersecting; a lean reply is still key-only.
     let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move {
         server
@@ -531,7 +537,7 @@ async fn search_filters_round_trip() {
 #[tokio::test]
 async fn projects_round_trip_over_the_transport() {
     let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move {
@@ -734,7 +740,7 @@ async fn projects_round_trip_over_the_transport() {
 #[tokio::test]
 async fn upsert_patches_one_field_over_the_transport() {
     let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move {
@@ -852,7 +858,7 @@ async fn upsert_patches_one_field_over_the_transport() {
 async fn dupes_and_reembed_round_trip_over_the_transport() {
     // The two tools that were wired but never called by a test.
     let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move {
@@ -931,7 +937,7 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
 #[tokio::test]
 async fn project_get_on_a_missing_key_is_a_tool_error() {
     let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path()));
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move {

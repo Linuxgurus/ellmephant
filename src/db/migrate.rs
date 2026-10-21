@@ -71,6 +71,16 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         "claims: an atomic lease over a name",
     ),
     (
+        13,
+        include_str!("../../migrations/0013_mail.sql"),
+        "mail: addressed rows, read by the recipient's cursor",
+    ),
+    (
+        14,
+        include_str!("../../migrations/0014_provenance.sql"),
+        "provenance: asserted_by (stamped by the store) + origin (declared by the caller)",
+    ),
+    (
         15,
         include_str!("../../migrations/0015_multi_kind_queue.sql"),
         "the queue keys on a keyslug and carries the rendered text: no hash, no kind column, no retries",
@@ -87,8 +97,9 @@ pub fn latest() -> i32 {
     MIGRATIONS.iter().map(|(v, _, _)| *v).max().unwrap_or(0)
 }
 
-fn known_version(current: i32) -> bool {
-    MIGRATIONS.iter().any(|(v, _, _)| *v == current)
+/// Every version this binary knows, in order.
+fn versions() -> Vec<i32> {
+    MIGRATIONS.iter().map(|(v, _, _)| *v).collect()
 }
 
 /// The escape hatch for a ROLLBACK, and only for a rollback.
@@ -118,34 +129,7 @@ pub fn run(conn: &Connection) -> Result<()> {
 ///   which is the silent no-op this whole check exists to end.
 pub fn run_with(conn: &Connection, allow_ahead: bool) -> Result<()> {
     let mut current = version(conn)?;
-    let known = latest();
-    if current != 0 && current > known {
-        if !allow_ahead {
-            return Err(crate::error::Error::Config(format!(
-                "STORE IS NEWER THAN THIS BINARY: the store is at schema v{current} and this binary \
-                 knows up to v{known}. That is what a rollback looks like. Refusing to read a schema \
-                 it cannot honour; if this is deliberate, set {ALLOW_STORE_AHEAD}=1 and it will \
-                 proceed with a loud warning."
-            )));
-        }
-        tracing::warn!(
-            store = current,
-            binary = known,
-            "proceeding on a store NEWER than this binary: a rollback is in progress, and any \
-             migration this binary is missing has NOT been undone"
-        );
-    } else if current != 0 && !known_version(current) {
-        return Err(crate::error::Error::Config(format!(
-            "the store is at schema v{current}, which is MISSING from this binary's migration list \
-             (it knows {}). A migration was skipped and never applied. This is refused with no \
-             override: proceeding would read a schema this binary believes it created.",
-            MIGRATIONS
-                .iter()
-                .map(|(v, _, _)| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        )));
-    }
+    check_version(current, &versions(), allow_ahead)?;
     for (version, sql, _label) in MIGRATIONS {
         if *version <= current {
             continue;
@@ -157,4 +141,84 @@ pub fn run_with(conn: &Connection, allow_ahead: bool) -> Result<()> {
         current = *version;
     }
     Ok(())
+}
+
+/// The decision, split from the loop so both sides can be tested against a synthetic version list.
+///
+/// Two states look identical from a bare counter and must not be treated alike — see [`run_with`].
+fn check_version(current: i32, known: &[i32], allow_ahead: bool) -> Result<()> {
+    if current == 0 {
+        return Ok(());
+    }
+    let max = known.iter().copied().max().unwrap_or(0);
+    if current > max {
+        if !allow_ahead {
+            return Err(crate::error::Error::Config(format!(
+                "STORE IS NEWER THAN THIS BINARY: the store is at schema v{current} and this binary \
+                 knows up to v{max}. That is what a rollback looks like. Refusing to read a schema \
+                 it cannot honour; if this is deliberate, set {ALLOW_STORE_AHEAD}=1 and it will \
+                 proceed with a loud warning."
+            )));
+        }
+        tracing::warn!(
+            store = current,
+            binary = max,
+            "proceeding on a store NEWER than this binary: a rollback is in progress, and any \
+             migration this binary is missing has NOT been undone"
+        );
+    } else if !known.contains(&current) {
+        return Err(crate::error::Error::Config(format!(
+            "the store is at schema v{current}, which is MISSING from this binary's migration list \
+             (it knows {}). A migration was skipped and never applied. This is refused with no \
+             override: proceeding would read a schema this binary believes it created.",
+            known
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A list with a HOLE in it: 3 was never applied, so a store at 3 is a skipped migration.
+    /// This is the case the real list cannot express while it is contiguous — which is exactly why the
+    /// decision is a function of the list rather than of the compiled one.
+    #[test]
+    fn a_hole_in_the_list_is_refused_even_with_the_rollback_override() {
+        let holey = [1, 2, 4];
+        for allow in [false, true] {
+            let err = check_version(3, &holey, allow)
+                .expect_err("a skipped migration must be refused, override or not");
+            let text = format!("{err}");
+            assert!(
+                text.contains("MISSING") && text.contains("no override"),
+                "{text}"
+            );
+        }
+        // A version the list DOES contain is fine, and so is a fresh store.
+        assert!(check_version(4, &holey, false).is_ok());
+        assert!(check_version(0, &holey, false).is_ok());
+    }
+
+    /// The store being AHEAD of the binary is a rollback, not a bug, and a bad deploy must stay
+    /// recoverable — but only by an act, never by default.
+    #[test]
+    fn a_store_ahead_is_refused_by_default_and_allowed_by_an_act() {
+        let holey = [1, 2, 4];
+        let err = check_version(9, &holey, false).expect_err("refused by default");
+        let text = format!("{err}");
+        assert!(
+            text.contains("NEWER") && text.contains(ALLOW_STORE_AHEAD),
+            "{text}"
+        );
+        assert!(
+            check_version(9, &holey, true).is_ok(),
+            "the override proceeds"
+        );
+    }
 }

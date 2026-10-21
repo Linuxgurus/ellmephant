@@ -39,6 +39,11 @@ pub struct Route {
 /// are surfaces of their own, not tools, so they are absent by design).
 pub const ROUTES: &[Route] = &[
     Route {
+        method: "GET",
+        path: "/whoami",
+        tool: "whoami",
+    },
+    Route {
         method: "POST",
         path: "/memory",
         tool: "memory_upsert",
@@ -122,6 +127,26 @@ pub const ROUTES: &[Route] = &[
         method: "GET",
         path: "/claim",
         tool: "claim_list",
+    },
+    Route {
+        method: "POST",
+        path: "/mail",
+        tool: "mail_send",
+    },
+    Route {
+        method: "GET",
+        path: "/mail",
+        tool: "mail_inbox",
+    },
+    Route {
+        method: "GET",
+        path: "/mail/{seq}",
+        tool: "mail_read",
+    },
+    Route {
+        method: "POST",
+        path: "/mail/prune",
+        tool: "mail_prune",
     },
 ];
 
@@ -350,6 +375,7 @@ struct FrontMatter {
     title: Option<String>,
     tags: Option<Vec<String>>,
     source: Option<String>,
+    origin: Option<String>,
     version_note: Option<String>,
     body: String,
 }
@@ -384,6 +410,7 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
             "Key" => out.key = Some(value.to_string()),
             "Title" => out.title = Some(value.to_string()),
             "Source" => out.source = Some(value.to_string()),
+            "Origin" => out.origin = Some(value.to_string()),
             "Note" => out.version_note = Some(value.to_string()),
             "Tags" => {
                 out.tags = Some(
@@ -412,8 +439,12 @@ fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
         title: fm.title,
         body: Some(fm.body),
         source: fm.source,
+        // A text body carries no speaker: the handler stamps `asserted_by` from the request.
+        asserted_by: None,
+        origin: fm.origin,
         tags: fm.tags,
         version_note: fm.version_note,
+        expected_version: None,
     })
 }
 
@@ -424,8 +455,11 @@ struct MemoryJson {
     title: Option<String>,
     body: Option<String>,
     source: Option<String>,
+    origin: Option<String>,
     tags: Option<Vec<String>>,
     version_note: Option<String>,
+    /// The CAS token, as `memory_get` returns it.
+    expected_version: Option<i64>,
 }
 
 /// A `memory_upsert` patch from a JSON body.
@@ -436,8 +470,11 @@ fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
         title: m.title,
         body: m.body,
         source: m.source,
+        asserted_by: None,
+        origin: m.origin,
         tags: m.tags,
         version_note: m.version_note,
+        expected_version: m.expected_version,
     })
 }
 
@@ -531,6 +568,43 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| format!("bad json body: {e}"))
+}
+
+/// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
+/// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
+/// same question the model asks instead of guessing from a remembered flag.
+pub async fn whoami(headers: HeaderMap) -> Response {
+    let (doc, text) = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => {
+            let text = format!("{name} (proven)\n");
+            (
+                serde_json::json!({ "asserted_by": name, "proven": true }),
+                text,
+            )
+        }
+        Ok(None) => (
+            serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false }),
+            format!("{} (not proven)\n", crate::identity::ANONYMOUS),
+        ),
+        // A claim that failed verification is still worth reporting: the caller learns the name it
+        // sent is not the name it has. The secret is never echoed.
+        Err(forged) => {
+            let claimed = forged.0;
+            (
+                serde_json::json!({
+                    "asserted_by": crate::identity::ANONYMOUS,
+                    "proven": false,
+                    "claimed": claimed,
+                    "problem": "the X-Stet-Auth proof is missing or wrong",
+                }),
+                format!(
+                    "{} (not proven; claimed `{claimed}`)\n",
+                    crate::identity::ANONYMOUS
+                ),
+            )
+        }
+    };
+    render(StatusCode::OK, true, doc.to_string(), text)
 }
 
 /// `GET /stats` — the whole-store digest (`memory_stats`).
@@ -2049,4 +2123,168 @@ fn boot_json(view: &BootView, tools: Option<&[BootTool]>) -> serde_json::Value {
         doc["tools"] = serde_json::Value::Array(tools);
     }
     doc
+}
+
+/// `POST /mail` — write one letter (`mail_send`). JSON body; nothing is delivered.
+pub async fn mail_send(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let (Some(sender), Some(recipient), Some(letter)) =
+        (field("sender"), field("recipient"), field("body"))
+    else {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`sender`, `recipient` and `body` are required",
+        );
+    };
+    let subject = field("subject").unwrap_or_default();
+    let encoding = field("encoding").unwrap_or_else(|| "text".to_string());
+    let to = recipient.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("mail_send", move |s| {
+            s.mail_send(&sender, &recipient, &subject, &letter, &encoding)
+        })
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, seq = out.seq, to = %to, "letter over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                format!("letter {} written to `{to}`", out.seq),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `GET /mail?recipient=&since=&limit=` — envelopes after the reader's cursor (`mail_inbox`).
+pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let Some(recipient) = params.maybe("recipient").map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`recipient` is required");
+    };
+    let since = params
+        .maybe("since")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit = params
+        .maybe("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_usize);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("mail_inbox", move |s| {
+            s.mail_inbox(&recipient, since, limit)
+        })
+        .await
+    {
+        Ok(rows) => {
+            let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
+            let text = if rows.is_empty() {
+                format!("no mail after {since}")
+            } else {
+                rows.iter()
+                    .map(|r| {
+                        format!(
+                            "{} {} {} ({} · {} bytes)",
+                            r.seq, r.at, r.sender, r.subject, r.bytes
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "letters": rows, "max_seq": max_seq }).to_string(),
+                text,
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `GET /mail/{seq}` — one letter, body included (`mail_read`).
+pub async fn mail_read(
+    State(state): State<HttpState>,
+    axum::extract::Path(seq): axum::extract::Path<i64>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("mail_read", move |s| s.mail_read(seq))
+        .await
+    {
+        Ok(Some(letter)) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&letter).unwrap_or_default(),
+            letter.body.clone(),
+        ),
+        Ok(None) => error(json, StatusCode::NOT_FOUND, "no such letter"),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `POST /mail/prune?keep_days=7` — drop letters nobody ever read (`mail_prune`).
+pub async fn mail_prune(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let keep_days = params
+        .maybe("keep_days")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14_i64);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("mail_prune", move |s| s.mail_prune(keep_days))
+        .await
+    {
+        Ok(removed) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "removed": removed }).to_string(),
+            format!("pruned {removed} letter(s) older than {keep_days}d"),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
 }

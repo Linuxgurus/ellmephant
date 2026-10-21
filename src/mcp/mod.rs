@@ -41,6 +41,7 @@ use crate::store::{self, project};
 
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
+    "whoami",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -58,6 +59,10 @@ pub const TOOLS: &[&str] = &[
     "claim_acquire",
     "claim_release",
     "claim_list",
+    "mail_send",
+    "mail_inbox",
+    "mail_read",
+    "mail_prune",
 ];
 
 /// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
@@ -277,6 +282,12 @@ pub struct UpsertParams {
         description = "Proof stone: command/path/repo that derive this. Never live state. Omit to keep it; an empty string clears it."
     )]
     pub source: Option<String>,
+    /// Where the information came from, when it is not the speaker.
+    #[serde(default)]
+    #[schemars(
+        description = "Where this came from, when it is NOT you: a URL, a file, a command, `my inference`. Recorded BESIDE the store-stamped `asserted_by` (who spoke), so relaying a fact never makes you its source. Omit when you are the origin."
+    )]
+    pub origin: Option<String>,
     /// Aspect tags.
     #[serde(default)]
     #[schemars(
@@ -289,6 +300,12 @@ pub struct UpsertParams {
         description = "Why THIS change — recorded beside the version this write creates, so a later reader (`memory_history`) learns the intent instead of reconstructing it. Only a change to `title`/`body` creates a version; a note alone does not."
     )]
     pub version_note: Option<String>,
+    /// The CAS token: the `version` a `memory_get` returned.
+    #[serde(default)]
+    #[schemars(
+        description = "Write only if the memory is STILL at this `version` (the field `memory_get` returns). A mismatch writes nothing and returns `status: conflict` with the current version — the safe way to read-modify-write (a bank balance, a counter). `0` means 'this key does not exist yet'. Omit for last-write-wins."
+    )]
+    pub expected_version: Option<i64>,
 }
 
 impl UpsertParams {
@@ -299,8 +316,13 @@ impl UpsertParams {
             title: self.title,
             body: self.body,
             source: self.source,
+            // Stamped by the caller of `into_patch` from the connection's PROVEN identity — the
+            // request payload cannot set it, because `asserted_by` is not a param.
+            asserted_by: None,
+            origin: self.origin,
             tags: self.tags,
             version_note: self.version_note,
+            expected_version: self.expected_version,
         }
     }
 }
@@ -550,6 +572,78 @@ pub struct ClaimListParams {
     pub name: Option<String>,
 }
 
+/// Parameters for [`MemoryServer::mail_send`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailSendParams {
+    /// Who is writing.
+    #[schemars(
+        description = "Who is writing: `stet` for the self, or `stet/finger-<id>` for one of its fingers. ASSERTED by the caller, not authenticated by the store."
+    )]
+    pub sender: String,
+    /// The self the letter is addressed to.
+    #[schemars(
+        description = "The SELF the letter is addressed to (`stet`, `twine`). Never a finger: a finger is how a self ANSWERS mail, not who receives it."
+    )]
+    pub recipient: String,
+    /// One line.
+    #[serde(default)]
+    #[schemars(description = "One line, so an inbox can be scanned without fetching bodies.")]
+    pub subject: Option<String>,
+    /// The letter itself.
+    #[schemars(
+        description = "The letter. Free text — no verbs, no priority, no task fields. If you want something done, ASK, and let the reader decide."
+    )]
+    pub body: String,
+    /// How to read the body.
+    #[serde(default)]
+    #[schemars(
+        description = "How the body is encoded: `text` (default), `json`, `gzip+base64`. Declared so the reader does not spend a finger decoding gibberish."
+    )]
+    pub encoding: Option<String>,
+}
+
+/// Parameters for [`MemoryServer::mail_inbox`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailInboxParams {
+    /// Whose box to read.
+    #[schemars(description = "Whose box: the self whose mail this is (`stet`, `twine`).")]
+    pub recipient: String,
+    /// The reader's cursor.
+    #[serde(default)]
+    #[schemars(
+        description = "Your cursor: the highest `seq` you have already dealt with (0 for everything). Keep it in YOUR store as `mail-last-read` and advance it only AFTER handling the letters — the advance is the commit."
+    )]
+    pub since: Option<i64>,
+    /// Long-poll.
+    #[serde(default)]
+    #[schemars(
+        description = "Block up to this many seconds (max 25) and return the moment a letter lands. This is how a hand waits for mail without polling; omit it to check and return immediately."
+    )]
+    pub wait_seconds: Option<u64>,
+    /// Page size.
+    #[serde(default)]
+    #[schemars(description = "Most envelopes to return (default 50, max 500).")]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for [`MemoryServer::mail_read`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailReadParams {
+    /// Which letter.
+    #[schemars(description = "The `seq` from `mail_inbox`.")]
+    pub seq: i64,
+}
+
+/// Parameters for [`MemoryServer::mail_prune`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailPruneParams {
+    /// Retention window.
+    #[schemars(
+        description = "Delete letters older than this many days. ★ Letters expire because they are kept for a reader, not for the truth; memories have no such path."
+    )]
+    pub keep_days: i64,
+}
+
 /// Parameters for [`MemoryServer::memory_dupes`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DupesParams {
@@ -681,6 +775,43 @@ pub struct ProjectListParams {
     pub mode: Option<MatchModeParam>,
 }
 
+/// The caller's PROVEN identity, read from the HTTP request that carried this call.
+///
+/// `Ok(None)` means nothing was claimed — a stdio transport has no HTTP request, and a client that
+/// sends no headers has claimed nothing. `Err` means a name was claimed and could not be proved, and
+/// it is REFUSED rather than downgraded to `anonymous`: an unproven name is a lie with a signature.
+fn identity_of(
+    ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+) -> Result<Option<String>, crate::identity::Forged> {
+    let Some(parts) = ctx.extensions.get::<axum::http::request::Parts>() else {
+        return Ok(None);
+    };
+    crate::identity::resolve(&parts.headers)
+}
+
+/// ★ A WRITE REQUIRES A PEN. Reads are open to anyone; a write with NO proven identity is REFUSED,
+/// not stamped `anonymous`. Anonymous is an honest answer to "who spoke", but the store has no
+/// reason to accept an unsigned hand: an anonymous write is indistinguishable from one nobody meant,
+/// and it cannot be held to anything. Every refusal costs one header pair to fix; `whoami` says what
+/// this connection currently is.
+fn pen_name(
+    ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    declared: Option<&str>,
+) -> std::result::Result<String, String> {
+    match identity_of(ctx) {
+        Ok(Some(name)) => Ok(name),
+        // ★ A TRANSPORT WITH NO REQUEST MAY DECLARE ITS PEN ONCE, at construction: a stdio or
+        // in-process server is started BY a process and is as trusted as that process. HTTP
+        // transports ignore this — their headers decide, and an unproven header is still refused.
+        Ok(None) => match declared {
+            Some(name) => Ok(name.to_string()),
+            None => Err("refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is."
+                .to_string()),
+        },
+        Err(forged) => Err(forged.to_string()),
+    }
+}
+
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
 #[derive(Clone)]
@@ -693,6 +824,27 @@ pub struct MemoryServer {
     paths: crate::config::Paths,
     cfg: crate::config::Config,
     encoder: Arc<super::cli::session::Encoder>,
+    /// ★ A DECLARED PEN, for transports that carry no HTTP request (stdio, in-process). A server
+    /// started BY a process is as trusted as that process, so it may say who it is once, at
+    /// construction; every write it makes is stamped with that name instead of being refused as
+    /// anonymous. HTTP transports ignore this — their headers decide.
+    declared: Option<String>,
+    /// ★ WHO MAY READ WHOSE MAIL, stated out loud: `(from, to)` pairs from
+    /// `ELLMEPHANT_MAIL_SURROGATES=hands=stet`. The hand that serves `stet` authenticates as `hands`,
+    /// so without a declared surrogate the recipient-only rule would lock my own hand out of the
+    /// mail it exists to read. Every exception is written here instead of being implied.
+    surrogates: Vec<(String, String)>,
+}
+
+/// Parse `a=b,c=d` into pairs. Blank or malformed entries are dropped rather than guessed at.
+fn parse_surrogates(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (from, to) = pair.split_once('=')?;
+            let (from, to) = (from.trim(), to.trim());
+            (!from.is_empty() && !to.is_empty()).then(|| (from.to_string(), to.to_string()))
+        })
+        .collect()
 }
 
 impl MemoryServer {
@@ -720,7 +872,41 @@ impl MemoryServer {
             paths,
             cfg,
             encoder,
+            declared: None,
+            surrogates: parse_surrogates(
+                &std::env::var("ELLMEPHANT_MAIL_SURROGATES").unwrap_or_default(),
+            ),
         }
+    }
+
+    /// ★ ONLY THE RECIPIENT READS ITS MAIL. `mail_inbox` takes a recipient as an argument, so without
+    /// this any caller could read any box. A proven identity reads its own box, or a box an explicit
+    /// surrogate map hands it; anonymous is refused before the box is even considered.
+    fn mail_box_for(
+        &self,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        requested: &str,
+    ) -> std::result::Result<String, String> {
+        let who = pen_name(ctx, self.declared.as_deref())?;
+        if who.eq_ignore_ascii_case(requested) {
+            return Ok(who);
+        }
+        let allowed = self.surrogates.iter().any(|(from, to)| {
+            from.eq_ignore_ascii_case(&who) && to.eq_ignore_ascii_case(requested)
+        });
+        if allowed {
+            return Ok(who);
+        }
+        Err(format!(
+            "refused: `{who}` may not read `{requested}`'s mail — only the recipient, or a declared surrogate, may"
+        ))
+    }
+
+    /// Declare the pen for a transport with no HTTP request (stdio / in-process). Writes are then
+    /// stamped with this name; without it they are REFUSED, because anonymous is read-only.
+    pub fn with_identity(mut self, name: impl Into<String>) -> Self {
+        self.declared = Some(name.into());
+        self
     }
 
     /// The writer witness this server marks while a tool holds the store lock.
@@ -1122,6 +1308,39 @@ pub(crate) async fn upvote_sweep(
 
 #[tool_router]
 impl MemoryServer {
+    /// WHO this connection speaks for — the name a write would be stamped with, and whether it was
+    /// PROVEN. A read: it changes nothing, and it never returns the secret.
+    #[tool(
+        name = "whoami",
+        description = "Report the identity this connection writes as: `asserted_by` (the `sender`/author a write is stamped with) and `proven` (true when `X-Stet-From` was matched against `X-Stet-Auth`). `proven: false` with `asserted_by: anonymous` means the connection presents no identity, so every write will be REFUSED (reads need no identity). Use this instead of guessing, and never to test credentials — it does not echo them.",
+        annotations(
+            title = "Who am I",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn whoami(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let body = match identity_of(&ctx) {
+            Ok(Some(name)) => serde_json::json!({ "asserted_by": name, "proven": true }),
+            Ok(None) => {
+                serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false })
+            }
+            // A claim that did not verify still deserves an answer: the caller learns the name it
+            // sent is not the name it has, which is the whole confusion this tool exists to end.
+            Err(forged) => serde_json::json!({
+                "asserted_by": crate::identity::ANONYMOUS,
+                "proven": false,
+                "claimed": forged.0,
+                "problem": "the X-Stet-Auth proof is missing or wrong",
+            }),
+        };
+        Ok(json_ok(body))
+    }
+
     /// Store one atomic memory; upserts by key. See the description for the write law.
     #[tool(
         name = "memory_upsert",
@@ -1136,9 +1355,14 @@ impl MemoryServer {
     )]
     async fn memory_upsert(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
-        let patch = p.into_patch();
+        let mut patch = p.into_patch();
+        // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
+        // rather than silently becoming `anonymous`, because a lie with a signature is worse than
+        // no signature at all.
+        patch.asserted_by = Some(pen_name(&ctx, self.declared.as_deref())?);
         let outcome = self
             .with_store("memory_upsert", move |s| s.memory_merge(&patch))
             .await?;
@@ -1147,8 +1371,19 @@ impl MemoryServer {
             key = %outcome.key,
             created = outcome.created,
             queued = outcome.queued,
+            conflict = ?outcome.conflict,
             "memory stored"
         );
+        // ★ A CONFLICT IS A RESULT, NOT AN ERROR: the caller asked "write if unchanged", the answer is
+        // "it changed", and the current version is what it needs to retry. Reporting it as a tool
+        // error would make a retry look like a failure of the store.
+        if let Some(current) = outcome.conflict {
+            return Ok(json_ok(serde_json::json!({
+                "status": "conflict",
+                "key": outcome.key,
+                "current_version": current,
+            })));
+        }
         Ok(json_ok(serde_json::json!({
             "status": if outcome.created { "created" } else { "updated" },
             "key": outcome.key,
@@ -1170,8 +1405,10 @@ impl MemoryServer {
     )]
     async fn memory_delete(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
@@ -1213,8 +1450,10 @@ impl MemoryServer {
     )]
     async fn memory_merge(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
@@ -1417,8 +1656,10 @@ impl MemoryServer {
     )]
     async fn memory_upvote(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         upvote_sweep(self, p.keys).await
     }
 
@@ -1516,8 +1757,10 @@ impl MemoryServer {
     )]
     async fn memory_reembed(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reembed", move |s| s.reembed())
             .await?;
@@ -1553,8 +1796,10 @@ impl MemoryServer {
     )]
     async fn project_upsert(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| s.project_merge(&patch))
@@ -1636,7 +1881,7 @@ impl MemoryServer {
     /// Take or renew an atomic lease over a name — the cross-machine claim.
     #[tool(
         name = "claim_acquire",
-        description = "Take (or renew) an atomic LEASE over a `name`. This is coordination between TWO writers to one store — the store versions but does not transact, so a bank `debit` (or any read-modify-write) can be lost when two writers interleave. The store owns this primitive because acquiring a client-side lease is itself a read-modify-write, and clocks cannot order the tie-break (two hands skew hours). ONE statement decides and writes: it succeeds when the name is free or the lease has EXPIRED, and is REFUSED while a DIFFERENT owner holds a live lease. The SAME owner re-acquiring is a renewal, not a conflict. Returns `won` and the holder NOW — on a loss, `claim` names who holds it and until when. Hold it only around the critical section (claim → act and debit → `claim_release`), and pass a `ttl_seconds` that outlives the work but not the buyer: a crashed holder EXPIRES out of the way on its own. Not security — both writers are the same self; coordination only.",
+        description = "Take (or renew) an atomic LEASE over a `name`. This is coordination between TWO writers to one store — the store versions but does not transact, so a bank `debit` (or any read-modify-write) can be lost when two writers interleave. The store owns this primitive because acquiring a client-side lease is itself a read-modify-write, and clocks cannot order the tie-break (two hands skew hours). ONE statement decides and writes: it succeeds when the name is free or the lease has EXPIRED, and is REFUSED while a DIFFERENT owner holds a live lease. The SAME owner re-acquiring is a renewal, not a conflict — names and owners are case-insensitive (`Hand-A` renews `hand-a`), and a renewal keeps the FIRST `acquired_at`. Returns `won` and the holder NOW — on a loss, `claim` names who holds it and until when. Hold it only around the critical section (claim → act and debit → `claim_release`), and pass a `ttl_seconds` that outlives the work but not the buyer: a crashed holder EXPIRES out of the way on its own. Not security — both writers are the same self; coordination only.",
         annotations(
             title = "Acquire claim",
             read_only_hint = false,
@@ -1647,6 +1892,7 @@ impl MemoryServer {
     )]
     async fn claim_acquire(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimAcquireParams>,
     ) -> std::result::Result<String, String> {
         let ClaimAcquireParams {
@@ -1654,6 +1900,14 @@ impl MemoryServer {
             owner,
             ttl_seconds,
         } = p;
+        // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
+        // terminal, never a browser chat. Without it, this stays open exactly as it was.
+        let proven = pen_name(&ctx, self.declared.as_deref())?;
+        crate::identity::may_lease(Some(&proven))?;
+        // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
+        // someone else's name; an unproven caller's assertion stands, as before.
+        let _asserted_owner = owner; // the pen decides; the argument is history
+        let owner = proven;
         let out = self
             .with_store("claim_acquire", move |s| {
                 s.claim_acquire(&name, &owner, ttl_seconds)
@@ -1683,8 +1937,10 @@ impl MemoryServer {
     )]
     async fn claim_release(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimReleaseParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let ClaimReleaseParams { name, owner } = p;
         let log_name = name.clone();
         let log_owner = owner.clone();
@@ -1724,6 +1980,168 @@ impl MemoryServer {
             .await?;
         tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
         serde_json::to_string(&serde_json::json!({ "claims": rows })).map_err(|e| e.to_string())
+    }
+
+    /// Write one letter into a self's box.
+    #[tool(
+        name = "mail_send",
+        description = "Write ONE letter into another self's box. This is a MAILBOX, not a message bus: the row is the whole event — nothing is delivered, no door is rung, and the sender NEVER learns whether it was read. ★ A letter is a CLAIM, NOT AN ORDER: it may be ignored, and there is deliberately no priority field and no verb in the schema — if you want something done, ASK in prose and let the reader decide. Address a SELF (`stet`, `twine`); a finger answers mail, it never receives it. Bodies may be large but stay under 1 MiB — put a real artifact in object storage and send a link plus a checksum. Returns the letter's `seq`, which the reader uses as its cursor.",
+        annotations(
+            title = "Send mail",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_send(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailSendParams>,
+    ) -> std::result::Result<String, String> {
+        let MailSendParams {
+            sender,
+            recipient,
+            subject,
+            body,
+            encoding,
+        } = p;
+        // A PROVEN identity outranks the argument. `sender` is asserted text — the one field a chat
+        // could use to speak as someone else — so the header pair, when it verifies, decides it.
+        let _asserted_sender = sender; // the argument is history; the pen decides
+        let sender = pen_name(&ctx, self.declared.as_deref())?;
+        let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
+        let out = self
+            .with_store("mail_send", move |s| {
+                s.mail_send(
+                    &sender,
+                    &recipient,
+                    subject.as_deref().unwrap_or(""),
+                    &body,
+                    encoding.as_deref().unwrap_or("text"),
+                )
+            })
+            .await?;
+        tracing::info!(
+            tool = "mail_send",
+            sender = %log_sender,
+            recipient = %log_recipient,
+            seq = out.seq,
+            bytes = out.bytes,
+            "letter written"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// What is in a box after a cursor. Bodies omitted; `wait_seconds` long-polls.
+    #[tool(
+        name = "mail_inbox",
+        description = "What is in `recipient`'s box AFTER `since` — envelopes only (seq, at, sender, subject, encoding, bytes), oldest first, bodies omitted so you can decide whether a body is worth fetching (`mail_read`). ★ `since` is your own cursor: keep it in YOUR store as `mail-last-read` and advance it ONLY after you have dealt with the letters — the advance is the commit, so a processor that dies first leaves them unread and sees them again. `wait_seconds` LONG-POLLS: the call blocks up to 25s and returns the moment a letter lands, which is how a hand waits for mail without polling. No receipt is ever sent to the sender.",
+        annotations(
+            title = "Read inbox",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_inbox(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailInboxParams>,
+    ) -> std::result::Result<String, String> {
+        let MailInboxParams {
+            recipient,
+            since,
+            wait_seconds,
+            limit,
+        } = p;
+        // ★ THE BOX IS CHECKED BEFORE THE LONG POLL: waiting 25 seconds to be told you may not read
+        // it is a worse answer than being told now.
+        self.mail_box_for(&ctx, &recipient)?;
+        let since = since.unwrap_or(0);
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let wait = wait_seconds
+            .unwrap_or(0)
+            .min(crate::store::mail::MAX_WAIT_SECONDS);
+
+        // ★ THE LONG POLL IS THE RECIPIENT'S OWN: the reader holds the connection open and nobody
+        // pushes into its room. That keeps "a letter is a claim" true at the transport level too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+        loop {
+            let who = recipient.clone();
+            let rows = self
+                .with_read("mail_inbox", move |s| s.mail_inbox(&who, since, limit))
+                .await?;
+            if !rows.is_empty() || std::time::Instant::now() >= deadline {
+                let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
+                return serde_json::to_string(&serde_json::json!({
+                    "letters": rows,
+                    "max_seq": max_seq,
+                    "waited": wait > 0 && rows.is_empty(),
+                }))
+                .map_err(|e| e.to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// One letter, body included.
+    #[tool(
+        name = "mail_read",
+        description = "Fetch ONE letter whole, body included, by `seq`. Read the envelope in `mail_inbox` first: `bytes` and `encoding` are there so you can decide whether the body is worth the context, and how to interpret it (`text`, `json`, `gzip+base64`). `none` means that seq is gone — pruned, or never written; letters expire, memories do not.",
+        annotations(
+            title = "Read letter",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_read(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailReadParams>,
+    ) -> std::result::Result<String, String> {
+        let seq = p.seq;
+        let found = self
+            .with_read("mail_read", move |s| s.mail_read(seq))
+            .await?;
+        // ★ A LETTER IS PRIVATE CORRESPONDENCE: the box it is addressed to decides who may read it,
+        // and the check happens on the LETTER, not on an argument the caller chose.
+        if let Some(letter) = &found {
+            self.mail_box_for(&ctx, &letter.recipient)?;
+        }
+        match found {
+            Some(letter) => serde_json::to_string(&letter).map_err(|e| e.to_string()),
+            None => Ok(serde_json::json!({ "letter": null, "seq": seq }).to_string()),
+        }
+    }
+
+    /// Drop letters nobody ever read.
+    #[tool(
+        name = "mail_prune",
+        description = "Delete letters older than `keep_days`, returning how many went. ★ THIS IS WHAT MAKES A MAILBOX NOT A MEMORY STORE: a memory is kept because it is TRUE, a letter is kept because NOBODY HAS READ IT YET — so once nobody plausibly will, it should go. Memories have no such path. Run it from a bell; there is no automatic expiry.",
+        annotations(
+            title = "Prune mail",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_prune(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailPruneParams>,
+    ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let keep_days = p.keep_days;
+        let removed = self
+            .with_store("mail_prune", move |s| s.mail_prune(keep_days))
+            .await?;
+        tracing::info!(tool = "mail_prune", keep_days, removed, "letters pruned");
+        Ok(serde_json::json!({ "removed": removed, "keep_days": keep_days }).to_string())
     }
 }
 
@@ -1841,6 +2259,7 @@ pub fn http_router(
     use crate::http_surface as surface;
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
+        .route("/whoami", axum::routing::get(surface::whoami))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/history", axum::routing::get(surface::history))
@@ -1868,6 +2287,13 @@ pub fn http_router(
             "/claim/{key}/release",
             axum::routing::post(surface::claim_release),
         )
+        // The mailbox. Same rule as the tools: a letter is a claim, not an order.
+        .route(
+            "/mail",
+            axum::routing::get(surface::mail_inbox).post(surface::mail_send),
+        )
+        .route("/mail/prune", axum::routing::post(surface::mail_prune))
+        .route("/mail/{seq}", axum::routing::get(surface::mail_read))
         .route("/reembed", axum::routing::post(surface::reembed))
         // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.
         .fallback(surface::not_found)
@@ -1892,6 +2318,7 @@ async fn serve_http(
     port: u16,
     state: crate::http::HttpState,
 ) -> crate::error::Result<()> {
+    spawn_snapshotter(state.paths.clone());
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     let addr = listener.local_addr()?;
     tracing::info!(%addr, "ellmephant mcp listening on http://{addr}/mcp");
@@ -1900,6 +2327,39 @@ async fn serve_http(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Write a consistent snapshot on a timer — the QUIESCE that makes the backup trustworthy.
+///
+/// A known place to pause for a moment is worth more than a clever one: this loop is deliberately
+/// dull — open a reader, `VACUUM INTO`, rename, sleep. Its failure is logged and never fatal, because
+/// a store that cannot snapshot is still a store that serves.
+fn spawn_snapshotter(paths: crate::config::Paths) {
+    let Some(every) = crate::store::snapshot::every() else {
+        tracing::info!("snapshotter disabled (ELLMEPHANT_SNAPSHOT_HOURS=0)");
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            let root = paths.clone();
+            let done =
+                tokio::task::spawn_blocking(move || -> crate::error::Result<std::path::PathBuf> {
+                    // ★ A READER, not the writing open: a snapshot must never migrate or take the writer
+                    // lock. VACUUM INTO only READS the store and writes a new file.
+                    let conn = crate::db::open_read_only(&root)?;
+                    crate::store::snapshot::write(&conn, root.root())
+                })
+                .await;
+            match done {
+                Ok(Ok(path)) => {
+                    tracing::info!(path = %path.display(), "consistent snapshot written")
+                }
+                Ok(Err(err)) => tracing::warn!(error = %err, "snapshot failed"),
+                Err(err) => tracing::warn!(error = %err, "snapshot task failed"),
+            }
+            tokio::time::sleep(every).await;
+        }
+    });
 }
 
 /// Resolves when the process is asked to stop, so `axum` can finish open requests.

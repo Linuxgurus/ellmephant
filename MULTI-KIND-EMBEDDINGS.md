@@ -201,9 +201,10 @@ rebuild.
   missing. No cursor, no saved position, no resume logic: a crash or a restore just looks again and
   continues. The same rule repairs a torn index and catches a vector deleted by hand, so one
   mechanism replaces three.
-- **A document that can never be embedded must not become a loop.** It is queued, fails, dropped,
-  and immediately looks "missing" again. Guard: the worker skips keyslugs that failed recently, held
-  in memory only — no schema, cleared on restart.
+- **A failed embed keeps its entry; the caller steps over it.** The entry is the record that a vector
+  is owed, so removing it would hide a stale vector (see *Failure handling*). The worker holds the
+  failed keyslugs in memory and skips them, so a permanent failure becomes a backlog that does not
+  drain — visible — rather than a hot loop or a silence. In memory only, so a restart retries.
 - **A rebuild never makes a document unsearchable.** It enqueues replacements at bulk priority and
   overwrites on settle; the old vector answers until the new one lands. The single exception is a
   **dimension change**, where the old vectors are unreadable by width and the table must be recreated.
@@ -213,12 +214,39 @@ rebuild.
 - **`?wait=true`** stays: the synchronous door for a caller that needs a vector now. It is what makes
   eventual consistency safe rather than a gamble.
 
-## Failure handling
+## Failure handling — the entry stays, the caller steps over it
 
-An embed that fails: **drop the queue row** and log it (never the content — a letter's text must not
-land in a log). No `attempts`, no `last_error` — a hot retry loop spends money, and a queue holding
-failure history is a database wearing a queue's clothes. The retry mechanism is the refill rule
-above, gated by the in-memory recent-failure set.
+★ **Corrected 2026-10-21 after review (stet): an entry is KEPT when its embed fails.** Dropping it was
+wrong, and wrong in the exact way this design is supposed to abolish: **"no vector" is not "stale
+vector".** The refill rule asks whether a document *has* a vector; a document whose text moved and
+whose embed then failed has one — the previous text's — so `missing()` cannot see it. The entry was
+therefore the only record that the vector was owed, and dropping it left a stale vector with nothing
+anywhere saying so. That is the recidivism `encode_hash` used to prevent, reintroduced by deleting it.
+
+So: **nothing removes an entry except a successful settle**, and the invariant is
+**a document's vector is current iff no queue entry names it**. That is stronger than the hash it
+replaces, because it survives a torn index too — the index loses a vector, the refill rule re-names it.
+
+What stops a permanent failure from spinning: the caller keeps the failed keyslugs **in memory** and
+skips them (`next(conn, skip)` steps over them), so a restart retries at once and a hot loop is
+impossible. `attempts`/`last_error` still do not exist: the cost of a failure is a backlog that will
+not drain — which `/health` reports as an age that never resets — plus one WARN per pass. Never the
+document's content in the log; a letter's text must not land in a log.
+
+## Search: what an unfiltered query means
+
+★ Clarified 2026-10-21 after review (stet): `k` is per-partition when a `type` is given and global
+when it is not, so an unfiltered search would be **silently dominated by the largest kind** —
+memories vastly outnumber projects, and the query would become a memory search wearing a store search
+costume. The rule, stated so nobody has to infer it:
+
+- **`semantic_search(query, type)`** — that kind's `k`, that kind's distance floor.
+- **`semantic_search(query)`** — **per-kind**: the same `k` *within each kind*, each kind's own floor,
+  then merged by distance. Every kind gets asked; none can crowd another out.
+- `memory_search` remains the memory-only alias, unchanged.
+
+Cost: N queries instead of one, N being the number of kinds (2 today). Accepted, because the
+alternative is a ranking that silently stops meaning "the whole store".
 
 ## Rebuilds are additive; only a width change purges
 
@@ -264,10 +292,21 @@ deliberately refuses foreign keys ("rot is *detected* by the audit instead of ra
 error") — so the sweep is the detection half, not belt-and-braces: an orphan in the live index is
 moved to the tombstone index rather than dropped.
 
-**Purge is a retention decision, not a delete.** A kind that promises removal — `mail` above all —
-must purge its tombstone (vector, queue row, log line) instead of keeping one, because a searchable
-deleted letter is a disclosure. Tombstoning is the default; purging is the exception that a kind opts
-into when it says so.
+**Retention is declared per kind, and PURGE is the default for anything a person expects gone.**
+★ Strengthened 2026-10-21 after review (stet): *"deleted" must mean unreachable by meaning, not merely
+absent from a default view* — and disclosure is the worse failure, because an unrecoverable delete is
+visible while a disclosure is not. So:
+
+- `memory` → **tombstone**: its content may be wanted as history, and the store already refuses to
+  lose what it deletes (versions, snapshots).
+- `mail` → **purge** (vector, queue row, log line): a letter's deletion is a promise to the person,
+  not a filing decision.
+- `project` → undeclared until it has a delete path; the default until then is **purge**, because a
+  kind that has not argued for retention has not earned it.
+
+A tombstone must be unreachable by meaning through every normal path — the sibling table guarantees
+that structurally, since no default query touches it — and reachable only by asking for deleted
+results explicitly.
 
 ## What dies
 
@@ -328,6 +367,17 @@ unchanged, so nothing needs the encoder.
 No re-embedding, no hour of backfill, no window where search is wrong. The only cost is that the
 store must be **quiesced** for the duration (one write lock; the copy of ~300 vectors is
 milliseconds).
+
+★ **Take the number clash; never take a gap.** 0013 collides with the unmerged mailbox branch
+(`0013_mail.sql`); whoever lands second renumbers. Skipping to 0015 to be polite would be worse: the
+store would jump to 15 and #13/#14 would never apply, silently and permanently. A clash is visible and
+renumberable; a gap is not.
+
+★ **And make a gap loud (stet, 2026-10-21).** `user_version` is currently the only record of what ran —
+a counter with no independent check. A `schema_applied(version, label, applied_at)` table, written in
+the same transaction as each migration and backfilled for 1..12 as "assumed", lets a startup assertion
+say *"version N implies N rows, contiguous"*. Follow-up, not this work: it is migration machinery, not
+embeddings.
 
 ## API change (deliberate, not incidental)
 
@@ -400,6 +450,9 @@ an hour of background work because someone edited a format string.
 - **`tests/vec_kind_filter.rs`**: `INSERT INTO new_vec SELECT id, embedding, … FROM old_vec` copies a
   vector between vec0 tables and the copy answers a KNN at distance `0.0` — so the migration needs no
   encoder and no backfill window.
+- **`tests/`**, the failure contract: `a_failed_embed_keeps_its_entry_so_the_staleness_stays_visible`
+  pins the vector unchanged, `missing()` **empty** (so the refill cannot mask it) and the debt still
+  queued; `the_queue_steps_over_a_document_that_has_just_failed` pins that skipping removes nothing.
 - **`tests/vec_kind_filter.rs`**, tombstone move: copy to `gone` + `DELETE FROM live` leaves the live
   KNN with one hit (the survivor) and the tombstone KNN with the deleted one, `deleted_at` readable as
   an auxiliary column. So a delete can be a move, and "search the deleted" is a real query.

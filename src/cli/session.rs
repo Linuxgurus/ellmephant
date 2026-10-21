@@ -259,6 +259,32 @@ impl Session {
 
     /// Run a query, borrowing the encoder only when there is a phrase to embed. A read-only session
     /// serves the rows from its own connection, so a search does not wait for a write to finish.
+    /// Vectors held for one document type — what `semantic_search` checks before promising a type.
+    pub fn vectors_of(&self, kind: &str) -> Result<i64> {
+        crate::index::vec::count_of(&self.conn, kind)
+    }
+
+    /// Search the **tombstone** index: deleted documents, by meaning.
+    ///
+    /// A different table rather than a filtered view, which is what makes "unreachable by a normal
+    /// search" structural: no ordinary query names this table, so no hit can leak into one, and the
+    /// `k` a caller asks for is exactly the `k` they get.
+    pub fn search_deleted(
+        &self,
+        text: &str,
+        k: usize,
+        max_distance: Option<f32>,
+    ) -> Result<Vec<crate::index::vec::Tombstone>> {
+        self.encoder.with(|e| {
+            let vector = e.embed_query(text)?;
+            crate::index::vec::knn_deleted(
+                &self.conn,
+                &vector,
+                &crate::index::vec::Knn { k, max_distance },
+            )
+        })
+    }
+
     pub fn search(&self, q: &Query) -> Result<Bundle> {
         let needs_embedder = q
             .text

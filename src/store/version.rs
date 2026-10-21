@@ -13,7 +13,7 @@
 //! WHAT IS DELIBERATELY NOT STORED, none of it an oversight:
 //!   * nothing for an INSERT — nothing was replaced;
 //!   * nothing for a TAG or SOURCE write — filing is not meaning, which is exactly the
-//!     `encode_hash` predicate the write path already computes;
+//!     the title/body comparison the write path already makes;
 //!   * no vector, ever: a version is reached by ADDRESS and must be unable to be found as current;
 //!   * no cascade from `memory` (there is no FK), so history survives a delete — which makes erasure
 //!     a POLICY ([`erase`]) rather than an accident of the schema;

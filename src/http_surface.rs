@@ -18,7 +18,7 @@ use crate::db;
 use crate::http::HttpState;
 use crate::mcp::{
     DUPES_LIMIT, FieldParam, GET_NUDGE, HISTORY_LIMIT, MatchModeParam, MemoryServer, SERVER_NAME,
-    SearchParams, instructions, json_ok, tool_catalog,
+    SearchParams, SemanticSearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
 use crate::store::{self, encode, links::backlinks_to_wire_json, project, tags};
@@ -62,6 +62,11 @@ pub const ROUTES: &[Route] = &[
         method: "GET",
         path: "/search",
         tool: "memory_search",
+    },
+    Route {
+        method: "GET",
+        path: "/semantic",
+        tool: "semantic_search",
     },
     Route {
         method: "GET",
@@ -799,6 +804,50 @@ pub async fn search(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> 
         Err(r) => return r,
     };
     match server.run_search(search).await {
+        Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /semantic` — the store-wide search (`semantic_search`): an optional `type`, and
+/// `deleted=true` for the graveyard. Same body as the tool, by construction.
+pub async fn semantic_search(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let mut fields = Vec::new();
+    if let Some(raw) = params.maybe("fields") {
+        for name in raw.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            match field_param(name) {
+                Some(f) => fields.push(f),
+                None => {
+                    return error(
+                        json,
+                        StatusCode::BAD_REQUEST,
+                        format!("bad `fields`: {name}"),
+                    );
+                }
+            }
+        }
+    }
+    let p = SemanticSearchParams {
+        query: params.maybe("q").map(str::to_string),
+        kind: params.maybe("type").map(str::to_string),
+        deleted: params
+            .maybe("deleted")
+            .map(|v| matches!(v, "1" | "true" | "yes")),
+        k: params.maybe("k").and_then(|v| v.parse().ok()),
+        max_distance: params.maybe("max_distance").and_then(|v| v.parse().ok()),
+        fields,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server.run_semantic(p).await {
         Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
         Err(e) => error(json, error_status(&e), e),
     }

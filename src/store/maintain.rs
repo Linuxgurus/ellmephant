@@ -3,7 +3,7 @@
 //!
 //! The relational rows are the source of truth, so changing the encoder (or its dimension)
 //! is a *re-embed*, never a migration: walk `memory`, recompute the document projection,
-//! rewrite each row's `encode_hash`, and repopulate `memory_vec`. The `[[link]]` graph is derived
+//! queue every document at bulk priority, and rebuild the `[[link]]` graph, which is derived
 //! too — its edges are computed at *write* time — so the same pass re-parses every body
 //! ([`links::reparse`]), making "derived and rebuildable" true rather than aspirational. `meta`
 //! records what the vectors now correspond to so `doctor` can tell a swapped model from a corrupt

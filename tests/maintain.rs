@@ -450,3 +450,61 @@ fn opening_the_store_migrates_the_index_without_any_write() {
         "and knows which document it belongs to"
     );
 }
+
+/// ★ THE GRAVEYARD IS REACHABLE, AND ONLY BY ASKING (2026-10-21).
+///
+/// A delete MOVES the vector into `document_vec_deleted`, so the document stops being findable by a
+/// normal search — not because a filter hides it, but because no normal query names that table. The
+/// deleted-search is the way back, and it returns a NAME, never a body.
+#[test]
+fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let (id, _) = store::add(
+        &conn,
+        &memory("buried", "the velero restore rehearsal notes", &[]),
+    )
+    .expect("write");
+    common::settle(&conn, &embedder);
+
+    let query = embedder
+        .embed_one(&projection::embed_document(
+            "buried",
+            "buried",
+            "the velero restore rehearsal notes",
+        ))
+        .expect("query vector");
+    let hint = vec::Knn {
+        k: 5,
+        max_distance: None,
+    };
+
+    // Nothing is buried yet.
+    assert!(
+        vec::knn_deleted(&conn, &query, &hint)
+            .expect("graveyard")
+            .is_empty(),
+        "no tombstones before a delete"
+    );
+
+    assert!(store::delete(&conn, "buried").expect("delete"));
+
+    // The LIVE index no longer answers, and the vector count says so.
+    assert_eq!(
+        vec::count(&conn).expect("live"),
+        0,
+        "gone from the live index"
+    );
+    assert!(
+        vec::get(&conn, id).expect("get").is_none(),
+        "no live vector for the id"
+    );
+
+    // The GRAVEYARD does — as a name with a date, never a body.
+    let buried = vec::knn_deleted(&conn, &query, &hint).expect("graveyard");
+    assert_eq!(buried.len(), 1, "the graveyard finds it");
+    assert_eq!(buried[0].key, "buried");
+    assert_eq!(buried[0].kind, "memory");
+    assert!(!buried[0].deleted_at.is_empty(), "and says when it went");
+}

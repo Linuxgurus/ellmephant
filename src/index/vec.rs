@@ -598,3 +598,51 @@ mod tests {
         );
     }
 }
+
+/// A tombstoned document: what the store once knew, without the text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tombstone {
+    pub kind: String,
+    pub key: String,
+    pub distance: f32,
+    pub deleted_at: String,
+}
+
+/// KNN over the **tombstone** index — deleted documents, reachable only by asking for them.
+///
+/// This is the one query that touches `document_vec_deleted`, and it is a different table rather than
+/// a filtered view: no normal search can reach these rows because no normal search names their table.
+pub fn knn_deleted(conn: &Connection, query: &[f32], hint: &Knn) -> Result<Vec<Tombstone>> {
+    if query.is_empty() {
+        return Err(Error::Config("empty query vector".into()));
+    }
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![DELETED_TABLE],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    let k = i64::try_from(hint.k).map_err(|_| Error::Config("k too large".into()))?;
+    let sql = format!(
+        "SELECT type, key, distance, deleted_at FROM {DELETED_TABLE} \
+         WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![to_blob(query), k])?;
+    let mut out: Vec<Tombstone> = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Tombstone {
+            kind: row.get(0)?,
+            key: row.get(1)?,
+            distance: row.get(2)?,
+            deleted_at: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        });
+    }
+    drop(rows);
+    if let Some(max) = hint.max_distance {
+        out.retain(|t| t.distance <= max);
+    }
+    Ok(out)
+}

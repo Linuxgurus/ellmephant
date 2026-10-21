@@ -23,10 +23,10 @@ use crate::error::{Error, Result};
 use crate::index;
 
 /// One atomic memory: the storage *and* embedding unit. `Default` is the draft baseline the
-/// write path fills in (`id`/`encode_hash`/timestamps are derived on insert).
+/// write path fills in (`id`/timestamps are derived on insert).
 ///
-/// `title`, `body` and `tags` are stored literally; `encode_hash` is the re-embed trigger for the
-/// single document embedding (`key` + `title` + `body` — tags are *filing*, not meaning).
+/// `title`, `body` and `tags` are stored literally; a change to title or body is what queues a single
+/// document embedding (`key` + `title` + `body` — tags are *filing*, not meaning).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Memory {
     /// Rowid; `None` before insert and omitted from serialized output (local/derived).

@@ -274,9 +274,21 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     let phrase = phrase_ids(conn, embedder, q)?;
     let ranked = phrase.is_some();
 
-    let mut ordered: Vec<(i64, Option<f32>)> = match phrase {
-        Some(p) => p,
-        None => all_ranked(conn)?,
+    // ★ TWO LEGS, FUSED BY RRF (soma/ellmephant#62). The semantic leg answers "means this"; the word
+    // index answers "says this". Neither dominates: measured on 2026-10-21 the correct memory for
+    // `runner has no cargo` ranked FIFTH at 0.5945 behind an unrelated 0.5795, while a paraphrase
+    // shares no words at all and only the vector leg can find it.
+    //
+    // Reciprocal Rank Fusion combines RANKS, not scores, precisely because cosine distance and BM25
+    // are different units in different directions (lower-better and negative-lower-better) — adding
+    // them would need a calibration nobody has. `k=60` is the constant from the RRF literature: it
+    // flattens the top of each list so one leg's runaway first place does not veto the other.
+    let lexical = phrase_ids_lexical(conn, q)?;
+    let mut ordered: Vec<(i64, Option<f32>)> = match (&phrase, &lexical) {
+        (Some(p), Some(l)) => fuse(p, l, q.k.max(1)),
+        (Some(p), None) => p.clone(),
+        (None, Some(l)) => l.clone(),
+        (None, None) => all_ranked(conn)?,
     };
     // Structured filters intersect the candidate set BEFORE the k cap, so a filtered result
     // is exact (the KNN already spans the whole store): filter, then truncate, never the reverse.
@@ -288,8 +300,8 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     if let Some(set) = lexical_set(conn, q)? {
         ordered.retain(|(id, _)| set.contains(id));
     }
-    if ranked {
-        ordered.truncate(q.k.max(1)); // k caps the distance-ranked case only
+    if ranked && lexical.is_none() {
+        ordered.truncate(q.k.max(1)); // k caps a single-leg list; `fuse` already capped a fused one
     }
 
     let mut hits = Vec::with_capacity(ordered.len());
@@ -314,6 +326,63 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         Vec::new()
     };
     Ok(Bundle { hits, neighbors })
+}
+
+/// The lexical leg: FTS5 over the same columns, ranked by BM25 (`soma/ellmephant#62`).
+///
+/// `None` when the query has no phrase or the phrase has nothing indexable. An FTS failure is an
+/// error rather than an empty list: a leg that cannot run must not silently shrink a search that the
+/// other leg would have answered — the caller asked for a phrase and deserves to know halving it was
+/// not possible.
+fn phrase_ids_lexical(conn: &Connection, q: &Query) -> Result<Option<Vec<Candidate>>> {
+    let Some(text) = q.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    // Room for the lexical leg to contribute rows the vector leg missed, without dragging in the
+    // whole store: four times the requested page, floored at 50.
+    let want = (q.k.max(1) * 4).max(50);
+    let hits = index::fts::search(conn, text, want)?;
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    // `distance` stays None: BM25 is not a distance, and reporting a negative number in a field
+    // documented as cosine distance is the unit confusion #59 exists to prevent.
+    Ok(Some(hits.into_iter().map(|h| (h.id, None)).collect()))
+}
+
+/// Reciprocal Rank Fusion: `score = Σ 1/(60 + rank)` over the legs that found the row.
+///
+/// The vector leg's distance survives into the result (it is the only meaningful distance we have);
+/// the lexical leg contributes only its rank. Ties break on the vector distance, so a row both legs
+/// found sorts ahead of an equally-ranked lexical-only one.
+fn fuse(vector: &[Candidate], lexical: &[(i64, Option<f32>)], k: usize) -> Vec<Candidate> {
+    const K: f32 = 60.0;
+    let mut score: std::collections::HashMap<i64, (f32, Option<f32>)> =
+        std::collections::HashMap::new();
+    for (rank, (id, distance)) in vector.iter().enumerate() {
+        score.insert(*id, (1.0 / (K + rank as f32), *distance));
+    }
+    for (rank, (id, _)) in lexical.iter().enumerate() {
+        let add = 1.0 / (K + rank as f32);
+        score
+            .entry(*id)
+            .and_modify(|(s, _)| *s += add)
+            .or_insert((add, None));
+    }
+    let mut out: Vec<(i64, f32, Option<f32>)> =
+        score.into_iter().map(|(id, (s, d))| (id, s, d)).collect();
+    // Fused score descending; then distance ascending (closer first); then id for determinism.
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.2.unwrap_or(f32::MAX)
+                    .partial_cmp(&b.2.unwrap_or(f32::MAX))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out.into_iter().take(k).map(|(id, _, d)| (id, d)).collect()
 }
 
 /// The ids passing every structured predicate (`tags`, size, time bounds), or `None`
@@ -554,5 +623,43 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         // No phrase ⇒ no candidates, and no embedder required.
         assert!(phrase_ids(&conn, None, &q).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+
+    /// ★ RRF pinned directly, because an end-to-end test with a fake embedder cannot prove it: the
+    /// vector leg may happen to rank the right row anyway. Here the legs are given by hand.
+    #[test]
+    fn rrf_rewards_a_row_both_legs_found() {
+        // Vector leg: A first, B second. Lexical leg: B first, C second.
+        let vector: Vec<Candidate> = vec![(1, Some(0.10)), (2, Some(0.20))];
+        let lexical: Vec<Candidate> = vec![(2, None), (3, None)];
+        let out = fuse(&vector, &lexical, 10);
+        // B is the only row both legs ranked, so it must lead: 1/(60+1) + 1/(60+0) beats any single.
+        assert_eq!(out[0].0, 2, "the row both legs found wins: {out:?}");
+        // A and C each appear once; A's vector distance survives, C's stays None.
+        let a = out.iter().find(|(id, _)| *id == 1).expect("A present");
+        assert_eq!(a.1, Some(0.10), "the vector distance is preserved");
+        let c = out.iter().find(|(id, _)| *id == 3).expect("C present");
+        assert_eq!(c.1, None, "a lexical-only row carries no distance");
+    }
+
+    #[test]
+    fn rrf_keeps_a_row_only_one_leg_found() {
+        let vector: Vec<Candidate> = vec![(1, Some(0.1))];
+        let lexical: Vec<Candidate> = vec![(2, None)];
+        let out = fuse(&vector, &lexical, 10);
+        let ids: Vec<i64> = out.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1) && ids.contains(&2), "{ids:?}");
+    }
+
+    #[test]
+    fn fuse_caps_at_k() {
+        let vector: Vec<Candidate> = (0..20).map(|i| (i, Some(i as f32))).collect();
+        let out = fuse(&vector, &[], 5);
+        assert_eq!(out.len(), 5);
     }
 }

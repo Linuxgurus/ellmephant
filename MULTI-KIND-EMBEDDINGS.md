@@ -209,8 +209,8 @@ rebuild.
   overwrites on settle; the old vector answers until the new one lands. The single exception is a
   **dimension change**, where the old vectors are unreadable by width and the table must be recreated.
 - **A delete does not erase knowledge of the document.** The vector moves to the tombstone index and
-  stops appearing in normal search; it is reachable only by asking for deleted results. A kind with a
-  retention promise (`mail`) purges instead.
+  stops appearing in normal search; it is reachable only by asking — `semantic_search(..., deleted =
+  true)`, which returns keys and never bodies. A kind with a retention promise (`mail`) purges instead.
 - **`?wait=true`** stays: the synchronous door for a caller that needs a vector now. It is what makes
   eventual consistency safe rather than a gamble.
 
@@ -392,8 +392,11 @@ read.
 
 **`semantic_search(query, type?, deleted?)`** is a new tool; `type` is optional and absent means
 per-kind `k` merged by distance (see *Search* above). `deleted = true` (default `false`) searches the
-**tombstone index** and nothing else — it is never merged with live results, so the flag cannot quietly
-pollute a normal search.
+**tombstone index** and nothing else — never both, never merged, so the flag cannot quietly pollute a
+normal search. ★ Decided 2026-10-21 (James): an **argument**, not a dedicated verb — the API surface
+stays one search tool, and the naming stays one word per thing (`document_vec_deleted`, `deleted_at`,
+`deleted`). `deleted` also filters by `type` when both are given, because the tombstone index carries
+the same partition key.
 
 Deleted hits are **keys, not bodies**: `type`, `key`, `distance`, `deleted_at`. That is deliberate and
 it is what makes the recovery honest — the tombstone's job is to turn *"I remember something about X"*
@@ -409,7 +412,8 @@ knows it once had and can no longer name. Keeping it one explicit search away is
 deletion is a promise to a **different** person (`mail`), there is no deleted search at all — it purges.
 
 `memory_search` stays **permanently** as a thin alias for `semantic_search(type = "memory")` —
-removing a tool that callers depend on buys nothing and breaks them.
+removing a tool that callers depend on buys nothing and breaks them. It forwards `deleted`, since
+memory is the kind that has a graveyard.
 
 `max_distance` becomes a **per-type, tunable** default: 0.45 to start (the value chosen for
 memories), overridable per type without a code change. Project text is short and title-headed so its

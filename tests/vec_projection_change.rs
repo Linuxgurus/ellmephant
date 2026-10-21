@@ -152,8 +152,10 @@ fn a_rebuild_that_exceeds_the_budget_is_refused_and_nothing_is_purged() {
     }
 
     // Three documents, ceiling of two: unaffordable by this store's own arithmetic.
-    let mut cfg = ellmephant::config::Config::default();
-    cfg.rebuild_max_documents = 2;
+    let mut cfg = ellmephant::config::Config {
+        rebuild_max_documents: 2,
+        ..Default::default()
+    };
     let conn = db::open_with(&paths, &cfg).expect("open");
 
     assert_eq!(

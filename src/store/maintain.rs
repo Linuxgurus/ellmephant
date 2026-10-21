@@ -94,10 +94,7 @@ pub enum Rebuild {
 /// STALE, which is the state this design already has a name for, and the encoder refuses to embed into
 /// a mixed index (see [`crate::mcp`]'s worker). Recovery is a decision: raise the budget, roll the
 /// config back, or run `reembed` by hand — never a silent half-index.
-pub fn reindex_if_stale(
-    conn: &Connection,
-    cfg: &crate::config::Config,
-) -> Result<Option<usize>> {
+pub fn reindex_if_stale(conn: &Connection, cfg: &crate::config::Config) -> Result<Option<usize>> {
     Ok(match reindex(conn, cfg)? {
         Rebuild::Started { documents, .. } => Some(documents),
         Rebuild::Current | Rebuild::Refused { .. } => None,
@@ -195,7 +192,10 @@ pub fn note_rebuild_finished(conn: &Connection) -> Result<()> {
     meta::set(
         conn,
         REBUILD,
-        &format!("{record} finished={now} elapsed_s={}", (now - started).max(0)),
+        &format!(
+            "{record} finished={now} elapsed_s={}",
+            (now - started).max(0)
+        ),
     )?;
     tracing::info!(
         elapsed_s = (now - started).max(0),
@@ -206,7 +206,11 @@ pub fn note_rebuild_finished(conn: &Connection) -> Result<()> {
 
 /// Epoch seconds from the store, so timestamps come from one clock rather than the process's.
 fn now_epoch(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?)
+    Ok(
+        conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.

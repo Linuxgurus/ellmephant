@@ -1086,77 +1086,94 @@ fn pass(
     watch: &crate::http::LockWatch,
     encoder: &super::cli::session::Encoder,
     idle: &rusqlite::Connection,
+    skipped: &mut std::collections::HashMap<String, std::time::Instant>,
 ) -> crate::error::Result<bool> {
+    // 0. Forget skips that have expired: a document that failed once must be tried again, or a
+    //    transient model error would cost it its freshness forever.
+    skipped.retain(|_, at| at.elapsed().as_secs() < SKIP_SECS);
     // 1. The head, on a read-only connection: no store lock, so an empty queue costs one indexed
     //    SELECT and contends with no one.
-    let Some(entry) = crate::store::encode::next(idle)? else {
-        return Ok(false);
+    let skip_now: std::collections::HashSet<String> = skipped.keys().cloned().collect();
+    let entry = match crate::store::encode::next(idle, &skip_now)? {
+        Some(entry) => entry,
+        None => {
+            // The refill rule, and the only producer this queue has: nothing is queued, so ask what
+            // has no vector and queue it at bulk priority. A rebuild is therefore "delete the
+            // vectors" plus this; a crash, a dropped entry and a hand-deleted vector are the same
+            // question with the same answer, and the answer is empty when there is nothing to do.
+            let skip: std::collections::HashSet<String> = skipped.keys().cloned().collect();
+            let queued = {
+                let _held = watch.held("memory_encode_refill");
+                let session = lock(session)?;
+                session.refill(&skip)?
+            };
+            if queued > 0 {
+                tracing::info!(
+                    queued,
+                    "encode worker: refilled the queue from what has no vector"
+                );
+            }
+            match crate::store::encode::next(idle, &skip_now)? {
+                Some(entry) => entry,
+                None => return Ok(false),
+            }
+        }
     };
     let started = std::time::Instant::now();
-    // 2. Claim under a short lock — witnessed, so `/health` can say who holds the writer.
+    // 2. Claim under a short lock — witnessed, so `/health` can say who holds the writer. The TEXT
+    //    crosses in the claim itself: the queue carries it, so nothing is re-rendered here.
     let claim = {
         let _held = watch.held("memory_encode");
         let session = lock(session)?;
-        session.claim_encode(&entry.key)?
+        session.claim_encode(&entry.keyslug)?
     };
     let Some(claim) = claim else {
         return Ok(false);
     };
     // 3. The model call, with the store lock held NOWHERE. This is where the 1.2 GB cold load lands:
     //    on this worker, not on whoever is waiting to write.
-    let vector = if claim.needs_embed() {
-        let doc = claim.doc().to_string();
-        match encoder.with(|e| e.embed_one(&doc)) {
-            Ok(vector) => Some(vector),
-            Err(err) => {
-                // Count the attempt and leave the entry: it is retried until `MAX_ATTEMPTS`, then
-                // skipped and reported, rather than spun on.
-                let attempts = {
-                    let session = lock(session)?;
-                    session.record_encode_failure(&entry.key, &err)?
-                };
-                if attempts >= crate::store::encode::MAX_ATTEMPTS {
-                    // Once, at the moment it gives up: past here the document is skipped by `next`,
-                    // so this line is the only thing that ever says why it stopped being searchable.
-                    tracing::error!(
-                        key = %entry.key,
-                        attempts,
-                        error = %err,
-                        "encode worker: giving up on a document — it stays unsearchable until it is written again"
-                    );
-                } else {
-                    tracing::warn!(
-                        key = %entry.key,
-                        attempts,
-                        max = crate::store::encode::MAX_ATTEMPTS,
-                        error = %err,
-                        "encode worker: embed failed — the entry is retried"
-                    );
-                }
-                return Ok(true);
-            }
+    let captured = claim.doc().to_string();
+    let vector = match encoder.with(|e| e.embed_one(&captured)) {
+        Ok(vector) => vector,
+        Err(err) => {
+            // KEEP the entry. It is the record that this document's vector is owed: deleting it
+            // would leave a row whose vector describes text that is no longer there, with nothing
+            // left to say so — `missing()` could not see it either, because a vector exists. So the
+            // cost of a failure is a backlog that does not drain, which is visible; the skip list
+            // only stops the retry from becoming a hot loop, and it lives in memory so a restart
+            // tries again immediately.
+            skipped.insert(entry.keyslug.clone(), std::time::Instant::now());
+            tracing::warn!(
+                keyslug = %entry.keyslug,
+                error = %err,
+                skip_secs = SKIP_SECS,
+                "encode worker: embed failed — entry dropped, retried after the skip window"
+            );
+            return Ok(true);
         }
-    } else {
-        None
     };
     // 4. Settle under a second short lock, and read the queue's new shape while we are in there — the
     //    log line then costs no second lock, and the number it prints is the one the settle left.
     let counts = {
         let _held = watch.held("memory_encode_write");
         let session = lock(session)?;
-        session.settle_encode(&claim, vector.as_deref())?;
+        session.settle_encode(&claim, &vector)?;
         session.encode_counts()?
     };
+    skipped.remove(&entry.keyslug);
     tracing::info!(
-        key = %entry.key,
-        embedded = vector.is_some(),
+        keyslug = %entry.keyslug,
         elapsed_ms = started.elapsed().as_millis() as u64,
         pending = counts.pending,
-        failed = counts.failed,
         "encode worker: encoded"
     );
     Ok(true)
 }
+
+/// How long a document that failed to embed is left out of the refill rule. Long enough that a broken
+/// document cannot spin (a pass is ~one embed), short enough that a transient failure recovers.
+#[cfg(feature = "encoder")]
+const SKIP_SECS: u64 = 600;
 
 /// The encode worker: the queue's one consumer, and the reason a write does not embed.
 ///
@@ -1220,8 +1237,10 @@ impl MemoryServer {
                     interval_ms = interval.as_millis() as u64,
                     "encode worker up"
                 );
+                let mut skipped: std::collections::HashMap<String, std::time::Instant> =
+                    std::collections::HashMap::new();
                 while !flag.load(Ordering::SeqCst) {
-                    match pass(&session, &watch, &encoder, &idle) {
+                    match pass(&session, &watch, &encoder, &idle, &mut skipped) {
                         Ok(_) => {}
                         Err(err) => tracing::warn!(error = %err, "encode worker: pass failed"),
                     }

@@ -138,7 +138,10 @@ async fn health_cannot_create_a_store() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.contains("store missing"), "{body}");
     assert!(
-        body.contains("not in schema v8"),
+        body.contains(&format!(
+            "not in schema v{}",
+            ellmephant::store::encode::SCHEMA
+        )),
         "and the queue line admits it cannot be read, rather than reporting zeroes: {body}"
     );
     assert!(!paths.db().exists(), "the probe must not create the store");
@@ -206,7 +209,10 @@ async fn a_queued_document_is_load_and_not_a_fault() {
 
     let (_, text, _) = get(&app, "/health").await;
     assert!(text.contains("1 pending"), "{text}");
-    assert!(text.contains("0 failed"), "{text}");
+    assert!(
+        !text.contains("failed"),
+        "the queue keeps no failure history any more, so the line must not claim one: {text}"
+    );
     assert!(
         !text.contains("without a vector"),
         "the old fault wording is gone, because a queue is not one: {text}"

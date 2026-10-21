@@ -546,22 +546,22 @@ fn a_deleted_key_leaves_no_queue_entry() {
     let spec = ellmephant::embed::VecSpec::new(MODEL, DIM);
     let queued = |conn: &rusqlite::Connection| -> Vec<String> {
         let mut stmt = conn
-            .prepare("SELECT key FROM encode_queue ORDER BY key")
+            .prepare("SELECT keyslug FROM encode_queue ORDER BY keyslug")
             .expect("prepare");
         let rows = stmt.query_map([], |r| r.get(0)).expect("query");
         rows.collect::<rusqlite::Result<Vec<String>>>()
-            .expect("keys")
+            .expect("keyslugs")
     };
 
     ellmephant::store::add(&conn, &spec, &memory("gone", "never to be embedded")).expect("write");
     ellmephant::store::add(&conn, &spec, &memory("kept", "still owed a vector")).expect("write");
-    assert_eq!(queued(&conn), ["gone", "kept"]);
+    assert_eq!(queued(&conn), ["memory:gone", "memory:kept"]);
 
     // Delete: the entry goes in the same transaction as the row.
     assert!(ellmephant::store::delete(&conn, "gone").expect("delete"));
     assert_eq!(
         queued(&conn),
-        ["kept"],
+        ["memory:kept"],
         "the deleted key's entry went with it"
     );
 
@@ -574,11 +574,11 @@ fn a_deleted_key_leaves_no_queue_entry() {
         &memory("new", "survivor, now carrying: deleted"),
     )
     .expect("write");
-    assert_eq!(queued(&conn), ["kept", "new", "old"]);
-    ellmephant::store::links::merge_into(&conn, &spec, "old", "new").expect("merge");
+    assert_eq!(queued(&conn), ["memory:kept", "memory:new", "memory:old"]);
+    ellmephant::store::links::merge_into(&conn, "old", "new").expect("merge");
     assert_eq!(
         queued(&conn),
-        ["kept", "new"],
+        ["memory:kept", "memory:new"],
         "the deleted key's entry went with it"
     );
 }

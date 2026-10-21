@@ -6,6 +6,7 @@ mod common;
 
 use common::{count, temp_store};
 use ellmephant::db;
+use ellmephant::db::migrate;
 use rusqlite::{Connection, params};
 
 fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
@@ -335,4 +336,36 @@ fn key_is_unique() {
         err.is_err(),
         "duplicate keys must be rejected by the UNIQUE constraint"
     );
+}
+
+// The skipped-migration (hole in the list) case is unit-tested in `src/db/migrate.rs`, because a
+// store at a version *below* the binary's highest and *unknown to it* cannot be built against a
+// contiguous list: with 1..15 present, every lower version is known. The synthetic-list test is the
+// honest way to exercise it.
+
+/// The opposite state: the STORE IS NEWER than this binary, which is what a rollback looks like.
+/// Refusing here would make a bad deploy unrecoverable, so it is allowed — but only deliberately.
+#[test]
+fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
+    let (_dir, paths) = temp_store();
+    {
+        let conn = db::open(&paths).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+    }
+
+    let conn = Connection::open(paths.db()).unwrap();
+    let err = migrate::run_with(&conn, false).expect_err("a rollback must be refused by default");
+    let text = format!("{err}");
+    assert!(
+        text.contains("STORE IS NEWER") && text.contains("ROLLBACK") || text.contains("rollback"),
+        "the refusal must name the direction, not just the number: {text}"
+    );
+    assert!(
+        text.contains(migrate::ALLOW_STORE_AHEAD),
+        "and it must name the escape: {text}"
+    );
+
+    // The deliberate override proceeds, and applies nothing (the store is already beyond this list).
+    migrate::run_with(&conn, true).expect("the rollback override must work");
+    assert_eq!(migrate::version(&conn).unwrap(), 99, "untouched");
 }

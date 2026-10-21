@@ -8,7 +8,7 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::embed::{VecSpec, projection};
+use crate::embed::projection;
 use crate::error::{Error, Result};
 use crate::index;
 use crate::store::slug;
@@ -71,6 +71,30 @@ impl Kind {
         } else {
             Kind::Memory
         }
+    }
+
+    /// The identity of one document: `kind:key`. The type is the TABLE name, so the slug says where
+    /// the row lives rather than what it is called — a kind is a table that holds documents.
+    ///
+    /// Safe by construction: keys are `[a-z0-9-]+` ([`slug::slugify`]), so `:` can never occur inside
+    /// one and the split is unambiguous without escaping.
+    pub fn keyslug(self, key: &str) -> String {
+        format!("{}:{}", self.as_str(), key)
+    }
+
+    /// Split a keyslug back into its kind and key. `None` when it is not one — an unknown type, no
+    /// separator, or an empty half. Used by the queue, which stores text and must not guess.
+    pub fn from_keyslug(slug: &str) -> Option<(Kind, &str)> {
+        let (kind, key) = slug.split_once(':')?;
+        if key.is_empty() {
+            return None;
+        }
+        let kind = match kind {
+            "memory" => Kind::Memory,
+            "project" => Kind::Project,
+            _ => return None,
+        };
+        Some((kind, key))
     }
 }
 
@@ -280,7 +304,7 @@ fn squash(s: &str) -> String {
 /// A caller may still fold the prose itself FIRST, and should when it wants the survivor to read as
 /// one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and
 /// the call has nothing to integrate. `[[prj:from]]` is *not* rewritten: that names a project.
-pub fn merge_into(conn: &Connection, spec: &VecSpec, from: &str, into: &str) -> Result<MergeInto> {
+pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto> {
     let from = slug::slugify(from);
     let into = slug::slugify(into);
     if from == into {
@@ -322,8 +346,12 @@ pub fn merge_into(conn: &Connection, spec: &VecSpec, from: &str, into: &str) -> 
         // home for that write — and a moved document is queued for a new vector like any other write.
         crate::store::write_links(&tx, into_id, &into, &body)?;
         let doc = projection::embed_document(&into, &into_title, &body);
-        let hash = crate::store::row_hash(spec, &doc);
-        crate::store::encode::enqueue(&tx, &into, &hash, crate::store::encode::INTERACTIVE)?;
+        crate::store::encode::enqueue(
+            &tx,
+            &Kind::Memory.keyslug(&into),
+            &doc,
+            crate::store::encode::PRIORITY_LIVE,
+        )?;
     }
     // The tokens. A bare `[[from]]` is a memory; `[[prj:from]]` names the other table and must not
     // move — which is why the kind rides on the edge, not the name.
@@ -356,7 +384,7 @@ pub fn merge_into(conn: &Connection, spec: &VecSpec, from: &str, into: &str) -> 
     index::vec::delete(&tx, from_id)?;
     // The deleted key's queue entry goes with the row: `from` no longer exists, so a document for it
     // can never be embedded and must not be left for the worker to discover.
-    crate::store::encode::forget(&tx, &from)?;
+    crate::store::encode::forget(&tx, &Kind::Memory.keyslug(&from))?;
     tx.commit()?;
 
     Ok(MergeInto {
@@ -392,7 +420,7 @@ pub struct RenameOutcome {
 /// swap. (Their `updated` moves; that is the whole of it.)
 ///
 /// Refuses to clobber an existing key; a same-key rename is a no-op.
-pub fn rename(conn: &Connection, spec: &VecSpec, old: &str, new: &str) -> Result<RenameOutcome> {
+pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> {
     let old = slug::slugify(old);
     let new = slug::slugify(new);
     if old == new {
@@ -427,7 +455,6 @@ pub fn rename(conn: &Connection, spec: &VecSpec, old: &str, new: &str) -> Result
     // The document under the NEW key. Nothing is embedded here: the key moved, so the document moved,
     // and a moved document is queued like any other write.
     let doc_text = projection::embed_document(&new, &title, &body);
-    let doc_hash = crate::store::row_hash(spec, &doc_text);
 
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -453,7 +480,12 @@ pub fn rename(conn: &Connection, spec: &VecSpec, old: &str, new: &str) -> Result
           WHERE to_key = ?1 AND to_type = 'memory'",
         params![old, new],
     )?;
-    crate::store::encode::enqueue(&tx, &new, &doc_hash, crate::store::encode::INTERACTIVE)?;
+    crate::store::encode::enqueue(
+        &tx,
+        &Kind::Memory.keyslug(&new),
+        &doc_text,
+        crate::store::encode::PRIORITY_LIVE,
+    )?;
     tx.commit()?;
 
     Ok(RenameOutcome {

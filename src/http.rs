@@ -242,15 +242,9 @@ impl HealthReport {
                 encode::SCHEMA
             )
         } else if let Some(age) = self.encode_oldest_s {
-            format!(
-                "{} pending (oldest {}s), {} failed",
-                self.encode_pending, age, self.encode_failed
-            )
+            format!("{} pending (oldest {}s)", self.encode_pending, age)
         } else {
-            format!(
-                "{} pending, {} failed",
-                self.encode_pending, self.encode_failed
-            )
+            format!("{} pending", self.encode_pending)
         };
         out.push_str(&format!("  {:<12}{queue}\n", "encode"));
         let snap = match self.snapshot_age_s {
@@ -384,7 +378,6 @@ fn read_store(paths: &Paths, report: &mut HealthReport) -> crate::error::Result<
     if report.schema >= encode::SCHEMA {
         let queue = encode::counts(&conn)?;
         report.encode_pending = queue.pending;
-        report.encode_failed = queue.failed;
         report.encode_oldest_s = queue.oldest_s;
     }
     Ok(stale)

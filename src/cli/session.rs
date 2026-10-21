@@ -186,7 +186,7 @@ impl Session {
     /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch
     /// behind `memory_upsert`.)
     pub fn merge_into(&self, from: &str, into: &str) -> Result<links::MergeInto> {
-        links::merge_into(&self.conn, &self.vec_spec(), from, into)
+        links::merge_into(&self.conn, from, into)
     }
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
@@ -293,28 +293,42 @@ impl Session {
     }
 
     /// The head of the encode queue, or `None` when nothing is waiting to be embedded.
-    pub fn next_encode(&self) -> Result<Option<encode::Entry>> {
-        encode::next(&self.conn)
+    pub fn next_encode(
+        &self,
+        skip: &std::collections::HashSet<String>,
+    ) -> Result<Option<encode::Entry>> {
+        encode::next(&self.conn, skip)
     }
 
     /// Take one queued document **without embedding anything**: the read half of a job.
     ///
     /// Split from [`settle_encode`](Self::settle_encode) on purpose — the worker drops the store lock
     /// between the two, so the model call runs holding nothing at all. `ENCODE-WORKER.md` is the why.
-    pub fn claim_encode(&self, key: &str) -> Result<Option<encode::Claim>> {
-        encode::claim(&self.conn, &self.vec_spec(), key)
+    pub fn claim_encode(&self, keyslug: &str) -> Result<Option<encode::Claim>> {
+        encode::claim(&self.conn, &self.vec_spec(), keyslug)
     }
 
     /// Store a claim's vector and settle its queue entry: the write half of a job.
-    pub fn settle_encode(&self, claim: &encode::Claim, vector: Option<&[f32]>) -> Result<()> {
+    pub fn settle_encode(&self, claim: &encode::Claim, vector: &[f32]) -> Result<()> {
         encode::settle_encoded(&self.conn, claim, vector)
     }
 
-    /// Count a failed embed attempt. The entry stays and is retried until `encode::MAX_ATTEMPTS`,
-    /// after which it is skipped and reported rather than retried in a hot loop forever. Returns the
-    /// entry's attempt count, so a caller can say when it has just exhausted them.
-    pub fn record_encode_failure(&self, key: &str, err: &Error) -> Result<i64> {
-        encode::record_failure(&self.conn, key, err)
+    /// Queue every document that has no vector, at bulk priority, skipping the keyslugs a caller has
+    /// just seen fail. Returns how many were queued.
+    ///
+    /// This is the queue's ONLY producer, and it is stateless on purpose: "what has no vector" is read
+    /// off the index, so a rebuild, a crash, a dropped entry and a hand-deleted vector all arrive here
+    /// as the same question. When nothing is missing it queues nothing and the worker idles.
+    pub fn refill(&self, skip: &std::collections::HashSet<String>) -> Result<usize> {
+        let mut queued = 0;
+        for (keyslug, content) in encode::missing(&self.conn)? {
+            if skip.contains(&keyslug) {
+                continue;
+            }
+            encode::enqueue(&self.conn, &keyslug, &content, encode::PRIORITY_BULK)?;
+            queued += 1;
+        }
+        Ok(queued)
     }
 
     /// Documents still waiting for a vector — the encoder's backlog.
@@ -333,9 +347,12 @@ impl Session {
     /// Deliberately the exception. It holds the store lock across the model call, which is precisely
     /// the coupling the queue exists to remove — so it is opt-in, and for a caller that genuinely
     /// cannot proceed until the row is searchable.
+    /// The `?wait=true` door is MEMORY-shaped: its callers have just written a memory and hold its
+    /// key, so the keyslug is built here rather than at every call site.
     pub fn encode_document(&self, key: &str) -> Result<bool> {
+        let keyslug = crate::store::links::Kind::Memory.keyslug(key);
         self.encoder
-            .with(|e| encode::encode_one(&self.conn, e, &self.vec_spec(), key))
+            .with(|e| encode::encode_one(&self.conn, e, &self.vec_spec(), &keyslug))
     }
 
     /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.

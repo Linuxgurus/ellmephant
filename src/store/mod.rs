@@ -546,11 +546,14 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     };
     write_links(tx, id, &prepared.key, &mem.body)?;
     if pending {
-        encode::enqueue(
+        // The queue carries the TEXT, so the render happens here — at the write, where the kind is
+        // known — and the worker never needs to know what a memory is.
+        encode::enqueue_memory(
             tx,
             &prepared.key,
-            &prepared.encode_hash,
-            encode::INTERACTIVE,
+            &mem.title,
+            &mem.body,
+            encode::PRIORITY_LIVE,
         )?;
     }
     Ok(id)
@@ -618,7 +621,7 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
     // rediscover. Both halves ride in one transaction, so neither undoes the other.
-    encode::forget(&tx, key)?;
+    encode::forget(&tx, &crate::store::links::Kind::Memory.keyslug(key))?;
     let id: Option<i64> = tx
         .query_row("SELECT id FROM memory WHERE key = ?1", params![key], |r| {
             r.get(0)

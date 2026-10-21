@@ -248,3 +248,147 @@ fn a_deleted_document_moves_to_the_tombstone_index() {
     assert_eq!(tombstones[0].0, "drop");
     assert!(!tombstones[0].1.is_empty(), "deleted_at is readable");
 }
+
+/// Can the vec0 primary key be DERIVED instead of kept in a counter?
+///
+/// stet's question, and he was right that it must be measured, not reasoned: a counter in `meta` is a
+/// second record of a fact the table already holds, and a counter can fall behind the table after a
+/// restore. So: does vec0 assign an id when the caller omits it, and is `max(vector_id)` a legal read?
+#[test]
+fn probes_whether_vec0_can_allocate_its_own_identity() {
+    register();
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE v USING vec0(
+           vector_id INTEGER PRIMARY KEY,
+           embedding float[4] distance_metric=cosine,
+           type text partition key,
+           +key TEXT
+         );",
+    )
+    .expect("create");
+
+    let assigned = conn.execute(
+        "INSERT INTO v(embedding, type, key) VALUES(?1, 'memory', 'auto')",
+        rusqlite::params![blob([1.0, 0.0, 0.0, 0.0])],
+    );
+    println!("INSERT WITHOUT ID: {assigned:?}");
+
+    let max: Result<i64, _> =
+        conn.query_row("SELECT coalesce(max(vector_id), 0) FROM v", [], |r| {
+            r.get(0)
+        });
+    println!("MAX(vector_id): {max:?}");
+
+    let ids: Result<Vec<(i64, i64)>, _> = conn
+        .prepare("SELECT rowid, vector_id FROM v")
+        .and_then(|mut s| s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect());
+    println!("ROWID vs VECTOR_ID: {ids:?}");
+
+    let explicit = conn.execute(
+        "INSERT INTO v(vector_id, embedding, type, key) VALUES(100, ?1, 'memory', 'explicit')",
+        rusqlite::params![blob([0.0, 1.0, 0.0, 0.0])],
+    );
+    println!("INSERT WITH ID 100: {explicit:?}");
+    let max_after: i64 = conn
+        .query_row("SELECT coalesce(max(vector_id), 0) FROM v", [], |r| {
+            r.get(0)
+        })
+        .expect("max after");
+    println!("MAX AFTER EXPLICIT 100: {max_after}");
+}
+
+/// Outside a KNN, is an auxiliary column filterable? The identity lookup `(type, key) -> vector_id`
+/// depends on it: if it works, no companion table is needed to map a keyslug to a vector.
+#[test]
+fn probes_a_plain_lookup_by_partition_and_aux_column() {
+    register();
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE v USING vec0(
+           vector_id INTEGER PRIMARY KEY,
+           embedding float[4] distance_metric=cosine,
+           type text partition key,
+           +key TEXT
+         );
+         INSERT INTO v(vector_id, embedding, type, key) VALUES
+           (7, X'0000803F000000000000000000000000', 'memory', 'mem-a'),
+           (8, X'0000803F000000000000000000000000', 'project', 'mem-a');",
+    )
+    .expect("seed");
+
+    let found: Result<i64, _> = conn.query_row(
+        "SELECT vector_id FROM v WHERE type = 'project' AND key = 'mem-a'",
+        [],
+        |r| r.get(0),
+    );
+    println!("PLAIN LOOKUP (type+aux key): {found:?}");
+
+    let count: Result<i64, _> =
+        conn.query_row("SELECT count(*) FROM v WHERE type = 'memory'", [], |r| {
+            r.get(0)
+        });
+    println!("COUNT BY PARTITION: {count:?}");
+
+    // The same key in two kinds must resolve to different vectors — the whole point of the keyslug.
+    let mem: Result<i64, _> = conn.query_row(
+        "SELECT vector_id FROM v WHERE type = 'memory' AND key = 'mem-a'",
+        [],
+        |r| r.get(0),
+    );
+    println!("PLAIN LOOKUP (memory): {mem:?}");
+}
+
+/// Can a vec0 table carry TWO partition keys — `type` and the author pen — so that a KNN can be
+/// restricted to "my private documents of this kind" instead of over-fetching and sifting?
+#[test]
+fn probes_two_partition_keys() {
+    register();
+    let conn = Connection::open_in_memory().expect("open");
+    let created = conn.execute_batch(
+        "CREATE VIRTUAL TABLE v USING vec0(
+           vector_id INTEGER PRIMARY KEY,
+           embedding float[4] distance_metric=cosine,
+           type text PARTITION KEY,
+           pen  text PARTITION KEY,
+           +key TEXT
+         );",
+    );
+    println!("TWO PARTITION KEYS: {created:?}");
+    if created.is_err() {
+        return;
+    }
+    for (id, e, ty, pen, key) in [
+        (1, [1.0, 0.0, 0.0, 0.0], "memory", "stet", "mine"), // same pen, same type
+        (2, [0.9, 0.1, 0.0, 0.0], "memory", "stet", "mine2"),
+        (3, [0.8, 0.2, 0.0, 0.0], "memory", "james", "theirs"),
+        (4, [0.1, 0.9, 0.0, 0.0], "project", "stet", "other-type"),
+    ] {
+        conn.execute(
+            "INSERT INTO v(vector_id, embedding, type, pen, key) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![id, blob(e), ty, pen, key],
+        )
+        .expect("insert");
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, distance FROM v
+              WHERE embedding MATCH ?1 AND k = ?2 AND type = 'memory' AND pen = 'stet'
+              ORDER BY distance",
+        )
+        .expect("prepare two-partition knn");
+    let hits: Vec<(String, f64)> = stmt
+        .query_map(rusqlite::params![blob([1.0, 0.0, 0.0, 0.0]), 10i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    println!("KNN type=memory pen=stet k=10: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        2,
+        "k is per partition pair: only my own memories"
+    );
+}

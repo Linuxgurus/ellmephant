@@ -24,7 +24,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::embed::{Embedder, VecSpec, projection};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index;
 use crate::store::links::Kind;
 use crate::store::row_hash;
@@ -212,7 +212,13 @@ pub fn settle_encoded(conn: &Connection, claim: &Claim, vector: &[f32]) -> Resul
     // The vec table is created outside the transaction: DDL does not ride inside one.
     index::vec::ensure(conn, vector.len())?;
     let tx = conn.unchecked_transaction()?;
-    index::vec::upsert(&tx, claim.id, vector)?;
+    let (kind, key) = Kind::from_keyslug(&claim.keyslug).ok_or_else(|| {
+        Error::Config(format!(
+            "claim has an unaddressable keyslug: {}",
+            claim.keyslug
+        ))
+    })?;
+    index::vec::upsert(&tx, claim.id, kind.as_str(), key, vector)?;
     // Interim, until a later migration drops the column: keep `encode_hash` describing the text whose
     // vector was just written, so a reader is never told something false. Nothing READS it for
     // correctness any more — `claim` asks the index, and the queue asks its own content.
@@ -709,7 +715,7 @@ mod tests {
 
         // A vector removed by hand is exactly the shape of a torn index.
         conn.execute(
-            "DELETE FROM memory_vec WHERE memory_id = ?1",
+            "DELETE FROM document_vec WHERE vector_id = ?1",
             [id_of(&conn, "a")],
         )
         .unwrap();

@@ -32,9 +32,9 @@ fn finds_only_the_pair_inside_the_ceiling() {
     let (c, _) = common::add_now(&conn, &embedder, &memory("gamma", "C", "body c")).unwrap();
 
     // Controlled vectors: alpha ≈ beta; gamma orthogonal to both.
-    vec::upsert(&conn, a, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-    vec::upsert(&conn, b, &[0.9998, 0.02, 0.0, 0.0]).unwrap();
-    vec::upsert(&conn, c, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+    vec::upsert(&conn, a, "memory", "ka", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+    vec::upsert(&conn, b, "memory", "kb", &[0.9998, 0.02, 0.0, 0.0]).unwrap();
+    vec::upsert(&conn, c, "memory", "kc", &[0.0, 1.0, 0.0, 0.0]).unwrap();
 
     let pairs = dupes::find(&conn, 0.05, 50).unwrap();
     assert_eq!(pairs.len(), 1, "{pairs:?}");
@@ -57,8 +57,8 @@ fn a_pair_is_emitted_once_not_twice() {
     let (a, _) = common::add_now(&conn, &embedder, &memory("one", "One", "x")).unwrap();
     let (b, _) = common::add_now(&conn, &embedder, &memory("two", "Two", "y")).unwrap();
     // Identical vectors: distance 0, and the pair must not appear from both ends.
-    vec::upsert(&conn, a, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-    vec::upsert(&conn, b, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+    vec::upsert(&conn, a, "memory", "ka", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+    vec::upsert(&conn, b, "memory", "kb", &[1.0, 0.0, 0.0, 0.0]).unwrap();
 
     let pairs = dupes::find(&conn, 0.05, 50).unwrap();
     assert_eq!(pairs.len(), 1, "one pair, not two: {pairs:?}");

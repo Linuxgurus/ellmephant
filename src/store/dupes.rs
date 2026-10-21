@@ -61,6 +61,7 @@ pub fn find(conn: &Connection, max_distance: f32, limit: usize) -> Result<Vec<Du
                 k,
                 max_distance: None,
             },
+            Some("memory"),
         )? {
             if other == id || distance > max_distance {
                 continue;

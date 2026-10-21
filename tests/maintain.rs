@@ -246,3 +246,162 @@ fn reparse_applies_the_code_span_rule_to_an_existing_body() {
         "the code-span token is no longer an edge"
     );
 }
+
+/// The legacy index is **copied**, not re-embedded: `memory_vec` was keyed by `memory_id`, the new
+/// table is partitioned by `type` with an opaque `vector_id`, and the dimension did not change — so
+/// the vectors move by `INSERT..SELECT` and the encoder is never called.
+///
+/// This is the migration that makes the whole change cheap: ~300 vectors at ~11s each would be an
+/// hour of work, and a copy is milliseconds (measured: the copy answers a KNN at distance 0.0).
+#[test]
+fn the_legacy_index_is_copied_not_reembedded() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let spec = VecSpec::of(&embedder);
+    let id = store::add(&conn, &spec, &memory("a", "alpha", &[]))
+        .expect("write")
+        .0;
+
+    // Put the store back into the OLD shape by hand: no partitioned table, a `memory_vec` holding one
+    // vector under the memory's own id.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS document_vec;
+         DROP TABLE IF EXISTS document_vec_deleted;
+         CREATE VIRTUAL TABLE memory_vec USING vec0(
+           memory_id INTEGER PRIMARY KEY, embedding float[4] distance_metric=cosine);",
+    )
+    .expect("legacy shape");
+    conn.execute(
+        "INSERT INTO memory_vec(memory_id, embedding) VALUES(?1, ?2)",
+        params![id, vec::to_blob(&[1.0, 0.0, 0.0, 0.0])],
+    )
+    .expect("legacy vector");
+
+    // The first `ensure` after the upgrade is the migration.
+    vec::ensure(&conn, 4).expect("migrate");
+
+    assert_eq!(
+        vec::count(&conn).expect("count"),
+        1,
+        "the vector came across"
+    );
+    assert!(
+        vec::get(&conn, id).expect("get").is_some(),
+        "under the same id, because a memory's id is its vector id"
+    );
+    assert_eq!(
+        vec::keys_of(&conn, "memory").expect("keys"),
+        vec!["a"],
+        "and it knows which document it belongs to"
+    );
+    let legacy: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'memory_vec'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("lookup");
+    assert_eq!(legacy, 0, "the old table is gone once copied");
+}
+
+/// A delete MOVES the vector into the tombstone index — it is not erased.
+///
+/// James, 2026-10-21: an embedding is semantic, not the source of truth, so deleting a document must
+/// not erase what the store knew about it. The tombstone is a *separate table*, which is what makes
+/// "unreachable by any normal search" structural rather than a filter someone must remember.
+#[test]
+fn a_delete_moves_the_vector_to_the_tombstone_index() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let spec = VecSpec::of(&embedder);
+    let (id, _) = store::add(&conn, &spec, &memory("gone", "to be deleted", &[])).expect("write");
+    common::settle(&conn, &embedder);
+    assert!(vec::get(&conn, id).expect("get").is_some(), "indexed");
+
+    assert!(store::delete(&conn, "gone").expect("delete"));
+
+    assert!(
+        vec::get(&conn, id).expect("get").is_none(),
+        "no normal search can reach it"
+    );
+    assert_eq!(
+        vec::count_deleted(&conn).expect("tombstones"),
+        1,
+        "but the store still knows it existed"
+    );
+    assert_eq!(vec::count(&conn).expect("live"), 0);
+}
+
+/// The half-copied state, constructed on purpose — stet's test, and the one that catches the bug this
+/// code had: `execute_batch` autocommits each statement, so the copy could land while the DROP did
+/// not, and then `ensure` failed on every open and the store never started again.
+///
+/// The contract: the copy and the drop are ONE transaction, and a partial state (rows in BOTH tables)
+/// COMPLETES rather than colliding. Nothing is duplicated, nothing is overwritten with legacy data.
+#[test]
+fn a_half_copied_legacy_index_completes_without_duplicating() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let spec = VecSpec::of(&embedder);
+    let a = store::add(&conn, &spec, &memory("a", "alpha", &[]))
+        .expect("write")
+        .0;
+    let b = store::add(&conn, &spec, &memory("b", "beta", &[]))
+        .expect("write")
+        .0;
+
+    // Old shape, with two vectors in it.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS document_vec;
+         DROP TABLE IF EXISTS document_vec_deleted;
+         CREATE VIRTUAL TABLE memory_vec USING vec0(
+           memory_id INTEGER PRIMARY KEY, embedding float[4] distance_metric=cosine);
+         INSERT INTO memory_vec(memory_id, embedding) VALUES
+           (1, X'0000803F000000000000000000000000'),
+           (2, X'0000803F000000000000000000000000');",
+    )
+    .expect("legacy shape");
+
+    // The crash window, reproduced: the copy landed for one row, the drop did not.
+    vec::ensure(&conn, 4).expect("first ensure migrates");
+    conn.execute_batch(
+        "DROP TABLE document_vec_deleted;
+         CREATE VIRTUAL TABLE document_vec_deleted USING vec0(
+           vector_id INTEGER PRIMARY KEY, embedding float[4] distance_metric=cosine,
+           type text PARTITION KEY, +key TEXT, +deleted_at TEXT);
+         CREATE VIRTUAL TABLE memory_vec USING vec0(
+           memory_id INTEGER PRIMARY KEY, embedding float[4] distance_metric=cosine);
+         INSERT INTO memory_vec(memory_id, embedding) VALUES (1, X'0000803F000000000000000000000000');",
+    )
+    .expect("re-create the legacy table with an already-copied id");
+
+    // A store that already holds both must still open, complete, and not duplicate.
+    let done = vec::ensure(&conn, 4);
+    assert!(done.is_ok(), "a half-copied index must complete: {done:?}");
+    assert_eq!(
+        vec::count(&conn).expect("count"),
+        2,
+        "no duplicates, no loss"
+    );
+    let rows: Vec<i64> = {
+        let mut st = conn
+            .prepare("SELECT vector_id FROM document_vec ORDER BY vector_id")
+            .expect("prepare");
+        st.query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<i64>>>()
+            .expect("rows")
+    };
+    assert_eq!(rows, vec![a, b], "each id appears exactly once");
+    let legacy: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'memory_vec'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("lookup");
+    assert_eq!(legacy, 0, "and the legacy table is gone at the end");
+}

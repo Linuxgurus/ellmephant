@@ -149,12 +149,22 @@ fn migrate_legacy(conn: &Connection) -> Result<()> {
     if legacy == 0 {
         return Ok(());
     }
-    conn.execute_batch(&format!(
+    // ONE TRANSACTION, and the drop is the commit marker — stet's condition, and it was not met
+    // before: `execute_batch` autocommits each statement, so the INSERT could land while the DROP did
+    // not. That state is worse than a duplicate: `document_vec` holds the rows AND the legacy table
+    // exists, re-running hits a PRIMARY KEY conflict, `ensure` returns Err, and the store will not
+    // open again until someone repairs it by hand.
+    let tx = conn.unchecked_transaction()?;
+    // `WHERE NOT EXISTS` so a half-copied state COMPLETES rather than colliding: the copy is a
+    // fact-per-row repair, not an all-or-nothing insert.
+    tx.execute_batch(&format!(
         "INSERT INTO {TABLE}(vector_id, embedding, type, key)
            SELECT v.memory_id, v.embedding, 'memory', m.key
-             FROM {LEGACY_TABLE} v JOIN memory m ON m.id = v.memory_id;
-         DROP TABLE {LEGACY_TABLE};"
+             FROM {LEGACY_TABLE} v JOIN memory m ON m.id = v.memory_id
+            WHERE NOT EXISTS (SELECT 1 FROM {TABLE} d WHERE d.vector_id = v.memory_id);"
     ))?;
+    tx.execute_batch(&format!("DROP TABLE {LEGACY_TABLE};"))?;
+    tx.commit()?;
     tracing::info!(
         "index: copied every vector out of {LEGACY_TABLE} into {TABLE}, partitioned by type"
     );

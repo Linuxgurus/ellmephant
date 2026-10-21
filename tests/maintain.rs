@@ -246,3 +246,90 @@ fn reparse_applies_the_code_span_rule_to_an_existing_body() {
         "the code-span token is no longer an edge"
     );
 }
+
+/// The legacy index is **copied**, not re-embedded: `memory_vec` was keyed by `memory_id`, the new
+/// table is partitioned by `type` with an opaque `vector_id`, and the dimension did not change — so
+/// the vectors move by `INSERT..SELECT` and the encoder is never called.
+///
+/// This is the migration that makes the whole change cheap: ~300 vectors at ~11s each would be an
+/// hour of work, and a copy is milliseconds (measured: the copy answers a KNN at distance 0.0).
+#[test]
+fn the_legacy_index_is_copied_not_reembedded() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let spec = VecSpec::of(&embedder);
+    let id = store::add(&conn, &spec, &memory("a", "alpha", &[]))
+        .expect("write")
+        .0;
+
+    // Put the store back into the OLD shape by hand: no partitioned table, a `memory_vec` holding one
+    // vector under the memory's own id.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS document_vec;
+         DROP TABLE IF EXISTS document_vec_deleted;
+         CREATE VIRTUAL TABLE memory_vec USING vec0(
+           memory_id INTEGER PRIMARY KEY, embedding float[4] distance_metric=cosine);",
+    )
+    .expect("legacy shape");
+    conn.execute(
+        "INSERT INTO memory_vec(memory_id, embedding) VALUES(?1, ?2)",
+        params![id, vec::to_blob(&[1.0, 0.0, 0.0, 0.0])],
+    )
+    .expect("legacy vector");
+
+    // The first `ensure` after the upgrade is the migration.
+    vec::ensure(&conn, 4).expect("migrate");
+
+    assert_eq!(
+        vec::count(&conn).expect("count"),
+        1,
+        "the vector came across"
+    );
+    assert!(
+        vec::get(&conn, id).expect("get").is_some(),
+        "under the same id, because a memory's id is its vector id"
+    );
+    assert_eq!(
+        vec::keys_of(&conn, "memory").expect("keys"),
+        vec!["a"],
+        "and it knows which document it belongs to"
+    );
+    let legacy: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'memory_vec'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("lookup");
+    assert_eq!(legacy, 0, "the old table is gone once copied");
+}
+
+/// A delete MOVES the vector into the tombstone index — it is not erased.
+///
+/// James, 2026-10-21: an embedding is semantic, not the source of truth, so deleting a document must
+/// not erase what the store knew about it. The tombstone is a *separate table*, which is what makes
+/// "unreachable by any normal search" structural rather than a filter someone must remember.
+#[test]
+fn a_delete_moves_the_vector_to_the_tombstone_index() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let spec = VecSpec::of(&embedder);
+    let (id, _) = store::add(&conn, &spec, &memory("gone", "to be deleted", &[])).expect("write");
+    common::settle(&conn, &embedder);
+    assert!(vec::get(&conn, id).expect("get").is_some(), "indexed");
+
+    assert!(store::delete(&conn, "gone").expect("delete"));
+
+    assert!(
+        vec::get(&conn, id).expect("get").is_none(),
+        "no normal search can reach it"
+    );
+    assert_eq!(
+        vec::count_deleted(&conn).expect("tombstones"),
+        1,
+        "but the store still knows it existed"
+    );
+    assert_eq!(vec::count(&conn).expect("live"), 0);
+}

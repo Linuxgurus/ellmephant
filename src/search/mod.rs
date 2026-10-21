@@ -451,7 +451,7 @@ fn semantic_ids(
         k: indexed.max(1) as usize,
         max_distance: q.max_distance,
     };
-    index::vec::knn(conn, &query_vector, &hint)
+    index::vec::knn(conn, &query_vector, &hint, Some("memory"))
 }
 
 /// Breadth-first over `memory_link` in *both* directions, up to `hops` from the seeds.

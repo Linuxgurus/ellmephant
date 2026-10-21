@@ -4,10 +4,19 @@
 //! touching the rest of the crate. The module is registered **in-process** with
 //! `sqlite3_auto_extension` — no `.dylib`, no `load_extension`.
 //!
-//! One vec0 table, `memory_vec`, holds one vector per memory: the embedding of the whole
-//! document (`key` + `title` + `body`, SPEC §6/§8). It is a *derived, rebuildable*
-//! index: its dimension is a runtime property of the embedder, so it is created by
-//! [`ensure`] rather than by a SQL migration.
+//! Two vec0 tables hold the index: `document_vec` (live) and `document_vec_deleted` (tombstones).
+//! Each row is one document embedding — key + title + body, as the kind rendered it — plus the
+//! **partition key** `type` and the document `key` as an auxiliary column.
+//!
+//! Both are *derived and rebuildable*: the dimension is a runtime property of the embedder, so they
+//! are created by [`ensure`] rather than by a SQL migration, and vectors can be copied between them
+//! by `INSERT..SELECT` (measured: the copy answers a KNN at distance 0.0).
+//!
+//! ★ **`type` is a PARTITION KEY, and that is not a style choice.** Measured against the pinned
+//! sqlite-vec 0.1.9: a KNN cannot filter on an auxiliary column (*"An illegal WHERE constraint was
+//! provided on a vec0 auxiliary column in a KNN query"*), but it can filter on a partition key — and
+//! then `k` is per-partition, which is what a type-filtered search needs. `tests/vec_kind_filter.rs`
+//! holds those measurements as assertions.
 
 use std::sync::Once;
 
@@ -17,8 +26,14 @@ use crate::db::meta;
 use crate::embed::projection;
 use crate::error::{Error, Result};
 
-/// The single vec0 table holding one document embedding per memory.
-pub const TABLE: &str = "memory_vec";
+/// The live index: one vector per document, partitioned by kind.
+pub const TABLE: &str = "document_vec";
+
+/// The tombstone index: vectors of deleted documents, unreachable by any normal search.
+pub const DELETED_TABLE: &str = "document_vec_deleted";
+
+/// The table this one replaced. Vectors are COPIED out of it on first open, not re-embedded.
+const LEGACY_TABLE: &str = "memory_vec";
 
 /// Register the `vec0` virtual-table module on the process. Idempotent.
 ///
@@ -69,10 +84,20 @@ pub fn stored_dim(conn: &Connection) -> Result<Option<usize>> {
 }
 
 /// The `CREATE VIRTUAL TABLE` for a given dimension.
-fn create_sql(dim: usize) -> String {
+fn create_sql(dim: usize, table: &str) -> String {
+    // The tombstone table carries WHEN the document went, so a deleted-search can report an age. The
+    // live table has no such column: a live document has no deletion to date.
+    let extra = if table == DELETED_TABLE {
+        ", +deleted_at TEXT"
+    } else {
+        ""
+    };
     format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {TABLE} USING vec0(\
-         memory_id INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine)"
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(\
+         vector_id INTEGER PRIMARY KEY, \
+         embedding float[{dim}] distance_metric=cosine, \
+         type text PARTITION KEY, \
+         +key TEXT{extra})",
     )
 }
 
@@ -100,7 +125,39 @@ pub fn ensure(conn: &Connection, dim: usize) -> Result<()> {
     if meta::get(conn, meta::PROJECTION)?.is_none() {
         meta::set(conn, meta::PROJECTION, &projection::fingerprint())?;
     }
-    conn.execute_batch(&create_sql(dim))?;
+    conn.execute_batch(&create_sql(dim, TABLE))?;
+    conn.execute_batch(&create_sql(dim, DELETED_TABLE))?;
+    migrate_legacy(conn)?;
+    Ok(())
+}
+
+/// Move the old single-kind index into the partitioned one, once.
+///
+/// `memory_vec` was keyed by `memory_id`; the new table is keyed by an opaque `vector_id` and
+/// partitioned by `type`. Dimension and model are unchanged, so the vectors are **copied, never
+/// re-embedded** — measured: an `INSERT..SELECT` copy answers a KNN at distance 0.0. The ids stay the
+/// memory ids, which is why nothing has to be renumbered for the memory kind.
+///
+/// Idempotent by construction: it does nothing when the legacy table is absent, and drops it when it
+/// has finished, so a crash mid-copy leaves the legacy table intact and the copy re-runs.
+fn migrate_legacy(conn: &Connection) -> Result<()> {
+    let legacy: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![LEGACY_TABLE],
+        |r| r.get(0),
+    )?;
+    if legacy == 0 {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "INSERT INTO {TABLE}(vector_id, embedding, type, key)
+           SELECT v.memory_id, v.embedding, 'memory', m.key
+             FROM {LEGACY_TABLE} v JOIN memory m ON m.id = v.memory_id;
+         DROP TABLE {LEGACY_TABLE};"
+    ))?;
+    tracing::info!(
+        "index: copied every vector out of {LEGACY_TABLE} into {TABLE}, partitioned by type"
+    );
     Ok(())
 }
 
@@ -142,14 +199,20 @@ pub fn recreate(conn: &Connection, dim: usize) -> Result<()> {
     if dim == 0 {
         return Err(Error::Config("embedder dim must be > 0".into()));
     }
-    conn.execute_batch(&format!("DROP TABLE IF EXISTS {TABLE}"))?;
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {TABLE}; DROP TABLE IF EXISTS {DELETED_TABLE};"
+    ))?;
     meta::set(conn, meta::DIM, &dim.to_string())?;
-    conn.execute_batch(&create_sql(dim))?;
+    conn.execute_batch(&create_sql(dim, TABLE))?;
+    conn.execute_batch(&create_sql(dim, DELETED_TABLE))?;
     Ok(())
 }
 
-/// Insert or replace the vector for `id` (vec0 has no `ON CONFLICT`, so delete+insert).
-pub fn upsert(conn: &Connection, id: i64, vector: &[f32]) -> Result<()> {
+/// Insert or replace the vector for `id`, recording which document it belongs to.
+///
+/// The partition (`type`) and the `key` ride along so the row is self-describing: a KNN can filter by
+/// type, and a document can be found without knowing its vector id.
+pub fn upsert(conn: &Connection, id: i64, kind: &str, key: &str, vector: &[f32]) -> Result<()> {
     if vector.is_empty() {
         return Err(Error::Config("refusing to store an empty vector".into()));
     }
@@ -158,13 +221,15 @@ pub fn upsert(conn: &Connection, id: i64, vector: &[f32]) -> Result<()> {
     conn.execute_batch("SAVEPOINT vec_upsert")?;
     let written = conn
         .execute(
-            &format!("DELETE FROM {TABLE} WHERE memory_id = ?1"),
+            &format!("DELETE FROM {TABLE} WHERE vector_id = ?1"),
             params![id],
         )
         .and_then(|_| {
             conn.execute(
-                &format!("INSERT INTO {TABLE}(memory_id, embedding) VALUES (?1, ?2)"),
-                params![id, to_blob(vector)],
+                &format!(
+                    "INSERT INTO {TABLE}(vector_id, embedding, type, key) VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![id, to_blob(vector), kind, key],
             )
         });
     match written {
@@ -185,8 +250,37 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
         // memory from a store that has not encoded anything yet lands here.
         return Ok(());
     }
+    // A DELETE MOVES THE VECTOR. James, 2026-10-21: an embedding is semantic, not the source of
+    // truth, so deleting a document should not erase what the store once knew about it. The vector
+    // goes to the tombstone table, where no normal search can reach it (it is a different table, not a
+    // filtered one) and a deliberate deleted-search can. A kind with a retention promise purges
+    // instead — `purge` is the verb for that, never this one.
     conn.execute(
-        &format!("DELETE FROM {TABLE} WHERE memory_id = ?1"),
+        &format!(
+            "INSERT INTO {DELETED_TABLE}(vector_id, embedding, type, key, deleted_at)
+               SELECT vector_id, embedding, type, key, datetime('now') FROM {TABLE} WHERE vector_id = ?1;"
+        ),
+        params![id],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM {TABLE} WHERE vector_id = ?1"),
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Destroy a document's vector outright: no tombstone, no trace. For a kind whose deletion is a
+/// promise to a person (`mail`), and for `memory_history_erase`.
+pub fn purge(conn: &Connection, id: i64) -> Result<()> {
+    if !table_exists(conn)? {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("DELETE FROM {TABLE} WHERE vector_id = ?1"),
+        params![id],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM {DELETED_TABLE} WHERE vector_id = ?1"),
         params![id],
     )?;
     Ok(())
@@ -200,7 +294,7 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Vec<f32>>> {
     }
     let blob: Option<Vec<u8>> = conn
         .query_row(
-            &format!("SELECT embedding FROM {TABLE} WHERE memory_id = ?1"),
+            &format!("SELECT embedding FROM {TABLE} WHERE vector_id = ?1"),
             params![id],
             |r| r.get(0),
         )
@@ -228,9 +322,50 @@ pub fn ids(conn: &Connection) -> Result<Vec<i64>> {
     if !table_exists(conn)? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&format!("SELECT memory_id FROM {TABLE}"))?;
+    let mut stmt = conn.prepare(&format!("SELECT vector_id FROM {TABLE}"))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+}
+
+/// The document keys of one kind that have a live vector. `missing` compares this against the kind's
+/// rows, so a document that moved kind (it cannot) or lost its vector is visible.
+pub fn keys_of(conn: &Connection, kind: &str) -> Result<Vec<String>> {
+    if !table_exists(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT key FROM {TABLE} WHERE type = ?1"))?;
+    let rows = stmt.query_map(params![kind], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+/// Vectors held for one kind — the number `/health` and `doctor` report per type, so a single count
+/// can never again stand in for "is everything indexed".
+pub fn count_of(conn: &Connection, kind: &str) -> Result<i64> {
+    if !table_exists(conn)? {
+        return Ok(0);
+    }
+    Ok(conn.query_row(
+        &format!("SELECT count(*) FROM {TABLE} WHERE type = ?1"),
+        params![kind],
+        |r| r.get(0),
+    )?)
+}
+
+/// Tombstoned vectors — deleted documents, reachable only by asking for them.
+pub fn count_deleted(conn: &Connection) -> Result<i64> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![DELETED_TABLE],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(0);
+    }
+    Ok(
+        conn.query_row(&format!("SELECT count(*) FROM {DELETED_TABLE}"), [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Whether the vec0 table has been created yet.
@@ -243,7 +378,12 @@ fn table_exists(conn: &Connection) -> Result<bool> {
 }
 
 /// KNN over the table, nearest first: `(memory_id, cosine distance)`.
-pub fn knn(conn: &Connection, query: &[f32], hint: &Knn) -> Result<Vec<(i64, f32)>> {
+pub fn knn(
+    conn: &Connection,
+    query: &[f32],
+    hint: &Knn,
+    kind: Option<&str>,
+) -> Result<Vec<(i64, f32)>> {
     if query.is_empty() {
         return Err(Error::Config("empty query vector".into()));
     }
@@ -251,19 +391,28 @@ pub fn knn(conn: &Connection, query: &[f32], hint: &Knn) -> Result<Vec<(i64, f32
         return Ok(Vec::new()); // nothing indexed: nothing can be near
     }
     let k = i64::try_from(hint.k).map_err(|_| Error::Config("k too large".into()))?;
-    let sql = format!(
-        "SELECT memory_id, distance FROM {TABLE} \
-         WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
-    );
+    // `k` is per-partition when a type is given and global when it is not (measured). An unfiltered
+    // search therefore has to be built per kind and merged, or the largest kind takes every slot.
+    let sql = match kind {
+        Some(_) => format!(
+            "SELECT vector_id, distance FROM {TABLE} \
+             WHERE embedding MATCH ?1 AND k = ?2 AND type = ?3 ORDER BY distance"
+        ),
+        None => format!(
+            "SELECT vector_id, distance FROM {TABLE} \
+             WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+        ),
+    };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![to_blob(query), k], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?))
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    let mut rows = match kind {
+        Some(kind) => stmt.query(params![to_blob(query), k, kind])?,
+        None => stmt.query(params![to_blob(query), k])?,
+    };
+    let mut out: Vec<(i64, f32)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push((row.get(0)?, row.get(1)?));
     }
+    drop(rows);
     if let Some(max) = hint.max_distance {
         out.retain(|(_, d)| *d <= max);
     }
@@ -308,10 +457,10 @@ mod tests {
     fn ensure_round_trips_a_vector() {
         let conn = conn();
         ensure(&conn, 3).unwrap();
-        upsert(&conn, 1, &[1.0, 2.0, 3.0]).unwrap();
+        upsert(&conn, 1, "memory", "k", &[1.0, 2.0, 3.0]).unwrap();
         assert_eq!(get(&conn, 1).unwrap(), Some(vec![1.0, 2.0, 3.0]));
 
-        upsert(&conn, 1, &[4.0, 5.0, 6.0]).unwrap();
+        upsert(&conn, 1, "memory", "k", &[4.0, 5.0, 6.0]).unwrap();
         assert_eq!(get(&conn, 1).unwrap(), Some(vec![4.0, 5.0, 6.0]));
         assert_eq!(count(&conn).unwrap(), 1);
 
@@ -332,12 +481,12 @@ mod tests {
     fn recreate_switches_dimension_and_clears() {
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        upsert(&conn, 1, &[1.0, 0.0]).unwrap();
+        upsert(&conn, 1, "memory", "k", &[1.0, 0.0]).unwrap();
 
         recreate(&conn, 4).unwrap();
         assert_eq!(stored_dim(&conn).unwrap(), Some(4));
         assert_eq!(count(&conn).unwrap(), 0, "rebuild starts empty");
-        upsert(&conn, 1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        upsert(&conn, 1, "memory", "k", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         assert_eq!(get(&conn, 1).unwrap().unwrap().len(), 4);
 
         clear(&conn).unwrap();
@@ -363,7 +512,7 @@ mod tests {
     fn upsert_rejects_an_empty_vector() {
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        assert!(upsert(&conn, 1, &[]).is_err());
+        assert!(upsert(&conn, 1, "memory", "k", &[]).is_err());
     }
 
     #[test]
@@ -374,15 +523,15 @@ mod tests {
             k: 1,
             max_distance: None,
         };
-        assert!(knn(&conn, &[], &hint).is_err());
+        assert!(knn(&conn, &[], &hint, Some("memory")).is_err());
     }
 
     #[test]
     fn knn_returns_nearest_first() {
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        upsert(&conn, 1, &[1.0, 0.0]).unwrap();
-        upsert(&conn, 2, &[0.0, 1.0]).unwrap();
+        upsert(&conn, 1, "memory", "k", &[1.0, 0.0]).unwrap();
+        upsert(&conn, 2, "memory", "k", &[0.0, 1.0]).unwrap();
 
         let hits = knn(
             &conn,
@@ -391,6 +540,7 @@ mod tests {
                 k: 3,
                 max_distance: None,
             },
+            Some("memory"),
         )
         .unwrap();
         assert_eq!(hits[0].0, 1, "exact match should rank first");
@@ -411,7 +561,7 @@ mod tests {
         // so they cannot be proven to match the current projection. Flagged, not assumed away.
         let conn = conn();
         ensure(&conn, 2).unwrap();
-        upsert(&conn, 1, &[1.0, 0.0]).unwrap();
+        upsert(&conn, 1, "memory", "k", &[1.0, 0.0]).unwrap();
         conn.execute("DELETE FROM meta WHERE k = ?1", params![meta::PROJECTION])
             .unwrap();
         assert!(projection_stale(&conn).unwrap());

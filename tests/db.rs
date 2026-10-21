@@ -145,6 +145,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
     // migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE mail", []).unwrap();
+    // ...and predates the MAIL CURSOR (0017), which is a table of its own.
+    conn.execute("DROP TABLE mail_cursor", []).unwrap();
     // ...and predates PROVENANCE (0014): undo its columns, index first — SQLite refuses to drop an
     // indexed column.
     conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
@@ -247,6 +249,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
     // migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE mail", []).unwrap();
+    // ...and predates the MAIL CURSOR (0017), which is a table of its own.
+    conn.execute("DROP TABLE mail_cursor", []).unwrap();
     // ...and predates PROVENANCE (0014), for the same reason.
     conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
         .unwrap();

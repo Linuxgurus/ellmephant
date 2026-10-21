@@ -100,6 +100,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0018_memory_audience.sql"),
         "the read audience: public, or exactly one pen (#54/#55)",
     ),
+    (
+        19,
+        include_str!("../../migrations/0019_mail_cursor.sql"),
+        "mail cursor: one row per (reader, box), reader resolved from the proven pen",
+    ),
 ];
 
 /// Current schema version recorded in the file.

@@ -1090,3 +1090,92 @@ async fn semantic_search_honours_the_kind_parameter() {
     .await;
     assert_eq!(alias.is_error, Some(true), "`kind` is an alias of `type`");
 }
+
+/// ★ soma/ellmephant#79 over the real transport: the cursor is the PROVEN pen's, stored in the store,
+/// so `mail_inbox` needs no `since` and the caller cannot forget, re-spell or advance someone else's.
+#[tokio::test]
+async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    for n in 0..2 {
+        let sent = call(
+            &client,
+            "mail_send",
+            serde_json::json!({
+                "sender": "james",
+                "recipient": "tester",
+                "subject": format!("letter {n}"),
+                "body": "body",
+            }),
+        )
+        .await;
+        assert!(!sent.is_error.unwrap_or(false), "{}", text(&sent));
+    }
+
+    // No `since`: the store knows where this pen is (nowhere yet) and says what is left.
+    let inbox = call(
+        &client,
+        "mail_inbox",
+        serde_json::json!({ "recipient": "tester" }),
+    )
+    .await;
+    assert!(!inbox.is_error.unwrap_or(false), "{}", text(&inbox));
+    let first: serde_json::Value = serde_json::from_str(&text(&inbox)).expect("json");
+    assert_eq!(first["reader"], "tester", "the cursor names its reader");
+    assert_eq!(first["cursor"], 0, "never advanced");
+    assert_eq!(first["unread"], 2, "one call answers 'how much mail'");
+    let page_top = first["page_top"].as_i64().expect("a full page");
+
+    let ack = call(
+        &client,
+        "mail_ack",
+        serde_json::json!({ "recipient": "tester", "seq": page_top }),
+    )
+    .await;
+    assert!(!ack.is_error.unwrap_or(false), "{}", text(&ack));
+    let acked: serde_json::Value = serde_json::from_str(&text(&ack)).expect("json");
+    assert_eq!(acked["seq"], page_top);
+    assert_eq!(acked["moved"], 2, "what the advance covered");
+    assert_eq!(acked["unread"], 0);
+
+    // The stored cursor is the default now: no `since` means "after where I am".
+    let again = call(
+        &client,
+        "mail_inbox",
+        serde_json::json!({ "recipient": "tester" }),
+    )
+    .await;
+    let second: serde_json::Value = serde_json::from_str(&text(&again)).expect("json");
+    assert_eq!(second["cursor"], page_top);
+    assert_eq!(second["letters"].as_array().map(Vec::len), Some(0));
+
+    // A cursor only moves forward, and the refusal says where it actually is.
+    let back = call(
+        &client,
+        "mail_ack",
+        serde_json::json!({ "recipient": "tester", "seq": 0 }),
+    )
+    .await;
+    assert!(back.is_error.unwrap_or(false), "{}", text(&back));
+    assert!(
+        text(&back).contains("only moves forward"),
+        "{}",
+        text(&back)
+    );
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

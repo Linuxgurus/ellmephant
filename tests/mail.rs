@@ -205,3 +205,46 @@ fn a_short_page_reports_its_own_top_not_the_boxs() -> Result<()> {
     );
     Ok(())
 }
+
+/// ★ soma/ellmephant#79: three cursors for two readers, in three shapes. The cursor is now ONE row per
+/// (reader, box) — and "one reader" is a fact the store holds, not a convention two callers remember.
+#[test]
+fn a_cursor_belongs_to_one_reader_and_only_moves_forward() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+
+    let one = mail::send(&conn, "james", "stet", "one", "first", "text")?;
+    let two = mail::send(&conn, "james", "stet", "two", "second", "text")?;
+
+    // No row is not 0: it is "this reader has never advanced here", and the whole box is unread.
+    assert_eq!(mail::cursor(&conn, "stet", "stet")?, None);
+    assert_eq!(mail::cursor_or_zero(&conn, "stet", "stet")?, 0);
+
+    // Two readers of ONE box are two rows — the hand and the self are not the same place.
+    let hand = mail::advance(&conn, "hands", "stet", one.seq)?;
+    assert_eq!(hand.moved, one.seq, "it skipped the first letter");
+    assert_eq!(hand.head, two.seq);
+    assert_eq!(hand.unread, 1, "one letter left in the box");
+
+    let me = mail::advance(&conn, "Stet", "stet", 0)?;
+    assert_eq!(me.reader, "stet", "names are one box however typed");
+    assert_eq!(me.unread, 2, "the self has read nothing");
+    assert_eq!(
+        mail::cursor_or_zero(&conn, "hands", "stet")?,
+        one.seq,
+        "the hand's place did not move when the self advanced"
+    );
+
+    // Backwards is REFUSED, not silently ignored — and the refusal says where you actually are.
+    let err = mail::advance(&conn, "hands", "stet", 0).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("already at"), "{msg}");
+    assert!(msg.contains("only moves forward"), "{msg}");
+
+    // Idempotent at the current value: a re-acknowledgement is a success with nothing moved.
+    let again = mail::advance(&conn, "hands", "stet", one.seq)?;
+    assert_eq!(again.moved, 0);
+    assert_eq!(again.seq, one.seq);
+    assert_eq!(mail::cursor(&conn, "hands", "stet")?.unwrap().seq, one.seq);
+    Ok(())
+}

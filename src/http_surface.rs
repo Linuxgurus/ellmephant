@@ -159,6 +159,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/mail/ack",
+        tool: "mail_ack",
+    },
+    Route {
+        method: "POST",
         path: "/mail/prune",
         tool: "mail_prune",
     },
@@ -2385,40 +2390,56 @@ pub async fn mail_send(
 }
 
 /// `GET /mail?recipient=&since=&limit=` — envelopes after the reader's cursor (`mail_inbox`).
-pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+///
+/// ★ THE CURSOR BELONGS TO THE PROVEN PEN (migration 0017). With `X-Stet-From`/`X-Stet-Auth` the
+/// request reads that pen's stored cursor; an explicit `since` still wins, because a diagnostic may
+/// want to look again. Anonymous is NOT an error here — reads are open — it simply has no stored
+/// cursor, so `since` (or 0) decides, and nothing is written.
+pub async fn mail_inbox(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let Some(recipient) = params.maybe("recipient").map(str::to_string) else {
         return error(json, StatusCode::BAD_REQUEST, "`recipient` is required");
     };
-    let since = params
-        .maybe("since")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let explicit = params.maybe("since").and_then(|v| v.parse::<i64>().ok());
     let limit = params
         .maybe("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_usize);
+    let reader = crate::identity::resolve(&headers).ok().flatten();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
+    let me = reader.clone();
     match server
         .with_read(
             "mail_inbox",
             crate::store::audience::Reader::everything(),
             move |s| {
-                // The box's top and the page's top are different facts; see `mail_inbox` in `mcp`.
+                // The box's top, the page's top, and the READER's place are three facts (see the MCP tool).
+                let stored = match &me {
+                    Some(name) => s.mail_cursor(name, &recipient)?,
+                    None => None,
+                };
+                let since = explicit.unwrap_or_else(|| stored.as_ref().map(|c| c.seq).unwrap_or(0));
                 Ok((
                     s.mail_inbox(&recipient, since, limit)?,
                     s.mail_head(&recipient)?,
+                    stored,
+                    since,
                 ))
             },
         )
         .await
     {
-        Ok((rows, newest)) => {
-            let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
+        Ok((rows, head, stored, since)) => {
+            let page_top = rows.iter().map(|r| r.seq).max();
+            let cursor = stored.as_ref().map(|c| c.seq).unwrap_or(0);
             let text = if rows.is_empty() {
                 format!("no mail after {since}")
             } else {
@@ -2435,12 +2456,82 @@ pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery)
             render(
                 StatusCode::OK,
                 json,
-                serde_json::json!({ "letters": rows, "max_seq": max_seq, "newest_available": newest })
-                    .to_string(),
+                serde_json::json!({
+                    "reader": stored
+                        .as_ref()
+                        .map(|c| c.reader.clone())
+                        .unwrap_or_else(|| reader.clone().unwrap_or_else(|| crate::identity::ANONYMOUS.to_string())),
+                    "cursor": cursor,
+                    "head": head,
+                    "unread": (head - cursor).max(0),
+                    "letters": rows,
+                    "page_top": page_top,
+                    "max_seq": page_top.unwrap_or(since),
+                    "newest_available": head,
+                })
+                .to_string(),
                 text,
             )
         }
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `POST /mail/ack?recipient=&seq=` — advance the caller's own cursor (`mail_ack`).
+///
+/// ★ A CURSOR NEEDS A READER, so this is the one mail route that REFUSES anonymous: there is no row
+/// to move without a proven pen, and guessing one would hand someone else's cursor to whoever asked.
+pub async fn mail_ack(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let (Some(recipient), Some(seq)) = (
+        params.maybe("recipient").map(str::to_string),
+        params.maybe("seq").and_then(|v| v.parse::<i64>().ok()),
+    ) else {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`recipient` and `seq` are required",
+        );
+    };
+    let reader = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::FORBIDDEN,
+                "refused: a cursor belongs to a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+            );
+        }
+        Err(forged) => return error(json, StatusCode::FORBIDDEN, forged.to_string()),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("mail_ack", move |s| {
+            s.mail_advance(&reader, &recipient, seq)
+        })
+        .await
+    {
+        Ok(cursor) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&cursor).unwrap_or_default(),
+            format!(
+                "cursor moved to {} (+{}), {} unread",
+                cursor.seq, cursor.moved, cursor.unread
+            ),
+        ),
+        Err(e) => error(json, error_status(&e), e),
     }
 }
 

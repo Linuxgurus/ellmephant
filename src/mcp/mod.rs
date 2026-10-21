@@ -64,6 +64,7 @@ pub const TOOLS: &[&str] = &[
     "mail_send",
     "mail_inbox",
     "mail_read",
+    "mail_ack",
     "mail_prune",
 ];
 
@@ -682,7 +683,7 @@ pub struct MailInboxParams {
     /// The reader's cursor.
     #[serde(default)]
     #[schemars(
-        description = "Your cursor: the highest `seq` you have already dealt with (0 for everything). Keep it in YOUR store as `mail-last-read` and advance it only AFTER handling the letters — the advance is the commit."
+        description = "The highest `seq` you have already dealt with, if you want to override the STORED cursor for this call. Omit it and the store uses YOUR cursor (one row per proven pen and box, `mail_cursor`) — which is what you should normally do: there is nothing to remember and nothing to pass."
     )]
     pub since: Option<i64>,
     /// Long-poll.
@@ -703,6 +704,21 @@ pub struct MailInboxParams {
 pub struct MailReadParams {
     /// Which letter.
     #[schemars(description = "The `seq` from `mail_inbox`.")]
+    pub seq: i64,
+}
+
+/// Parameters for [`MemoryServer::mail_ack`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MailAckParams {
+    /// Whose box.
+    #[schemars(
+        description = "The box whose cursor you are advancing — your own mail, or a box a declared surrogate hands you."
+    )]
+    pub recipient: String,
+    /// How far to advance.
+    #[schemars(
+        description = "The highest `seq` you have DEALT WITH (usually the last letter in the page you just read). It only moves forward."
+    )]
     pub seq: i64,
 }
 
@@ -2360,7 +2376,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     /// What is in a box after a cursor. Bodies omitted; `wait_seconds` long-polls.
     #[tool(
         name = "mail_inbox",
-        description = "What is in `recipient`'s box AFTER `since` — envelopes only (seq, at, sender, subject, encoding, bytes), oldest first, bodies omitted so you can decide whether a body is worth fetching (`mail_read`). ★ `since` is your own cursor: keep it in YOUR store as `mail-last-read` and advance it ONLY after you have dealt with the letters — the advance is the commit, so a processor that dies first leaves them unread and sees them again. `wait_seconds` LONG-POLLS: the call blocks up to 25s and returns the moment a letter lands, which is how a hand waits for mail without polling. No receipt is ever sent to the sender.",
+        description = "What is in `recipient`'s box AFTER your cursor — envelopes only (seq, at, sender, subject, encoding, bytes), oldest first, bodies omitted so you can decide whether a body is worth fetching (`mail_read`). ★ THE CURSOR IS STORED, ONE ROW PER PROVEN PEN AND BOX (migration 0017): omit `since` and the store uses yours, so there is nothing to remember and no memory to keep in sync. The reply carries `cursor` (where you are), `head` (the top of the box) and `unread` — one call answers \"how much mail have I not read\". ★ THE ADVANCE IS THE COMMIT and it is a separate call (`mail_ack`), so a reader that dies before advancing sees the letters again; advance only AFTER dealing with them. `wait_seconds` LONG-POLLS: the call blocks up to 25s and returns the moment a letter lands, which is how a hand waits for mail without polling. No receipt is ever sent to the sender.",
         annotations(
             title = "Read inbox",
             read_only_hint = true,
@@ -2380,10 +2396,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             wait_seconds,
             limit,
         } = p;
-        // ★ THE BOX IS CHECKED BEFORE THE LONG POLL: waiting 25 seconds to be told you may not read
-        // it is a worse answer than being told now.
-        self.mail_box_for(&ctx, &recipient)?;
-        let since = since.unwrap_or(0);
+        // ★ THE BOX AND THE READER ARE CHECKED BEFORE THE LONG POLL: waiting 25 seconds to be told you
+        // may not read it is a worse answer than being told now. The reader is the PROVEN pen, which
+        // is also the cursor's key — never an argument.
+        let reader = self.mail_box_for(&ctx, &recipient)?;
         let limit = limit.unwrap_or(50).clamp(1, 500);
         let wait = wait_seconds
             .unwrap_or(0)
@@ -2394,31 +2410,78 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
         loop {
             let who = recipient.clone();
-            let (rows, newest) = self
+            let me = reader.clone();
+            let (rows, head, cursor) = self
                 .with_read(
                     "mail_inbox",
                     crate::store::audience::Reader::everything(),
                     move |s| {
-                        // Two facts, and they were being conflated: the top of THIS PAGE and the top of
-                        // the BOX. `max_seq` was read as "newest letter that exists" while it meant
-                        // "highest seq returned" — which cost two readers an hour of theorising about a
-                        // 273-letter discrepancy that never existed (measured 2026-10-21).
-                        Ok((s.mail_inbox(&who, since, limit)?, s.mail_head(&who)?))
+                        // Three facts, and they were being conflated: the top of THIS PAGE, the top of
+                        // the BOX, and where the READER is. `max_seq` was read as "newest letter that
+                        // exists" while it meant "highest seq returned" — which cost two readers an
+                        // hour of theorising about a 273-letter discrepancy that never existed
+                        // (measured 2026-10-21).
+                        let stored = s.mail_cursor(&me, &who)?;
+                        let seq =
+                            since.unwrap_or_else(|| stored.as_ref().map(|c| c.seq).unwrap_or(0));
+                        Ok((s.mail_inbox(&who, seq, limit)?, s.mail_head(&who)?, stored))
                     },
                 )
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
-                let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
+                let page_top = rows.iter().map(|r| r.seq).max();
                 return serde_json::to_string(&serde_json::json!({
+                    "reader": cursor.as_ref().map(|c| c.reader.clone()).unwrap_or(reader),
+                    "cursor": cursor.as_ref().map(|c| c.seq).unwrap_or(0),
+                    "head": head,
+                    "unread": (head - cursor.as_ref().map(|c| c.seq).unwrap_or(0)).max(0),
                     "letters": rows,
-                    "max_seq": max_seq,
-                    "newest_available": newest,
-                    "waited": wait > 0 && rows.is_empty(),
+                    "page_top": page_top,
+                    "max_seq": page_top.unwrap_or_else(|| since.unwrap_or(0)),
+                    "newest_available": head,
+                    "waited": wait > 0 && page_top.is_none(),
                 }))
                 .map_err(|e| e.to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
+    }
+
+    /// Advance the caller's own cursor — the commit of an inbox read.
+    #[tool(
+        name = "mail_ack",
+        description = "Move YOUR mail cursor in `recipient`'s box to `seq` — the commit of `mail_inbox`. ★ The cursor belongs to the PROVEN pen, so this call can only ever move your own row: another pen's cursor is not addressable from here, and moving yours backwards is refused rather than silently accepted (the error names where you actually are). Idempotent at the current value (`moved: 0`). The reply carries `seq`, `moved` (how many letters this skipped), `head` and `unread`, so \"how much is left\" needs no second call.",
+        annotations(
+            title = "Acknowledge mail",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_ack(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailAckParams>,
+    ) -> std::result::Result<String, String> {
+        let MailAckParams { recipient, seq } = p;
+        let reader = self.mail_box_for(&ctx, &recipient)?;
+        let (log_reader, log_recipient) = (reader.clone(), recipient.clone());
+        let out = self
+            .with_store("mail_ack", move |s| {
+                s.mail_advance(&reader, &recipient, seq)
+            })
+            .await?;
+        tracing::info!(
+            tool = "mail_ack",
+            reader = %log_reader,
+            recipient = %log_recipient,
+            seq = out.seq,
+            moved = out.moved,
+            unread = out.unread,
+            "cursor advanced"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Turn a bare "no such memory" into a claim with its evidence (soma/ellmephant#57).
@@ -2713,6 +2776,7 @@ pub fn http_router(
             axum::routing::get(surface::mail_inbox).post(surface::mail_send),
         )
         .route("/mail/prune", axum::routing::post(surface::mail_prune))
+        .route("/mail/ack", axum::routing::post(surface::mail_ack))
         .route("/mail/{seq}", axum::routing::get(surface::mail_read))
         .route("/reembed", axum::routing::post(surface::reembed))
         // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.

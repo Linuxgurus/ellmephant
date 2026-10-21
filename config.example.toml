@@ -10,7 +10,7 @@ precision = "bf16"                     # bf16 (default) | f16
 device = "cpu"                         # cpu | metal
 instruction = "Given a question, retrieve relevant memories"  # query side only
 default_k = 5                          # search result count
-default_max_distance = 0.6             # cosine-distance ceiling when a search omits it; null = off
+default_max_distance = 0.52            # cosine-distance ceiling when a search omits it; null = off
 port = 8888                            # MCP HTTP port (`mcp --stdio` ignores it)
 
 # How long the encode worker sleeps between jobs, in milliseconds. It is also the worker's idle poll

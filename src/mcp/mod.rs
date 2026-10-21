@@ -1715,9 +1715,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return serde_json::to_string(&v).map_err(|e| e.to_string());
         }
         let lookup = key.clone();
-        let mut mem = self
-            .with_read("memory_get", move |s| s.show(&lookup))
-            .await?;
+        let mut mem = match self.with_read("memory_get", move |s| s.show(&lookup)).await {
+            Ok(m) => m,
+            Err(e) => return Err(self.explain_miss(&key, e).await),
+        };
         // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
         // write holds the store this visit simply goes uncounted — which is nothing, next to a read
         // that queued behind the entire write.
@@ -2227,6 +2228,57 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 .map_err(|e| e.to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Turn a bare "no such memory" into a claim with its evidence (soma/ellmephant#57).
+    ///
+    /// A miss says something about the WHOLE store, and on 2026-10-21 it said the wrong thing for 42
+    /// minutes while nobody could test which of four hypotheses was true. Nothing here changes the
+    /// answer — a missing row is still an error — but it names the store, its size, its schema and the
+    /// key's history, so the next reader can tell an absent key from a wrong file, a stale reader or a
+    /// delete. Refusals that are NOT misses pass through untouched.
+    async fn explain_miss(&self, key: &str, err: String) -> String {
+        if !err.contains("no such memory") {
+            return err;
+        }
+        let lookup = key.to_string();
+        let facts = match self
+            .with_read("memory_get", move |s| s.miss_facts(&lookup))
+            .await
+        {
+            Ok(f) => f,
+            // The diagnostic itself failed — say so rather than replacing one silent answer with
+            // another; the original error is still the truth the caller asked for.
+            Err(e) => {
+                tracing::warn!(tool = "memory_get", key = %key, diagnostic = %e, "memory_get miss, and the diagnostic failed too");
+                return err;
+            }
+        };
+        tracing::warn!(
+            tool = "memory_get",
+            key = %key,
+            store = %facts.store,
+            memories = facts.memories,
+            schema = facts.schema,
+            versions = facts.versions,
+            newest = ?facts.newest,
+            "memory_get miss"
+        );
+        if facts.versions > 0 {
+            format!(
+                "no such memory: {key} — but {} holds {} memories (schema {}) and {} version(s) for this key, newest {}. So this is a DELETED row with history, or a reader looking at the wrong store; `memory_history` lists the versions and `memory_get` with `version=N` fetches one. Do not treat this as 'never existed'.",
+                facts.store,
+                facts.memories,
+                facts.schema,
+                facts.versions,
+                facts.newest.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            format!(
+                "no such memory: {key} — {} holds {} memories (schema {}) and has no history for this key, so it has never existed THERE. If you believe it does, the store that holds it is not this one.",
+                facts.store, facts.memories, facts.schema
+            )
         }
     }
 

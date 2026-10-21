@@ -269,6 +269,34 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert_eq!(gone.is_error, Some(true));
+    // ★ A MISS IS A CLAIM, AND IT MUST CARRY ITS EVIDENCE (soma/ellmephant#57): a deleted key is not
+    // an absent one, and a reader that cannot tell them apart spends a session on the wrong theory.
+    let miss = text(&gone);
+    assert!(
+        miss.contains("version(s) for this key"),
+        "a deleted-but-versioned key must say so: {miss}"
+    );
+    assert!(
+        miss.contains("DELETED row with history"),
+        "and name which of the two states it is in: {miss}"
+    );
+    assert!(
+        miss.contains("schema"),
+        "the store's identity is the first thing to rule out: {miss}"
+    );
+
+    // A key that never existed says the other thing, and does not pretend to know otherwise.
+    let never = call(
+        &client,
+        "memory_get",
+        serde_json::json!({ "key": "never-existed-at-all" }),
+    )
+    .await;
+    let never_text = text(&never);
+    assert!(
+        never_text.contains("has never existed THERE"),
+        "an absent key must not be described as deleted: {never_text}"
+    );
 
     // `memory_stats` is the read-only digest: one keyed JSON object, no bodies.
     let stats = call(&client, "memory_stats", serde_json::json!({})).await;

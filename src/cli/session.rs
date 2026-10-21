@@ -257,6 +257,31 @@ impl Session {
         store::version::count_for(&self.conn, key)
     }
 
+    /// The facts a MISS needs to be evidence rather than an assertion (soma/ellmephant#57).
+    ///
+    /// `memory_get` answering "no such memory" makes a claim about the whole store, and a bare
+    /// refusal gives the reader nothing to test: on 2026-10-21 a live, versioned key was reported
+    /// absent for 42 minutes and nobody could tell "wrong store" from "deleted" from "stale reader".
+    /// These three numbers are the difference, and they cost one indexed query each.
+    pub fn miss_facts(&self, key: &str) -> Result<MissFacts> {
+        let memories: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+        let versions = store::version::count_for(&self.conn, key)?;
+        let newest: Option<String> = self.conn.query_row(
+            "SELECT MAX(written_at) FROM memory_version WHERE type = 'memory' AND key = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )?;
+        Ok(MissFacts {
+            store: self.paths.db().display().to_string(),
+            memories,
+            schema: crate::db::migrate::version(&self.conn)?,
+            versions,
+            newest,
+        })
+    }
+
     /// Run a query, borrowing the encoder only when there is a phrase to embed. A read-only session
     /// serves the rows from its own connection, so a search does not wait for a write to finish.
     /// Vectors held for one document type — what `semantic_search` checks before promising a type.
@@ -474,6 +499,21 @@ impl Session {
     pub fn mail_prune(&self, keep_days: i64) -> Result<usize> {
         mail::prune(&self.conn, keep_days)
     }
+}
+
+/// What a miss can prove without a second round trip — see [`Session::miss_facts`].
+#[derive(Debug, Clone)]
+pub struct MissFacts {
+    /// The store file the reader actually opened. The first hypothesis in #57 was "a different file".
+    pub store: String,
+    /// How many memories that file holds: zero means an empty/other store, not a missing key.
+    pub memories: i64,
+    /// Schema version of that file, so a stale reader or an unmigrated copy is visible.
+    pub schema: i32,
+    /// Versions recorded for this key — history outlives a delete, so >0 means "deleted, not absent".
+    pub versions: i64,
+    /// When the newest version was written, when there is one.
+    pub newest: Option<String>,
 }
 
 #[cfg(test)]

@@ -323,14 +323,22 @@ async fn tools_round_trip_over_the_transport() {
         "stats must not carry bodies: {raw}"
     );
 
-    // An unknown argument is ignored (serde default), so the search still succeeds.
+    // ★ AN UNKNOWN ARGUMENT IS REFUSED (soma/ellmephant#87). This test used to assert the opposite —
+    // that `match: "fuzzy"` was silently ignored and the search "still succeeded". That is precisely
+    // how `type` was dropped for a day: serde's default is to ignore what it does not know, so the
+    // server answered a question nobody asked and looked confident doing it.
     let extra = call(
         &client,
         "memory_search",
         serde_json::json!({ "query": "where do logs go", "match": "fuzzy" }),
     )
     .await;
-    assert!(!extra.is_error.unwrap_or(false), "{}", text(&extra));
+    assert_eq!(
+        extra.is_error,
+        Some(true),
+        "an argument the tool does not understand must be refused, not discarded: {}",
+        text(&extra)
+    );
     // `memory_merge` integrates one key into another and deletes it, repointing its references (the
     // safe merge). The survivor already carries the deleted body's prose, so there is nothing to
     // integrate here and the call has nothing to integrate.
@@ -1005,4 +1013,80 @@ async fn project_get_on_a_missing_key_is_a_tool_error() {
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
+}
+
+/// ★ `semantic_search(type=…)` MUST FILTER (soma/ellmephant#87). The parameter was named `kind` in
+/// Rust while the description promised `type`, and serde discarded the argument it did not know — so
+/// every "kind-filtered" search returned the whole store, and one of my own verifications passed
+/// because the hits *looked* like projects.
+#[tokio::test]
+async fn semantic_search_honours_the_kind_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    let m = call(
+        &client,
+        "memory_upsert",
+        serde_json::json!({ "key": "velero-notes-memory", "title": "Velero notes", "body": "velero restores the cluster from the bucket" }),
+    )
+    .await;
+    assert!(!m.is_error.unwrap_or(false), "{}", text(&m));
+    settle(dir.path());
+
+    // ★ THE PROOF IS THE REFUSAL, NOT A HIT. Before the fix, `type: "project"` was silently dropped
+    // and this call answered with MEMORIES — confidently, and with no sign the filter was discarded
+    // (soma/ellmephant#87). Projects carry no vectors yet (that is its own open item), so an honest
+    // filtered search must SAY SO rather than quietly widen to every kind.
+    let projects = call(
+        &client,
+        "semantic_search",
+        serde_json::json!({ "query": "velero", "type": "project", "k": 10, "fields": ["key"] }),
+    )
+    .await;
+    assert_eq!(
+        projects.is_error,
+        Some(true),
+        "a kind with no vectors must be refused, not silently widened: {}",
+        text(&projects)
+    );
+    assert!(
+        text(&projects).contains("project"),
+        "and the refusal must name the kind: {}",
+        text(&projects)
+    );
+
+    // The kind that DOES have vectors still answers.
+    let memories = call(
+        &client,
+        "semantic_search",
+        serde_json::json!({ "query": "velero", "type": "memory", "k": 10, "fields": ["key"] }),
+    )
+    .await;
+    assert!(!memories.is_error.unwrap_or(false), "{}", text(&memories));
+    assert!(
+        text(&memories).contains("velero-notes-memory"),
+        "the memory must still be found: {}",
+        text(&memories)
+    );
+
+    // `kind` remains an alias for the name the schema advertises.
+    let alias = call(
+        &client,
+        "semantic_search",
+        serde_json::json!({ "query": "velero", "kind": "project", "k": 10, "fields": ["key"] }),
+    )
+    .await;
+    assert_eq!(alias.is_error, Some(true), "`kind` is an alias of `type`");
 }

@@ -420,7 +420,12 @@ fn the_dangling_finder_names_every_edge_not_every_target() {
     seed(&conn, &embedder, "kept", "a memory that stays");
     seed(&conn, &embedder, "first", "points at [[gone]]");
     seed(&conn, &embedder, "second", "also points at [[gone]]");
-    seed(&conn, &embedder, "typo", "and at [[kept]] — one edge that resolves");
+    seed(
+        &conn,
+        &embedder,
+        "typo",
+        "and at [[kept]] — one edge that resolves",
+    );
 
     let edges = links::dangling_edges(&conn).expect("finder");
     assert_eq!(edges.len(), 2, "one row per REFERRER: {edges:?}");
@@ -438,7 +443,12 @@ fn the_dangling_finder_names_every_edge_not_every_target() {
     assert_eq!(referrers, vec!["first", "second"], "ordered, and named");
 
     // Repairing the target empties the finder, and the count with it.
-    seed(&conn, &embedder, "gone", "the missing memory, written at last");
+    seed(
+        &conn,
+        &embedder,
+        "gone",
+        "the missing memory, written at last",
+    );
     assert!(
         links::dangling_edges(&conn).expect("finder").is_empty(),
         "no edges left"

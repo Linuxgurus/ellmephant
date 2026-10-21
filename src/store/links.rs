@@ -224,8 +224,10 @@ pub fn dangling_edges(conn: &Connection) -> Result<Vec<DanglingEdge>> {
 /// Distinct missing targets — the same rule `memory_stats.dangling` counts by, so a finder and a
 /// count cannot disagree about the number.
 pub fn dangling_targets(edges: &[DanglingEdge]) -> usize {
-    let mut targets: Vec<(&str, Kind)> =
-        edges.iter().map(|e| (e.to_key.as_str(), e.to_type)).collect();
+    let mut targets: Vec<(&str, Kind)> = edges
+        .iter()
+        .map(|e| (e.to_key.as_str(), e.to_type))
+        .collect();
     targets.sort_unstable();
     targets.dedup();
     targets.len()

@@ -88,6 +88,11 @@ pub const ROUTES: &[Route] = &[
         tool: "memory_backlinks",
     },
     Route {
+        method: "GET",
+        path: "/dangling",
+        tool: "memory_dangling",
+    },
+    Route {
         method: "POST",
         path: "/memory/{key}/upvote",
         tool: "memory_upvote",

@@ -405,3 +405,53 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
         .expect("lookup");
     assert_eq!(legacy, 0, "and the legacy table is gone at the end");
 }
+
+/// ★ A ROLLED STORE MUST NOT SERVE AN EMPTY INDEX (2026-10-21). The vec0 tables used to appear on the
+/// first *embed*, so a store whose queue was quiet after an upgrade had no index at all: search
+/// returned nothing and nothing said why. Opening the store now creates (and migrates) the derived
+/// index, so "the store is up" and "the index exists" are one event.
+#[test]
+fn opening_the_store_migrates_the_index_without_any_write() {
+    let (_dir, paths) = temp_store();
+    let embedder = HashEmbedder::new(4);
+    let spec = VecSpec::of(&embedder);
+    let id = {
+        let conn = db::open(&paths).expect("open");
+        let (id, _) = store::add(&conn, &spec, &memory("a", "alpha", &[])).expect("write");
+        common::settle(&conn, &embedder);
+        // Put the store back into the OLD shape: no partitioned table, a populated `memory_vec`.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS document_vec;
+             DROP TABLE IF EXISTS document_vec_deleted;
+             CREATE VIRTUAL TABLE memory_vec USING vec0(
+               memory_id INTEGER PRIMARY KEY, embedding float[4] distance_metric=cosine);",
+        )
+        .expect("legacy shape");
+        conn.execute(
+            "INSERT INTO memory_vec(memory_id, embedding) VALUES(?1, ?2)",
+            params![id, vec::to_blob(&[1.0, 0.0, 0.0, 0.0])],
+        )
+        .expect("legacy vector");
+        // Nothing left to do: the queue is empty and no write is coming.
+        conn.execute("DELETE FROM encode_queue", [])
+            .expect("empty queue");
+        id
+    };
+
+    // Re-opening — the roll — is the only event that happens.
+    let conn = db::open(&paths).expect("re-open");
+    assert_eq!(
+        vec::count(&conn).expect("count"),
+        1,
+        "the index exists and holds the vector"
+    );
+    assert!(
+        vec::get(&conn, id).expect("get").is_some(),
+        "under the memory's id, migrated, with no write to trigger it"
+    );
+    assert_eq!(
+        vec::keys_of(&conn, "memory").expect("keys"),
+        vec!["a"],
+        "and knows which document it belongs to"
+    );
+}

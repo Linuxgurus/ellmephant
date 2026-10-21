@@ -50,6 +50,7 @@ pub const TOOLS: &[&str] = &[
     "memory_get",
     "memory_history",
     "memory_backlinks",
+    "memory_dangling",
     "memory_upvote",
     "memory_stats",
     "memory_dupes",
@@ -1826,10 +1827,33 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
     }
 
+    /// Name every broken `[[…]]` edge — the finder `memory_stats.dangling` never had.
+    #[tool(
+        name = "memory_dangling",
+        description = "List every BROKEN `[[…]]` edge as a row: the referrer (`from`), the target that resolves to nothing (`to`), and the table it was expected in (`to_type`). ★ `memory_stats.dangling` counts DISTINCT MISSING TARGETS, not edges — two bodies pointing at one missing key are `dangling: 1` and TWO rows here, so the count can never tell you which body to repair. Repair by deleting the token, renaming the target, or writing the missing memory; an empty list is the only proof the count is honestly 0.",
+        annotations(
+            title = "Dangling links",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_dangling(&self) -> std::result::Result<String, String> {
+        let edges = self.with_read("memory_dangling", |s| s.dangling()).await?;
+        tracing::debug!(
+            tool = "memory_dangling",
+            edges = edges.len(),
+            targets = crate::store::links::dangling_targets(&edges),
+            "dangling edges"
+        );
+        Ok(crate::store::links::dangling_to_wire_json(&edges))
+    }
+
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
     #[tool(
         name = "memory_stats",
-        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age, and the ENCODE QUEUE (`encode_pending` documents still owing a vector, `encode_failed` those the encoder gave up on, `encode_oldest_s` how long the oldest has waited). A non-empty `encode_pending` is normal — a write schedules its document and returns; a growing `encode_oldest_s` means the worker is not keeping up.",
+        description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age, and the ENCODE QUEUE (`encode_pending` documents still owing a vector, `encode_failed` those the encoder gave up on, `encode_oldest_s` how long the oldest has waited). A non-empty `encode_pending` is normal — a write schedules its document and returns; a growing `encode_oldest_s` means the worker is not keeping up. ★ `dangling` is a count of DISTINCT MISSING TARGETS, not edges: `memory_dangling` is the finder that names each broken edge.",
         annotations(
             title = "Store stats",
             read_only_hint = true,
@@ -2458,6 +2482,7 @@ pub fn http_router(
         .route("/whoami", axum::routing::get(surface::whoami))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
+        .route("/dangling", axum::routing::get(surface::dangling))
         .route("/history", axum::routing::get(surface::history))
         .route(
             "/memory/{key}",

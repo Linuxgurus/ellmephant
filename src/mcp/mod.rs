@@ -262,6 +262,7 @@ all to list every project.";
 /// Parameters for [`MemoryServer::memory_upsert`]. Every field is optional: an omitted field keeps
 /// the value already stored under `key`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertParams {
     /// Stable slug.
     #[serde(default)]
@@ -339,17 +340,21 @@ document is a name to look up rather than text to read (`memory_history KEY` hol
 /// Parameters for `semantic_search` — the store-wide search, with the two knobs `memory_search`
 /// deliberately does not have.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchParams {
     /// The phrase to match.
     #[serde(default)]
     #[schemars(description = "Phrase to hunt with, matched against each document's embedding.")]
     pub query: Option<String>,
-    /// Restrict to one document type.
-    #[serde(default)]
+    /// Restrict to one document type. ★ The NAME IS `type`, because that is what the tool description
+    /// promised and what callers sent: the field was `kind` here, so `type` was silently discarded by
+    /// serde and every filtered search returned the whole store (soma/ellmephant#87). `kind` remains
+    /// an alias for compatibility; the advertised name is the one that works.
+    #[serde(rename = "type", alias = "kind", default)]
     #[schemars(
         description = "Restrict to one document type (`memory`, `project`). Absent = every type that has vectors."
     )]
-    pub kind: Option<String>,
+    pub doc_type: Option<String>,
     /// Search deleted documents instead of live ones.
     #[serde(default)]
     #[schemars(
@@ -374,6 +379,7 @@ pub struct SemanticSearchParams {
 
 /// Parameters for [`MemoryServer::memory_search`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchParams {
     /// The phrase to match.
     #[serde(default)]
@@ -493,6 +499,7 @@ impl MatchModeParam {
 
 /// A single-key request.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
@@ -501,6 +508,7 @@ pub struct KeyParams {
 
 /// Parameters for [`MemoryServer::memory_get`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
@@ -515,6 +523,7 @@ pub struct GetParams {
 
 /// Parameters for [`MemoryServer::memory_history`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryParams {
     /// The key whose versions to list; omitted, the reply is the index of every key that has one.
     #[schemars(
@@ -536,6 +545,7 @@ pub struct HistoryParams {
 
 /// Parameters for [`MemoryServer::memory_merge`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MergeParams {
     /// The key to delete.
     #[schemars(
@@ -551,6 +561,7 @@ pub struct MergeParams {
 
 /// A many-key request (feedback sweep).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeysParams {
     /// The memories' keys.
     #[schemars(description = "Memory keys (one or more). Slugs.")]
@@ -559,6 +570,7 @@ pub struct KeysParams {
 
 /// Parameters for [`MemoryServer::memory_stats`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatsParams {
     /// Include the full tag vocabulary.
     #[serde(default)]
@@ -570,10 +582,12 @@ pub struct StatsParams {
 
 /// Parameters for a no-argument tool (e.g. `memory_reembed`).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListParams {}
 
 /// Parameters for [`MemoryServer::claim_acquire`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimAcquireParams {
     /// The name to lease.
     #[schemars(
@@ -595,6 +609,7 @@ pub struct ClaimAcquireParams {
 
 /// Parameters for [`MemoryServer::claim_release`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimReleaseParams {
     /// The name to release.
     #[schemars(description = "The name the lease is over.")]
@@ -608,6 +623,7 @@ pub struct ClaimReleaseParams {
 
 /// Parameters for [`MemoryServer::claim_list`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimListParams {
     /// Limit to one name.
     #[serde(default)]
@@ -619,6 +635,7 @@ pub struct ClaimListParams {
 
 /// Parameters for [`MemoryServer::mail_send`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MailSendParams {
     /// Who is writing.
     #[schemars(
@@ -649,6 +666,7 @@ pub struct MailSendParams {
 
 /// Parameters for [`MemoryServer::mail_inbox`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MailInboxParams {
     /// Whose box to read.
     #[schemars(description = "Whose box: the self whose mail this is (`stet`, `twine`).")]
@@ -673,6 +691,7 @@ pub struct MailInboxParams {
 
 /// Parameters for [`MemoryServer::mail_read`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MailReadParams {
     /// Which letter.
     #[schemars(description = "The `seq` from `mail_inbox`.")]
@@ -681,6 +700,7 @@ pub struct MailReadParams {
 
 /// Parameters for [`MemoryServer::mail_prune`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MailPruneParams {
     /// Retention window.
     #[schemars(
@@ -691,6 +711,7 @@ pub struct MailPruneParams {
 
 /// Parameters for [`MemoryServer::memory_dupes`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DupesParams {
     /// Cosine-distance ceiling (tight by default).
     #[serde(default)]
@@ -704,6 +725,7 @@ pub struct DupesParams {
 
 /// Parameters for [`MemoryServer::project_get`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectKeyParams {
     /// The project's key.
     #[schemars(description = "Project key — a plain slug (`prj:`/`prj-` accepted and stripped).")]
@@ -718,6 +740,7 @@ pub struct ProjectKeyParams {
 
 /// Parameters for [`MemoryServer::project_upsert`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectUpsertParams {
     /// Stable slug.
     #[serde(default)]
@@ -793,6 +816,7 @@ impl ProjectUpsertParams {
 
 /// Parameters for [`MemoryServer::project_list`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectListParams {
     /// Lifecycle filter.
     #[serde(default)]
@@ -1574,7 +1598,7 @@ impl MemoryServer {
         }
         // A live search: one type if asked, otherwise the whole store. Today only memories are
         // enqueued, so a request for another type must SAY that rather than return a quiet empty.
-        if let Some(kind) = p.kind.as_deref() {
+        if let Some(kind) = p.doc_type.as_deref() {
             let kind = kind.trim().to_string();
             if kind != "memory" {
                 let probe = kind.clone();

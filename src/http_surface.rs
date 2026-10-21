@@ -835,7 +835,7 @@ pub async fn semantic_search(State(state): State<HttpState>, RawQuery(raw): RawQ
     }
     let p = SemanticSearchParams {
         query: params.maybe("q").map(str::to_string),
-        kind: params.maybe("type").map(str::to_string),
+        doc_type: params.maybe("type").map(str::to_string),
         deleted: params
             .maybe("deleted")
             .map(|v| matches!(v, "1" | "true" | "yes")),

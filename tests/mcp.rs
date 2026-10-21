@@ -284,6 +284,17 @@ async fn tools_round_trip_over_the_transport() {
         miss.contains("schema"),
         "the store's identity is the first thing to rule out: {miss}"
     );
+    // ★ AND THE BIT THAT HALVES THE SEARCH (soma/ellmephant#57): with the row deleted, this process's
+    // writer must AGREE it is absent. If it ever disagrees, the read is blind to a row the writer can
+    // prove — which is the only shape the original incident can have had.
+    assert!(
+        miss.contains("writer-agrees-absent"),
+        "the miss must report what the writer connection sees: {miss}"
+    );
+    assert!(
+        !miss.contains("writer-sees-it"),
+        "a deleted row must not be reported as visible to the writer: {miss}"
+    );
 
     // A key that never existed says the other thing, and does not pretend to know otherwise.
     let never = call(

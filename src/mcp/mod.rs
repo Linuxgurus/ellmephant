@@ -1977,8 +1977,14 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             open_world_hint = false
         )
     )]
-    async fn memory_dangling(&self) -> std::result::Result<String, String> {
-        let edges = self.with_read("memory_dangling", |s| s.dangling()).await?;
+    async fn memory_dangling(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        let edges = self
+            .with_read("memory_dangling", reader, |s| s.dangling())
+            .await?;
         tracing::debug!(
             tool = "memory_dangling",
             edges = edges.len(),

@@ -765,13 +765,21 @@ pub async fn backlinks(
 }
 
 /// `GET /dangling` — every broken `[[…]]` edge, one row per referrer (`memory_dangling`).
-pub async fn dangling(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn dangling(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let json = Params::parse(raw.as_deref()).json();
+    let reader = reader_from(&headers);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
-    match server.with_read("memory_dangling", |s| s.dangling()).await {
+    match server
+        .with_read("memory_dangling", reader, |s| s.dangling())
+        .await
+    {
         Ok(rows) => {
             let wire = dangling_to_wire_json(&rows);
             render(

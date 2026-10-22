@@ -405,3 +405,57 @@ fn merge_into_refuses_a_missing_target_and_a_self_merge() {
     assert!(store::get(&conn, "a").unwrap().is_some());
     assert!(store::get(&conn, "b").unwrap().is_some());
 }
+
+/// ★ soma/ellmephant#48: the count said `dangling: 2` and no surface could name the two. A finder is
+/// only worth having if its number AGREES with the count while its LEDGER disagrees — one missing
+/// target with two referrers is one count and two rows, and that gap is exactly what the old count
+/// hid. Falsifiable: if the rows were deduped to targets, the second assertion fails.
+#[test]
+fn the_dangling_finder_names_every_edge_not_every_target() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let _spec = VecSpec::of(&embedder);
+
+    seed(&conn, &embedder, "kept", "a memory that stays");
+    seed(&conn, &embedder, "first", "points at [[gone]]");
+    seed(&conn, &embedder, "second", "also points at [[gone]]");
+    seed(
+        &conn,
+        &embedder,
+        "typo",
+        "and at [[kept]] — one edge that resolves",
+    );
+
+    let edges = links::dangling_edges(&conn).expect("finder");
+    assert_eq!(edges.len(), 2, "one row per REFERRER: {edges:?}");
+    assert_eq!(
+        links::dangling_targets(&edges),
+        1,
+        "one distinct missing target — the number memory_stats counts"
+    );
+    assert_eq!(
+        links::dangling_targets(&edges) as i64,
+        store::stats::compute(&conn).expect("stats").dangling,
+        "the finder and the count cannot disagree"
+    );
+    let referrers: Vec<&str> = edges.iter().map(|e| e.from_key.as_str()).collect();
+    assert_eq!(referrers, vec!["first", "second"], "ordered, and named");
+
+    // Repairing the target empties the finder, and the count with it.
+    seed(
+        &conn,
+        &embedder,
+        "gone",
+        "the missing memory, written at last",
+    );
+    assert!(
+        links::dangling_edges(&conn).expect("finder").is_empty(),
+        "no edges left"
+    );
+    assert_eq!(
+        store::stats::compute(&conn).expect("stats").dangling,
+        0,
+        "and the count agrees"
+    );
+}

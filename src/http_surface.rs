@@ -21,7 +21,11 @@ use crate::mcp::{
     SearchParams, SemanticSearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
-use crate::store::{self, encode, links::backlinks_to_wire_json, project, tags};
+use crate::store::{
+    self, encode,
+    links::{backlinks_to_wire_json, dangling_to_wire_json},
+    project, tags,
+};
 use rusqlite::OptionalExtension;
 
 /// One MCP tool reachable over HTTP — the parity table. A route the table does not name is a tool
@@ -82,6 +86,11 @@ pub const ROUTES: &[Route] = &[
         method: "GET",
         path: "/memory/{key}/backlinks",
         tool: "memory_backlinks",
+    },
+    Route {
+        method: "GET",
+        path: "/dangling",
+        tool: "memory_dangling",
     },
     Route {
         method: "POST",
@@ -749,6 +758,27 @@ pub async fn backlinks(
                 json,
                 wire.clone(),
                 list_text("backlinks", &wire),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /dangling` — every broken `[[…]]` edge, one row per referrer (`memory_dangling`).
+pub async fn dangling(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server.with_read("memory_dangling", |s| s.dangling()).await {
+        Ok(rows) => {
+            let wire = dangling_to_wire_json(&rows);
+            render(
+                StatusCode::OK,
+                json,
+                wire.clone(),
+                list_text("dangling", &wire),
             )
         }
         Err(e) => error(json, error_status(&e), e),

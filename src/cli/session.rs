@@ -500,6 +500,12 @@ impl Session {
         links::backlinks_seen(&self.conn, &mem.key, &self.reader)
     }
 
+    /// Every broken `[[…]]` edge, one row per referrer — the finder behind `memory_dangling`.
+    /// [`crate::store::stats::Stats::dangling`] counts DISTINCT missing targets; this names them.
+    pub fn dangling(&self) -> Result<Vec<links::DanglingEdge>> {
+        links::dangling_edges(&self.conn)
+    }
+
     /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a
     /// project is structure, not a document.
     pub fn project_merge(&self, patch: &project::Patch) -> Result<project::MergeOutcome> {

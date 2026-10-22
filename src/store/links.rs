@@ -178,6 +178,19 @@ pub struct Dangling {
     pub from_keys: Vec<String>,
 }
 
+/// One broken EDGE, not one missing target: the referrer, what it pointed at, and the table that
+/// target was expected in. [`Dangling`] groups these; this is the row a repair pass can act on
+/// (`memory_dangling`, soma/ellmephant#48) — the count alone cannot name the body to fix.
+#[derive(Debug, Clone, Serialize)]
+pub struct DanglingEdge {
+    /// The memory whose body carries the token.
+    pub from_key: String,
+    /// The target key that resolves to nothing.
+    pub to_key: String,
+    /// Which table the target was expected in.
+    pub to_type: Kind,
+}
+
 /// Group ordered `(to_key, to_type, from_key)` rows into [`Dangling`]s. Shared by the `[[…]]` audit
 /// and the project audit, which both count rot the same way: one entry per unresolved target. The
 /// GROUP is the pair — the same bare key can be missing as both a memory and a project.
@@ -207,6 +220,51 @@ pub fn group_dangling(rows: Vec<(String, Kind, String)>) -> Result<Vec<Dangling>
 /// a memory called `sessions`. A link to a project is still a `see` edge and not membership:
 /// `contains` means "born here", a link only points.
 pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
+    group_dangling(dangling_rows(conn)?)
+}
+
+/// Every broken edge, one row per referrer. The same SQL as [`dangling`], flattened rather than
+/// grouped: `memory_stats.dangling` counts DISTINCT MISSING TARGETS, so two referrers to one missing
+/// key are one count and two rows here. That difference is the point of soma/ellmephant#48 — the
+/// count could not tell a maintenance reader which body to repair.
+pub fn dangling_edges(conn: &Connection) -> Result<Vec<DanglingEdge>> {
+    Ok(dangling_rows(conn)?
+        .into_iter()
+        .map(|(to_key, to_type, from_key)| DanglingEdge {
+            from_key,
+            to_key,
+            to_type,
+        })
+        .collect())
+}
+
+/// Distinct missing targets — the same rule `memory_stats.dangling` counts by, so a finder and a
+/// count cannot disagree about the number.
+pub fn dangling_targets(edges: &[DanglingEdge]) -> usize {
+    let mut targets: Vec<(&str, Kind)> = edges
+        .iter()
+        .map(|e| (e.to_key.as_str(), e.to_type))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets.len()
+}
+
+/// Positional wire form for both doors: `cols` names the fields once, rows are bare arrays.
+pub fn dangling_to_wire_json(edges: &[DanglingEdge]) -> String {
+    let rows: Vec<serde_json::Value> = edges
+        .iter()
+        .map(|e| serde_json::json!([e.from_key, e.to_key, e.to_type.as_str()]))
+        .collect();
+    format!(
+        "{{\"cols\":[\"from\",\"to\",\"to_type\"],\"targets\":{},\"dangling\":{}}}",
+        dangling_targets(edges),
+        crate::wire::rows_array(&rows)
+    )
+}
+
+/// `(to_key, to_type, from_key)` for every unresolved edge, ordered by target then referrer.
+fn dangling_rows(conn: &Connection) -> Result<Vec<(String, Kind, String)>> {
     let mut stmt = conn.prepare(
         "SELECT l.to_key, l.to_type, m.key FROM memory_link l
            JOIN memory m ON m.id = l.from_id
@@ -221,7 +279,7 @@ pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
             r.get::<_, String>(2)?,
         ))
     })?;
-    group_dangling(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Rebuild the `memory_link` graph for every memory from its **current** body.

@@ -714,24 +714,13 @@ async fn failures_are_ours_not_the_gateways() {
 async fn bootstrap_is_the_door_to_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    seed(
-        &app,
-        "tok",
-        "bootstrap-self",
-        "boot me",
-        "BOOT: read me first, then go",
-    )
-    .await;
+    seed(&app, "tok", "bootstrap", "boot me", "BOOT: read me first, then go").await;
+    // Someone else's identity, and a self tag that is NOT this caller's. An anonymous boot must show
+    // neither: the door used to inline `stet-self` for every caller, which is how a cold Cline was
+    // handed Stet's identity (2026-10-22).
     let secret = "a body that is NOT resident, only indexed by key";
-    seed_tagged(
-        &app,
-        "tok",
-        "other-self",
-        "another cline-self key",
-        "cline-self",
-        secret,
-    )
-    .await;
+    seed_tagged(&app, "tok", "other-self", "another self key", "self:cline", secret).await;
+    seed(&app, "tok", "bootstrap-stet", "stet boot", "STET ONLY BODY").await;
 
     let (status, doc, content_type) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
@@ -753,18 +742,18 @@ async fn bootstrap_is_the_door_to_the_store() {
         "the boot note's body must be resident: {doc}"
     );
     assert!(
-        doc.contains("bootstrap-self"),
+        doc.contains("memory `bootstrap`"),
         "and named, so it can be fetched again: {doc}"
     );
 
-    // Everything else in the self set is an INDEX: key and title, never the body.
+    // NO SELF SET for an anonymous caller — and no other body smuggled in by any route.
     assert!(
-        doc.contains("other-self") && doc.contains("another cline-self key"),
-        "the self set is indexed by key and title: {doc}"
+        doc.contains("no self set") && doc.contains("proved no pen"),
+        "an unproven caller is told it has no self set rather than being given one: {doc}"
     );
     assert!(
-        !doc.contains(secret),
-        "a non-resident body must not be smuggled in: {doc}"
+        !doc.contains(secret) && !doc.contains("STET ONLY BODY"),
+        "another agent's identity must never be served: {doc}"
     );
 
     // The catalogue is NOT inline: no argument schemas, and the pointer says how much it would cost.
@@ -778,29 +767,28 @@ async fn bootstrap_is_the_door_to_the_store() {
     );
 }
 
-/// The note moved to `stet-self` on 2026-10-22, and the OLD key is read when the new one is absent —
-/// so a store mid-rename still boots with its identity. When both exist the new key wins.
+/// ★ THE DOOR MUST NOT NAME A CALLER IT CANNOT NAME (2026-10-22). The boot once inlined `stet-self`
+/// for everyone and indexed `cline-self`, so an anonymous caller was handed one agent's first-person
+/// identity. The address is built from the PROVEN pen now; with no pen there is no self set, and the
+/// legacy keys are not a back door to somebody else's note.
 #[tokio::test]
-async fn bootstrap_reads_the_new_note_key_and_falls_back_to_the_old_one() {
+async fn bootstrap_never_serves_another_agents_identity() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "bootstrap", "floor", "FLOOR BODY").await;
+    seed(&app, "tok", "bootstrap-stet", "stet boot", "STET BODY").await;
     seed(&app, "tok", "bootstrap-self", "old note", "OLD BODY").await;
+    seed_tagged(&app, "tok", "stet-self", "stet self", "stet-self", "STET SELF BODY").await;
 
-    let (_, doc, _) = get(&app, "/bootstrap").await;
+    let (status, doc, _) = get(&app, "/bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
     assert!(
-        doc.contains("OLD BODY") && doc.contains("memory `bootstrap-self`"),
-        "the legacy key stands in while the rename is in flight: {doc}"
-    );
-
-    seed(&app, "tok", "stet-self", "new note", "NEW BODY").await;
-    let (_, doc, _) = get(&app, "/bootstrap").await;
-    assert!(
-        doc.contains("NEW BODY") && doc.contains("memory `stet-self`"),
-        "once the rename lands the new key wins: {doc}"
+        doc.contains("FLOOR BODY") && doc.contains("memory `bootstrap`"),
+        "an anonymous caller gets the shared floor: {doc}"
     );
     assert!(
-        !doc.contains("OLD BODY"),
-        "the fallback is not a merge: {doc}"
+        !doc.contains("STET BODY") && !doc.contains("OLD BODY") && !doc.contains("STET SELF BODY"),
+        "no other agent's note or self set may be served: {doc}"
     );
 }
 
@@ -818,7 +806,7 @@ async fn bootstrap_stays_inside_its_budget() {
     seed(
         &app,
         "tok",
-        "bootstrap-self",
+        "bootstrap",
         "boot me",
         &"resident prose. ".repeat(100),
     )
@@ -829,7 +817,7 @@ async fn bootstrap_stays_inside_its_budget() {
             "tok",
             &format!("self-{i:02}"),
             &"a title that is long enough to be clipped somewhere sensible".repeat(2),
-            "cline-self",
+            "self:cline",
             "body",
         )
         .await;
@@ -860,7 +848,7 @@ async fn bootstrap_stays_inside_its_budget() {
     );
     // The size is not bought by dropping the content the boot exists for.
     assert!(doc.contains("resident prose."), "{doc}");
-    assert!(doc.contains("self-00") && doc.contains("self-19"), "{doc}");
+    assert!(doc.contains("no self set"), "an unproven caller is told so: {doc}");
 }
 
 /// A boot still becomes a boot with no store to read: the API part survives, and the missing facts are
@@ -899,7 +887,7 @@ async fn bootstrap_json_is_the_door_in_json() {
     seed(
         &app,
         "tok",
-        "bootstrap-self",
+        "bootstrap",
         "boot me",
         "BOOT: read me first, then go",
     )
@@ -964,7 +952,7 @@ async fn bootstrap_json_is_the_door_in_json() {
     // The resident note is carried, body and all; the rest of the set is keys and titles.
     assert_eq!(
         doc["youResident"]["key"],
-        serde_json::json!("bootstrap-self")
+        serde_json::json!("bootstrap")
     );
     assert_eq!(
         doc["youResident"]["body"],

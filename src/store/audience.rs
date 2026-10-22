@@ -97,6 +97,11 @@ impl Reader {
         }
     }
 
+    /// The proven pen's NAME, without the audience prefix — what a boot address is spelled from.
+    pub fn pen_name(&self) -> Option<&str> {
+        self.pen.as_deref().and_then(|p| p.strip_prefix(PEN))
+    }
+
     /// A reader with no pen: sees public rows only.
     pub fn anonymous() -> Self {
         Reader::default()

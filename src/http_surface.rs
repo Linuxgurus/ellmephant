@@ -1819,6 +1819,8 @@ pub const BOOT_BUDGET_BYTES: usize = 8_192;
 struct BootView {
     /// The resident note: `(key, title, body)`.
     note: Option<(String, String, String)>,
+    /// The self set's tag for THIS caller — `self:<pen>`; empty when no pen was proven.
+    tag: String,
     /// The self set as `(key, title)`, key-ascending.
     self_set: Vec<(String, String)>,
     /// Open projects as `(key, status, goal)`.
@@ -1854,7 +1856,8 @@ impl BootView {
         conn: &rusqlite::Connection,
         reader: &crate::store::audience::Reader,
     ) -> crate::error::Result<Self> {
-        let note = [BOOT_NOTE, BOOT_NOTE_LEGACY]
+        let pen = reader.pen_name();
+        let note = boot_candidates(pen)
             .into_iter()
             .find_map(|key| {
                 conn.query_row(
@@ -1866,9 +1869,15 @@ impl BootView {
                 .transpose()
             })
             .transpose()?;
+        let tag = boot_tag(pen).unwrap_or_default();
+        let self_set = match boot_tag(pen) {
+            Some(tag) => tags::keys_with_seen(conn, &tag, reader)?,
+            None => Vec::new(),
+        };
         Ok(BootView {
             note,
-            self_set: tags::keys_with_seen(conn, BOOT_TAG, reader)?,
+            tag,
+            self_set,
             projects: project::open(conn)?,
             state: Some(state_line(conn)?),
             unreadable: None,
@@ -1902,16 +1911,29 @@ fn state_line(conn: &rusqlite::Connection) -> crate::error::Result<String> {
     ))
 }
 
-/// The self set's tag: the keys a cold client is made of, indexed at boot and loaded on demand.
-const BOOT_TAG: &str = "cline-self";
+/// The shared floor: the one document every caller may be given, whoever it is.
+const BOOT_FLOOR: &str = "bootstrap";
 
-/// The resident note, inlined at boot. One key, because one body is what a cold agent needs before it
-/// can decide anything else; the rest of the self set is an index it can walk.
-const BOOT_NOTE: &str = "stet-self";
+/// The keys a caller's resident note is looked for under, in order.
+///
+/// ★ A DOOR THAT CANNOT NAME ITS CALLER MUST NOT NAME A CALLER (2026-10-22). This endpoint used to
+/// inline `stet-self` for everybody and index the tag `cline-self` — one agent's first-person
+/// identity, served to all — which is how a cold Cline came to narrate itself as Stet. The address is
+/// now built from the PROVEN pen: `bootstrap-<pen>` when it exists, else the shared floor. Anonymous
+/// callers get the floor and no self set, which is honest rather than generous.
+fn boot_candidates(pen: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(pen) = pen {
+        keys.push(format!("bootstrap-{pen}"));
+    }
+    keys.push(BOOT_FLOOR.to_string());
+    keys
+}
 
-/// The note's name until 2026-10-22. Read as a fallback so the store's rename can land on either side
-/// of a deploy without a window where a cold agent boots with no identity.
-const BOOT_NOTE_LEGACY: &str = "bootstrap-self";
+/// The self set's tag for a caller: `self:<pen>`. `None` for a caller who proved nothing.
+fn boot_tag(pen: Option<&str>) -> Option<String> {
+    pen.map(|pen| format!("self:{pen}"))
+}
 
 /// `GET /bootstrap` — **the door, and what is behind it**: everything a cold client needs in one
 /// read, in the order it needs it, small enough to arrive intact.
@@ -1984,17 +2006,25 @@ fn boot_text(view: &BootView, tools: Option<&[BootTool]>) -> String {
         "\n## 1. YOU — resident, in full (memory `{}`)\n",
         view.note
             .as_ref()
-            .map_or(BOOT_NOTE, |(key, _, _)| key.as_str())
+            .map_or(BOOT_FLOOR, |(key, _, _)| key.as_str())
     ));
     match &view.note {
         Some((_, _, body)) => out.push_str(&format!("{}\n", indent_block(body, "  "))),
         None => out.push_str("  (no resident note in this store)\n"),
     }
 
-    out.push_str(&format!(
-        "\n## 2. THE REST OF YOU — tag `{BOOT_TAG}`, {} keys; a body is GET /memory/{{key}}\n",
-        view.self_set.len()
-    ));
+    if view.tag.is_empty() {
+        out.push_str(
+            "\n## 2. THE REST OF YOU — no self set: this caller proved no pen\n\
+             \x20 (a proved pen gets `self:<pen>` indexed here; anonymous callers get the floor only)\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "\n## 2. THE REST OF YOU — tag `{}`, {} keys; a body is GET /memory/{{key}}\n",
+            view.tag,
+            view.self_set.len()
+        ));
+    }
     for (key, title) in &view.self_set {
         out.push_str(&format!("  {key:<34} {}\n", clip(title, INDEX_TITLE_CHARS)));
     }
@@ -2235,7 +2265,7 @@ fn boot_json(view: &BootView, tools: Option<&[BootTool]>) -> serde_json::Value {
             "key": key, "title": title, "body": body,
         })),
         "selfSet": {
-            "tag": BOOT_TAG,
+            "tag": view.tag,
             "keys": view.self_set.iter().map(|(key, title)| serde_json::json!({
                 "key": key, "title": clip(title, INDEX_TITLE_CHARS),
             })).collect::<Vec<_>>(),

@@ -648,6 +648,26 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Project>> {
 /// *list* order, because the query's order must never leak into the result. A key that resolves to
 /// nothing is **kept** (with `title`/`body` null), not dropped: a forward reference is information.
 pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref>> {
+    preload_seen(
+        conn,
+        key,
+        hydrate,
+        &crate::store::audience::Reader::everything(),
+    )
+}
+
+/// Preload entries as one reader sees them.
+///
+/// ★ THE THREE STATES ARE NOT TWO. A key that names nothing is shown with no title (the field is the
+/// project's own, and a caller may be repairing it). A key that names a row this reader may not see
+/// is OMITTED — the entry is gone, because a `null` title in that slot would say "this exists and you
+/// cannot have it", which is the disclosure #55 forbids.
+pub fn preload_seen(
+    conn: &Connection,
+    key: &str,
+    hydrate: Hydrate,
+    reader: &crate::store::audience::Reader,
+) -> Result<Vec<Ref>> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT mem_preload FROM project WHERE key = ?1",
@@ -661,26 +681,28 @@ pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref
     }
     let placeholders = vec!["?"; keys.len()].join(",");
     let mut stmt = conn.prepare(&format!(
-        "SELECT key, title, body FROM memory WHERE key IN ({placeholders})"
+        "SELECT key, title, body, audience FROM memory WHERE key IN ({placeholders})"
     ))?;
-    let rows: HashMap<String, (String, String)> = stmt
+    let rows: HashMap<String, (String, String, String)> = stmt
         .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
-            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
         })?
         .collect::<rusqlite::Result<HashMap<_, _>>>()?;
     Ok(keys
         .into_iter()
-        .map(|key| match rows.get(&key) {
-            Some((title, body)) => Ref {
+        .filter_map(|key| match rows.get(&key) {
+            // Present but not ours: absent. Not "present and withheld".
+            Some((_, _, audience)) if !reader.sees(audience) => None,
+            Some((title, body, _)) => Some(Ref {
                 key,
                 title: Some(title.clone()),
                 body: hydrate.body(body),
-            },
-            None => Ref {
+            }),
+            None => Some(Ref {
                 key,
                 title: None,
                 body: None,
-            },
+            }),
         })
         .collect())
 }
@@ -724,11 +746,26 @@ pub fn repoint_preload(conn: &Connection, from: &str, into: &str) -> Result<usiz
 /// The project plus its preload — the `project_get` read ("stand inside it"). `hydrate` decides how
 /// much of each preload memory's body to carry ([`Hydrate::None`] keeps it a reading list).
 pub fn view(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Option<View>> {
+    view_seen(
+        conn,
+        key,
+        hydrate,
+        &crate::store::audience::Reader::everything(),
+    )
+}
+
+/// One project as a given reader sees it: the project itself is public, its preload is not.
+pub fn view_seen(
+    conn: &Connection,
+    key: &str,
+    hydrate: Hydrate,
+    reader: &crate::store::audience::Reader,
+) -> Result<Option<View>> {
     let Some(project) = get(conn, key)? else {
         return Ok(None);
     };
     Ok(Some(View {
-        preload: preload(conn, &project.key, hydrate)?,
+        preload: preload_seen(conn, &project.key, hydrate, reader)?,
         project,
     }))
 }

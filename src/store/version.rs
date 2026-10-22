@@ -149,6 +149,23 @@ pub fn count(conn: &Connection) -> Result<(i64, i64)> {
 }
 
 /// How many versions one key holds — the question a delete leaves behind: *what did I not remove?*
+/// The NEWEST snapshot of a key, whole. Used to class the history of a key whose live row is gone:
+/// the last thing it said about who may read it is the only class it has.
+pub fn read_latest(conn: &Connection, key: &str) -> Result<Option<serde_json::Value>> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT content FROM memory_version WHERE type = ?1 AND key = ?2 \
+              ORDER BY n DESC LIMIT 1",
+            params![MEMORY, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match found {
+        Some(text) => Ok(Some(serde_json::from_str(&text)?)),
+        None => Ok(None),
+    }
+}
+
 pub fn count_for(conn: &Connection, key: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM memory_version WHERE type = ?1 AND key = ?2",

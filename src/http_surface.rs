@@ -624,8 +624,22 @@ pub async fn whoami(headers: HeaderMap) -> Response {
     render(StatusCode::OK, true, doc.to_string(), text)
 }
 
+/// Who this request reads as. A proven pair decides; anything else — including a forged claim — is
+/// nobody, and nobody sees public rows only. Reads never fail for want of a pen.
+fn reader_from(headers: &HeaderMap) -> crate::store::audience::Reader {
+    match crate::identity::resolve(headers) {
+        Ok(Some(name)) => crate::store::audience::Reader::pen(&name),
+        _ => crate::store::audience::Reader::anonymous(),
+    }
+}
+
 /// `GET /stats` — the whole-store digest (`memory_stats`).
-pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn stats(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tags = params.flag("tags");
@@ -634,7 +648,7 @@ pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> R
         Err(r) => return r,
     };
     match server
-        .with_store("memory_stats", move |s| s.stats(with_tags))
+        .with_read("memory_stats", reader, move |s| s.stats(with_tags))
         .await
     {
         Ok(stats) => render(
@@ -651,9 +665,11 @@ pub async fn stats(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> R
 /// one write a read may make, because a counter is not data (HTTP.md invariant 1).
 pub async fn memory_get(
     State(state): State<HttpState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let version = match params.parse_as::<i64>("version") {
@@ -669,7 +685,7 @@ pub async fn memory_get(
     if let Some(n) = version {
         let lookup = key.clone();
         return match server
-            .with_read("memory_get", move |s| s.version(&lookup, n))
+            .with_read("memory_get", reader.clone(), move |s| s.version(&lookup, n))
             .await
         {
             Ok(Some(past)) => {
@@ -690,7 +706,7 @@ pub async fn memory_get(
     }
     let lookup = key.clone();
     match server
-        .with_read("memory_get", move |s| s.show(&lookup))
+        .with_read("memory_get", reader, move |s| s.show(&lookup))
         .await
     {
         Ok(mut mem) => {
@@ -712,16 +728,18 @@ pub async fn memory_get(
 /// `GET /memory/{key}/backlinks` — incoming `[[…]]` edges (`memory_backlinks`).
 pub async fn backlinks(
     State(state): State<HttpState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let reader = reader_from(&headers);
     let json = Params::parse(raw.as_deref()).json();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("memory_backlinks", move |s| s.backlinks(&key))
+        .with_read("memory_backlinks", reader, move |s| s.backlinks(&key))
         .await
     {
         Ok(rows) => {
@@ -742,7 +760,12 @@ pub async fn backlinks(
 /// A TOP-LEVEL path on purpose: history is not a sub-resource of a live memory. The case it exists
 /// for — an orphan, whose row is gone — has no `/memory/{key}` to hang from, and a path that implied
 /// the memory still existed would be wrong for exactly the caller who needs it most.
-pub async fn history(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn history(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let cap = match params.parse_as::<u32>("limit") {
@@ -758,7 +781,9 @@ pub async fn history(State(state): State<HttpState>, RawQuery(raw): RawQuery) ->
         Some(key) => {
             let lookup = key.to_string();
             match server
-                .with_read("memory_history", move |s| s.versions(&lookup))
+                .with_read("memory_history", reader.clone(), move |s| {
+                    s.versions(&lookup)
+                })
                 .await
             {
                 Ok(rows) => {
@@ -781,7 +806,9 @@ pub async fn history(State(state): State<HttpState>, RawQuery(raw): RawQuery) ->
         }
         // No key: the INDEX. Nothing else lists keys that are gone, so this is how an orphan is found.
         None => match server
-            .with_read("memory_history", move |s| s.version_index(orphans_only))
+            .with_read("memory_history", reader, move |s| {
+                s.version_index(orphans_only)
+            })
             .await
         {
             Ok(rows) => {
@@ -804,7 +831,12 @@ pub async fn history(State(state): State<HttpState>, RawQuery(raw): RawQuery) ->
 }
 
 /// `GET /search` — the same query surface as `memory_search`, same bytes.
-pub async fn search(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn search(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let search = match search_params(&params) {
@@ -815,7 +847,7 @@ pub async fn search(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> 
         Ok(s) => s,
         Err(r) => return r,
     };
-    match server.run_search(search).await {
+    match server.run_search(search, reader).await {
         Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
         Err(e) => error(json, error_status(&e), e),
     }
@@ -823,7 +855,12 @@ pub async fn search(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> 
 
 /// `GET /semantic` — the store-wide search (`semantic_search`): an optional `type`, and
 /// `deleted=true` for the graveyard. Same body as the tool, by construction.
-pub async fn semantic_search(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn semantic_search(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mut fields = Vec::new();
@@ -859,14 +896,19 @@ pub async fn semantic_search(State(state): State<HttpState>, RawQuery(raw): RawQ
         Ok(s) => s,
         Err(r) => return r,
     };
-    match server.run_semantic(p).await {
+    match server.run_semantic(p, reader).await {
         Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
         Err(e) => error(json, error_status(&e), e),
     }
 }
 
 /// `GET /dupes` — near-duplicate candidate pairs (`memory_dupes`).
-pub async fn dupes(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn dupes(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let max_distance = match params.parse_as::<f32>("max_distance") {
@@ -882,7 +924,9 @@ pub async fn dupes(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> R
         Err(r) => return r,
     };
     match server
-        .with_store("memory_dupes", move |s| s.dupes(max_distance, limit))
+        .with_read("memory_dupes", reader, move |s| {
+            s.dupes(max_distance, limit)
+        })
         .await
     {
         Ok(pairs) => {
@@ -899,7 +943,12 @@ pub async fn dupes(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> R
 }
 
 /// `GET /projects` — the project index (`project_list`), same bytes.
-pub async fn projects(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn projects(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mode = match mode_param(params.maybe("mode")) {
@@ -918,7 +967,7 @@ pub async fn projects(State(state): State<HttpState>, RawQuery(raw): RawQuery) -
         Err(r) => return r,
     };
     match server
-        .with_store("project_list", move |s| s.project_list(&filter))
+        .with_read("project_list", reader, move |s| s.project_list(&filter))
         .await
     {
         Ok(rows) => {
@@ -937,9 +986,11 @@ pub async fn projects(State(state): State<HttpState>, RawQuery(raw): RawQuery) -
 /// `GET /project/{key}` — one project with its ordered preload (`project_get`).
 pub async fn project_get(
     State(state): State<HttpState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let hydrate = match project::Hydrate::parse(params.get("hydrate").unwrap_or("none")) {
@@ -951,7 +1002,9 @@ pub async fn project_get(
         Err(r) => return r,
     };
     match server
-        .with_store("project_get", move |s| s.project_view(&key, hydrate))
+        .with_read("project_get", reader, move |s| {
+            s.project_view(&key, hydrate)
+        })
         .await
     {
         Ok(view) => {
@@ -1103,7 +1156,11 @@ pub async fn claims(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> 
         Err(r) => return r,
     };
     match server
-        .with_read("claim_list", move |s| s.claims(name.as_deref()))
+        .with_read(
+            "claim_list",
+            crate::store::audience::Reader::everything(),
+            move |s| s.claims(name.as_deref()),
+        )
         .await
     {
         Ok(rows) => {
@@ -1774,7 +1831,7 @@ struct BootView {
 
 impl BootView {
     /// Read the boot from the store on a read-only connection of our own.
-    fn read(paths: &Paths) -> Self {
+    fn read(paths: &Paths, reader: &crate::store::audience::Reader) -> Self {
         let conn = match db::open_read_only(paths) {
             Ok(conn) => conn,
             Err(err) => {
@@ -1784,7 +1841,7 @@ impl BootView {
                 };
             }
         };
-        match Self::fill(&conn) {
+        match Self::fill(&conn, reader) {
             Ok(view) => view,
             Err(err) => BootView {
                 unreadable: Some(err.to_string()),
@@ -1793,7 +1850,10 @@ impl BootView {
         }
     }
 
-    fn fill(conn: &rusqlite::Connection) -> crate::error::Result<Self> {
+    fn fill(
+        conn: &rusqlite::Connection,
+        reader: &crate::store::audience::Reader,
+    ) -> crate::error::Result<Self> {
         let note = [BOOT_NOTE, BOOT_NOTE_LEGACY]
             .into_iter()
             .find_map(|key| {
@@ -1808,7 +1868,7 @@ impl BootView {
             .transpose()?;
         Ok(BootView {
             note,
-            self_set: tags::keys_with(conn, BOOT_TAG)?,
+            self_set: tags::keys_with_seen(conn, BOOT_TAG, reader)?,
             projects: project::open(conn)?,
             state: Some(state_line(conn)?),
             unreadable: None,
@@ -1867,7 +1927,12 @@ const BOOT_NOTE_LEGACY: &str = "bootstrap-self";
 /// resident note in full, an index of the self set, the work still open, and the style. The tool
 /// catalogue is `?tools=true` — the one part that cannot be small, which the caller should choose to
 /// spend tokens on rather than receive by default.
-pub async fn bootstrap(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn bootstrap(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tools = params.flag("tools");
@@ -1875,7 +1940,7 @@ pub async fn bootstrap(State(state): State<HttpState>, RawQuery(raw): RawQuery) 
     // behind a writer, and a boot during an outage still describes a store it cannot read.
     let view = tokio::task::spawn_blocking({
         let paths = state.paths.clone();
-        move || BootView::read(&paths)
+        move || BootView::read(&paths, &reader)
     })
     .await
     .unwrap_or_default();
@@ -2271,13 +2336,17 @@ pub async fn mail_inbox(State(state): State<HttpState>, RawQuery(raw): RawQuery)
         Err(r) => return r,
     };
     match server
-        .with_read("mail_inbox", move |s| {
-            // The box's top and the page's top are different facts; see `mail_inbox` in `mcp`.
-            Ok((
-                s.mail_inbox(&recipient, since, limit)?,
-                s.mail_head(&recipient)?,
-            ))
-        })
+        .with_read(
+            "mail_inbox",
+            crate::store::audience::Reader::everything(),
+            move |s| {
+                // The box's top and the page's top are different facts; see `mail_inbox` in `mcp`.
+                Ok((
+                    s.mail_inbox(&recipient, since, limit)?,
+                    s.mail_head(&recipient)?,
+                ))
+            },
+        )
         .await
     {
         Ok((rows, newest)) => {
@@ -2320,7 +2389,11 @@ pub async fn mail_read(
         Err(r) => return r,
     };
     match server
-        .with_read("mail_read", move |s| s.mail_read(seq))
+        .with_read(
+            "mail_read",
+            crate::store::audience::Reader::everything(),
+            move |s| s.mail_read(seq),
+        )
         .await
     {
         Ok(Some(letter)) => render(

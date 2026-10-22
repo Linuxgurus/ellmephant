@@ -98,6 +98,10 @@ pub struct Session {
     cfg: Config,
     conn: Connection,
     encoder: Arc<Encoder>,
+    /// WHO this session reads as. The CLI holds the file, so it is [`Reader::everything`] by default
+    /// — the honest limit of the private tier (#54). A DOOR replaces it with the connection's proven
+    /// pen, and then every read below filters through it.
+    reader: store::audience::Reader,
 }
 
 impl Session {
@@ -110,6 +114,7 @@ impl Session {
             cfg,
             conn,
             encoder,
+            reader: store::audience::Reader::everything(),
         })
     }
 
@@ -117,12 +122,28 @@ impl Session {
     /// read is served while a write is in flight — the writer holds its session for the whole write,
     /// embedding included, so a read that queued on it would wait out the write.
     pub fn read_only(paths: &Paths, cfg: Config, encoder: Arc<Encoder>) -> Result<Self> {
+        Self::read_only_as(paths, cfg, encoder, store::audience::Reader::everything())
+    }
+
+    /// A read-only session that reads as one pen (or as nobody): the door's shape.
+    pub fn read_only_as(
+        paths: &Paths,
+        cfg: Config,
+        encoder: Arc<Encoder>,
+        reader: store::audience::Reader,
+    ) -> Result<Self> {
         Ok(Self {
             paths: paths.clone(),
             cfg,
             conn: db::open_read_only(paths)?,
             encoder,
+            reader,
         })
+    }
+
+    /// The reader this session sees with.
+    pub fn reader(&self) -> &store::audience::Reader {
+        &self.reader
     }
 
     /// Inject a pre-built encoder (see [`Encoder::inject`]) — the test harnesses' fake.
@@ -178,7 +199,13 @@ impl Session {
     /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
     /// both doors, and the only caller is [`Self::fetch`] itself.
     pub(crate) fn show(&self, key: &str) -> Result<Memory> {
-        store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))
+        // ABSENCE, not refusal: a row this reader may not see is answered exactly as a key that was
+        // never written. A distinct "private" error would confirm the row exists, which is the
+        // disclosure the tier is for.
+        match store::get(&self.conn, key)? {
+            Some(mem) if self.reader.sees(&mem.audience) => Ok(mem),
+            _ => Err(Error::NotFound(key.to_string())),
+        }
     }
 
     /// Retire one memory into another: repoint every reference, then delete the source. The prose
@@ -215,7 +242,7 @@ impl Session {
     /// Find near-duplicate candidate pairs (the merge finder, SPEC §9). No encoder needed —
     /// it reads the stored document vectors.
     pub fn dupes(&self, max_distance: f32, limit: usize) -> Result<Vec<store::dupes::DupePair>> {
-        store::dupes::find(&self.conn, max_distance, limit)
+        store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
     /// Delete one memory by key; `false` means there was nothing to delete.
@@ -230,12 +257,33 @@ impl Session {
     /// Deliberately by KEY, never resolved through the `memory` row: a key that is GONE still has
     /// history, and that history is then the only copy of what it said.
     pub fn versions(&self, key: &str) -> Result<Vec<store::version::Version>> {
+        self.version_guard(key)?;
         store::version::history(&self.conn, key)
+    }
+
+    /// ★ VERSIONS HOLD THE BODY, so history is gated by the row's CURRENT class (the decision #54
+    /// asked to state rather than discover): a note that went private takes its past with it. A key
+    /// with no live row is classed by its NEWEST snapshot, because that is the last thing it said
+    /// about who could read it — and a private note's history must not outlive the note in public.
+    fn version_guard(&self, key: &str) -> Result<()> {
+        let class: Option<String> = match store::get(&self.conn, key)? {
+            Some(mem) => Some(mem.audience),
+            None => store::version::read_latest(&self.conn, key)?.and_then(|snap| {
+                snap.get("audience")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string)
+            }),
+        };
+        match class {
+            Some(audience) if !self.reader.sees(&audience) => Err(Error::NotFound(key.to_string())),
+            _ => Ok(()),
+        }
     }
 
     /// One version's snapshot, in the SAME shape as a live memory ([`Memory`]), so a caller handles a
     /// past state and a present one alike. `None` means no such version; the address need not exist.
     pub fn version(&self, key: &str, n: i64) -> Result<Option<Memory>> {
+        self.version_guard(key)?;
         match store::version::read(&self.conn, key, n)? {
             Some(snap) => Ok(Some(serde_json::from_value(snap)?)),
             None => Ok(None),
@@ -246,6 +294,7 @@ impl Session {
     /// how a deleted key is found at all — nothing else in the store lists keys that are gone.
     pub fn version_index(&self, orphans_only: bool) -> Result<Vec<store::version::HistoryIndex>> {
         let mut rows = store::version::index(&self.conn)?;
+        rows.retain(|r| self.version_guard(&r.key).is_ok());
         if orphans_only {
             rows.retain(|r| r.orphan);
         }
@@ -278,15 +327,30 @@ impl Session {
     /// absent for 42 minutes and nobody could tell "wrong store" from "deleted" from "stale reader".
     /// These three numbers are the difference, and they cost one indexed query each.
     pub fn miss_facts(&self, key: &str) -> Result<MissFacts> {
-        let memories: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
-        let versions = store::version::count_for(&self.conn, key)?;
-        let newest: Option<String> = self.conn.query_row(
-            "SELECT MAX(written_at) FROM memory_version WHERE type = 'memory' AND key = ?1",
-            rusqlite::params![key],
+        // ★ A DIAGNOSTIC IS A READ. "It existed 42 minutes ago" is exactly the sentence the tier
+        // exists to prevent, so the history half is gated by the same rule as `memory_history`, and
+        // the store count is the reader's count, not the file's.
+        let (predicate, binds) = self.reader.sql();
+        let memories: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM memory WHERE {predicate}"),
+            rusqlite::params_from_iter(binds.iter()),
             |r| r.get(0),
         )?;
+        let may_see_history = self.version_guard(key).is_ok();
+        let versions = if may_see_history {
+            store::version::count_for(&self.conn, key)?
+        } else {
+            0
+        };
+        let newest: Option<String> = if may_see_history {
+            self.conn.query_row(
+                "SELECT MAX(written_at) FROM memory_version WHERE type = 'memory' AND key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )?
+        } else {
+            None
+        };
         Ok(MissFacts {
             store: self.paths.db().display().to_string(),
             memories,
@@ -331,18 +395,20 @@ impl Session {
             .map(str::trim)
             .is_some_and(|s| !s.is_empty());
         if needs_embedder {
-            return self.encoder.with(|e| search::run(&self.conn, Some(e), q));
+            return self
+                .encoder
+                .with(|e| search::run(&self.conn, Some(e), &self.reader, q));
         }
-        search::run(&self.conn, None, q)
+        search::run(&self.conn, None, &self.reader, q)
     }
 
     /// A read-only digest of the store (`stats`); `db_bytes` comes from the store file, so the
     /// MCP surface reports the real size rather than a zero the caller was expected to fill.
     /// `with_tags` additionally fills the full tag vocabulary — the digest stays lean without it.
     pub fn stats(&self, with_tags: bool) -> Result<store::stats::Stats> {
-        let mut stats = store::stats::compute(&self.conn)?;
+        let mut stats = store::stats::compute_seen(&self.conn, &self.reader)?;
         if with_tags {
-            stats.all_tags = store::stats::vocabulary(&self.conn)?;
+            stats.all_tags = store::stats::vocabulary_seen(&self.conn, &self.reader)?;
         }
         Ok(stats)
     }
@@ -427,8 +493,11 @@ impl Session {
     /// whether a memory is safe to delete. The lookup goes through `store::get`, so the key is
     /// normalised exactly as it is everywhere else.
     pub fn backlinks(&self, key: &str) -> Result<Vec<links::Backlink>> {
-        let mem = store::get(&self.conn, key)?.ok_or_else(|| Error::NotFound(key.to_string()))?;
-        links::backlinks(&self.conn, &mem.key)
+        // The TARGET is gated first: asking for backlinks of a row you cannot see must not tell you
+        // whether the row exists. Then the SOURCES are filtered — a private note that names this key
+        // is not a note this reader can be shown.
+        let mem = self.show(key)?;
+        links::backlinks_seen(&self.conn, &mem.key, &self.reader)
     }
 
     /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a
@@ -440,7 +509,7 @@ impl Session {
     /// One project with both relations resolved — the "stand inside it" read. `hydrate` decides how
     /// much of each preload memory's body to carry.
     pub fn project_view(&self, key: &str, hydrate: project::Hydrate) -> Result<project::View> {
-        project::view(&self.conn, key, hydrate)?
+        project::view_seen(&self.conn, key, hydrate, &self.reader)?
             .ok_or_else(|| Error::NoProject(project::normalize_key(key)))
     }
 

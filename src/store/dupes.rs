@@ -41,7 +41,23 @@ pub struct DupePair {
 /// One KNN pass per memory; pairs are deduplicated (`a`,`b` == `b`,`a`) and no memory is its
 /// own neighbour.
 pub fn find(conn: &Connection, max_distance: f32, limit: usize) -> Result<Vec<DupePair>> {
-    let rows = load_rows(conn)?;
+    find_seen(
+        conn,
+        &crate::store::audience::Reader::everything(),
+        max_distance,
+        limit,
+    )
+}
+
+/// The same finder over the rows one reader may see. A private row must not be paired with a public
+/// neighbour: the pair itself would name it, and the distance would describe its content.
+pub fn find_seen(
+    conn: &Connection,
+    reader: &crate::store::audience::Reader,
+    max_distance: f32,
+    limit: usize,
+) -> Result<Vec<DupePair>> {
+    let rows = load_rows(conn, reader)?;
     if rows.len() < 2 {
         return Ok(Vec::new());
     }
@@ -89,10 +105,16 @@ pub fn find(conn: &Connection, max_distance: f32, limit: usize) -> Result<Vec<Du
 }
 
 /// `id -> (key, title)` for every stored memory.
-fn load_rows(conn: &Connection) -> Result<HashMap<i64, (String, String)>> {
-    let mut stmt = conn.prepare("SELECT id, key, title FROM memory")?;
+fn load_rows(
+    conn: &Connection,
+    reader: &crate::store::audience::Reader,
+) -> Result<HashMap<i64, (String, String)>> {
+    let (predicate, binds) = reader.sql();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, key, title FROM memory WHERE {predicate}"
+    ))?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 (r.get::<_, String>(1)?, r.get::<_, String>(2)?),

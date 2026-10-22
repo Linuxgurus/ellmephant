@@ -526,11 +526,38 @@ pub struct Backlink {
 /// Memory-kind edges only: a `[[prj:sessions]]` link is aimed at the project, so it is not a
 /// backlink of a memory called `sessions`.
 pub fn backlinks(conn: &Connection, key: &str) -> Result<Vec<Backlink>> {
-    let mut stmt = conn.prepare(
+    backlinks_seen(conn, key, &crate::store::audience::Reader::everything())
+}
+
+/// The same list, filtered to the sources this reader may see.
+///
+/// ★ BACKLINKS LEAK UPWARD (#55): "this private note links to X" tells anyone who can see the note
+/// that X exists. So the filter is on the SOURCE, and a source the reader may not see is not a
+/// source — the edge is absent, exactly as an unwritten one would be.
+pub fn backlinks_seen(
+    conn: &Connection,
+    key: &str,
+    reader: &crate::store::audience::Reader,
+) -> Result<Vec<Backlink>> {
+    // The TARGET is gated first: a list of backlinks is itself an answer to "does this key exist".
+    let target: Option<String> = conn
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if target.is_some_and(|audience| !reader.sees(&audience)) {
+        return Ok(Vec::new());
+    }
+    let (predicate, binds) = reader.sql();
+    let mut stmt = conn.prepare(&format!(
         "SELECT m.key, m.title FROM memory_link l JOIN memory m ON m.id = l.from_id
-          WHERE l.to_key = ?1 AND l.to_type = 'memory' ORDER BY m.key",
-    )?;
-    let rows = stmt.query_map(params![key], |r| {
+          WHERE l.to_key = ?1 AND l.to_type = 'memory' AND ({predicate}) ORDER BY m.key"
+    ))?;
+    let mut all: Vec<rusqlite::types::Value> = vec![key.to_string().into()];
+    all.extend(binds.into_iter().map(Into::into));
+    let rows = stmt.query_map(rusqlite::params_from_iter(all), |r| {
         Ok(Backlink {
             key: r.get(0)?,
             title: r.get(1)?,

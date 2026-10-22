@@ -466,12 +466,17 @@ fn a_project_tag_is_how_memories_join() {
             updated_after: None,
             updated_before: None,
         };
-        ellmephant::search::run(&conn, None, &q)
-            .expect("search")
-            .hits
-            .iter()
-            .map(|h| h.key.clone())
-            .collect()
+        ellmephant::search::run(
+            &conn,
+            None,
+            &ellmephant::store::audience::Reader::everything(),
+            &q,
+        )
+        .expect("search")
+        .hits
+        .iter()
+        .map(|h| h.key.clone())
+        .collect()
     };
     assert_eq!(
         hits(&["prj:chronos"]),

@@ -121,7 +121,12 @@ pub fn evaluate(
     for case in cases {
         let cutoff = case.k.unwrap_or(k).max(1);
         let query = case_query(case, cutoff);
-        let bundle = search::run(conn, embedder, &query)?;
+        let bundle = search::run(
+            conn,
+            embedder,
+            &crate::store::audience::Reader::everything(),
+            &query,
+        )?;
         if let Some(rank) = bundle
             .hits
             .iter()
@@ -257,7 +262,12 @@ pub fn timings(
             k.max(1),
         );
         let started = Instant::now();
-        search::run(conn, Some(embedder), &query)?;
+        search::run(
+            conn,
+            Some(embedder),
+            &crate::store::audience::Reader::everything(),
+            &query,
+        )?;
         search_times.push(started.elapsed().as_secs_f64() * 1e3);
     }
 

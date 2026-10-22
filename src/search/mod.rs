@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::embed::{Embedder, projection};
 use crate::error::{Error, Result};
 use crate::index;
+use crate::store::audience;
 use crate::store::{self, Memory};
 
 /// A candidate row: its id and, when the phrase was semantic, its cosine distance.
@@ -270,8 +271,13 @@ fn wire_distance(d: f32) -> f64 {
 }
 
 /// Run a query. `embedder` is required when a phrase is given, ignored otherwise.
-pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Result<Bundle> {
-    let phrase = phrase_ids(conn, embedder, q)?;
+pub fn run(
+    conn: &Connection,
+    embedder: Option<&dyn Embedder>,
+    reader: &audience::Reader,
+    q: &Query,
+) -> Result<Bundle> {
+    let mut phrase = phrase_ids(conn, embedder, q)?;
     let ranked = phrase.is_some();
 
     // ★ TWO LEGS, FUSED BY RRF (soma/ellmephant#62). The semantic leg answers "means this"; the word
@@ -283,13 +289,26 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     // are different units in different directions (lower-better and negative-lower-better) — adding
     // them would need a calibration nobody has. `k=60` is the constant from the RRF literature: it
     // flattens the top of each list so one leg's runaway first place does not veto the other.
-    let lexical = phrase_ids_lexical(conn, q)?;
+    let mut lexical = phrase_ids_lexical(conn, q)?;
+    // ★ VISIBILITY IS APPLIED TO EACH LEG BEFORE ANY CAP. A private row that survived into `fuse`
+    // would take one of the k slots and then be dropped, and the caller would see a short page with
+    // no way to tell it from a thin result set — the absence has to be indistinguishable from
+    // never-written, and a page of 4 where 10 were asked for is a confession.
+    let visible = reader.visible_ids(conn)?;
+    let hidden = |id: &i64| visible.as_ref().is_some_and(|v| !v.contains(id));
+    if let Some(p) = phrase.as_mut() {
+        p.retain(|(id, _)| !hidden(id));
+    }
+    if let Some(l) = lexical.as_mut() {
+        l.retain(|(id, _)| !hidden(id));
+    }
     let mut ordered: Vec<(i64, Option<f32>)> = match (&phrase, &lexical) {
         (Some(p), Some(l)) => fuse(p, l, q.k.max(1)),
         (Some(p), None) => p.clone(),
         (None, Some(l)) => l.clone(),
         (None, None) => all_ranked(conn)?,
     };
+    ordered.retain(|(id, _)| !hidden(id));
     // Structured filters intersect the candidate set BEFORE the k cap, so a filtered result
     // is exact (the KNN already spans the whole store): filter, then truncate, never the reverse.
     if let Some(set) = filter_set(conn, q)? {
@@ -309,6 +328,11 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
         let Some(mem) = store::get_by_id(conn, id)? else {
             continue; // the leg returned an id that vanished; skip, don't fail the query
         };
+        // Belt and braces: the legs were filtered above, so a row here that the reader may not see
+        // means a leg forgot — and the honest answer is still to say nothing.
+        if !reader.sees(&mem.audience) {
+            continue;
+        }
         let chars = embedded_len(&mem);
         hits.push(Hit {
             id,
@@ -321,7 +345,7 @@ pub fn run(conn: &Connection, embedder: Option<&dyn Embedder>, q: &Query) -> Res
     }
 
     let neighbors = if q.expand > 0 {
-        expand(conn, &hits, q.expand)?
+        expand(conn, &hits, q.expand, &visible)?
     } else {
         Vec::new()
     };
@@ -525,13 +549,18 @@ fn semantic_ids(
 
 /// Breadth-first over `memory_link` in *both* directions, up to `hops` from the seeds.
 /// Dangling targets (a `[[key]]` to a row that does not exist) are silently skipped.
-pub fn expand(conn: &Connection, seeds: &[Hit], hops: u8) -> Result<Vec<Neighbor>> {
+pub fn expand(
+    conn: &Connection,
+    seeds: &[Hit],
+    hops: u8,
+    visible: &Option<HashSet<i64>>,
+) -> Result<Vec<Neighbor>> {
     let mut visited: HashSet<i64> = seeds.iter().map(|h| h.id).collect();
     let mut frontier: Vec<(i64, String)> = seeds.iter().map(|h| (h.id, h.key.clone())).collect();
     let mut out = Vec::new();
 
     for hop in 1..=hops.max(1) {
-        frontier = expand_frontier(conn, &frontier, hop, &mut visited, &mut out)?;
+        frontier = expand_frontier(conn, &frontier, hop, &mut visited, &mut out, visible)?;
         if frontier.is_empty() {
             break;
         }
@@ -547,10 +576,16 @@ fn expand_frontier(
     hop: u8,
     visited: &mut HashSet<i64>,
     out: &mut Vec<Neighbor>,
+    visible: &Option<HashSet<i64>>,
 ) -> Result<Vec<(i64, String)>> {
     let mut next = Vec::new();
     for (id, key) in frontier {
         for (nid, nkey) in adjacent(conn, *id, key)? {
+            // A neighbour the reader may not see must not appear — nor be walked THROUGH, because
+            // one hop past it would name a key that only exists in a room they cannot enter.
+            if visible.as_ref().is_some_and(|v| !v.contains(&nid)) {
+                continue;
+            }
             if !visited.insert(nid) {
                 continue;
             }

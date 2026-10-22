@@ -601,7 +601,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             mem.updated,
             mem.asserted_by,
             mem.origin,
-            mem.audience
+            audience::effective(&mem.audience)
         ],
     )?;
     Ok(())
@@ -628,7 +628,7 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.updated,
             mem.asserted_by,
             mem.origin,
-            mem.audience
+            audience::effective(&mem.audience)
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -643,22 +643,33 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
     // rediscover. Both halves ride in one transaction, so neither undoes the other.
     encode::forget(&tx, &crate::store::links::Kind::Memory.keyslug(key))?;
-    let id: Option<i64> = tx
-        .query_row("SELECT id FROM memory WHERE key = ?1", params![key], |r| {
-            r.get(0)
-        })
+    let row: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
-    if let Some(id) = id {
+    let existed = row.is_some();
+    if let Some((id, audience)) = row {
         // A delete SUPERSEDES the state the memory is in, so it snapshots it first — exactly as an
         // edit does, and in the same transaction. Without this, a deleted key's newest version would
         // be some earlier state and the content it actually held would be the one thing versioning
         // did not keep; with it, `erase` is the store's single true destroyer.
         version::snapshot(&tx, id, key, None)?;
         tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
-        index::vec::delete(&tx, id)?;
+        // ★ A PRIVATE ROW'S VECTOR IS PURGED, NOT TOMBSTONED. The tombstone table is a DELIBERATE
+        // search surface (`semantic_search(deleted=true)`), so moving a private document's vector
+        // there would keep it findable by meaning — by anyone — after its row was gone, and a
+        // tombstone names it. Deleting a private note must delete what points at it.
+        if audience == audience::PUBLIC || audience.is_empty() {
+            index::vec::delete(&tx, id)?;
+        } else {
+            index::vec::purge(&tx, id)?;
+        }
     }
     tx.commit()?;
-    Ok(id.is_some())
+    Ok(existed)
 }
 
 /// The outcome of a feedback sweep (see [`record_useful_many`]): `(key, new_total)` for every key

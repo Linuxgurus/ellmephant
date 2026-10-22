@@ -68,9 +68,14 @@ fn semantic_ranks_the_closest_document_first() {
         &[],
     );
 
-    let hits = search::run(&conn, Some(&embedder), &query(Some("alpha beta gamma")))
-        .expect("search")
-        .hits;
+    let hits = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &query(Some("alpha beta gamma")),
+    )
+    .expect("search")
+    .hits;
 
     assert_eq!(hits[0].key, "alpha-note");
     assert!(
@@ -116,7 +121,13 @@ fn a_tag_is_reached_by_the_filter_not_by_semantics() {
 fn semantic_needs_an_embedder() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
-    let err = search::run(&conn, None, &query(Some("anything"))).unwrap_err();
+    let err = search::run(
+        &conn,
+        None,
+        &ellmephant::store::audience::Reader::everything(),
+        &query(Some("anything")),
+    )
+    .unwrap_err();
     assert!(format!("{err}").contains("needs an embedder"));
 }
 
@@ -131,9 +142,14 @@ fn max_distance_filters_the_semantic_leg() {
     // Cosine distance: the exact document is ~0, the unrelated one is ~1.
     let mut q = query(Some("alpha beta gamma"));
     q.max_distance = Some(0.5);
-    let hits = search::run(&conn, Some(&embedder), &q)
-        .expect("search")
-        .hits;
+    let hits = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search")
+    .hits;
     assert!(
         hits.iter().all(|h| h.distance.unwrap_or(1.0) <= 0.5),
         "got {hits:?}"
@@ -155,7 +171,13 @@ fn hits_carry_no_body() {
     let embedder = HashEmbedder::new(DIM);
     seed(&conn, &embedder, "long-note", &"zebra ".repeat(200), &[]);
 
-    let bundle = search::run(&conn, Some(&embedder), &query(Some("zebra"))).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &query(Some("zebra")),
+    )
+    .expect("search");
     assert_eq!(bundle.hits[0].title, "long-note");
     let json = serde_json::to_string(&bundle).unwrap();
     assert!(
@@ -177,7 +199,13 @@ fn expand_pulls_link_neighbours_and_backlinks() {
     let mut q = query(Some("start here"));
     q.k = 1; // only the top hit seeds the expansion
     q.expand = 2;
-    let bundle = search::run(&conn, Some(&embedder), &q).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search");
     assert_eq!(bundle.hits[0].key, "note-a");
     let keys: Vec<(&str, &str, u8)> = bundle
         .neighbors
@@ -190,7 +218,13 @@ fn expand_pulls_link_neighbours_and_backlinks() {
     let mut q = query(Some("terminal note"));
     q.k = 1;
     q.expand = 1;
-    let bundle = search::run(&conn, Some(&embedder), &q).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search");
     assert_eq!(bundle.hits[0].key, "note-c");
     assert_eq!(bundle.neighbors.len(), 1);
     assert_eq!(bundle.neighbors[0].memory.key, "note-b");
@@ -204,7 +238,14 @@ fn no_constraints_returns_everything_in_key_order() {
     seed(&conn, &embedder, "b", "two", &[]);
     seed(&conn, &embedder, "a", "one", &[]);
 
-    let hits = search::run(&conn, None, &query(None)).expect("search").hits;
+    let hits = search::run(
+        &conn,
+        None,
+        &ellmephant::store::audience::Reader::everything(),
+        &query(None),
+    )
+    .expect("search")
+    .hits;
     assert_eq!(
         hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
         ["a", "b"]
@@ -330,7 +371,14 @@ fn tag_and_size_filters_intersect() {
     let mut q = query(None);
     q.tags = vec!["k8s".into()];
     q.min_chars = Some(100);
-    let hits = search::run(&conn, None, &q).expect("search").hits;
+    let hits = search::run(
+        &conn,
+        None,
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search")
+    .hits;
     assert_eq!(
         hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
         ["long-k8s"]
@@ -340,12 +388,17 @@ fn tag_and_size_filters_intersect() {
 
 /// The keys of a query's hits, in order.
 fn hit_keys(conn: &Connection, q: &Query) -> Vec<String> {
-    search::run(conn, None, q)
-        .expect("search")
-        .hits
-        .into_iter()
-        .map(|h| h.key)
-        .collect()
+    search::run(
+        conn,
+        None,
+        &ellmephant::store::audience::Reader::everything(),
+        q,
+    )
+    .expect("search")
+    .hits
+    .into_iter()
+    .map(|h| h.key)
+    .collect()
 }
 
 #[test]
@@ -365,7 +418,14 @@ fn literal_pattern_finds_a_half_remembered_string() {
     let mut q = query(None);
     // A literal the semantic leg cannot reach, and case-insensitive.
     q.pattern = Some("LOCALHOST:8888".into());
-    let hits = search::run(&conn, None, &q).expect("search").hits;
+    let hits = search::run(
+        &conn,
+        None,
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search")
+    .hits;
     assert_eq!(
         hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
         ["mcp-port"]
@@ -398,7 +458,13 @@ fn a_bad_regex_is_a_pattern_error() {
     let mut q = query(None);
     q.pattern = Some("(unclosed".into());
     q.mode = MatchMode::Regex;
-    let err = search::run(&conn, None, &q).unwrap_err();
+    let err = search::run(
+        &conn,
+        None,
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .unwrap_err();
     assert!(format!("{err}").contains("invalid pattern"), "{err}");
 }
 
@@ -438,9 +504,14 @@ fn the_lexical_leg_intersects_the_semantic_phrase() {
 
     let mut q = query(Some("alpha beta gamma"));
     q.pattern = Some("8888".into());
-    let hits = search::run(&conn, Some(&embedder), &q)
-        .expect("search")
-        .hits;
+    let hits = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search")
+    .hits;
     assert_eq!(
         hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
         ["ports-a"]
@@ -499,7 +570,13 @@ fn time_bounds_filter_created_and_updated() {
     // Bounds compose with the semantic phrase by intersection (this leg needs the encoder).
     let mut q = query(Some("fact"));
     q.updated_before = Some("2026-02-01".into());
-    let bundle = search::run(&conn, Some(&embedder), &q).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q,
+    )
+    .expect("search");
     assert_eq!(
         bundle
             .hits

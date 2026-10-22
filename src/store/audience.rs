@@ -34,6 +34,21 @@ pub fn pen(name: &str) -> String {
     format!("{PEN}{}", name.trim().to_ascii_lowercase())
 }
 
+/// The value a row is stored with: an unset audience is a public one. `Memory::default` leaves the
+/// string empty, and an empty audience would be a row nobody could see — the worst failure direction.
+pub fn effective(value: &str) -> &str {
+    if value.trim().is_empty() {
+        PUBLIC
+    } else {
+        value
+    }
+}
+
+/// The serde default: an omitted audience is a public one.
+pub fn default_audience() -> String {
+    PUBLIC.to_string()
+}
+
 /// Is this a well-formed audience? Refused on write, so a stored row cannot carry a value no reader
 /// can interpret — the failure mode of an unparseable audience would be a row nobody can see.
 pub fn is_valid(value: &str) -> bool {
@@ -67,6 +82,10 @@ pub fn for_write(private: bool, who: Option<&str>) -> crate::error::Result<Strin
 pub struct Reader {
     /// The proven pen, already lowercased into an audience value. `None` is an anonymous reader.
     pen: Option<String>,
+    /// Every row, private ones included. ONLY for a process that already holds the file — the CLI,
+    /// maintenance, tests. A tier that claims to stop someone holding the SQLite file would be a lie
+    /// (#54 says so out loud), and pretending the CLI is subject to it would only hide that.
+    all: bool,
 }
 
 impl Reader {
@@ -74,12 +93,22 @@ impl Reader {
     pub fn pen(name: &str) -> Self {
         Reader {
             pen: Some(pen(name)),
+            all: false,
         }
     }
 
     /// A reader with no pen: sees public rows only.
     pub fn anonymous() -> Self {
         Reader::default()
+    }
+
+    /// The process holding the file: the CLI, the maintenance paths, tests. Not a pen, and not a
+    /// forensic act — it is the honest limit of the tier, written down rather than implied.
+    pub fn everything() -> Self {
+        Reader {
+            pen: None,
+            all: true,
+        }
     }
 
     /// The pen as an audience value (`pen:<x>`), when there is one.
@@ -92,7 +121,7 @@ impl Reader {
     /// Written as an allow-list, not a deny-list: an audience value nobody understands is visible to
     /// nobody. The opposite choice would make a typo in a writer a silent publication.
     pub fn sees(&self, audience: &str) -> bool {
-        audience == PUBLIC || Some(audience) == self.pen.as_deref()
+        self.all || audience == PUBLIC || Some(audience) == self.pen.as_deref()
     }
 
     /// The SQL predicate over `memory.audience`, and the parameters it binds.
@@ -101,6 +130,9 @@ impl Reader {
     /// reader's own audience, bound once. A caller composing a query passes the returned fragment as
     /// `AND {predicate}` and appends the returned binds in the order they are returned.
     pub fn sql(&self) -> (String, Vec<String>) {
+        if self.all {
+            return ("1 = 1".to_string(), Vec::new());
+        }
         match &self.pen {
             Some(p) => (
                 "(audience = 'public' OR audience = ?)".to_string(),
@@ -122,6 +154,42 @@ pub struct Forensic<'a> {
     pub pen: &'a str,
     /// Why the exemption is being used. Required, and stored.
     pub reason: &'a str,
+}
+
+impl Reader {
+    /// The ids this reader may see, or `None` when **nothing is hidden** — the common case today.
+    ///
+    /// `None` is not an optimisation dressed as semantics: it is the statement "this store has no
+    /// private rows, so every query over it is already exact". When it is `Some`, the set is the
+    /// allow-list every candidate list must be intersected with BEFORE `k` truncation, or a private
+    /// row would consume a slot and the caller's page would come back thin for no visible reason.
+    pub fn visible_ids(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> crate::error::Result<Option<std::collections::HashSet<i64>>> {
+        let total: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+        if self.all {
+            return Ok(None);
+        }
+        let (predicate, binds) = self.sql();
+        let visible: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM memory WHERE {predicate}"),
+            rusqlite::params_from_iter(binds.iter()),
+            |r| r.get(0),
+        )?;
+        if visible == total {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(&format!("SELECT id FROM memory WHERE {predicate}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            r.get::<_, i64>(0)
+        })?;
+        let mut set = std::collections::HashSet::new();
+        for row in rows {
+            set.insert(row?);
+        }
+        Ok(Some(set))
+    }
 }
 
 #[cfg(test)]
@@ -174,9 +242,4 @@ mod tests {
         assert!(sql.contains("audience = ?"));
         assert_eq!(binds, vec!["pen:stet".to_string()]);
     }
-}
-
-/// The serde default: an omitted audience is a public one.
-pub fn default_audience() -> String {
-    PUBLIC.to_string()
 }

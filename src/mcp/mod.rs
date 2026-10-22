@@ -865,6 +865,23 @@ fn identity_of(
     crate::identity::resolve(&parts.headers)
 }
 
+/// Who this READ is for. A proven pen filters; a transport that declared its pen once is as trusted
+/// as its parent process; anything else — including a FORGED claim — is nobody, and nobody sees only
+/// public rows. A refusal is not an error here: reads stay open, they just stay narrow.
+fn reader_of(
+    ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    declared: Option<&str>,
+) -> crate::store::audience::Reader {
+    match identity_of(ctx) {
+        Ok(Some(name)) => crate::store::audience::Reader::pen(&name),
+        Ok(None) => match declared {
+            Some(name) => crate::store::audience::Reader::pen(name),
+            None => crate::store::audience::Reader::anonymous(),
+        },
+        Err(_) => crate::store::audience::Reader::anonymous(),
+    }
+}
+
 /// ★ A WRITE REQUIRES A PEN. Reads are open to anyone; a write with NO proven identity is REFUSED,
 /// not stamped `anonymous`. Anonymous is an honest answer to "who spoke", but the store has no
 /// reason to accept an unsigned hand: an anonymous write is indistinguishable from one nobody meant,
@@ -1058,6 +1075,7 @@ impl MemoryServer {
     pub(crate) async fn with_read<T, F>(
         &self,
         tool: &'static str,
+        reader: crate::store::audience::Reader,
         f: F,
     ) -> std::result::Result<T, String>
     where
@@ -1069,7 +1087,8 @@ impl MemoryServer {
         let encoder = Arc::clone(&self.encoder);
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
-            let session = Session::read_only(&paths, cfg, encoder).map_err(|e| e.to_string())?;
+            let session =
+                Session::read_only_as(&paths, cfg, encoder, reader).map_err(|e| e.to_string())?;
             f(&session).map_err(|e| e.to_string())
         })
         .await;
@@ -1562,15 +1581,18 @@ impl MemoryServer {
     )]
     async fn semantic_search(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SemanticSearchParams>,
     ) -> std::result::Result<String, String> {
-        self.run_semantic(p).await
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        self.run_semantic(p, reader).await
     }
 
     /// The `semantic_search` body, shared by the tool and `GET /semantic` so the two doors cannot drift.
     pub(crate) async fn run_semantic(
         &self,
         p: SemanticSearchParams,
+        reader: crate::store::audience::Reader,
     ) -> std::result::Result<String, String> {
         let query = p.query.unwrap_or_default();
         if query.trim().is_empty() {
@@ -1581,7 +1603,9 @@ impl MemoryServer {
         if p.deleted.unwrap_or(false) {
             let md = p.max_distance;
             let hits = self
-                .with_read("semantic_search", move |s| s.search_deleted(&query, k, md))
+                .with_read("semantic_search", reader.clone(), move |s| {
+                    s.search_deleted(&query, k, md)
+                })
                 .await?;
             let hits: Vec<serde_json::Value> = hits
                 .into_iter()
@@ -1610,7 +1634,9 @@ impl MemoryServer {
             if kind != "memory" {
                 let probe = kind.clone();
                 let n = self
-                    .with_read("semantic_search", move |s| s.vectors_of(&probe))
+                    .with_read("semantic_search", reader.clone(), move |s| {
+                        s.vectors_of(&probe)
+                    })
                     .await?;
                 if n == 0 {
                     return Err(format!(
@@ -1637,7 +1663,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             updated_before: None,
             fields: p.fields,
         };
-        self.run_search(params).await
+        self.run_search(params, reader).await
     }
 
     /// Semantic phrase search: KNN over the document embeddings.
@@ -1654,14 +1680,20 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn memory_search(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
-        self.run_search(p).await
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        self.run_search(p, reader).await
     }
 
     /// Run a search and render its wire JSON. Shared by the MCP tool and `GET /search`, so the two
     /// doors emit byte-identical bodies (HTTP.md § "the wire grammar").
-    pub(crate) async fn run_search(&self, p: SearchParams) -> std::result::Result<String, String> {
+    pub(crate) async fn run_search(
+        &self,
+        p: SearchParams,
+        reader: crate::store::audience::Reader,
+    ) -> std::result::Result<String, String> {
         let query = p.query;
         let pattern = p.pattern;
         let mode = p.mode.map(MatchModeParam::to_mode).unwrap_or_default();
@@ -1681,7 +1713,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let log_query = query.clone();
         let started = std::time::Instant::now();
         let bundle = self
-            .with_read("memory_search", move |s| {
+            .with_read("memory_search", reader.clone(), move |s| {
                 let q = Query {
                     text: query,
                     pattern,
@@ -1726,8 +1758,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn memory_get(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<GetParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let key = p.key;
         // A VERSION is reached by address, never resolved through the live row (which need not exist
         // — its history outlives it), and it counts no visit: `visits` measures the memory, not a
@@ -1735,7 +1769,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         if let Some(n) = p.version {
             let lookup = key.clone();
             let past = self
-                .with_read("memory_get", move |s| s.version(&lookup, n))
+                .with_read("memory_get", reader.clone(), move |s| s.version(&lookup, n))
                 .await?
                 .ok_or_else(|| format!("no version {n} for {key}"))?;
             let mut v = serde_json::to_value(&past).map_err(|e| e.to_string())?;
@@ -1746,9 +1780,12 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return serde_json::to_string(&v).map_err(|e| e.to_string());
         }
         let lookup = key.clone();
-        let mut mem = match self.with_read("memory_get", move |s| s.show(&lookup)).await {
+        let mut mem = match self
+            .with_read("memory_get", reader.clone(), move |s| s.show(&lookup))
+            .await
+        {
             Ok(m) => m,
-            Err(e) => return Err(self.explain_miss(&key, e).await),
+            Err(e) => return Err(self.explain_miss(&key, e, reader.clone()).await),
         };
         // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
         // write holds the store this visit simply goes uncounted — which is nothing, next to a read
@@ -1780,14 +1817,18 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn memory_history(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<HistoryParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let cap = p.limit.unwrap_or(HISTORY_LIMIT as u32) as usize;
         match p.key {
             Some(key) => {
                 let lookup = key.clone();
                 let rows = self
-                    .with_read("memory_history", move |s| s.versions(&lookup))
+                    .with_read("memory_history", reader.clone(), move |s| {
+                        s.versions(&lookup)
+                    })
                     .await?;
                 let total = rows.len();
                 tracing::debug!(tool = "memory_history", key = %key, total, "history listed");
@@ -1800,7 +1841,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             None => {
                 let orphans = p.orphans_only;
                 let rows = self
-                    .with_read("memory_history", move |s| s.version_index(orphans))
+                    .with_read("memory_history", reader.clone(), move |s| {
+                        s.version_index(orphans)
+                    })
                     .await?;
                 let total = rows.len();
                 Ok(json_ok(serde_json::json!({
@@ -1846,12 +1889,16 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn memory_backlinks(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let key = p.key;
         let lookup = key.clone();
         let links = self
-            .with_read("memory_backlinks", move |s| s.backlinks(&lookup))
+            .with_read("memory_backlinks", reader.clone(), move |s| {
+                s.backlinks(&lookup)
+            })
             .await?;
         tracing::debug!(tool = "memory_backlinks", key = %key, count = links.len(), "backlinks");
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
@@ -1871,11 +1918,13 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn memory_stats(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<StatsParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let with_tags = p.tags.unwrap_or(false);
         let stats = self
-            .with_read("memory_stats", move |s| s.stats(with_tags))
+            .with_read("memory_stats", reader.clone(), move |s| s.stats(with_tags))
             .await?;
         tracing::info!(tool = "memory_stats", memories = stats.memories, "stats");
         serde_json::to_string(&stats).map_err(|e| e.to_string())
@@ -1895,12 +1944,16 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn memory_dupes(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<DupesParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let max_distance = p.max_distance.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE);
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
         let pairs = self
-            .with_read("memory_dupes", move |s| s.dupes(max_distance, limit))
+            .with_read("memory_dupes", reader.clone(), move |s| {
+                s.dupes(max_distance, limit)
+            })
             .await?;
         tracing::info!(
             tool = "memory_dupes",
@@ -1999,14 +2052,18 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn project_get(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectKeyParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let key = p.key;
         let hydrate = project::Hydrate::parse(p.hydrate.as_deref().unwrap_or("none"))
             .map_err(|e| e.to_string())?;
         let lookup = key.clone();
         let view = self
-            .with_read("project_get", move |s| s.project_view(&lookup, hydrate))
+            .with_read("project_get", reader.clone(), move |s| {
+                s.project_view(&lookup, hydrate)
+            })
             .await?;
         tracing::debug!(
             tool = "project_get",
@@ -2031,8 +2088,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn project_list(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectListParams>,
     ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref());
         let filter = project::Filter {
             status: p.status,
             tags: p.tags,
@@ -2041,7 +2100,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
         };
         let rows = self
-            .with_read("project_list", move |s| s.project_list(&filter))
+            .with_read("project_list", reader.clone(), move |s| {
+                s.project_list(&filter)
+            })
             .await?;
         tracing::info!(tool = "project_list", projects = rows.len(), "projects");
         project::list_to_wire_json(&rows).map_err(|e| e.to_string())
@@ -2145,7 +2206,11 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let name = p.name;
         let lookup = name.clone();
         let rows = self
-            .with_read("claim_list", move |s| s.claims(lookup.as_deref()))
+            .with_read(
+                "claim_list",
+                crate::store::audience::Reader::everything(),
+                move |s| s.claims(lookup.as_deref()),
+            )
             .await?;
         tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
         serde_json::to_string(&serde_json::json!({ "claims": rows })).map_err(|e| e.to_string())
@@ -2240,13 +2305,17 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         loop {
             let who = recipient.clone();
             let (rows, newest) = self
-                .with_read("mail_inbox", move |s| {
-                    // Two facts, and they were being conflated: the top of THIS PAGE and the top of
-                    // the BOX. `max_seq` was read as "newest letter that exists" while it meant
-                    // "highest seq returned" — which cost two readers an hour of theorising about a
-                    // 273-letter discrepancy that never existed (measured 2026-10-21).
-                    Ok((s.mail_inbox(&who, since, limit)?, s.mail_head(&who)?))
-                })
+                .with_read(
+                    "mail_inbox",
+                    crate::store::audience::Reader::everything(),
+                    move |s| {
+                        // Two facts, and they were being conflated: the top of THIS PAGE and the top of
+                        // the BOX. `max_seq` was read as "newest letter that exists" while it meant
+                        // "highest seq returned" — which cost two readers an hour of theorising about a
+                        // 273-letter discrepancy that never existed (measured 2026-10-21).
+                        Ok((s.mail_inbox(&who, since, limit)?, s.mail_head(&who)?))
+                    },
+                )
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
                 let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(since);
@@ -2269,13 +2338,18 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     /// answer — a missing row is still an error — but it names the store, its size, its schema and the
     /// key's history, so the next reader can tell an absent key from a wrong file, a stale reader or a
     /// delete. Refusals that are NOT misses pass through untouched.
-    async fn explain_miss(&self, key: &str, err: String) -> String {
+    async fn explain_miss(
+        &self,
+        key: &str,
+        err: String,
+        reader: crate::store::audience::Reader,
+    ) -> String {
         if !err.contains("no such memory") {
             return err;
         }
         let lookup = key.to_string();
         let facts = match self
-            .with_read("memory_get", move |s| s.miss_facts(&lookup))
+            .with_read("memory_get", reader, move |s| s.miss_facts(&lookup))
             .await
         {
             Ok(f) => f,
@@ -2356,7 +2430,11 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     ) -> std::result::Result<String, String> {
         let seq = p.seq;
         let found = self
-            .with_read("mail_read", move |s| s.mail_read(seq))
+            .with_read(
+                "mail_read",
+                crate::store::audience::Reader::everything(),
+                move |s| s.mail_read(seq),
+            )
             .await?;
         // ★ A LETTER IS PRIVATE CORRESPONDENCE: the box it is addressed to decides who may read it,
         // and the check happens on the LETTER, not on an argument the caller chose.

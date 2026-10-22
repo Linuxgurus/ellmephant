@@ -293,16 +293,25 @@ fn key_is_an_address_not_a_field() {
     )
     .expect("merge everything");
 
-    // PROVENANCE is part of the row now: who asserted this version, and where it came from, kept as
-    // separate facts — a relayer names the truth's home without becoming the truth.
-    let (asserted, origin): (String, Option<String>) = conn
+    // PROVENANCE is part of the row now, and it is TWO facts: who asserted this row (write-once —
+    // the seeded row proved nothing, so it is `anonymous`) and who wrote it last (this patch, James).
+    // A write may not restamp authorship: that was the #107 bug, where a tag pass rewrote the author
+    // with no version to show for it.
+    let (asserted, last_written, origin): (String, String, Option<String>) = conn
         .query_row(
-            "SELECT asserted_by, origin FROM memory WHERE id = ?1",
+            "SELECT asserted_by, last_written_by, origin FROM memory WHERE id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .expect("provenance stored");
-    assert_eq!(asserted, "James", "a write is attributed to its writer");
+    assert_eq!(
+        asserted, "anonymous",
+        "authorship is write-once: the writer of a patch is not the row's author"
+    );
+    assert_eq!(
+        last_written, "James",
+        "and the write names itself as the last writer"
+    );
     assert_eq!(
         origin.as_deref(),
         Some("https://example.com/record"),

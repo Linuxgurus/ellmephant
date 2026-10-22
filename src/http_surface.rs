@@ -1367,7 +1367,7 @@ pub async fn upvote(
     };
     // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
     // errors nor the JSON can drift apart.
-    match crate::mcp::upvote_sweep(server, keys).await {
+    match crate::mcp::upvote_sweep(server, reader_from(&headers), keys).await {
         Ok(payload) => {
             tracing::info!(area = scope.area, keys = %named, "upvoted over http");
             render(StatusCode::OK, json, payload, format!("upvoted {named}"))

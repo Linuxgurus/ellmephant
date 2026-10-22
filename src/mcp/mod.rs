@@ -1370,16 +1370,42 @@ impl MemoryServer {
 /// implementation, a second *way in*.
 pub(crate) async fn upvote_sweep(
     server: &MemoryServer,
+    reader: crate::store::audience::Reader,
     keys: Vec<String>,
 ) -> std::result::Result<String, String> {
     if keys.is_empty() {
         return Err("memory_upvote needs at least one key".to_string());
     }
+    // ★ A COUNTER IS STILL A READ. "Upvoted" for a row the caller cannot see would confirm it exists,
+    // and leaving it out of `missing` would confirm it twice. So the sweep is narrowed to visible
+    // keys first, and an invisible key is reported exactly as one that was never written.
+    let probe = keys.clone();
+    let visible: Vec<String> = server
+        .with_read("memory_upvote", reader, move |s| {
+            Ok(probe
+                .into_iter()
+                .filter(|k| s.show(k).is_ok())
+                .collect::<Vec<_>>())
+        })
+        .await?;
+    // Everything the probe could not see is reported as missing — which is also what a key that was
+    // never written reads as, and that is the point.
+    let hidden: Vec<String> = keys
+        .iter()
+        .filter(|k| !visible.iter().any(|v| v == *k))
+        .cloned()
+        .collect();
+    let keys = visible;
     let sweep = keys.clone();
-    let (upvoted, missing) = server
+    let (upvoted, mut missing) = server
         .with_store("memory_upvote", move |s| s.record_useful_many(&sweep))
         .await
         .map_err(|e| e.to_string())?;
+    for key in hidden {
+        if !missing.contains(&key) {
+            missing.push(key);
+        }
+    }
     // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
     if upvoted.is_empty() {
         return Err(Error::NotFound(keys.join(", ")).to_string());
@@ -1872,7 +1898,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
         pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
-        upvote_sweep(self, p.keys).await
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        upvote_sweep(self, reader, p.keys).await
     }
 
     /// List the memories whose bodies link to `key`.

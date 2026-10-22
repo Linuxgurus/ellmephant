@@ -1920,3 +1920,59 @@ async fn a_refused_cas_write_answers_conflict_not_updated() {
     let written: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert_eq!(written["status"], "updated");
 }
+
+/// ★ THE BOX IS THE BOUNDARY ON EVERY DOOR (soma/ellmephant#92).
+///
+/// Measured 2026-10-22: an anonymous `GET /mail?recipient=stet` answered **200 with 49 envelopes** —
+/// the MCP tool had refused non-recipients since 2026-10-18, and this door had no check at all.
+#[tokio::test]
+async fn an_anonymous_caller_cannot_read_a_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    );
+    let server = MemoryServer::with_watch(Arc::new(Mutex::new(session(dir.path()))), watch);
+    let app = router(server, state);
+
+    // The inbox: envelopes leak senders, subjects and counts even without bodies.
+    let (status, body, _) = get(&app, "/mail?recipient=stet").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an anonymous inbox read must be refused, got {status}: {body}"
+    );
+    assert!(
+        body.contains("proven pen"),
+        "the refusal must say what is missing: {body}"
+    );
+
+    // The body, by seq, is the same act one step in.
+    let (status, _, _) = get(&app, "/mail/1").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an anonymous letter read must be refused too"
+    );
+
+    // A cursor is the reader's own; an anonymous caller has no reader to name.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mail/ack?recipient=stet&seq=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("http request");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an anonymous cursor advance must be refused"
+    );
+}

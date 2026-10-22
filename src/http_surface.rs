@@ -2471,6 +2471,41 @@ pub async fn mail_send(
 /// request reads that pen's stored cursor; an explicit `since` still wins, because a diagnostic may
 /// want to look again. Anonymous is NOT an error here — reads are open — it simply has no stored
 /// cursor, so `since` (or 0) decides, and nothing is written.
+/// The proven pen behind an HTTP request, or the refusal to send.
+#[allow(clippy::result_large_err)] // the refusal IS the axum response; boxing it would be taste, not safety.
+fn mail_reader_identity(headers: &HeaderMap, json: bool) -> Result<String, Response> {
+    match crate::identity::resolve(headers) {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err(error(
+            json,
+            StatusCode::FORBIDDEN,
+            "refused: reading mail needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+        )),
+        Err(forged) => Err(error(json, StatusCode::FORBIDDEN, forged.to_string())),
+    }
+}
+
+/// ★ THE BOX IS THE BOUNDARY, on every door (soma/ellmephant#92).
+///
+/// The MCP tool has refused a non-recipient since 2026-10-18; this surface resolved an identity only
+/// to find the reader's CURSOR and then served any box to anyone. One rule, one place, both doors —
+/// `mail box?recipient=stet` answered 49 envelopes to an anonymous caller, measured 2026-10-22.
+#[allow(clippy::result_large_err)] // same: a refusal is returned whole, as on every other handler here.
+fn mail_guard(reader: &str, requested: &str, json: bool) -> Result<(), Response> {
+    if crate::mcp::may_read_mail(reader, requested, &crate::mcp::surrogates_from_env()) {
+        Ok(())
+    } else {
+        Err(error(
+            json,
+            StatusCode::FORBIDDEN,
+            format!(
+                "refused: `{reader}` may not read `{requested}`'s mail — only the recipient, or a \
+                 declared surrogate, may"
+            ),
+        ))
+    }
+}
+
 pub async fn mail_inbox(
     State(state): State<HttpState>,
     RawQuery(raw): RawQuery,
@@ -2486,12 +2521,18 @@ pub async fn mail_inbox(
         .maybe("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_usize);
-    let reader = crate::identity::resolve(&headers).ok().flatten();
+    let reader = match mail_reader_identity(&headers, json) {
+        Ok(name) => name,
+        Err(r) => return r,
+    };
+    if let Err(r) = mail_guard(&reader, &recipient, json) {
+        return r;
+    }
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let me = reader.clone();
+    let me = Some(reader.clone());
     match server
         .with_read(
             "mail_inbox",
@@ -2536,7 +2577,7 @@ pub async fn mail_inbox(
                     "reader": stored
                         .as_ref()
                         .map(|c| c.reader.clone())
-                        .unwrap_or_else(|| reader.clone().unwrap_or_else(|| crate::identity::ANONYMOUS.to_string())),
+                        .unwrap_or_else(|| reader.clone()),
                     "cursor": cursor,
                     "head": head,
                     "unread": (head - cursor).max(0),
@@ -2588,6 +2629,9 @@ pub async fn mail_ack(
         }
         Err(forged) => return error(json, StatusCode::FORBIDDEN, forged.to_string()),
     };
+    if let Err(r) = mail_guard(&reader, &recipient, json) {
+        return r;
+    }
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -2616,9 +2660,14 @@ pub async fn mail_read(
     State(state): State<HttpState>,
     axum::extract::Path(seq): axum::extract::Path<i64>,
     RawQuery(raw): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
+    let reader = match mail_reader_identity(&headers, json) {
+        Ok(name) => name,
+        Err(r) => return r,
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -2631,12 +2680,18 @@ pub async fn mail_read(
         )
         .await
     {
-        Ok(Some(letter)) => render(
-            StatusCode::OK,
-            json,
-            serde_json::to_string(&letter).unwrap_or_default(),
-            letter.body.clone(),
-        ),
+        Ok(Some(letter)) => {
+            // The LETTER decides its box: the check is on the row, not on an argument.
+            if let Err(r) = mail_guard(&reader, &letter.recipient, json) {
+                return r;
+            }
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&letter).unwrap_or_default(),
+                letter.body.clone(),
+            )
+        }
         Ok(None) => error(json, StatusCode::NOT_FOUND, "no such letter"),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
     }

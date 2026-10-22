@@ -382,6 +382,7 @@ struct FrontMatter {
     source: Option<String>,
     origin: Option<String>,
     version_note: Option<String>,
+    private: Option<bool>,
     body: String,
 }
 
@@ -417,6 +418,13 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
             "Source" => out.source = Some(value.to_string()),
             "Origin" => out.origin = Some(value.to_string()),
             "Note" => out.version_note = Some(value.to_string()),
+            "Private" => {
+                out.private = Some(match value.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "1" => true,
+                    "false" | "no" | "0" | "" => false,
+                    other => return Err(format!("`Private: {other}` is not true|false")),
+                })
+            }
             "Tags" => {
                 out.tags = Some(
                     value
@@ -448,6 +456,7 @@ fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
         asserted_by: None,
         origin: fm.origin,
         tags: fm.tags,
+        private: fm.private,
         version_note: fm.version_note,
         expected_version: None,
     })
@@ -463,6 +472,8 @@ struct MemoryJson {
     origin: Option<String>,
     tags: Option<Vec<String>>,
     version_note: Option<String>,
+    /// Keep this row to the writing pen alone.
+    private: Option<bool>,
     /// The CAS token, as `memory_get` returns it.
     expected_version: Option<i64>,
 }
@@ -478,6 +489,7 @@ fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
         asserted_by: None,
         origin: m.origin,
         tags: m.tags,
+        private: m.private,
         version_note: m.version_note,
         expected_version: m.expected_version,
     })

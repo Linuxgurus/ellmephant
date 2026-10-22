@@ -95,6 +95,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0017_memory_fts.sql"),
         "the word index: FTS5 over key/title/body, with all three triggers (soma/ellmephant#62)",
     ),
+    (
+        18,
+        include_str!("../../migrations/0018_memory_audience.sql"),
+        "the read audience: public, or exactly one pen (#54/#55)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

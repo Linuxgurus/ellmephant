@@ -296,6 +296,12 @@ pub struct UpsertParams {
         description = "Aspects of the subject, e.g. storage, gotchas. Omit to keep the stored tags; `[]` clears them."
     )]
     pub tags: Option<Vec<String>>,
+    /// Keep this row to the writing pen alone.
+    #[serde(default)]
+    #[schemars(
+        description = "Make this row PRIVATE to the writing pen (`true`), or public (`false`). Omit to keep the stored audience. Private is the READ tier: the row is invisible to every other pen — not as a hit, a title, a count or a backlink — and readable by you alone, plus the owner's recorded forensic path. The audience is derived from the PROVEN identity, so this flag cannot name someone else. Unencrypted: the file, the snapshot and the off-cluster copy hold it in plaintext, so it protects against another agent using the tools and against nothing else."
+    )]
+    pub private: Option<bool>,
     /// Why this change is being made, for the version it supersedes.
     #[serde(default)]
     #[schemars(
@@ -323,6 +329,7 @@ impl UpsertParams {
             asserted_by: None,
             origin: self.origin,
             tags: self.tags,
+            private: self.private,
             version_note: self.version_note,
             expected_version: self.expected_version,
         }

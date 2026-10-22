@@ -1272,6 +1272,31 @@ pub async fn upsert(
         .await
     {
         Ok(out) => {
+            // ★ A REFUSED COMPARE-AND-SWAP WRITE IS NOT A SUCCESS (#101). `expected_version` is the
+            // documented way to do read-modify-write ("a bank balance, a counter"), so a 200
+            // `updated` for a write that did not land is a silent failure: the reconcile loop
+            // believes it reconciled. Answer 409 with the SAME body the MCP tool returns, so a
+            // client that only checks the code is right too, and one that reads the body sees the
+            // version to retry against.
+            if let Some(current) = out.conflict {
+                let key = out.key;
+                tracing::info!(
+                    area = scope.area,
+                    key = %key,
+                    version = current,
+                    "compare-and-swap write refused over http"
+                );
+                return render(
+                    StatusCode::CONFLICT,
+                    json,
+                    json_ok(serde_json::json!({
+                        "status": "conflict",
+                        "key": key,
+                        "current_version": current,
+                    })),
+                    format!("conflict: {key} is at version {current}; nothing written"),
+                );
+            }
             let key = out.key.clone();
             let mut result = serde_json::json!({
                 "status": if out.created { "created" } else { "updated" },

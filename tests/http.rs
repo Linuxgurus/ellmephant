@@ -1823,3 +1823,100 @@ async fn claims_round_trip_over_http() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["won"], serde_json::json!(true), "{body}");
 }
+
+/// A REFUSED compare-and-swap write must never be reported as success (#101).
+///
+/// `expected_version` is the documented way to do read-modify-write. Over the plain-HTTP door the
+/// reply was built from `created` alone, so a refusal — nothing written — answered `200 updated`.
+/// That is a silent failure for the one caller who is trying to be careful: an editor that fetched
+/// a row, changed it, and posted back would believe it reconciled while another writer stood.
+#[tokio::test]
+async fn a_refused_cas_write_answers_conflict_not_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "cas-probe", "one sharp line", "v1").await;
+    settle(dir.path());
+
+    let (_, body, _) = get(&app, "/memory/cas-probe?format=json").await;
+    let row: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let version = row["version"].as_i64().expect("the row has a version");
+
+    // A stale expectation: the condition is false, so the store writes nothing.
+    let stale = serde_json::json!({
+        "key": "cas-probe",
+        "body": "stale write",
+        "expected_version": version - 1,
+    })
+    .to_string();
+    let (status, response, _) = request(
+        &app,
+        Method::POST,
+        "/memory?format=json",
+        Some("tok"),
+        Some("application/json"),
+        &stale,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a refused write must not answer 200: {response}"
+    );
+    let refused: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        refused["status"], "conflict",
+        "the MCP shape, on both doors"
+    );
+    assert_eq!(
+        refused["current_version"], version,
+        "the version to retry against"
+    );
+    assert_eq!(refused["key"], "cas-probe");
+
+    // And the refusal is honest: the row is untouched.
+    let (_, body, _) = get(&app, "/memory/cas-probe?format=json").await;
+    let row: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(row["version"], version, "nothing was written");
+    assert_eq!(row["body"], "v1");
+
+    // The text door agrees with the JSON door rather than saying "stored".
+    let (status, text, _) = request(
+        &app,
+        Method::POST,
+        "/memory",
+        Some("tok"),
+        Some("application/json"),
+        &stale,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(text.contains("conflict"), "text says conflict: {text}");
+    assert!(
+        !text.contains("stored"),
+        "text must not claim a store: {text}"
+    );
+
+    // A write with the RIGHT expectation still lands.
+    let fresh = serde_json::json!({
+        "key": "cas-probe",
+        "body": "v2",
+        "expected_version": version,
+    })
+    .to_string();
+    let (status, response, _) = request(
+        &app,
+        Method::POST,
+        "/memory?format=json",
+        Some("tok"),
+        Some("application/json"),
+        &fresh,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a valid CAS write still writes: {response}"
+    );
+    let written: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(written["status"], "updated");
+}

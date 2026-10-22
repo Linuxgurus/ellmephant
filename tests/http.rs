@@ -714,12 +714,27 @@ async fn failures_are_ours_not_the_gateways() {
 async fn bootstrap_is_the_door_to_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_with_token(dir.path(), "tok");
-    seed(&app, "tok", "bootstrap", "boot me", "BOOT: read me first, then go").await;
+    seed(
+        &app,
+        "tok",
+        "bootstrap",
+        "boot me",
+        "BOOT: read me first, then go",
+    )
+    .await;
     // Someone else's identity, and a self tag that is NOT this caller's. An anonymous boot must show
     // neither: the door used to inline `stet-self` for every caller, which is how a cold Cline was
     // handed Stet's identity (2026-10-22).
     let secret = "a body that is NOT resident, only indexed by key";
-    seed_tagged(&app, "tok", "other-self", "another self key", "self:cline", secret).await;
+    seed_tagged(
+        &app,
+        "tok",
+        "other-self",
+        "another self key",
+        "self:cline",
+        secret,
+    )
+    .await;
     seed(&app, "tok", "bootstrap-stet", "stet boot", "STET ONLY BODY").await;
 
     let (status, doc, content_type) = get(&app, "/bootstrap").await;
@@ -778,7 +793,15 @@ async fn bootstrap_never_serves_another_agents_identity() {
     seed(&app, "tok", "bootstrap", "floor", "FLOOR BODY").await;
     seed(&app, "tok", "bootstrap-stet", "stet boot", "STET BODY").await;
     seed(&app, "tok", "bootstrap-self", "old note", "OLD BODY").await;
-    seed_tagged(&app, "tok", "stet-self", "stet self", "stet-self", "STET SELF BODY").await;
+    seed_tagged(
+        &app,
+        "tok",
+        "stet-self",
+        "stet self",
+        "stet-self",
+        "STET SELF BODY",
+    )
+    .await;
 
     let (status, doc, _) = get(&app, "/bootstrap").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
@@ -848,7 +871,10 @@ async fn bootstrap_stays_inside_its_budget() {
     );
     // The size is not bought by dropping the content the boot exists for.
     assert!(doc.contains("resident prose."), "{doc}");
-    assert!(doc.contains("no self set"), "an unproven caller is told so: {doc}");
+    assert!(
+        doc.contains("no self set"),
+        "an unproven caller is told so: {doc}"
+    );
 }
 
 /// A boot still becomes a boot with no store to read: the API part survives, and the missing facts are
@@ -950,10 +976,7 @@ async fn bootstrap_json_is_the_door_in_json() {
     );
 
     // The resident note is carried, body and all; the rest of the set is keys and titles.
-    assert_eq!(
-        doc["youResident"]["key"],
-        serde_json::json!("bootstrap")
-    );
+    assert_eq!(doc["youResident"]["key"], serde_json::json!("bootstrap"));
     assert_eq!(
         doc["youResident"]["body"],
         serde_json::json!("BOOT: read me first, then go")

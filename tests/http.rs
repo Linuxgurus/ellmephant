@@ -778,6 +778,32 @@ async fn bootstrap_is_the_door_to_the_store() {
     );
 }
 
+/// The note moved to `stet-self` on 2026-10-22, and the OLD key is read when the new one is absent —
+/// so a store mid-rename still boots with its identity. When both exist the new key wins.
+#[tokio::test]
+async fn bootstrap_reads_the_new_note_key_and_falls_back_to_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    seed(&app, "tok", "bootstrap-self", "old note", "OLD BODY").await;
+
+    let (_, doc, _) = get(&app, "/bootstrap").await;
+    assert!(
+        doc.contains("OLD BODY") && doc.contains("memory `bootstrap-self`"),
+        "the legacy key stands in while the rename is in flight: {doc}"
+    );
+
+    seed(&app, "tok", "stet-self", "new note", "NEW BODY").await;
+    let (_, doc, _) = get(&app, "/bootstrap").await;
+    assert!(
+        doc.contains("NEW BODY") && doc.contains("memory `stet-self`"),
+        "once the rename lands the new key wins: {doc}"
+    );
+    assert!(
+        !doc.contains("OLD BODY"),
+        "the fallback is not a merge: {doc}"
+    );
+}
+
 /// **The boot has to survive being fetched.** A client that truncates on size delivered this endpoint's
 /// old body minus 7 KB of its middle — a document that reads as complete and is not. So the default
 /// view is held under a budget, and this test is what holds it there: it fails on the day the boot

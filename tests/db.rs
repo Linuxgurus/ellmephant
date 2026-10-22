@@ -174,6 +174,11 @@ fn a_v4_store_gains_the_project_tables_on_open() {
             .unwrap();
     }
     conn.execute("DROP TABLE memory_fts", []).unwrap();
+    // ...and predates the READ AUDIENCE (0018): drop the column the migration would add.
+    conn.execute("DROP INDEX IF EXISTS memory_audience", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -228,6 +233,10 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
             .unwrap();
     }
     conn.execute("DROP TABLE memory_fts", []).unwrap();
+    conn.execute("DROP INDEX IF EXISTS memory_audience", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();

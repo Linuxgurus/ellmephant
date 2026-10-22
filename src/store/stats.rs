@@ -152,7 +152,15 @@ fn ratio(a: i64, b: i64) -> f64 {
 /// [`compute`] leaves [`Stats::all_tags`] empty (the digest stays lean); a caller that wants the
 /// whole vocabulary fills it from here.
 pub fn vocabulary(conn: &Connection) -> Result<Vec<(String, i64)>> {
-    let mut counts = tags::list(conn)?; // (tag, count), name-ascending
+    vocabulary_seen(conn, &crate::store::audience::Reader::everything())
+}
+
+/// The whole vocabulary as one reader sees it.
+pub fn vocabulary_seen(
+    conn: &Connection,
+    reader: &crate::store::audience::Reader,
+) -> Result<Vec<(String, i64)>> {
+    let mut counts = tags::list_seen(conn, reader)?; // (tag, count), name-ascending
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(counts)
 }
@@ -162,26 +170,50 @@ pub fn vocabulary(conn: &Connection) -> Result<Vec<(String, i64)>> {
 /// file to size. (Leaving it `0` here and expecting the *caller* to fill it made the field lie:
 /// every MCP consumer saw a size of zero, which reads as an empty database.)
 pub fn compute(conn: &Connection) -> Result<Stats> {
+    compute_seen(conn, &crate::store::audience::Reader::everything())
+}
+
+/// The digest as ONE READER sees it.
+///
+/// ★ EVERY NUMBER HERE IS A DISCLOSURE SURFACE. A memory count that includes a row the reader cannot
+/// open, a tag only private rows carry, an edge count that moves when a private link is added — each
+/// is a one-bit leak, and two samples take the difference. So the predicate is applied to every
+/// aggregate, and the graph/version halves are computed over the visible subset (or left out, when
+/// the subset cannot be described without naming what is hidden).
+pub fn compute_seen(conn: &Connection, reader: &crate::store::audience::Reader) -> Result<Stats> {
+    let (pred, pred_binds) = reader.sql();
+    let one = |sql: &str| -> Result<i64> {
+        Ok(
+            conn.query_row(sql, rusqlite::params_from_iter(pred_binds.iter()), |r| {
+                r.get(0)
+            })?,
+        )
+    };
     let db_bytes = conn.path().map(|p| disk_bytes(Path::new(p))).unwrap_or(0);
-    let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+    let memories: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM memory WHERE {pred}"),
+        rusqlite::params_from_iter(pred_binds.iter()),
+        |r| r.get(0),
+    )?;
 
     // Body/title sums run in SQLite via `length()` (characters, not bytes) — bodies stay on disk.
     let (body_chars, body_min, body_max, title_chars): (i64, i64, i64, i64) = conn.query_row(
-        "SELECT coalesce(sum(length(body)), 0), coalesce(min(length(body)), 0), \
-                coalesce(max(length(body)), 0), coalesce(sum(length(title)), 0) FROM memory",
-        [],
+        &format!(
+            "SELECT coalesce(sum(length(body)), 0), coalesce(min(length(body)), 0), \
+                    coalesce(max(length(body)), 0), coalesce(sum(length(title)), 0) \
+               FROM memory WHERE {pred}"
+        ),
+        rusqlite::params_from_iter(pred_binds.iter()),
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    let with_source: i64 = conn.query_row(
-        "SELECT count(*) FROM memory WHERE source IS NOT NULL AND trim(source) <> ''",
-        [],
-        |r| r.get(0),
-    )?;
-    let tagged: i64 = conn.query_row("SELECT count(*) FROM memory WHERE tags <> ''", [], |r| {
-        r.get(0)
-    })?;
+    let with_source = one(&format!(
+        "SELECT count(*) FROM memory WHERE source IS NOT NULL AND trim(source) <> '' AND ({pred})"
+    ))?;
+    let tagged = one(&format!(
+        "SELECT count(*) FROM memory WHERE tags <> '' AND ({pred})"
+    ))?;
 
-    let mut counts = tags::list(conn)?; // (tag, count), name-ascending
+    let mut counts = tags::list_seen(conn, reader)?; // (tag, count), name-ascending
     let distinct_tags = counts.len() as i64;
     let tag_assignments: i64 = counts.iter().map(|(_, c)| c).sum();
     let singleton_tags = counts.iter().filter(|(_, c)| *c == 1).count() as i64;
@@ -192,63 +224,109 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     // the memory graph's degree, orphans or components — with bare keys, a project edge would
     // otherwise look like an edge to a memory that happens to share its name.
     let edges: i64 = conn.query_row(
-        "SELECT count(*) FROM memory_link WHERE to_type = 'memory'",
-        [],
+        &format!(
+            "SELECT count(*) FROM memory_link l JOIN memory m ON m.id = l.from_id \
+              WHERE l.to_type = 'memory' AND ({pred})"
+        ),
+        rusqlite::params_from_iter(pred_binds.iter()),
         |r| r.get(0),
     )?;
-    let dangling = links::dangling(conn)?.len() as i64;
+    let visible_keys: Option<std::collections::HashSet<String>> = match reader.visible_ids(conn)? {
+        None => None,
+        Some(ids) => {
+            let mut set = std::collections::HashSet::new();
+            let mut stmt = conn.prepare("SELECT key FROM memory WHERE id = ?1")?;
+            for id in ids {
+                if let Ok(key) = stmt.query_row([id], |r| r.get::<_, String>(0)) {
+                    set.insert(key);
+                }
+            }
+            Some(set)
+        }
+    };
+    let dangling = links::dangling(conn)?
+        .into_iter()
+        .filter(|d| match &visible_keys {
+            None => true,
+            // A dangling edge named only by rows the reader cannot see is not their rot to see.
+            Some(keys) => d.from_keys.iter().any(|k| keys.contains(k)),
+        })
+        .count() as i64;
     // A memory is linked if it appears as an edge source or resolves as an edge target.
     let orphans: i64 = conn.query_row(
-        "SELECT count(*) FROM memory m \
-          WHERE m.id NOT IN (SELECT from_id FROM memory_link) \
-            AND m.key NOT IN (SELECT to_key FROM memory_link WHERE to_type = 'memory')",
-        [],
+        &format!(
+            "SELECT count(*) FROM memory m \
+              WHERE m.id NOT IN (SELECT from_id FROM memory_link) \
+                AND m.key NOT IN (SELECT to_key FROM memory_link WHERE to_type = 'memory') \
+                AND ({pred})"
+        ),
+        rusqlite::params_from_iter(pred_binds.iter()),
         |r| r.get(0),
     )?;
 
-    let oldest: Option<String> =
-        conn.query_row("SELECT min(created) FROM memory", [], |r| r.get(0))?;
-    let newest: Option<String> =
-        conn.query_row("SELECT max(created) FROM memory", [], |r| r.get(0))?;
-    let added_7d: i64 = conn.query_row(
-        "SELECT count(*) FROM memory WHERE created >= datetime('now', '-7 days')",
-        [],
+    let oldest: Option<String> = conn.query_row(
+        &format!("SELECT min(created) FROM memory WHERE {pred}"),
+        rusqlite::params_from_iter(pred_binds.iter()),
         |r| r.get(0),
     )?;
-    let added_30d: i64 = conn.query_row(
-        "SELECT count(*) FROM memory WHERE created >= datetime('now', '-30 days')",
-        [],
+    let newest: Option<String> = conn.query_row(
+        &format!("SELECT max(created) FROM memory WHERE {pred}"),
+        rusqlite::params_from_iter(pred_binds.iter()),
         |r| r.get(0),
     )?;
+    let added_7d = one(&format!(
+        "SELECT count(*) FROM memory WHERE created >= datetime('now', '-7 days') AND ({pred})"
+    ))?;
+    let added_30d = one(&format!(
+        "SELECT count(*) FROM memory WHERE created >= datetime('now', '-30 days') AND ({pred})"
+    ))?;
 
     // Usage telemetry: the two counters, plus the most-useful memories (the store's own gold).
     let (visits_total, useful_total): (i64, i64) = conn.query_row(
-        "SELECT coalesce(sum(visits), 0), coalesce(sum(times_useful), 0) FROM memory",
-        [],
+        &format!(
+            "SELECT coalesce(sum(visits), 0), coalesce(sum(times_useful), 0) FROM memory WHERE {pred}"
+        ),
+        rusqlite::params_from_iter(pred_binds.iter()),
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let top_useful: Vec<(String, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT key, times_useful FROM memory WHERE times_useful > 0 \
-             ORDER BY times_useful DESC, key LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([TOP_USEFUL as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // ★ BARE `?` THROUGHOUT, bound in TEXT ORDER. Mixing `?1` with a `?` that appears earlier
+        // makes SQLite number the bare one first and then report a parameter count no caller can
+        // satisfy — the store paid an hour for that once already.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT key, times_useful FROM memory WHERE times_useful > 0 AND ({pred}) \
+             ORDER BY times_useful DESC, key LIMIT ?"
+        ))?;
+        let mut binds: Vec<rusqlite::types::Value> =
+            pred_binds.iter().cloned().map(Into::into).collect();
+        binds.push((TOP_USEFUL as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     // Hot but unvoted: read repeatedly, never marked useful — the store's own blind spot.
     let unvoted_hot: Vec<(String, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT key, visits FROM memory WHERE times_useful = 0 AND visits >= ?2 \
-             ORDER BY visits DESC, key LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([TOP_UNVOTED as i64, UNVOTED_MIN_VISITS], |r| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT key, visits FROM memory WHERE times_useful = 0 AND visits >= ? AND ({pred}) \
+             ORDER BY visits DESC, key LIMIT ?"
+        ))?;
+        let mut binds: Vec<rusqlite::types::Value> = vec![UNVOTED_MIN_VISITS.into()];
+        binds.extend(pred_binds.iter().cloned().map(Into::into));
+        binds.push((TOP_UNVOTED as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     // Dense clusters: connected components of the (undirected) link graph.
-    let (link_components, largest_component) = component_sizes(conn)?;
+    let (link_components, largest_component) = match &visible_keys {
+        None => component_sizes(conn)?,
+        // Graph shape over a subset needs the subset; rather than name hidden rows by counting
+        // components that include them, report the components among visible rows only.
+        Some(keys) => component_sizes_of(conn, keys)?,
+    };
 
     // The encode queue's shape: how much work, how much of it is broken, how long the oldest wait
     // has been. Derived state, but the only place the store reports on its own indexing.
@@ -257,6 +335,21 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
     // The version side table, reported so history cannot grow unseen: rows, bytes, and the ORPHANS
     // (history whose memory is gone, and whose newest version is therefore the only copy of it).
     let (versions, version_bytes) = version::count(conn)?;
+    // A version holds the BODY, so history is counted only for rows this reader may see. Orphan
+    // history (no live row) is excluded rather than classed: its audience is the newest snapshot's,
+    // and reporting it would name rows the reader never knew existed.
+    let (versions, version_bytes) = if reader.visible_ids(conn)?.is_none() {
+        (versions, version_bytes)
+    } else {
+        conn.query_row(
+            &format!(
+                "SELECT count(*), COALESCE(sum(length(v.content)), 0) FROM memory_version v \
+                   JOIN memory m ON m.key = v.key AND v.type = 'memory' WHERE {pred}"
+            ),
+            rusqlite::params_from_iter(pred_binds.iter()),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+    };
     let version_orphans: i64 = conn.query_row(
         "SELECT count(DISTINCT v.key) FROM memory_version v \
           LEFT JOIN memory m ON m.key = v.key \
@@ -307,12 +400,23 @@ pub fn compute(conn: &Connection) -> Result<Stats> {
 /// or more memories, and the size of the largest component (`0` for an empty store). Isolated
 /// memories are the `orphans` count, ignored here. Edges to a dangling `[[key]]` don't connect.
 fn component_sizes(conn: &Connection) -> Result<(i64, i64)> {
+    component_sizes_of(conn, &std::collections::HashSet::new())
+}
+
+/// Components over the nodes a reader may see. An empty `only` means every node.
+fn component_sizes_of(
+    conn: &Connection,
+    only: &std::collections::HashSet<String>,
+) -> Result<(i64, i64)> {
     let mut nodes: Vec<i64> = Vec::new();
     let mut by_key: HashMap<String, usize> = HashMap::new();
     let mut stmt = conn.prepare("SELECT id, key FROM memory")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (id, key) = row?;
+        if !only.is_empty() && !only.contains(&key) {
+            continue;
+        }
         by_key.insert(key, nodes.len());
         nodes.push(id);
     }

@@ -55,7 +55,7 @@ cannot proceed otherwise.
 
 **`/bootstrap` is the door, and what is behind it.** One fetch must be enough to *boot*: what this is,
 how to get a memory, who you are, what is open, where the rest is. It carries the resident set — the
-`bootstrap-self` body **in full**, the `cline-self` keys with their titles, the open projects, and a
+`stet-self` body **in full** (or the legacy `bootstrap-self` while a rename is in flight), the `cline-self` keys with their titles, the open projects, and a
 state line — plus the four calls that reach everything else. It does **not** carry every body (there
 are hundreds): that is not a boot, it is a context fill. If a fact is not meant to be resident,
 `/bootstrap` must not smuggle it in.
@@ -65,6 +65,39 @@ handed the old document — a verbatim `initialize` + `tools/list` dump, 14.8 KB
 7 KB punched out of the middle, and the reader has no way to know. So the default view is budgeted
 (`BOOT_BUDGET_BYTES`, asserted by the suite) and the tool catalogue is `?tools=true`: the one part
 that cannot be made small, which the caller should choose to spend tokens on.
+
+### Private memories — the read tier (#54, #55)
+
+A memory carries an `audience`: `public` (the default, what every row had before 2026-10-22) or
+`pen:<x>`, meaning the pen that wrote it. It is a **column on the truth row, not a tag** — tags are
+editable by any caller through a write, and an audience must not be. The value is derived by the store
+from the connection's **proven** identity: `private: true` on a write asks for "private to me", and no
+caller can name somebody else.
+
+- **Reads filter; writes do not authorise.** `memory_get`, `/search`, `/semantic`, backlinks, history,
+  `stats`, `dupes`, project `preload` and `/bootstrap` all narrow to the caller's pen.
+- **Absence, not refusal.** A row the reader may not see is answered exactly as a key that was never
+  written — no hit, no title, no count, no backlink, no dangling edge, no "it existed 42 minutes ago"
+  in the miss diagnostic. A refusal that says "private" confirms the row exists.
+- **Counts move with it.** `stats` excludes hidden rows from every aggregate (memories, chars, tags,
+  edges, orphans, components, top lists, versions), because a count that includes what the reader
+  cannot open is a one-bit leak and two samples take the difference.
+- **History takes the row's CURRENT class.** A note that goes private takes its past with it; a key
+  with no live row is classed by its newest snapshot.
+- **Deleting a private row PURGES its vector** rather than moving it to the tombstone table — the
+  deleted-search surface is deliberate, and a tombstone names what it holds.
+- **The audience is not editable by the party it excludes**: a pen that cannot read a row cannot
+  publish it, so `private` is not a lock with the key hanging beside the door.
+
+**The honest limit, said out loud (#54):** unencrypted privacy is a visibility convention, not a
+capability. The row is plaintext in the file, in the snapshot and in the off-cluster copy, and a
+process holding the database can read it. It protects against another agent **using the tools**, and
+against nothing else. Encryption is the `secret` tier, parked.
+
+**Forensics, for now, is direct access**: the owner reads through MCP as the `James` pen where the row
+is his, or opens the store with `sqlite3`. A recorded owner path (`memory_forensic(key, reason)` plus
+a `private_read` audit table) is not built yet, and is the one part of this tier that is a promise
+rather than a mechanism.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 
@@ -313,7 +346,7 @@ notes. So the document answers, in order:
 2. **how to get at it** — the four calls that reach everything: `/stats`, `/memory/{key}`,
    `/search?q=`, `POST /memory`. With the two facts a caller needs to use them: every GET takes
    `?format=json`, and a write may 401 because it wants a bearer.
-3. **you, resident** — the `bootstrap-self` body, in full. The one body a cold agent needs before it
+3. **you, resident** — the `stet-self` body, in full (falling back to `bootstrap-self`). The one body a cold agent needs before it
    can decide anything else.
 4. **the rest of you** — the `cline-self` tag as an index: key + clipped title per line, bodies one
    call away.
@@ -333,7 +366,7 @@ HOW TO GET AT IT — this endpoint is the door, not a handshake. Four calls reac
   POST /memory                          write: a JSON body of `memory_upsert`'s args (see ?tools=true)
   Every GET takes ?format=json. Reads are open. If a write 401s, it wants a bearer — ask me.
 
-## 1. YOU — resident, in full (memory `bootstrap-self`)
+## 1. YOU — resident, in full (memory `stet-self`)
   BOOT: read FIRST. Lean by design — only what a cold me needs RESIDENT …
   - I am Cline = the LINE (continuity), not the chassis. …
   …
@@ -359,7 +392,7 @@ and each card is MCP's with `method`/`path` where MCP had `name`:
   "instructions": "ellmephant = Memory storage in smart-caveman style — ...",
   "howToUse": { "what": "...", "calls": [ { "call": "GET /search?q=…&format=json", "for": "hunt by meaning" } ], "notes": [ "..." ] },
   "state": "ready — 302 memories, 15 projects, schema v8, encode 0 pending, 0 failed (detail: /health)",
-  "youResident": { "key": "bootstrap-self", "title": "...", "body": "..." },
+  "youResident": { "key": "stet-self", "title": "...", "body": "..." },
   "selfSet": { "tag": "cline-self", "keys": [ { "key": "...", "title": "..." } ] },
   "openProjects": [ { "key": "...", "status": "active", "goal": "...", "call": "GET /project/{key}?hydrate=full" } ],
   "tools": [ { "method": "GET", "path": "/memory/{key}", "description": "...", "inputSchema": { }, "annotations": { } } ]

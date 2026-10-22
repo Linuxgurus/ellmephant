@@ -1,5 +1,6 @@
 //! The write/read path over `memory` and its derived indexes (P4).
 
+pub mod audience;
 pub mod claim;
 pub mod codec;
 pub mod dupes;
@@ -50,6 +51,13 @@ pub struct Memory {
     /// `asserted_by`: a relayer names the truth's home without becoming the truth.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub origin: Option<String>,
+    /// Who may be shown this row: `public`, or `pen:<x>`. The READ tier (#54/#55) — never a tag,
+    /// because a tag is editable by any caller and an audience must not be.
+    #[serde(
+        default = "audience::default_audience",
+        skip_serializing_if = "is_public"
+    )]
+    pub audience: String,
     /// Aspect tags.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -74,6 +82,10 @@ pub struct Memory {
     /// with fresh numbers. Derived on read; never stored on the row.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub version: Option<i64>,
+}
+
+fn is_public(a: &str) -> bool {
+    a == audience::PUBLIC
 }
 
 /// One row's index entry: identity and shape, without the body (the `list` surface, SPEC §14).
@@ -245,6 +257,12 @@ pub struct Patch {
     pub origin: Option<String>,
     /// New tags. `Some(vec![])` clears them.
     pub tags: Option<Vec<String>>,
+    /// Set the row PRIVATE to the writing pen (`true`) or public (`false`). `None` leaves the stored
+    /// audience alone.
+    ///
+    /// ★ The value is not a name: the store derives the audience from the PROVEN identity, so a
+    /// caller cannot make a row private to somebody else, or publish a row it did not write.
+    pub private: Option<bool>,
     /// Why THIS change is being made. Not a field of the memory: it rides beside the version the
     /// write supersedes, so a later reader learns the intent without reconstructing it. It creates
     /// no version on its own — only a DOCUMENT change does (see `store::version`).
@@ -348,6 +366,30 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
     }
 }
 
+/// The audience is not a preference — it is a boundary, and boundaries are not editable by the party
+/// they exclude. A row private to `pen:stet` may only be re-classified by `stet`, or by the owner's
+/// explicit forensic path (which is a different act, recorded).
+fn guard_audience(existing: Option<&Memory>, patch: &Patch) -> Result<()> {
+    let Some(old) = existing else {
+        return Ok(());
+    };
+    if old.audience == audience::PUBLIC {
+        return Ok(());
+    }
+    let Some(private) = patch.private else {
+        return Ok(());
+    };
+    let already_private = audience::for_write(true, patch.asserted_by.as_deref()).ok();
+    if private && already_private.as_deref() == Some(old.audience.as_str()) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "`{}` is private to another pen: its audience is not yours to change. A row you cannot read \
+         is not a row you may publish.",
+        old.key
+    )))
+}
+
 pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     let probe = Memory {
         key: patch.key.clone().unwrap_or_default(),
@@ -362,6 +404,9 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         .map(|m| m.tags.clone())
         .unwrap_or_default();
     guard_protected(conn, &key, &was_tags, patch)?;
+    // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
+    // could not read. Without this, `private` would be a lock whose key hangs beside the door.
+    guard_audience(existing.as_ref(), patch)?;
 
     let (mem, created) = match existing {
         Some(old) => {
@@ -395,6 +440,13 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                         .clone()
                         .or_else(|| old.asserted_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
+                    audience: match patch.private {
+                        None => old.audience.clone(),
+                        Some(p) => audience::for_write(
+                            p,
+                            patch.asserted_by.as_deref().or(old.asserted_by.as_deref()),
+                        )?,
+                    },
                     ..Default::default()
                 },
                 false,
@@ -419,6 +471,10 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
                     asserted_by: patch.asserted_by.clone(),
                     origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
+                    audience: audience::for_write(
+                        patch.private == Some(true),
+                        patch.asserted_by.as_deref(),
+                    )?,
                     ..Default::default()
                 },
                 true,
@@ -533,6 +589,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
                 asserted_by = COALESCE(?7, asserted_by),
                 origin = COALESCE(?8, origin),
+                audience = ?9,
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -543,7 +600,8 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             mem.source,
             mem.updated,
             mem.asserted_by,
-            mem.origin
+            mem.origin,
+            audience::effective(&mem.audience)
         ],
     )?;
     Ok(())
@@ -555,11 +613,11 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
 /// settles it with the real hash of the vector it writes.
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
-        "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin)
+        "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin, audience)
          VALUES (?1, ?2, ?3, ?4, ?5,
                  COALESCE(NULLIF(?6, ''), datetime('now')),
                  COALESCE(NULLIF(?7, ''), datetime('now')),
-                 COALESCE(?8, 'anonymous'), ?9)",
+                 COALESCE(?8, 'anonymous'), ?9, ?10)",
         params![
             key,
             mem.title,
@@ -569,7 +627,8 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.created,
             mem.updated,
             mem.asserted_by,
-            mem.origin
+            mem.origin,
+            audience::effective(&mem.audience)
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -584,22 +643,33 @@ pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
     // rediscover. Both halves ride in one transaction, so neither undoes the other.
     encode::forget(&tx, &crate::store::links::Kind::Memory.keyslug(key))?;
-    let id: Option<i64> = tx
-        .query_row("SELECT id FROM memory WHERE key = ?1", params![key], |r| {
-            r.get(0)
-        })
+    let row: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
-    if let Some(id) = id {
+    let existed = row.is_some();
+    if let Some((id, audience)) = row {
         // A delete SUPERSEDES the state the memory is in, so it snapshots it first — exactly as an
         // edit does, and in the same transaction. Without this, a deleted key's newest version would
         // be some earlier state and the content it actually held would be the one thing versioning
         // did not keep; with it, `erase` is the store's single true destroyer.
         version::snapshot(&tx, id, key, None)?;
         tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
-        index::vec::delete(&tx, id)?;
+        // ★ A PRIVATE ROW'S VECTOR IS PURGED, NOT TOMBSTONED. The tombstone table is a DELIBERATE
+        // search surface (`semantic_search(deleted=true)`), so moving a private document's vector
+        // there would keep it findable by meaning — by anyone — after its row was gone, and a
+        // tombstone names it. Deleting a private note must delete what points at it.
+        if audience == audience::PUBLIC || audience.is_empty() {
+            index::vec::delete(&tx, id)?;
+        } else {
+            index::vec::purge(&tx, id)?;
+        }
     }
     tx.commit()?;
-    Ok(id.is_some())
+    Ok(existed)
 }
 
 /// The outcome of a feedback sweep (see [`record_useful_many`]): `(key, new_total)` for every key
@@ -673,7 +743,7 @@ const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, created, updat
      visits, times_useful, \
      (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
        WHERE type = 'memory' AND key = memory.key) AS version, \
-     asserted_by, origin";
+     asserted_by, origin, audience";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -692,6 +762,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         version: Some(r.get(10)?),
         asserted_by: r.get(11)?,
         origin: r.get(12)?,
+        audience: r.get(13)?,
     })
 }
 

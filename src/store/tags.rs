@@ -51,11 +51,23 @@ pub fn decode(raw: &str) -> Vec<String> {
 /// `GET /search?tags=…` would not return. (Deliberately *not* a second `LIKE` over the stored
 /// column: the tag filter has drifted from the writer's encoding once already.)
 pub fn keys_with(conn: &Connection, tag: &str) -> Result<Vec<(String, String)>> {
+    keys_with_seen(conn, tag, &crate::store::audience::Reader::everything())
+}
+
+/// The same index, as one reader sees it: a tagged row the reader may not see is not in the set.
+pub fn keys_with_seen(
+    conn: &Connection,
+    tag: &str,
+    reader: &crate::store::audience::Reader,
+) -> Result<Vec<(String, String)>> {
     let Some(want) = normalize(tag) else {
         return Ok(Vec::new());
     };
-    let mut stmt = conn.prepare("SELECT key, title, tags FROM memory ORDER BY key")?;
-    let rows = stmt.query_map([], |r| {
+    let (predicate, binds) = reader.sql();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT key, title, tags FROM memory WHERE {predicate} ORDER BY key"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -74,8 +86,20 @@ pub fn keys_with(conn: &Connection, tag: &str) -> Result<Vec<(String, String)>> 
 
 /// Single-tag counts over the whole store: `[(tag, count)]`, name-ascending.
 pub fn list(conn: &Connection) -> Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare("SELECT tags FROM memory")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    list_seen(conn, &crate::store::audience::Reader::everything())
+}
+
+/// The tag vocabulary as one reader sees it. A private row's tags are part of its content: a tag
+/// appearing in `stats` that appears on no visible row is a one-bit confession.
+pub fn list_seen(
+    conn: &Connection,
+    reader: &crate::store::audience::Reader,
+) -> Result<Vec<(String, i64)>> {
+    let (predicate, binds) = reader.sql();
+    let mut stmt = conn.prepare(&format!("SELECT tags FROM memory WHERE {predicate}"))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+        r.get::<_, String>(0)
+    })?;
     let mut counts: BTreeMap<String, i64> = BTreeMap::new();
     for row in rows {
         for tag in decode(&row?) {

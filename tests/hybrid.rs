@@ -59,7 +59,13 @@ fn an_exact_identifier_is_found_by_the_word_leg() {
         common::add_now(&conn, &embedder, &mem(k, k, body)).expect("add");
     }
 
-    let bundle = search::run(&conn, Some(&embedder), &q("pr53-verification", 5)).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q("pr53-verification", 5),
+    )
+    .expect("search");
     assert!(
         !bundle.hits.is_empty(),
         "the identifier must find something"
@@ -86,7 +92,13 @@ fn a_phrase_with_no_lexical_match_still_returns_vector_hits() {
         common::add_now(&conn, &embedder, &mem(k, k, "a body with ordinary words")).expect("add");
     }
 
-    let bundle = search::run(&conn, Some(&embedder), &q("zebra calculus", 3)).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q("zebra calculus", 3),
+    )
+    .expect("search");
     assert!(
         !bundle.hits.is_empty(),
         "a phrase with no lexical hit must still be answered by the vector leg"
@@ -125,7 +137,13 @@ fn a_document_with_no_vector_is_still_findable_lexically() {
     )
     .expect("write");
 
-    let bundle = search::run(&conn, Some(&embedder), &q("lexical-only", 5)).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &q("lexical-only", 5),
+    )
+    .expect("search");
     let hit = bundle
         .hits
         .iter()
@@ -162,7 +180,13 @@ fn a_tag_filter_still_applies_to_a_fused_search() {
 
     let mut query = q("velero", 5);
     query.tags = vec!["backup".into()];
-    let bundle = search::run(&conn, Some(&embedder), &query).expect("search");
+    let bundle = search::run(
+        &conn,
+        Some(&embedder),
+        &ellmephant::store::audience::Reader::everything(),
+        &query,
+    )
+    .expect("search");
     assert_eq!(
         bundle.hits.len(),
         1,

@@ -459,3 +459,71 @@ fn the_dangling_finder_names_every_edge_not_every_target() {
         "and the count agrees"
     );
 }
+
+/// The graph is derived at WRITE time, so a body rewritten by any path that does not re-derive
+/// leaves edges the rows no longer imply. `maintain::reparse` is the model-free broom for exactly
+/// that — and it must be judged by the BODIES, not by the history of edits (#99).
+#[test]
+fn reparse_makes_the_graph_agree_with_the_bodies() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let _spec = VecSpec::of(&embedder);
+
+    seed(&conn, &embedder, "target", "the target itself");
+    seed(
+        &conn,
+        &embedder,
+        "referrer",
+        "a note that points at [[target]]",
+    );
+    assert!(
+        links::dangling(&conn).expect("dangling").is_empty(),
+        "a live target dangles nothing"
+    );
+
+    // Delete the target the way `memory_delete` does: the row goes, its referrers do not.
+    store::delete(&conn, "target").expect("delete");
+
+    // The body still names `[[target]]`, so the edge is REAL and the audit is right to report it.
+    // Reparsing must agree with the text rather than with the history of edits.
+    let rows = links::reparse(&conn).expect("reparse");
+    assert_eq!(
+        rows, 1,
+        "the surviving memory is re-parsed (the target is gone)"
+    );
+    assert_eq!(
+        links::dangling(&conn).expect("dangling").len(),
+        1,
+        "the body still points at a deleted key"
+    );
+
+    // ★ THE DEFECT, reproduced: rewrite a body by a path that does not re-derive edges (a textual
+    // `UPDATE`, which is the shape a rename/merge `replace()` takes). The text is clean; the edge
+    // survives; the count accuses the writer for an edit already made.
+    conn.execute(
+        "UPDATE memory SET body = ?2 WHERE key = ?1",
+        rusqlite::params!["referrer", "a note that points at nothing now"],
+    )
+    .expect("textual rewrite");
+    assert_eq!(
+        links::dangling(&conn).expect("dangling").len(),
+        1,
+        "the stale edge survives a body rewrite that did not re-derive"
+    );
+
+    // The broom. No model, no queue — and the count now follows the bodies.
+    links::reparse(&conn).expect("reparse");
+    assert!(
+        links::dangling(&conn).expect("dangling").is_empty(),
+        "after a reparse the graph reflects the bodies, and nothing dangles"
+    );
+    let edges: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_link", [], |r| r.get(0))
+        .expect("count edges");
+    assert_eq!(edges, 0, "the only edge went with the token");
+
+    // And it is idempotent: a second pass changes nothing.
+    links::reparse(&conn).expect("reparse again");
+    assert!(links::dangling(&conn).expect("dangling").is_empty());
+}

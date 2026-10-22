@@ -55,6 +55,7 @@ pub const TOOLS: &[&str] = &[
     "memory_stats",
     "memory_dupes",
     "memory_reembed",
+    "memory_reparse",
     "project_upsert",
     "project_get",
     "project_list",
@@ -2110,6 +2111,52 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         })))
     }
 
+    /// Rebuild the `[[link]]` graph from every body. Model-free and seconds long.
+    ///
+    /// `memory_link` is derived, but its edges are computed at *write* time, so a body rewritten by
+    /// a path that does not re-derive leaks a stale edge: a rename or merge `replace()`, a parser
+    /// change, a binary that predates the current one. `memory_reembed` repairs it as a side effect
+    /// at the cost of a model load and an hour of worker time, so small drift went unrepaired and
+    /// `stats.dangling` accused the writer for edits that were already correct.
+    #[tool(
+        name = "memory_reparse",
+        description = "Rebuild the `[[link]]` graph from every memory body — NO model, NO queue, \
+                       milliseconds. Edge derivation happens at write time, so a textual rewrite \
+                       (rename, merge), a parser change, or an older binary can leave edges the \
+                       bodies no longer imply. `memory_reembed` repairs the same thing but loads the \
+                       model and queues the whole store; run this first, and check `memory_stats` \
+                       for `dangling` afterwards. Returns `rows` visited and `edges` the graph now \
+                       holds.",
+        annotations(
+            title = "Re-parse link graph",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_reparse(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(_): Parameters<ListParams>,
+    ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let report = self
+            .with_store("memory_reparse", move |s| s.reparse())
+            .await?;
+        tracing::info!(
+            tool = "memory_reparse",
+            rows = report.rows,
+            edges = report.edges,
+            "re-parsed the link graph"
+        );
+        Ok(json_ok(serde_json::json!({
+            "status": "reparsed",
+            "rows": report.rows,
+            "edges": report.edges,
+        })))
+    }
+
     /// Create or replace a project — the structures half of the store.
     #[tool(
         name = "project_upsert",
@@ -2779,6 +2826,7 @@ pub fn http_router(
         .route("/mail/ack", axum::routing::post(surface::mail_ack))
         .route("/mail/{seq}", axum::routing::get(surface::mail_read))
         .route("/reembed", axum::routing::post(surface::reembed))
+        .route("/reparse", axum::routing::post(surface::reparse))
         // Our own 404/405 bodies, so a gateway cannot substitute an empty one for the truth.
         .fallback(surface::not_found)
         .method_not_allowed_fallback(surface::method_not_allowed)

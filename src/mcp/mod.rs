@@ -1335,9 +1335,42 @@ impl MemoryServer {
                 );
                 let mut skipped: std::collections::HashMap<String, std::time::Instant> =
                     std::collections::HashMap::new();
+                // ★ A STALE INDEX HAS NO WORK IT MAY DO (soma/ellmephant#76): the rebuild was refused or
+                // has not run, so every vector written now would mix models. Hold the whole queue,
+                // say so once, and wait for a human decision instead of burning an hour into a
+                // poisoned index.
+                let mut held_stale = false;
                 while !flag.load(Ordering::SeqCst) {
+                    let stale = crate::index::vec::projection_stale(&idle).unwrap_or(false);
+                    if stale {
+                        if !held_stale {
+                            tracing::warn!(
+                                "encode worker: index STALE — holding every job; a rebuild was \
+                                 refused or not run (see `rebuild_max_documents`)"
+                            );
+                            held_stale = true;
+                        }
+                        std::thread::sleep(interval);
+                        continue;
+                    }
+                    held_stale = false;
                     match pass(&session, &watch, &encoder, &idle, &mut skipped) {
-                        Ok(_) => {}
+                        Ok(true) => {
+                            // The last owed vector closes the rebuild's books: estimate, actual.
+                            if crate::store::encode::pending(&idle).unwrap_or(0) == 0 {
+                                let outcome = {
+                                    let _held = watch.held("memory_encode_write");
+                                    match lock(&session) {
+                                        Ok(s) => s.note_rebuild_finished(),
+                                        Err(err) => Err(err),
+                                    }
+                                };
+                                if let Err(err) = outcome {
+                                    tracing::warn!(error = %err, "encode worker: cannot close the rebuild's books");
+                                }
+                            }
+                        }
+                        Ok(false) => {}
                         Err(err) => tracing::warn!(error = %err, "encode worker: pass failed"),
                     }
                     std::thread::sleep(interval);

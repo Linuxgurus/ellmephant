@@ -11,7 +11,18 @@ use crate::config::Paths;
 use crate::error::Result;
 
 /// Open (creating if needed) the store, apply pragmas, and run migrations.
+///
+/// The rebuild budget is read from `config.toml` here because the purge happens at OPEN, before any
+/// caller sees the connection (soma/ellmephant#76). A caller that already holds a [`Config`] should
+/// use [`open_with`] so the decision is made with the settings the process actually runs with.
 pub fn open(paths: &Paths) -> Result<Connection> {
+    let cfg = crate::config::Config::load(paths)?;
+    open_with(paths, &cfg)
+}
+
+/// [`open`] with an explicit config — the path a server takes, so the budget is not re-read from disk
+/// and cannot disagree with the running settings.
+pub fn open_with(paths: &Paths, cfg: &crate::config::Config) -> Result<Connection> {
     paths.ensure()?;
     // Auto-extensions only attach to connections created *after* registration, so this
     // must run before `Connection::open` (PLAN §5 S0.1).
@@ -27,11 +38,10 @@ pub fn open(paths: &Paths) -> Result<Connection> {
     // up" and "the index exists" the same event. A reader still opens read-only and touches no DDL.
     if let Some(dim) = crate::index::vec::stored_dim(&conn)? {
         crate::index::vec::ensure(&conn, dim)?;
-        // ★ AND A CHANGED PROJECTION PURGES HERE, before this connection can serve a write. A refill
-        // cannot fix a mixed index (a row with a vector is skipped even though its vector is from
-        // another model), so the only safe answer is: no vectors at all, every document queued, one
-        // transaction. See `maintain::reindex_if_stale` for the sequence that motivated it.
-        crate::store::maintain::reindex_if_stale(&conn)?;
+        // ★ AND A CHANGED PROJECTION PURGES HERE, before this connection can serve a write — if the
+        // rebuild fits its budget. A refusal leaves the index untouched and STALE (see
+        // `maintain::reindex_if_stale`).
+        crate::store::maintain::reindex_if_stale(&conn, cfg)?;
     }
     Ok(conn)
 }

@@ -164,6 +164,10 @@ config:
     default_k = 5
     default_max_distance = 0.52
     instruction = "Given a question, retrieve relevant memories"
+    # Price a projection-change rebuild BEFORE it purges: docs x 5-11.5 s, against this ceiling.
+    # A refusal keeps the old index and reports STALE (soma/ellmephant#76).
+    rebuild_max_documents = 2000
+    rebuild_allow_over_budget = false
 
 # Never open a socket; a cold weights cache is then a hard error (SPEC §6.4).
 offline: false

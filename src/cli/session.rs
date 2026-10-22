@@ -107,7 +107,7 @@ pub struct Session {
 impl Session {
     /// Open (creating if needed) the store and hold the connection.
     pub fn open(paths: Paths, cfg: Config, spec: model::Spec) -> Result<Self> {
-        let conn = db::open(&paths)?;
+        let conn = db::open_with(&paths, &cfg)?;
         let encoder = Encoder::new(spec, cfg.clone());
         Ok(Self {
             paths,
@@ -504,6 +504,11 @@ impl Session {
     /// [`crate::store::stats::Stats::dangling`] counts DISTINCT missing targets; this names them.
     pub fn dangling(&self) -> Result<Vec<links::DanglingEdge>> {
         links::dangling_edges(&self.conn)
+    }
+
+    /// Close the books on a rebuild: the actual duration, beside the estimate (`#76`).
+    pub fn note_rebuild_finished(&self) -> Result<()> {
+        maintain::note_rebuild_finished(&self.conn)
     }
 
     /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a

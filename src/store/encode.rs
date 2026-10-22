@@ -212,6 +212,18 @@ pub fn claim(conn: &Connection, keyslug: &str) -> Result<Option<Claim>> {
 /// The entry is settled *conditionally* — see [`settle`] — which is the guard that keeps a write
 /// landing mid-embed from being swallowed.
 pub fn settle_encoded(conn: &Connection, claim: &Claim, vector: &[f32]) -> Result<()> {
+    // ★ NEVER WRITE A VECTOR INTO A MIXED INDEX (soma/ellmephant#76). A refused rebuild leaves the
+    // old vectors in place and the fingerprint stale; embedding new text now would put two models in
+    // one index, which is worse than either — distances across models are meaningless. The refusal is
+    // a state, and this is the wall that makes it real.
+    if index::vec::projection_stale(conn)? {
+        return Err(Error::Config(
+            "the vector index is STALE and its rebuild did not run or was refused — refusing to write \
+             a vector that would mix models. Raise `rebuild_max_documents`, roll the config back, or \
+             run `memory_reembed`."
+                .into(),
+        ));
+    }
     // The vec table is created outside the transaction: DDL does not ride inside one.
     index::vec::ensure(conn, vector.len())?;
     let tx = conn.unchecked_transaction()?;

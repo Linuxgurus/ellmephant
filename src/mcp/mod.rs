@@ -948,7 +948,7 @@ pub struct MemoryServer {
 }
 
 /// Parse `a=b,c=d` into pairs. Blank or malformed entries are dropped rather than guessed at.
-fn parse_surrogates(raw: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_surrogates(raw: &str) -> Vec<(String, String)> {
     raw.split(',')
         .filter_map(|pair| {
             let (from, to) = pair.split_once('=')?;
@@ -956,6 +956,30 @@ fn parse_surrogates(raw: &str) -> Vec<(String, String)> {
             (!from.is_empty() && !to.is_empty()).then(|| (from.to_string(), to.to_string()))
         })
         .collect()
+}
+
+/// The surrogates declared for this process (`ELLMEPHANT_MAIL_SURROGATES`), read once per call so a
+/// door that is asked twice in one process still agrees with itself.
+pub(crate) fn surrogates_from_env() -> Vec<(String, String)> {
+    parse_surrogates(&std::env::var("ELLMEPHANT_MAIL_SURROGATES").unwrap_or_default())
+}
+
+/// ★ MAY `reader` READ `requested`'s MAIL? The one answer, used by BOTH doors.
+///
+/// The rule is the issue's: only the recipient, or a surrogate the store was told about. It lives
+/// here rather than beside each handler because the HTTP surface had no copy of it at all
+/// (soma/ellmephant#92) while the MCP tool had one — and a rule with two homes drifts.
+pub(crate) fn may_read_mail(
+    reader: &str,
+    requested: &str,
+    surrogates: &[(String, String)],
+) -> bool {
+    if reader.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    surrogates
+        .iter()
+        .any(|(from, to)| from.eq_ignore_ascii_case(reader) && to.eq_ignore_ascii_case(requested))
 }
 
 impl MemoryServer {
@@ -999,13 +1023,7 @@ impl MemoryServer {
         requested: &str,
     ) -> std::result::Result<String, String> {
         let who = pen_name(ctx, self.declared.as_deref())?;
-        if who.eq_ignore_ascii_case(requested) {
-            return Ok(who);
-        }
-        let allowed = self.surrogates.iter().any(|(from, to)| {
-            from.eq_ignore_ascii_case(&who) && to.eq_ignore_ascii_case(requested)
-        });
-        if allowed {
+        if may_read_mail(&who, requested, &self.surrogates) {
             return Ok(who);
         }
         Err(format!(
@@ -3163,5 +3181,28 @@ mod tests {
         let cfg = Config::default();
         let spec = crate::model::Spec::from_config(&cfg, &paths);
         Session::open(paths, cfg, spec).expect("open store")
+    }
+    /// ★ ONE RULE, BOTH DOORS (soma/ellmephant#92): only the recipient, or a declared surrogate.
+    #[test]
+    fn only_the_recipient_or_a_declared_surrogate_may_read_a_box() {
+        let surrogates = vec![("hands".to_string(), "stet".to_string())];
+        assert!(may_read_mail("stet", "stet", &surrogates), "own box");
+        assert!(may_read_mail("STET", "stet", &surrogates), "case folds");
+        assert!(
+            may_read_mail("hands", "stet", &surrogates),
+            "the hand serves stet's box by declaration"
+        );
+        assert!(
+            !may_read_mail("twine", "stet", &surrogates),
+            "not a recipient"
+        );
+        assert!(
+            !may_read_mail("hands", "twine", &surrogates),
+            "the surrogate map is one-way and one-pair"
+        );
+        assert!(
+            !may_read_mail("stet", "twine", &surrogates),
+            "boxes are not shared"
+        );
     }
 }

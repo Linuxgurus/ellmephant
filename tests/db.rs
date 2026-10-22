@@ -181,6 +181,9 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
         .unwrap();
+    // ...and predates LAST-WRITTEN-BY (0020), the second provenance column.
+    conn.execute("ALTER TABLE memory DROP COLUMN last_written_by", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -238,6 +241,9 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute("DROP INDEX IF EXISTS memory_audience", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
+        .unwrap();
+    // ...and predates LAST-WRITTEN-BY (0020), the second provenance column.
+    conn.execute("ALTER TABLE memory DROP COLUMN last_written_by", [])
         .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.

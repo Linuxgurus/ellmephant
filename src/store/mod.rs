@@ -44,8 +44,16 @@ pub struct Memory {
     pub source: Option<String>,
     /// WHO asserted this row's current state, as the store resolved it — never as the caller typed
     /// it. `anonymous` when the connection proved nothing. Stamped, not an argument.
+    ///
+    /// ★ WRITE-ONCE. It is set when the row is created and never changes: a later write names itself
+    /// in [`Memory::last_written_by`] instead. A tag pass may not launder authorship (#107).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub asserted_by: Option<String>,
+    /// WHO wrote this row's current state last — the moving fact. Every write sets it; a tag-only
+    /// edit moves this and leaves `asserted_by` where it is. Same value as `asserted_by` on a row
+    /// that has only ever been written once.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_written_by: Option<String>,
     /// WHERE the information came from, as the caller DECLARED it: a URL, a file, a command,
     /// "my inference". A promise, not a proof — which is why it is a separate column from
     /// `asserted_by`: a relayer names the truth's home without becoming the truth.
@@ -433,12 +441,15 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     body,
                     tags: patch.tags.clone().unwrap_or_else(|| old.tags.clone()),
                     source,
-                    // The writer is this connection, not whoever wrote it last; `None` keeps the
-                    // stored attribution so an internal write cannot launder it into anonymity.
-                    asserted_by: patch
+                    // ★ AUTHORSHIP IS WRITE-ONCE (#107). A patch is a write, not a claim about who
+                    // asserted the document: the stored author is carried through untouched, and the
+                    // writer names itself in `last_written_by` — so re-filing a row cannot launder
+                    // its provenance, and the move is visible without a version.
+                    asserted_by: old.asserted_by.clone(),
+                    last_written_by: patch
                         .asserted_by
                         .clone()
-                        .or_else(|| old.asserted_by.clone()),
+                        .or_else(|| old.last_written_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     audience: match patch.private {
                         None => old.audience.clone(),
@@ -470,6 +481,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     tags: patch.tags.clone().unwrap_or_default(),
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
                     asserted_by: patch.asserted_by.clone(),
+                    last_written_by: patch.asserted_by.clone(),
                     origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
                     audience: audience::for_write(
                         patch.private == Some(true),
@@ -590,6 +602,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
                 asserted_by = COALESCE(?7, asserted_by),
                 origin = COALESCE(?8, origin),
                 audience = ?9,
+                last_written_by = COALESCE(?10, ?7, last_written_by),
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -601,7 +614,8 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             mem.updated,
             mem.asserted_by,
             mem.origin,
-            audience::effective(&mem.audience)
+            audience::effective(&mem.audience),
+            mem.last_written_by
         ],
     )?;
     Ok(())
@@ -613,11 +627,13 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
 /// settles it with the real hash of the vector it writes.
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
-        "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin, audience)
+        "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin, audience,
+                            last_written_by)
          VALUES (?1, ?2, ?3, ?4, ?5,
                  COALESCE(NULLIF(?6, ''), datetime('now')),
                  COALESCE(NULLIF(?7, ''), datetime('now')),
-                 COALESCE(?8, 'anonymous'), ?9, ?10)",
+                 COALESCE(?8, 'anonymous'), ?9, ?10,
+                 COALESCE(?11, ?8, 'anonymous'))",
         params![
             key,
             mem.title,
@@ -628,7 +644,8 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.updated,
             mem.asserted_by,
             mem.origin,
-            audience::effective(&mem.audience)
+            audience::effective(&mem.audience),
+            mem.last_written_by
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -743,7 +760,7 @@ const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, created, updat
      visits, times_useful, \
      (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
        WHERE type = 'memory' AND key = memory.key) AS version, \
-     asserted_by, origin, audience";
+     asserted_by, origin, audience, last_written_by";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -763,6 +780,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         asserted_by: r.get(11)?,
         origin: r.get(12)?,
         audience: r.get(13)?,
+        last_written_by: r.get(14)?,
     })
 }
 

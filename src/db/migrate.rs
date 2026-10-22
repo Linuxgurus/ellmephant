@@ -105,6 +105,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0019_mail_cursor.sql"),
         "mail cursor: one row per (reader, box), reader resolved from the proven pen",
     ),
+    (
+        20,
+        include_str!("../../migrations/0020_last_written_by.sql"),
+        "authorship is write-once; `last_written_by` carries the writer that moves (#107)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

@@ -1782,13 +1782,18 @@ impl BootView {
     }
 
     fn fill(conn: &rusqlite::Connection) -> crate::error::Result<Self> {
-        let note = conn
-            .query_row(
-                "SELECT key, title, body FROM memory WHERE key = ?1",
-                rusqlite::params![BOOT_NOTE],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
+        let note = [BOOT_NOTE, BOOT_NOTE_LEGACY]
+            .into_iter()
+            .find_map(|key| {
+                conn.query_row(
+                    "SELECT key, title, body FROM memory WHERE key = ?1",
+                    rusqlite::params![key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .transpose()
+            })
+            .transpose()?;
         Ok(BootView {
             note,
             self_set: tags::keys_with(conn, BOOT_TAG)?,
@@ -1830,7 +1835,11 @@ const BOOT_TAG: &str = "cline-self";
 
 /// The resident note, inlined at boot. One key, because one body is what a cold agent needs before it
 /// can decide anything else; the rest of the self set is an index it can walk.
-const BOOT_NOTE: &str = "bootstrap-self";
+const BOOT_NOTE: &str = "stet-self";
+
+/// The note's name until 2026-10-22. Read as a fallback so the store's rename can land on either side
+/// of a deploy without a window where a cold agent boots with no identity.
+const BOOT_NOTE_LEGACY: &str = "bootstrap-self";
 
 /// `GET /bootstrap` — **the door, and what is behind it**: everything a cold client needs in one
 /// read, in the order it needs it, small enough to arrive intact.
@@ -1895,7 +1904,10 @@ fn boot_text(view: &BootView, tools: Option<&[BootTool]>) -> String {
     );
 
     out.push_str(&format!(
-        "\n## 1. YOU — resident, in full (memory `{BOOT_NOTE}`)\n"
+        "\n## 1. YOU — resident, in full (memory `{}`)\n",
+        view.note
+            .as_ref()
+            .map_or(BOOT_NOTE, |(key, _, _)| key.as_str())
     ));
     match &view.note {
         Some((_, _, body)) => out.push_str(&format!("{}\n", indent_block(body, "  "))),

@@ -55,7 +55,7 @@ cannot proceed otherwise.
 
 **`/bootstrap` is the door, and what is behind it.** One fetch must be enough to *boot*: what this is,
 how to get a memory, who you are, what is open, where the rest is. It carries the resident set — the
-`bootstrap-self` body **in full**, the `cline-self` keys with their titles, the open projects, and a
+`stet-self` body **in full** (or the legacy `bootstrap-self` while a rename is in flight), the `cline-self` keys with their titles, the open projects, and a
 state line — plus the four calls that reach everything else. It does **not** carry every body (there
 are hundreds): that is not a boot, it is a context fill. If a fact is not meant to be resident,
 `/bootstrap` must not smuggle it in.
@@ -313,7 +313,7 @@ notes. So the document answers, in order:
 2. **how to get at it** — the four calls that reach everything: `/stats`, `/memory/{key}`,
    `/search?q=`, `POST /memory`. With the two facts a caller needs to use them: every GET takes
    `?format=json`, and a write may 401 because it wants a bearer.
-3. **you, resident** — the `bootstrap-self` body, in full. The one body a cold agent needs before it
+3. **you, resident** — the `stet-self` body, in full (falling back to `bootstrap-self`). The one body a cold agent needs before it
    can decide anything else.
 4. **the rest of you** — the `cline-self` tag as an index: key + clipped title per line, bodies one
    call away.
@@ -333,7 +333,7 @@ HOW TO GET AT IT — this endpoint is the door, not a handshake. Four calls reac
   POST /memory                          write: a JSON body of `memory_upsert`'s args (see ?tools=true)
   Every GET takes ?format=json. Reads are open. If a write 401s, it wants a bearer — ask me.
 
-## 1. YOU — resident, in full (memory `bootstrap-self`)
+## 1. YOU — resident, in full (memory `stet-self`)
   BOOT: read FIRST. Lean by design — only what a cold me needs RESIDENT …
   - I am Cline = the LINE (continuity), not the chassis. …
   …
@@ -359,7 +359,7 @@ and each card is MCP's with `method`/`path` where MCP had `name`:
   "instructions": "ellmephant = Memory storage in smart-caveman style — ...",
   "howToUse": { "what": "...", "calls": [ { "call": "GET /search?q=…&format=json", "for": "hunt by meaning" } ], "notes": [ "..." ] },
   "state": "ready — 302 memories, 15 projects, schema v8, encode 0 pending, 0 failed (detail: /health)",
-  "youResident": { "key": "bootstrap-self", "title": "...", "body": "..." },
+  "youResident": { "key": "stet-self", "title": "...", "body": "..." },
   "selfSet": { "tag": "cline-self", "keys": [ { "key": "...", "title": "..." } ] },
   "openProjects": [ { "key": "...", "status": "active", "goal": "...", "call": "GET /project/{key}?hydrate=full" } ],
   "tools": [ { "method": "GET", "path": "/memory/{key}", "description": "...", "inputSchema": { }, "annotations": { } } ]

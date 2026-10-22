@@ -213,6 +213,31 @@ fn now_epoch(conn: &Connection) -> Result<i64> {
     )
 }
 
+/// What a link re-parse did. Model-free and seconds long, so it is reported synchronously rather
+/// than queued.
+#[derive(Debug, Clone)]
+pub struct Reparse {
+    /// Memories whose `[[link]]` edges were re-derived from their body.
+    pub rows: usize,
+    /// Edges the graph holds afterwards — the number a re-parse is judged against `stats.dangling`.
+    pub edges: usize,
+}
+
+/// Rebuild the `[[link]]` graph from the current bodies — NO model, NO queue.
+///
+/// `memory_link` is derived, but its edges are computed at *write* time, so a body rewritten by
+/// anything that does not re-derive (a textual rewrite, a parser change, an older binary) leaves a
+/// graph the rows no longer imply. Re-embedding would fix it and costs an hour of worker time and a
+/// model load; this costs milliseconds ([`links::reparse`]).
+pub fn reparse(conn: &Connection) -> Result<Reparse> {
+    let rows = links::reparse(conn)?;
+    let edges: i64 = conn.query_row("SELECT COUNT(*) FROM memory_link", [], |r| r.get(0))?;
+    Ok(Reparse {
+        rows,
+        edges: edges.max(0) as usize,
+    })
+}
+
 /// What a re-embed SCHEDULED. The work itself is done later, by the encode worker.
 #[derive(Debug, Clone)]
 pub struct Report {

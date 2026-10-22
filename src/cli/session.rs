@@ -423,6 +423,17 @@ impl Session {
         maintain::reembed(&self.conn, &self.vec_spec(), &self.cfg.instruction)
     }
 
+    /// Rebuild the `[[link]]` graph from every body — no model, no queue, milliseconds.
+    ///
+    /// The graph is derived but computed at *write* time, so any path that rewrites a body without
+    /// re-deriving (a textual rewrite like a rename/merge `replace()`, a parser change, an older
+    /// binary) leaves edges the rows no longer imply. `memory_reembed` fixes that as a side effect
+    /// and costs a model load plus an hour of worker time; this is the broom for when only the graph
+    /// moved. It backs the `memory_reparse` tool.
+    pub fn reparse(&self) -> Result<maintain::Reparse> {
+        maintain::reparse(&self.conn)
+    }
+
     /// The head of the encode queue, or `None` when nothing is waiting to be embedded.
     pub fn next_encode(
         &self,

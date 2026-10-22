@@ -114,6 +114,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/reparse",
+        tool: "memory_reparse",
+    },
+    Route {
+        method: "POST",
         path: "/project",
         tool: "project_upsert",
     },
@@ -1517,6 +1522,52 @@ pub async fn merge(
                     "merged {key} -> {into} ({} line(s) integrated, {} refs repointed)",
                     out.integrated.len(),
                     out.bodies
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /reparse` — rebuild the `[[link]]` graph from every body (`memory_reparse`).
+///
+/// Model-free and seconds long, which is the whole point: the alternative was a full re-embed.
+pub async fn reparse(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("memory_reparse", move |s| s.reparse())
+        .await
+    {
+        Ok(report) => {
+            tracing::info!(
+                area = scope.area,
+                rows = report.rows,
+                edges = report.edges,
+                "re-parsed the link graph over http"
+            );
+            render(
+                StatusCode::OK,
+                json,
+                json_ok(serde_json::json!({
+                    "status": "reparsed",
+                    "rows": report.rows,
+                    "edges": report.edges,
+                })),
+                format!(
+                    "re-parsed {} document(s); the graph now holds {} edge(s)",
+                    report.rows, report.edges
                 ),
             )
         }

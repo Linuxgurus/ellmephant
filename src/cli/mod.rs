@@ -76,6 +76,8 @@ pub enum Command {
         #[arg(long)]
         verify: bool,
     },
+    /// Rebuild the `[[link]]` graph from every body. No model, no queue — milliseconds.
+    Reparse,
     /// Weights cache: status | fetch | rm (SPEC §6.5).
     Model {
         #[command(subcommand)]
@@ -158,6 +160,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match command {
         Command::Doctor { verify } => doctor::run(&paths, &cfg, &spec, verify),
+        Command::Reparse => doctor::reparse(&paths, &cfg),
         Command::Model { command } => model::cmd(&spec, command),
         // MCP holds the store open and serves until the client disconnects (P7).
         Command::Mcp { stdio, host, port } => {

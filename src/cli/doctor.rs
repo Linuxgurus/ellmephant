@@ -30,6 +30,26 @@ pub fn run(paths: &Paths, cfg: &Config, spec: &model::Spec, verify: bool) -> Res
     Ok(())
 }
 
+/// `ellmephant reparse` — rebuild the `[[link]]` graph from every body, with no model and no queue.
+///
+/// The graph is derived at *write* time, so a textual rewrite (rename, merge), a parser change, or a
+/// binary that predates the current parser leaves edges the bodies no longer imply. `memory_reembed`
+/// repairs that too, at the cost of a model load and a full re-queue; when only the graph moved, this
+/// is the whole job. Output is deliberately two numbers, because that is what a caller checks against
+/// `dangling` afterwards.
+pub fn reparse(paths: &Paths, cfg: &Config) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let report = maintain::reparse(&conn)?;
+    println!(
+        "re-parsed {} document(s); the graph now holds {} edge(s)",
+        report.rows, report.edges
+    );
+    let dangling = links::dangling(&conn)?;
+    println!("  dangling targets  {}", dangling.len());
+    Ok(())
+}
+
 /// Paths, schema version and the configured model (PLAN §6 P9).
 fn print_env(paths: &Paths, cfg: &Config, schema: i32, objects: i64) {
     println!("ellmephant {}", crate::VERSION);

@@ -13,10 +13,11 @@
 //! ★ A MEMORY IS KEPT BECAUSE IT IS TRUE; A LETTER IS KEPT BECAUSE NOBODY HAS READ IT YET. Letters
 //! therefore expire ([`prune`]) and memories do not. If nobody would read it twice, it is a letter.
 //!
-//! THE CURSOR BELONGS TO THE READER and is not stored here: `seq` is monotonic (see the migration), so
-//! a reader keeps its own `mail-last-read` and asks for everything after it. ★ The cursor advance is
-//! the COMMIT: a processor that dies before advancing leaves the letter unread, so the next attempt
-//! sees it again — at-least-once, never silently swallowed.
+//! THE CURSOR BELONGS TO THE READER, and since migration `0017` it is stored here as one row per
+//! (reader, box) ([`cursor`]/[`advance`]) — the reader being the PROVEN pen, never a tool argument.
+//! `seq` is monotonic (see the migration), so a reader asks for everything after its own place. ★ The
+//! cursor advance is the COMMIT: a processor that dies before advancing leaves the letter unread, so
+//! the next attempt sees it again — at-least-once, never silently swallowed.
 //!
 //! WHAT THIS IS NOT: authenticated. `sender` is asserted by the caller (the store has no auth), so the
 //! FENCE around the store is the control and "claims, not orders" is the safety.
@@ -193,6 +194,116 @@ pub fn head(conn: &Connection, recipient: &str) -> Result<i64> {
         params![recipient.trim().to_ascii_lowercase()],
         |r| r.get(0),
     )?)
+}
+
+/// One reader's place in one box — a POINTER, not a fact (migration `0017`).
+///
+/// ★ A CURSOR HAS ONE READER AND ONE WRITER. The reader is the pen this connection PROVED, resolved by
+/// the door and handed here; it is never a tool argument, for the same reason a namespace is not: the
+/// caller is a model and a model can be told to name someone else. Two readers of one box are two rows
+/// (`hand` and `stet`), which is what makes "the hand read this" distinguishable from "the self did".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    /// The proven pen this place belongs to.
+    pub reader: String,
+    /// The box.
+    pub recipient: String,
+    /// The highest `seq` this reader has DEALT WITH (0 before the first advance).
+    pub seq: i64,
+    /// When it last moved (UTC, from the store's clock).
+    pub updated: String,
+    /// The top of the box — so `unread` needs no second call.
+    pub head: i64,
+    /// Letters after `seq` that are still in the box.
+    pub unread: i64,
+    /// How many letters this advance skipped over (`0` on a read, or a no-op advance).
+    pub moved: i64,
+}
+
+fn normalized(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+/// Read one reader's cursor in one box. `None` means this reader has never advanced here — which is a
+/// fact, not `0`: a reader with no row sees the whole box, and that is the difference the old memory
+/// cursors could not express.
+pub fn cursor(conn: &Connection, reader: &str, recipient: &str) -> Result<Option<Cursor>> {
+    let reader = normalized(reader);
+    let recipient = normalized(recipient);
+    let seq: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM mail_cursor WHERE reader = ?1 AND recipient = ?2",
+            params![reader, recipient],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match seq {
+        Some(seq) => Some(shape(conn, &reader, &recipient, seq, 0)?),
+        None => None,
+    })
+}
+
+/// The reader's cursor, or `0` — the answer `mail_inbox` starts from.
+pub fn cursor_or_zero(conn: &Connection, reader: &str, recipient: &str) -> Result<i64> {
+    Ok(cursor(conn, reader, recipient)?.map(|c| c.seq).unwrap_or(0))
+}
+
+/// Move a cursor forward — the COMMIT of a read, and the only write this table has.
+///
+/// ★ BACKWARD IS REFUSED, NOT IGNORED. A cursor that silently went back would re-deliver mail already
+/// dealt with and, worse, look like it had not; the refusal names the current value so a caller can
+/// see what it tried to overwrite. Idempotent at the same value: advancing to where you already are is
+/// a success with `moved: 0`.
+pub fn advance(conn: &Connection, reader: &str, recipient: &str, seq: i64) -> Result<Cursor> {
+    let reader = normalized(reader);
+    let recipient = normalized(recipient);
+    if reader.is_empty() {
+        return Err(Error::Invalid(
+            "a cursor needs a reader: it belongs to the pen that proved itself".into(),
+        ));
+    }
+    if seq < 0 {
+        return Err(Error::Invalid(format!(
+            "`seq` must be >= 0 (got {seq}); 0 is the beginning of the box"
+        )));
+    }
+    let current = cursor_or_zero(conn, &reader, &recipient)?;
+    if seq < current {
+        return Err(Error::Invalid(format!(
+            "refused: `{reader}`'s cursor in `{recipient}` is already at {current}; moving it back to \
+             {seq} would re-deliver mail already dealt with. A cursor only moves forward."
+        )));
+    }
+    conn.execute(
+        "INSERT INTO mail_cursor (reader, recipient, seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT(reader, recipient) DO UPDATE SET
+             seq = excluded.seq,
+             updated = datetime('now')",
+        params![reader, recipient, seq],
+    )?;
+    shape(conn, &reader, &recipient, seq, seq - current)
+}
+
+/// Assemble the reply from the row and the box's top, so `unread` is never derived by the caller.
+fn shape(conn: &Connection, reader: &str, recipient: &str, seq: i64, moved: i64) -> Result<Cursor> {
+    let updated: String = conn
+        .query_row(
+            "SELECT updated FROM mail_cursor WHERE reader = ?1 AND recipient = ?2",
+            params![reader, recipient],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let head = head(conn, recipient)?;
+    Ok(Cursor {
+        reader: reader.to_string(),
+        recipient: recipient.to_string(),
+        seq,
+        updated,
+        head,
+        unread: (head - seq).max(0),
+        moved,
+    })
 }
 
 fn read_envelope(conn: &Connection, seq: i64) -> Result<Option<Envelope>> {

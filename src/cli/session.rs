@@ -593,6 +593,16 @@ impl Session {
     pub fn mail_prune(&self, keep_days: i64) -> Result<usize> {
         mail::prune(&self.conn, keep_days)
     }
+
+    /// The reader's place in a box (`None` = never advanced, so the whole box is unread).
+    pub fn mail_cursor(&self, reader: &str, recipient: &str) -> Result<Option<mail::Cursor>> {
+        mail::cursor(&self.conn, reader, recipient)
+    }
+
+    /// Advance the reader's own cursor — the commit of an inbox read.
+    pub fn mail_advance(&self, reader: &str, recipient: &str, seq: i64) -> Result<mail::Cursor> {
+        mail::advance(&self.conn, reader, recipient, seq)
+    }
 }
 
 /// What a miss can prove without a second round trip — see [`Session::miss_facts`].

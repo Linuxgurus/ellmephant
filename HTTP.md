@@ -66,6 +66,39 @@ handed the old document — a verbatim `initialize` + `tools/list` dump, 14.8 KB
 (`BOOT_BUDGET_BYTES`, asserted by the suite) and the tool catalogue is `?tools=true`: the one part
 that cannot be made small, which the caller should choose to spend tokens on.
 
+### Private memories — the read tier (#54, #55)
+
+A memory carries an `audience`: `public` (the default, what every row had before 2026-10-22) or
+`pen:<x>`, meaning the pen that wrote it. It is a **column on the truth row, not a tag** — tags are
+editable by any caller through a write, and an audience must not be. The value is derived by the store
+from the connection's **proven** identity: `private: true` on a write asks for "private to me", and no
+caller can name somebody else.
+
+- **Reads filter; writes do not authorise.** `memory_get`, `/search`, `/semantic`, backlinks, history,
+  `stats`, `dupes`, project `preload` and `/bootstrap` all narrow to the caller's pen.
+- **Absence, not refusal.** A row the reader may not see is answered exactly as a key that was never
+  written — no hit, no title, no count, no backlink, no dangling edge, no "it existed 42 minutes ago"
+  in the miss diagnostic. A refusal that says "private" confirms the row exists.
+- **Counts move with it.** `stats` excludes hidden rows from every aggregate (memories, chars, tags,
+  edges, orphans, components, top lists, versions), because a count that includes what the reader
+  cannot open is a one-bit leak and two samples take the difference.
+- **History takes the row's CURRENT class.** A note that goes private takes its past with it; a key
+  with no live row is classed by its newest snapshot.
+- **Deleting a private row PURGES its vector** rather than moving it to the tombstone table — the
+  deleted-search surface is deliberate, and a tombstone names what it holds.
+- **The audience is not editable by the party it excludes**: a pen that cannot read a row cannot
+  publish it, so `private` is not a lock with the key hanging beside the door.
+
+**The honest limit, said out loud (#54):** unencrypted privacy is a visibility convention, not a
+capability. The row is plaintext in the file, in the snapshot and in the off-cluster copy, and a
+process holding the database can read it. It protects against another agent **using the tools**, and
+against nothing else. Encryption is the `secret` tier, parked.
+
+**Forensics, for now, is direct access**: the owner reads through MCP as the `James` pen where the row
+is his, or opens the store with `sqlite3`. A recorded owner path (`memory_forensic(key, reason)` plus
+a `private_read` audit table) is not built yet, and is the one part of this tier that is a promise
+rather than a mechanism.
+
 ### Parity with MCP — the requirement, not a nice-to-have
 
 The MCP surface is 13 tools (`TOOLS` in `src/mcp/mod.rs`). A second door that cannot reach the same

@@ -638,10 +638,10 @@ fn owner_pen_id(tx: &Connection, name: Option<&str>) -> Result<Option<i64>> {
     let Some(name) = name else { return Ok(None) };
     Ok(tx
         .query_row(
-            // Only a FINGER resolves to its parent. A pen that happens to have a parent for other
-            // reasons still owns what it writes (#109).
-            "SELECT CASE WHEN instr(author.name, '/') > 0
-                         THEN COALESCE(author.parent_id, author.id)
+            // KIND decides, not the name: a finger owns as its parent, everything else owns as
+            // itself. A name is an address; a permission read from a string is a permission anyone
+            // who can register a name can forge (Stet, review round 3).
+            "SELECT CASE WHEN author.kind = 'finger' THEN COALESCE(author.parent_id, author.id)
                          ELSE author.id END
                FROM pen author WHERE author.name = ?1",
             params![name],
@@ -790,7 +790,7 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()>
 
 /// Release a row: nobody is answerable for it any more. By the commons rule (#109) an ownerless row
 /// also loses `protected` and `private` — a disclaim is therefore a PUBLICATION, and is recorded.
-pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
+pub fn disclaim(conn: &Connection, key: &str, pen: &str, publish: bool) -> Result<()> {
     let who =
         exact_pen_id(conn, pen)?.ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
     // The owner may release its own row; any ancestor may release it for them. Nobody else.
@@ -802,30 +802,19 @@ pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
         )
         .optional()?
         .flatten();
-    let owner_parent: Option<i64> = match owner_id {
-        Some(id) => conn
-            .query_row(
-                "SELECT parent_id FROM pen WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten(),
-        None => None,
+    // Any ANCESTOR may release a descendant's row (James), not just the parent: a grandparent
+    // skipping a generation is the same act. The commons belongs to nobody, so nobody has to be
+    // asked to release it.
+    let allowed = match owner_id {
+        Some(id) => who == id || is_ancestor(conn, who, id)?,
+        None => true,
     };
-    if owner_id != Some(who) && owner_parent != Some(who) {
+    if !allowed {
         return Err(Error::Invalid(format!(
-            "{pen} may not disclaim {key}: only its owner or that owner's parent may"
+            "{pen} may not disclaim {key}: only its owner or one of that owner's ancestors may"
         )));
     }
-    let from: Option<i64> = conn
-        .query_row(
-            "SELECT owner FROM memory WHERE key = ?1",
-            params![key],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
+    let from = owner_id;
     let was_private = conn
         .query_row(
             "SELECT audience FROM memory WHERE key = ?1",
@@ -835,6 +824,16 @@ pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
         .optional()?
         .map(|a| a != audience::PUBLIC)
         .unwrap_or(false);
+    // ★ PUBLISHING ANOTHER PEN'S PRIVATE ROW IS NOT A DISCLAIM (Stet, review round 3). The private
+    // tier exists because the AUTHOR chose the audience; an ancestor releasing the row would publish
+    // words that were not its own, and nothing un-publishes. So private -> public must be named:
+    // `publish=true`, a `publish` row in the ledger (not `disclaim`), and the affected pen is the
+    // event's `from_pen`, so it can find the act by asking about itself.
+    if was_private && !publish {
+        return Err(Error::Invalid(format!(
+            "{key} is private; releasing it would publish another pen's words — pass publish=true to do that deliberately"
+        )));
+    }
     let n = conn.execute(
         "UPDATE memory SET owner = NULL, audience = ?2 WHERE key = ?1",
         params![key, audience::PUBLIC],
@@ -845,12 +844,12 @@ pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
     log_pen_event(
         conn,
         key,
-        "disclaim",
+        if was_private { "publish" } else { "disclaim" },
         Some(who),
         from,
         None,
         Some(if was_private {
-            "private dropped: a disclaimed row is public"
+            "published on disclaim: the row was private and is now readable by every pen"
         } else {
             "released"
         }),
@@ -902,6 +901,9 @@ pub enum History {
     /// `memory_history_erase`: the store's only true destroyer.
     Purge,
 }
+
+/// One ledger row: when, what, from whom, to whom — the responsibility story of a key (#109).
+pub type PenEvent = (String, String, Option<String>, Option<String>);
 
 /// What a retirement would do, computed without doing it.
 #[derive(Debug, Clone, Serialize)]
@@ -997,10 +999,9 @@ pub fn retire(
 
     let keys: Vec<String> = {
         let mut stmt = conn.prepare("SELECT key FROM memory WHERE owner = ?1 ORDER BY key")?;
-        let rows = stmt
-            .query_map(params![id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
+
+        stmt.query_map(params![id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     for key in &keys {
@@ -1090,10 +1091,7 @@ pub fn retire(
 }
 
 /// The responsibility ledger for one key: who acted, on what, from whom to whom, and why.
-pub fn pen_events(
-    conn: &Connection,
-    key: &str,
-) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+pub fn pen_events(conn: &Connection, key: &str) -> Result<Vec<PenEvent>> {
     let mut stmt = conn.prepare(
         "SELECT at, action, (SELECT name FROM pen WHERE id = from_pen), (SELECT name FROM pen WHERE id = to_pen)
            FROM pen_event WHERE key = ?1 ORDER BY id",

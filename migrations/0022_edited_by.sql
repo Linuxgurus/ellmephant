@@ -19,14 +19,22 @@ ALTER TABLE memory RENAME COLUMN last_written_by TO edited_by;
 ALTER TABLE memory_version ADD COLUMN edited_by INTEGER REFERENCES pen(id);
 CREATE INDEX memory_version_editor ON memory_version(edited_by);
 
+-- A snapshot may be SYNTHETIC: taken by a migration rather than observed at a write. The two are
+-- not the same claim — synthetic says "this pen was the last writer before we started recording",
+-- not "this pen made this edit" — and a query for observed edits must be able to exclude it
+-- (Stet, review round 3). Absence-with-two-meanings is the defect this table exists to prevent.
+ALTER TABLE memory_version ADD COLUMN synthetic INTEGER NOT NULL DEFAULT 0;
+
 -- History begins at the migration. One snapshot per row that has none, authored by the pen the
--- store already named for it — this is the only moment at which that is knowable, and it is cheap:
--- one row per memory, a few MB at most.
-INSERT INTO memory_version (type, key, n, encoding, note, content, edited_by)
-SELECT 'memory', key, 1, 'json', 'authored before 0022; snapshot taken by the migration',
+-- store already named for it — the last moment at which that is knowable, and cheap: one row per
+-- memory, a few MB at most. Marked `synthetic = 1`, because it is not an observed edit.
+INSERT INTO memory_version (type, key, n, encoding, note, content, edited_by, synthetic)
+SELECT 'memory', key, 1, 'json',
+       'SYNTHETIC snapshot: the last writer before 0022, not the author of this edit',
        json_object('key', key, 'title', title, 'body', body, 'tags', tags, 'source', source,
                    'created', created, 'updated', updated),
-       (SELECT id FROM pen WHERE name = memory.asserted_by)
+       (SELECT id FROM pen WHERE name = memory.asserted_by),
+       1
 FROM memory
 WHERE NOT EXISTS (
     SELECT 1 FROM memory_version v WHERE v.type = 'memory' AND v.key = memory.key

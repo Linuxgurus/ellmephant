@@ -423,6 +423,8 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         .unwrap();
     conn.execute("ALTER TABLE memory_version DROP COLUMN edited_by", [])
         .unwrap();
+    conn.execute("ALTER TABLE memory_version DROP COLUMN synthetic", [])
+        .unwrap();
     conn.execute(
         "ALTER TABLE memory RENAME COLUMN edited_by TO last_written_by",
         [],
@@ -454,15 +456,16 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         1
     );
 
-    // ...and a finger resolves through its parent, so it can never become an orphan string. The
-    // parent is a real row, not a prefix kept only in the child's name.
+    // ★ THE SEED NEVER INVENTS A TREE (Stet, review round 3). A history row knows a NAME existed, not
+    // a pen's standing: no parent, no kind. So a slash in a name grants nothing — the finger is
+    // seeded as a plain self with no parent, and its standing must be registered deliberately.
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM pen child JOIN pen parent ON child.parent_id = parent.id
-             WHERE child.name = 'stet/finger-3' AND parent.name = 'stet'"
+            "SELECT count(*) FROM pen WHERE name = 'stet/finger-3' AND kind = 'self' AND parent_id IS NULL"
         ),
-        1
+        1,
+        "a slash is an address, never a permission"
     );
 
     // Nothing is tombstoned on the way in: the registry records history, it does not rewrite it.

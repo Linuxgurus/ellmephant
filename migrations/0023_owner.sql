@@ -15,7 +15,7 @@ CREATE TABLE pen_event (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     at       TEXT NOT NULL DEFAULT (datetime('now')),
     key      TEXT NOT NULL,
-    action   TEXT NOT NULL CHECK (action IN ('adopt', 'transfer', 'disclaim', 'retire', 'delete')),
+    action   TEXT NOT NULL CHECK (action IN ('adopt', 'transfer', 'disclaim', 'publish', 'retire', 'delete')),
     pen_id   INTEGER REFERENCES pen(id),   -- who acted
     from_pen INTEGER REFERENCES pen(id),   -- who held it before (NULL = nobody)
     to_pen   INTEGER REFERENCES pen(id),   -- who holds it after (NULL = nobody)

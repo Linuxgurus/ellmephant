@@ -68,6 +68,20 @@ fn a_finger_never_owns_its_parent_does() {
         Some("stet"),
         "the finger typed it; its parent is answerable"
     );
+    // ★ THIS IS THE ONLY WRITE WHERE THE TWO COLUMNS MOVE INDEPENDENTLY, so the split is only
+    // exercised if they DISAGREE here (Stet, review): `asserted_by` names the pen that did it,
+    // `owner` the pen that answers for it. If they came out equal, nothing was being tested.
+    let mem = store::get(&conn, "by-a-finger").unwrap().unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("stet/finger-3"),
+        "who did it"
+    );
+    assert_eq!(mem.owner.as_deref(), Some("stet"), "who answers for it");
+    assert_ne!(
+        mem.asserted_by, mem.owner,
+        "the split, exercised rather than assumed"
+    );
 }
 
 #[test]

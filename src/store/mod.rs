@@ -202,7 +202,15 @@ fn check_body(body: &str) -> Result<()> {
 /// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
 /// config said rather than what the encoder actually emits.
 /// May `caller` write the row at `key`? Parentage is the grant: the owner, the pen that owns on the
-/// owner's behalf (a finger acts for its parent), or any ancestor of the owner. A row with no owner
+/// owner's behalf (a finger acts for its parent), or any ancestor of the owner.
+///
+/// ★ THE COST OF "A FINGER ACTS FOR ITS PARENT", stated here because this is where it is granted: a
+/// hand pod serving many fingers gives EVERY one of those fingers the hand's write authority — so a
+/// compromised finger writes as its parent, and if the parent is near the root it writes as the
+/// estate (Stet, review of #119). That is inherent to fingers being mechanisms rather than parties,
+/// not a defect in this check. The mitigation is that `asserted_by` survives the write: the damage
+/// is ATTRIBUTABLE even when it was authorised, which is the property to preserve if this ever
+/// changes. A row with no owner
 /// is the commons, and the commons belongs to nobody — so every pen may write it (#109).
 fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
     let owner: Option<i64> = conn

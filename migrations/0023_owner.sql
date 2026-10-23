@@ -27,9 +27,11 @@ CREATE INDEX pen_event_key ON pen_event(key, at);
 -- is a mechanism by which one self does more work; it is not a party to ownership.
 UPDATE memory
 SET owner = COALESCE(
+    -- a FINGER (a name with a `/` in it) is owned by its parent...
     (SELECT parent.id
        FROM pen author
        JOIN pen parent ON author.parent_id = parent.id
-      WHERE author.name = memory.asserted_by),
+      WHERE author.name = memory.asserted_by AND instr(author.name, '/') > 0),
+    -- ...any other pen owns what it wrote.
     (SELECT id FROM pen WHERE name = memory.asserted_by)
 );

@@ -126,3 +126,162 @@ fn a_finger_adopting_adopts_as_its_parent() {
     store::adopt(&conn, "adopted-by-finger", "stet/finger-4").expect("adopt");
     assert_eq!(owner(&conn, "adopted-by-finger").as_deref(), Some("stet"));
 }
+
+fn seed_pen(conn: &rusqlite::Connection, name: &str, parent: Option<&str>) {
+    registry(conn, name, parent);
+}
+
+#[test]
+fn inherit_moves_the_rows_to_the_parent() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let embedder = HashEmbedder::new(DIM);
+    seed_pen(&conn, "stet", None);
+    seed_pen(&conn, "stet/finger-9", Some("stet"));
+    // A finger's rows are already owned by its parent, so retire a CHILD pen that can own: use a
+    // plain child pen, which the registry allows by name.
+    seed_pen(&conn, "hand-of-stet", Some("stet"));
+    row(&conn, &embedder, "hand-work", "hand-of-stet");
+
+    let preview = store::retire_preview(&conn, "hand-of-stet").expect("preview");
+    assert_eq!(preview.rows, 1);
+    assert_eq!(preview.parent.as_deref(), Some("stet"));
+
+    store::retire(
+        &conn,
+        "hand-of-stet",
+        store::Rows::Inherit,
+        store::History::Memorialize,
+    )
+    .expect("retire");
+
+    assert_eq!(
+        owner(&conn, "hand-work").as_deref(),
+        Some("stet"),
+        "the parent carries the work"
+    );
+    let events = store::pen_events(&conn, "hand-work").unwrap();
+    assert_eq!(
+        events[0].1, "transfer",
+        "inheritance is a transfer, recorded per row"
+    );
+    let retired: Option<String> = conn
+        .query_row(
+            "SELECT ceased_at FROM pen WHERE name = 'hand-of-stet'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("ceased_at");
+    assert!(retired.is_some(), "a retired pen has ceased_at set");
+}
+
+#[test]
+fn disclaim_on_retirement_publishes_private_rows() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let embedder = HashEmbedder::new(DIM);
+    seed_pen(&conn, "stet", None);
+    seed_pen(&conn, "hand-of-stet", Some("stet"));
+    row(&conn, &embedder, "secret-work", "hand-of-stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:hand-of-stet' WHERE key = 'secret-work'",
+        [],
+    )
+    .unwrap();
+
+    store::retire(
+        &conn,
+        "hand-of-stet",
+        store::Rows::Disclaim,
+        store::History::Memorialize,
+    )
+    .expect("retire");
+
+    let mem = store::get(&conn, "secret-work").unwrap().unwrap();
+    assert_eq!(mem.owner, None, "the commons: nobody is answerable");
+    assert_eq!(
+        mem.audience, "public",
+        "a disclaimed private row is published"
+    );
+    assert_eq!(
+        store::pen_events(&conn, "secret-work").unwrap()[0].1,
+        "disclaim"
+    );
+}
+
+#[test]
+fn delete_on_retirement_removes_the_rows_and_can_purge_the_record() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let embedder = HashEmbedder::new(DIM);
+    seed_pen(&conn, "stet", None);
+    seed_pen(&conn, "hand-of-stet", Some("stet"));
+    row(&conn, &embedder, "doomed", "hand-of-stet");
+
+    store::retire(
+        &conn,
+        "hand-of-stet",
+        store::Rows::Delete,
+        store::History::Purge,
+    )
+    .expect("retire");
+
+    assert!(
+        store::get(&conn, "doomed").unwrap().is_none(),
+        "the row is gone"
+    );
+    let versions: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM memory_version WHERE key = 'doomed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        versions, 0,
+        "purge leaves no record — the store's only true destroyer"
+    );
+}
+
+#[test]
+fn inherit_without_a_parent_is_refused() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    seed_pen(&conn, "lonely", None);
+
+    let err = store::retire(
+        &conn,
+        "lonely",
+        store::Rows::Inherit,
+        store::History::Memorialize,
+    )
+    .expect_err("a root has no parent to inherit");
+    assert!(
+        format!("{err}").contains("no parent"),
+        "the message says where to go instead"
+    );
+}
+
+#[test]
+fn a_pen_cannot_be_retired_twice() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    seed_pen(&conn, "stet", None);
+    seed_pen(&conn, "hand-of-stet", Some("stet"));
+
+    store::retire(
+        &conn,
+        "hand-of-stet",
+        store::Rows::Disclaim,
+        store::History::Memorialize,
+    )
+    .unwrap();
+    let err = store::retire(
+        &conn,
+        "hand-of-stet",
+        store::Rows::Disclaim,
+        store::History::Memorialize,
+    )
+    .expect_err("already retired");
+    assert!(format!("{err}").contains("already retired"));
+}

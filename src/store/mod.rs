@@ -602,7 +602,12 @@ fn owner_pen_id(tx: &Connection, name: Option<&str>) -> Result<Option<i64>> {
     let Some(name) = name else { return Ok(None) };
     Ok(tx
         .query_row(
-            "SELECT COALESCE(author.parent_id, author.id) FROM pen author WHERE author.name = ?1",
+            // Only a FINGER resolves to its parent. A pen that happens to have a parent for other
+            // reasons still owns what it writes (#109).
+            "SELECT CASE WHEN instr(author.name, '/') > 0
+                         THEN COALESCE(author.parent_id, author.id)
+                         ELSE author.id END
+               FROM pen author WHERE author.name = ?1",
             params![name],
             |r| r.get(0),
         )
@@ -778,6 +783,194 @@ pub fn transfer(conn: &Connection, key: &str, from: &str, to: &str) -> Result<()
         Some(to_id),
         None,
     )
+}
+
+/// What happens to a retired pen's ROWS — the first of the two choices (#109, round 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rows {
+    /// `owner` moves to the parent: the rows survive, under the parent's responsibility.
+    Inherit,
+    /// `owner` -> NULL: the commons. Private/protected drop, so a private row is PUBLISHED.
+    Disclaim,
+    /// The rows are gone; the keys stay as tombstones and the act is recorded.
+    Delete,
+}
+
+/// What survives of the RECORD — the second choice. Independent of the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum History {
+    /// Tombstone; versions listed, bodies fetchable, memorial note on the ledger.
+    Memorialize,
+    /// Tombstone; content not meant to be read again — versions go.
+    Forget,
+    /// `memory_history_erase`: the store's only true destroyer.
+    Purge,
+}
+
+/// What a retirement would do, computed without doing it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetirePreview {
+    pub pen: String,
+    pub parent: Option<String>,
+    pub rows: i64,
+    pub private_rows: i64,
+}
+
+fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
+    conn.query_row(
+        "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+        params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
+}
+
+/// Count what retiring `pen` would touch. Read-only; safe to call before deciding.
+pub fn retire_preview(conn: &Connection, pen: &str) -> Result<RetirePreview> {
+    let (id, parent_id, _) = pen_row(conn, pen)?;
+    let rows: i64 = conn.query_row(
+        "SELECT count(*) FROM memory WHERE owner = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    let private_rows: i64 = conn.query_row(
+        "SELECT count(*) FROM memory WHERE owner = ?1 AND audience <> ?2",
+        params![id, audience::PUBLIC],
+        |r| r.get(0),
+    )?;
+    let parent: Option<String> = match parent_id {
+        Some(pid) => conn
+            .query_row("SELECT name FROM pen WHERE id = ?1", params![pid], |r| {
+                r.get(0)
+            })
+            .optional()?,
+        None => None,
+    };
+    Ok(RetirePreview {
+        pen: pen.to_string(),
+        parent,
+        rows,
+        private_rows,
+    })
+}
+
+/// Retire a pen: it ceases to be, and its rows and record go where the caller says.
+///
+/// NO DEFAULT, deliberately (#109): a retirement that does not say what happens to the rows is how
+/// ghosts are made — the pen is gone, the rows still name it, and `who_can` starts answering about a
+/// pen that officially does not exist.
+///
+/// Not wrapped in one transaction: `delete` opens its own. A failure part-way leaves the pen live and
+/// the ledger holding the events that did happen, which is the recoverable direction.
+pub fn retire(conn: &Connection, pen: &str, rows: Rows, history: History) -> Result<RetirePreview> {
+    let preview = retire_preview(conn, pen)?;
+    let (id, parent_id, ceased_at) = pen_row(conn, pen)?;
+    if ceased_at.is_some() {
+        return Err(Error::Invalid(format!("{pen} is already retired")));
+    }
+    let parent = match (rows, parent_id) {
+        (Rows::Inherit, None) => {
+            return Err(Error::Invalid(format!(
+                "{pen} has no parent: `inherit` needs somewhere for the rows to go (use disclaim or delete)"
+            )));
+        }
+        (Rows::Inherit, Some(pid)) => Some(pid),
+        _ => None,
+    };
+
+    let keys: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT key FROM memory WHERE owner = ?1 ORDER BY key")?;
+        let rows = stmt
+            .query_map(params![id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for key in &keys {
+        match rows {
+            Rows::Inherit => {
+                let to = parent.expect("checked above");
+                conn.execute(
+                    "UPDATE memory SET owner = ?2 WHERE key = ?1",
+                    params![key, to],
+                )?;
+                log_pen_event(
+                    conn,
+                    key,
+                    "transfer",
+                    Some(id),
+                    Some(id),
+                    Some(to),
+                    Some("inherited on retirement"),
+                )?;
+            }
+            Rows::Disclaim => {
+                let was_private: bool = conn
+                    .query_row(
+                        "SELECT audience FROM memory WHERE key = ?1",
+                        params![key],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|a| a != audience::PUBLIC)
+                    .unwrap_or(false);
+                conn.execute(
+                    "UPDATE memory SET owner = NULL, audience = ?2 WHERE key = ?1",
+                    params![key, audience::PUBLIC],
+                )?;
+                log_pen_event(
+                    conn,
+                    key,
+                    "disclaim",
+                    Some(id),
+                    Some(id),
+                    None,
+                    Some(if was_private {
+                        "disclaimed on retirement: private dropped, a disclaimed row is public"
+                    } else {
+                        "disclaimed on retirement"
+                    }),
+                )?;
+            }
+            Rows::Delete => {
+                log_pen_event(
+                    conn,
+                    key,
+                    "delete",
+                    Some(id),
+                    Some(id),
+                    None,
+                    Some("deleted on retirement"),
+                )?;
+                delete(conn, key)?;
+            }
+        }
+        match history {
+            History::Memorialize => {}
+            History::Forget | History::Purge => {
+                version::erase(conn, key)?;
+            }
+        }
+    }
+
+    conn.execute(
+        "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
+        params![id],
+    )?;
+    log_pen_event(
+        conn,
+        "",
+        "retire",
+        Some(id),
+        Some(id),
+        parent,
+        Some(&format!(
+            "rows: {:?} ({} rows, {} private), history: {:?}",
+            rows, preview.rows, preview.private_rows, history
+        )),
+    )?;
+    Ok(preview)
 }
 
 /// The responsibility ledger for one key: who acted, on what, from whom to whom, and why.

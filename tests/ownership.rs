@@ -669,3 +669,47 @@ fn a_deletion_of_an_owned_row_records_a_retire_in_effect() {
     assert_eq!(entry.2.as_deref(), Some("stet"), "who held it");
     assert_eq!(entry.4.as_deref(), Some("stet"), "who ended it");
 }
+
+#[test]
+fn the_ownerless_rows_can_be_listed_not_only_counted() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // Disclaimed BY CHOICE — what an ancestor does to a retiring descendant's rows when it does not
+    // want them. The author stays named; nobody owns it. A supported state, not damage.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // No author at all: a write made with no pen, or a pen that is gone.
+    conn.execute(
+        "INSERT INTO memory (key, title, body, created, updated, audience)
+         VALUES ('unwitnessed', 't', 'b', datetime('now'), datetime('now'), 'public')",
+        [],
+    )
+    .unwrap();
+
+    let rows = store::unowned(&conn, 50).expect("list");
+    assert_eq!(rows.len(), 2);
+    let by_key: std::collections::HashMap<_, _> =
+        rows.iter().map(|r| (r.key.as_str(), r)).collect();
+
+    let released = by_key["released"];
+    assert_eq!(
+        released.why, "disclaimed",
+        "released by a pen, author still named"
+    );
+    assert_eq!(released.asserted_by, "stet");
+
+    let unwitnessed = by_key["unwitnessed"];
+    assert_eq!(
+        unwitnessed.why, "unrecorded",
+        "no currently existing pen wrote it"
+    );
+    assert_eq!(unwitnessed.asserted_by, "anonymous");
+
+    // And the listing is the point: a claimer needs the ADDRESS, not the total.
+    assert!(
+        rows.iter()
+            .all(|r| !r.key.is_empty() && !r.created.is_empty())
+    );
+}

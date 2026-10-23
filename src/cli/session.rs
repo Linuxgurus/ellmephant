@@ -250,6 +250,11 @@ impl Session {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
+    /// Rows nobody owns, newest first — the list behind the counts.
+    pub fn unowned(&self, limit: i64) -> Result<Vec<store::Unowned>> {
+        store::unowned(&self.conn, limit)
+    }
+
     /// Delete one memory by key; `false` means there was nothing to delete.
     ///
     /// `acted_by` is the proven pen the door is acting for: a delete is a write of absence, so it

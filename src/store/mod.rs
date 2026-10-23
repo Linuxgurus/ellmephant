@@ -1171,6 +1171,58 @@ pub fn pen_events(conn: &Connection, key: &str) -> Result<Vec<PenEvent>> {
     Ok(rows)
 }
 
+/// One row nobody owns: the addressable half of the two counts in `memory_stats`.
+///
+/// ★ A NUMBER THAT CANNOT BECOME A LIST GETS QUOTED AND NEVER ACTED ON (Stet, review of #122). The
+/// counts say how many; this says WHICH, so somebody can look at a row and claim it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unowned {
+    /// The row's address.
+    pub key: String,
+    /// When it was written — the only ordering a claimer has to go on.
+    pub created: String,
+    /// Who typed it, as far as the store knows (`anonymous` when no currently existing pen is named).
+    pub asserted_by: String,
+    /// `disclaimed` — somebody RELEASED it, so the author is still named; or `unrecorded` — no author
+    /// is named at all, which is either a write with no pen or a pen that is gone.
+    pub why: String,
+}
+
+/// Every row with no owner, newest first, for somebody to claim.
+///
+/// ★ NOBODY OWNS IT IS A SUPPORTED STATE, NOT A BUG (James, 2026-10-23): when an ancestor retires a
+/// descendant it chooses adopt / disclaim / delete, and a DISCLAIMED row is owned by nobody on
+/// purpose — which is what "anonymous" means: no currently existing pen is answerable for it. So this
+/// listing is not a damage report; it is the place an owner goes to pick something up, and `why`
+/// keeps the two ways of arriving there apart.
+pub fn unowned(conn: &Connection, limit: i64) -> Result<Vec<Unowned>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, created, asserted_by FROM memory
+          WHERE owner IS NULL
+          ORDER BY created DESC, key
+          LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| {
+        let asserted_by: Option<String> = r.get(2)?;
+        let asserted_by = asserted_by.unwrap_or_default();
+        let why = if asserted_by.trim().is_empty()
+            || asserted_by.eq_ignore_ascii_case(crate::identity::ANONYMOUS)
+        {
+            "unrecorded"
+        } else {
+            "disclaimed"
+        };
+        Ok(Unowned {
+            key: r.get(0)?,
+            created: r.get(1)?,
+            asserted_by,
+            why: why.to_string(),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bool> {

@@ -58,6 +58,11 @@ pub const ROUTES: &[Route] = &[
         tool: "memory_delete",
     },
     Route {
+        method: "GET",
+        path: "/unowned",
+        tool: "memory_unowned",
+    },
+    Route {
         method: "POST",
         path: "/memory/{key}/merge",
         tool: "memory_merge",
@@ -739,6 +744,51 @@ pub async fn memory_get(
                 obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
             }
             render(StatusCode::OK, json, value.to_string(), memory_text(&mem))
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /unowned` — the rows nobody owns, and why (`memory_unowned`).
+pub async fn unowned(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let limit = params
+        .parse_as::<i64>("limit")
+        .map(|v| v.unwrap_or(50))
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("memory_unowned", reader_from(&headers), move |s| {
+            s.unowned(limit)
+        })
+        .await
+    {
+        Ok(rows) => {
+            let mut out = String::new();
+            for r in &rows {
+                out.push_str(&format!(
+                    "  {}  {:<12} {:<10} {}\n",
+                    r.key, r.why, r.asserted_by, r.created
+                ));
+            }
+            if rows.is_empty() {
+                out.push_str("  (no ownerless rows)\n");
+            }
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&rows).unwrap_or_default(),
+                out,
+            )
         }
         Err(e) => error(json, error_status(&e), e),
     }

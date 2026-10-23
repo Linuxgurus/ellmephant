@@ -867,6 +867,10 @@ fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
         "what it is to me"
     );
     assert_eq!(seen.owns, 1, "the rows it answers for");
+    assert_eq!(
+        seen.descendants, 2,
+        "how far it reaches: `f-1` and `f-1/f-2` hang below `stet/hand`, and that is what ancestor read grants"
+    );
     assert!(seen.ceased.is_none());
 
     // The relation is from the ASKER's seat: the same pen is a CHILD to its parent and a NEPHEW to
@@ -877,6 +881,9 @@ fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
     assert_eq!(from_self.relation.as_deref(), Some("ME"));
 
     // A pen from another estate is reachable by name and related to nobody here.
+    let root = store::whois(&conn, "estate", "estate").expect("whois");
+    assert_eq!(root.descendants, 6, "the root reaches everything below it");
+
     let island = store::whois(&conn, "stet", "island").expect("whois");
     assert_eq!(
         island.relation, None,

@@ -999,6 +999,10 @@ pub struct Whois {
     pub relation: Option<String>,
     /// The rows this pen answers for.
     pub owns: i64,
+    /// How many pens hang BELOW this one. A pen asking `whois <itself>` learns how far it reaches —
+    /// the one number that says what ancestor read actually grants it, rather than leaving a reader to
+    /// infer it from a tree it cannot see (#120).
+    pub descendants: i64,
 }
 
 /// A pen row as `whois` reads it: `(id, kind, parent_id, created, ceased_at)`.
@@ -1034,6 +1038,16 @@ pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
         params![id],
         |r| r.get(0),
     )?;
+    let descendants: i64 = conn.query_row(
+        "WITH RECURSIVE sub(id) AS (
+             SELECT id FROM pen WHERE parent_id = ?1
+             UNION
+             SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
+         )
+         SELECT count(*) FROM sub",
+        params![id],
+        |r| r.get(0),
+    )?;
     Ok(Whois {
         name: name.to_string(),
         kind,
@@ -1042,6 +1056,7 @@ pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
         ceased,
         relation: relation::relation(conn, viewer, name)?.map(|k| k.gloss()),
         owns,
+        descendants,
     })
 }
 

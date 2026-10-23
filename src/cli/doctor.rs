@@ -96,6 +96,28 @@ fn print_weights(spec: &model::Spec) -> Result<()> {
 /// Derived-index health (PLAN §6 P9): rows, `vec0`, links and tags.
 fn print_index_health(conn: &Connection) -> Result<()> {
     let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
+    // ★ TWO FACTS, ONE VALUE (Stet, review of #122). `owner` NULL means "nobody is answerable" —
+    // but WHICH nobody? A disclaimed row keeps its author: the commons, by someone's decision.
+    // A row with no author either is almost always a write bug (the HTTP door did not stamp
+    // `asserted_by` before 2026-10-23), and those want an owner to CLAIM them rather than being
+    // silently handed to everybody. Printed here as well as in `memory_stats` because doctor is what
+    // an operator runs at the store, and stats is what an agent reads.
+    let (commons, unattributed): (i64, i64) = conn.query_row(
+        "SELECT sum(CASE WHEN lower(trim(asserted_by)) NOT IN ('', 'anonymous') THEN 1 ELSE 0 END),
+                sum(CASE WHEN lower(trim(asserted_by)) IN ('', 'anonymous') THEN 1 ELSE 0 END)
+           FROM memory WHERE owner IS NULL",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
+        },
+    )?;
+    println!("  commons        {commons} row(s) released to nobody, author still named");
+    println!(
+        "  unattributed   {unattributed} row(s) with no owner AND no author — claim them, do not assume a commons"
+    );
     // The vec0 table only exists once something has been written; `stored_dim` is the tell.
     let dim = index::vec::stored_dim(conn)?;
     let vectors = match dim {

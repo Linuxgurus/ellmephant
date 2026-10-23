@@ -1836,6 +1836,17 @@ fn stats_text(s: &store::stats::Stats) -> String {
         ("link edges", s.edges.to_string()),
         ("orphans", s.orphans.to_string()),
         ("dangling", s.dangling.to_string()),
+        // Two numbers, because they are two facts that share one value (owner NULL).
+        ("commons", s.commons.to_string()),
+        (
+            "unattributed",
+            match s.unattributed {
+                0 => "0".to_string(),
+                n => format!(
+                    "{n} (no author RECORDED — a write bug, not a commons; they need claiming)"
+                ),
+            },
+        ),
         ("visits", s.visits_total.to_string()),
         ("useful", s.useful_total.to_string()),
         (

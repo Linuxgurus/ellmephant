@@ -623,3 +623,49 @@ fn a_commons_row_may_be_removed_by_anyone() {
 
     assert!(store::delete(&conn, "everyones", Some("cline")).expect("the commons is anyone's"));
 }
+
+#[test]
+fn stats_separate_the_commons_from_the_unattributed() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A released row: no owner, but the author is NAMED. That is the commons, and a decision.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // A row with no author at all — what the HTTP door produced for every write until 2026-10-23.
+    // Nobody is answerable AND nobody is named: a bug, and it must not be counted as a commons.
+    // `asserted_by` is NOT NULL and defaults to `anonymous`, so "nobody is named" is spelled with
+    // the reserved word rather than NULL — which is what makes the two cases separable at all.
+    conn.execute(
+        "INSERT INTO memory (key, title, body, created, updated, audience)
+         VALUES ('ghost', 'a ghost', 'no author', datetime('now'), datetime('now'), 'public')",
+        [],
+    )
+    .unwrap();
+
+    let stats = store::stats::compute(&conn).expect("stats");
+    assert_eq!(stats.commons, 1, "one released row, author still named");
+    assert_eq!(
+        stats.unattributed, 1,
+        "one row nobody wrote and nobody owns"
+    );
+}
+
+#[test]
+fn a_deletion_of_an_owned_row_records_a_retire_in_effect() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "owned-note", "stet");
+
+    // Stet's rule: "delete for what has no owner, retire for what has one — and if an owned row is
+    // deleted it needs a ledger row anyway, at which point it IS a retire". This is that ledger row.
+    assert!(store::delete(&conn, "owned-note", Some("stet")).expect("delete"));
+    let events = store::pen_events(&conn, "owned-note").unwrap();
+    let entry = events
+        .iter()
+        .find(|e| e.1 == "delete")
+        .expect("a ledger row");
+    assert_eq!(entry.2.as_deref(), Some("stet"), "who held it");
+    assert_eq!(entry.4.as_deref(), Some("stet"), "who ended it");
+}

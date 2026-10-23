@@ -514,3 +514,60 @@ fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
     migrate::run_with(&conn, true).expect("the rollback override must work");
     assert_eq!(migrate::version(&conn).unwrap(), 99, "untouched");
 }
+
+#[test]
+fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
+    let (_dir, paths) = temp_store();
+
+    // A store that already ran the OLD seed: `anonymous` exists as a pen, owns a row, and is named in
+    // the ledger and in a version snapshot. This is the state the pre-roll rehearsal found in a copy
+    // of the live store — 249 rows, not one.
+    let conn = db::open(&paths).expect("open");
+    conn.execute(
+        "INSERT INTO memory (key, title, body, created, updated, asserted_by, owner, audience)
+         VALUES ('ghosted', 't', 'b', datetime('now'), datetime('now'), 'anonymous',
+                 (SELECT id FROM pen WHERE name = 'anonymous'), 'public')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO pen_event (key, action, pen_id) VALUES ('ghosted', 'adopt',
+            (SELECT id FROM pen WHERE name = 'anonymous'))",
+        [],
+    )
+    .unwrap();
+    // Pretend the store stopped at v24, so only the repair runs on reopen.
+    conn.pragma_update(None, "user_version", 24).unwrap();
+    drop(conn);
+
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
+    let ghost: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pen WHERE lower(name) = 'anonymous'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ghost, 0,
+        "`anonymous` is a value meaning nobody, never a pen"
+    );
+
+    // Nothing was reassigned to somebody else: the row is UNATTRIBUTED, which is the honest state.
+    let owner: Option<i64> = conn
+        .query_row("SELECT owner FROM memory WHERE key = 'ghosted'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        owner, None,
+        "un-owning restores the question rather than answering it"
+    );
+
+    // And the ledger no longer points at a pen that does not exist.
+    let dangling: i64 = conn
+        .query_row("SELECT count(*) FROM pen_event WHERE pen_id IS NOT NULL AND pen_id NOT IN (SELECT id FROM pen)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(dangling, 0);
+}

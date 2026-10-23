@@ -21,7 +21,7 @@ pub fn run(paths: &Paths, cfg: &Config, spec: &model::Spec, verify: bool) -> Res
         [],
         |r| r.get(0),
     )?;
-    print_env(paths, cfg, schema, objects);
+    print_env(paths, cfg, schema, objects, &conn);
     print_weights(spec)?;
     print_index_health(&conn)?;
     if verify {
@@ -51,7 +51,7 @@ pub fn reparse(paths: &Paths, cfg: &Config) -> Result<()> {
 }
 
 /// Paths, schema version and the configured model (PLAN §6 P9).
-fn print_env(paths: &Paths, cfg: &Config, schema: i32, objects: i64) {
+fn print_env(paths: &Paths, cfg: &Config, schema: i32, objects: i64, conn: &Connection) {
     println!("ellmephant {}", crate::VERSION);
     println!("  root           {}", paths.root().display());
     println!("  db             {}", paths.db().display());
@@ -72,6 +72,33 @@ fn print_env(paths: &Paths, cfg: &Config, schema: i32, objects: i64) {
     );
     println!("  objects        {objects}");
     println!("  model          {} dim={}", cfg.model, cfg.dim);
+    // ★ IS THE TREE A TREE? (pre-roll rehearsal, 2026-10-23.) Seeded pens are NAMES; provisioning
+    // attaches them. Until it does, every pen is a root and the ancestry rules reach nothing — a store
+    // that looks healthy while `estate` has no descendants is the quietest way to ship a no-op. One
+    // root (`estate`) is the invariant; more means nobody has attached the tree yet.
+    let tree = (schema >= 21)
+        .then(|| {
+            conn.query_row(
+                "SELECT count(*), sum(CASE WHEN parent_id IS NULL THEN 1 ELSE 0 END) FROM pen",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    ))
+                },
+            )
+            .ok()
+        })
+        .flatten();
+    if let Some((pens, roots)) = tree {
+        let note = if roots > 1 {
+            "   <- NOT ATTACHED: seeded names, no parents; ancestry reaches nothing"
+        } else {
+            ""
+        };
+        println!("  pens           {pens} pen(s), {roots} root(s){note}");
+    }
 }
 
 /// The weights-cache summary (no network; SPEC §6.5).

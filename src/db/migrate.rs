@@ -130,6 +130,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0024_sudo.sql"),
         "`sudoers` + `active_sudo`: authority borrowed, bounded and revocable — `estate` has no identity, so its reach is only ever a borrow (#109)",
     ),
+    (
+        25,
+        include_str!("../../migrations/0025_pen_repair.sql"),
+        "repair: `anonymous` is a value meaning nobody, never a pen — un-own what the seed gave it (#109)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

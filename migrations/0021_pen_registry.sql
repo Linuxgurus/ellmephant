@@ -31,11 +31,21 @@ CREATE TABLE pen (
 CREATE INDEX pen_parent ON pen(parent_id);
 
 -- Every name that has ever spoken in this store, from memories and from mail.
+--
+-- ★ EXCEPT `anonymous`, WHICH IS NOT A NAME (found in the pre-roll rehearsal, 2026-10-23). It means
+-- **NO CURRENTLY EXISTING PEN WROTE THIS** (James) — not "nobody was talking", and not a pen that
+-- happens to be called anonymous: it is the absence of an author among the pens that exist. Seeding
+-- it as a pen would MANUFACTURE AN OWNER out of a vote of
+-- no confidence: on a copy of the live store the backfill handed it 249 rows, and every "unattributed"
+-- count then read zero, because the fiction was created before the question was asked. A row nobody
+-- wrote has no owner; it does not have an owner called `nobody`.
 INSERT OR IGNORE INTO pen (name)
 SELECT name FROM (
-    SELECT DISTINCT asserted_by AS name FROM memory WHERE asserted_by <> ''
+    SELECT DISTINCT asserted_by AS name FROM memory
+     WHERE asserted_by <> '' AND lower(asserted_by) <> 'anonymous'
     UNION
-    SELECT DISTINCT asserted_by AS name FROM mail WHERE asserted_by <> ''
+    SELECT DISTINCT asserted_by AS name FROM mail
+     WHERE asserted_by <> '' AND lower(asserted_by) <> 'anonymous'
 );
 
 -- The root pen is `estate` — the estate itself, which is where terraform metaphorically stands: a

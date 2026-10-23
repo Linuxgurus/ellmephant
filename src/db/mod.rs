@@ -30,6 +30,9 @@ pub fn open_with(paths: &Paths, cfg: &crate::config::Config) -> Result<Connectio
     let conn = Connection::open(paths.db())?;
     configure(&conn)?;
     migrate::run(&conn)?;
+    // ★ SUDO POLICY IS READ AT BOOT AND NEVER FATAL (#109): authority is granted by configuration, so
+    // a malformed line is a warning with a name, not a store that refuses to open.
+    crate::store::sudo::load_at_boot(&conn);
     // ★ EAGER INDEX, NOT LAZY (2026-10-21): the vec0 tables used to appear on the first *embed*, which
     // meant a rolled store served an EMPTY semantic index until somebody happened to write — and said
     // nothing about why. Worse for the shape change that moved `memory_vec` into the partitioned

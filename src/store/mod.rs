@@ -12,6 +12,7 @@ pub mod project;
 pub mod slug;
 pub mod snapshot;
 pub mod stats;
+pub mod sudo;
 pub mod tags;
 pub mod version;
 

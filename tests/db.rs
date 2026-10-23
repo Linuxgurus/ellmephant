@@ -186,6 +186,10 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         .unwrap();
     // ...and predates the PEN REGISTRY (0021), which is a table of its own.
     conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates SUDO (0024), which is two tables of its own.
+    conn.execute("DROP TABLE IF EXISTS active_sudo", [])
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS sudoers", []).unwrap();
     // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
     conn.execute("DROP INDEX IF EXISTS memory_owner", [])
         .unwrap();
@@ -255,6 +259,10 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         .unwrap();
     // ...and predates the PEN REGISTRY (0021), which is a table of its own.
     conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates SUDO (0024), which is two tables of its own.
+    conn.execute("DROP TABLE IF EXISTS active_sudo", [])
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS sudoers", []).unwrap();
     // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
     conn.execute("DROP INDEX IF EXISTS memory_owner", [])
         .unwrap();
@@ -431,6 +439,10 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     )
     .unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates SUDO (0024), which is two tables of its own.
+    conn.execute("DROP TABLE IF EXISTS active_sudo", [])
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS sudoers", []).unwrap();
     // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
     conn.execute("DROP INDEX IF EXISTS memory_owner", [])
         .unwrap();

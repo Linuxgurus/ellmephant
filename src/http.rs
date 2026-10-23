@@ -172,6 +172,10 @@ pub(crate) struct HealthReport {
     /// atomic, so "how old is the consistent copy?" is a question a bell can answer without kubectl
     /// and without a cross-namespace grant.
     pub(crate) snapshot_age_s: Option<i64>,
+    /// Sudo policy rows in force, and sessions live right now. Reported, never gated: authority is
+    /// configuration, and `/health` is where configuration becomes legible without kubectl.
+    pub(crate) sudo_policies: i64,
+    pub(crate) sudo_live: i64,
     pub(crate) ready: bool,
     pub(crate) reason: Option<String>,
 }
@@ -203,6 +207,8 @@ impl HealthReport {
             encode_failed: 0,
             encode_oldest_s: None,
             snapshot_age_s: None,
+            sudo_policies: 0,
+            sudo_live: 0,
             ready: false,
             reason: Some(reason.to_string()),
         }
@@ -252,6 +258,12 @@ impl HealthReport {
             None => "none yet — the backup is copying a LIVE database".to_string(),
         };
         out.push_str(&format!("  {:<12}{snap}\n", "snapshot"));
+        // Two numbers, because they are two questions: what may be borrowed, and what is borrowed
+        // right now. A session outliving its policy would show up here as live > 0 after a revoke.
+        out.push_str(&format!(
+            "  {:<12}{} rule(s), {} session(s)\n",
+            "sudo", self.sudo_policies, self.sudo_live
+        ));
         if let Some(reason) = &self.reason {
             out.push_str(&format!("  {:<12}false: {reason}\n", "ready"));
         }
@@ -284,6 +296,8 @@ impl HealthReport {
             // The quiesce: how old the newest CONSISTENT copy is. `null` means none has been written,
             // which is a fact worth surfacing rather than a zero.
             "snapshot_age_s": self.snapshot_age_s,
+            "sudo_policies": self.sudo_policies,
+            "sudo_live": self.sudo_live,
         })
     }
 }
@@ -310,6 +324,8 @@ pub(crate) fn probe(paths: &Paths, watch: &LockWatch, started: Instant) -> Healt
         encode_failed: 0,
         encode_oldest_s: None,
         snapshot_age_s: None,
+        sudo_policies: 0,
+        sudo_live: 0,
         ready: false,
         reason: None,
     };
@@ -378,6 +394,15 @@ fn read_store(paths: &Paths, report: &mut HealthReport) -> crate::error::Result<
     // matches is exactly the moment the index is EMPTY: reporting `current` there would be the same
     // silent lie in a smaller place. What counts as still-owed is `encode::owed`, never
     // `vectors < documents` — the ONE definition lives with the kind (soma/ellmephant#77).
+    // Sudo is a table from v24 on: an older store reports none rather than failing the probe.
+    if report.schema >= 24 {
+        report.sudo_policies = conn.query_row("SELECT count(*) FROM sudoers", [], |r| r.get(0))?;
+        report.sudo_live = conn.query_row(
+            "SELECT count(*) FROM active_sudo WHERE expires_at > datetime('now')",
+            [],
+            |r| r.get(0),
+        )?;
+    }
     let verdict = encode::projection(&conn)?;
     report.projection = verdict.verdict(report.vectors, report.memories);
     Ok(stale)

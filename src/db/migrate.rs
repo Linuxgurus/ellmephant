@@ -110,6 +110,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0020_last_written_by.sql"),
         "authorship is write-once; `last_written_by` carries the writer that moves (#107)",
     ),
+    (
+        21,
+        include_str!("../../migrations/0021_pen_registry.sql"),
+        "the pen registry: identity as a row, with a parent and a tombstone, so `owner` can exist (#109)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

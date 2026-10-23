@@ -382,6 +382,55 @@ fn key_is_unique() {
 /// The opposite state: the STORE IS NEWER than this binary, which is what a rollback looks like.
 /// Refusing here would make a bad deploy unrecoverable, so it is allowed — but only deliberately.
 #[test]
+fn a_v20_store_gains_the_pen_registry_on_open() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).unwrap();
+
+    // Two rows whose authors are of different shapes: a self, and a finger acting for it.
+    insert(&conn, "said-by-stet", "Said by stet", "body");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'stet' WHERE key = 'said-by-stet'",
+        [],
+    )
+    .unwrap();
+    insert(&conn, "said-by-a-finger", "Said by a finger", "body");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'stet/finger-3' WHERE key = 'said-by-a-finger'",
+        [],
+    )
+    .unwrap();
+
+    // A store from before the registry: the table gone, the version rolled back.
+    conn.execute("DROP TABLE pen", []).unwrap();
+    conn.execute("PRAGMA user_version = 20", []).unwrap();
+    drop(conn);
+
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
+
+    // Every name that has ever spoken became a pen...
+    assert_eq!(count(&conn, "SELECT count(*) FROM pen WHERE name = 'stet'"), 1);
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM pen WHERE name = 'stet/finger-3'"),
+        1
+    );
+
+    // ...and a finger resolves through its parent, so it can never become an orphan string. The
+    // parent is a real row, not a prefix kept only in the child's name.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM pen child JOIN pen parent ON child.parent_id = parent.id
+             WHERE child.name = 'stet/finger-3' AND parent.name = 'stet'"
+        ),
+        1
+    );
+
+    // Nothing is tombstoned on the way in: the registry records history, it does not rewrite it.
+    assert_eq!(count(&conn, "SELECT count(*) FROM pen WHERE status <> 'live'"), 0);
+}
+
+#[test]
 fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
     let (_dir, paths) = temp_store();
     {

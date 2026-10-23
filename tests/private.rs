@@ -252,3 +252,93 @@ fn project_preload_omits_what_the_reader_cannot_see() -> Result<()> {
     assert_eq!(theirs[0].key, "open-note");
     Ok(())
 }
+
+// ── ANCESTOR READ (#109, round 5) ────────────────────────────────────────────────────────────────
+// Parentage is the grant: a pen reaches DOWN into its own subtree. This is the doctor's licence —
+// the reason the tree exists at all is that someone must be able to read what went wrong inside a
+// descendant without being its author. It is not a widening of the tier: a sibling still sees
+// nothing, and a pen with no tree still sees nothing.
+
+fn tree(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO pen (name, kind) VALUES ('estate', 'self');
+         INSERT OR IGNORE INTO pen (name, kind) VALUES ('cline', 'self');
+         UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'estate') WHERE name = 'james';
+         UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'james')  WHERE name = 'stet';
+         UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'james')  WHERE name = 'cline';",
+    )
+    .expect("pen tree");
+}
+
+fn all_q() -> Query {
+    Query {
+        text: None,
+        pattern: None,
+        mode: Default::default(),
+        k: 50,
+        max_distance: None,
+        expand: 0,
+        tags: Vec::new(),
+        min_chars: None,
+        max_chars: None,
+        created_after: None,
+        created_before: None,
+        updated_after: None,
+        updated_before: None,
+    }
+}
+
+#[test]
+fn an_ancestor_reads_a_descendants_private_row() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded(dir.path());
+    tree(&conn);
+
+    let parent = Reader::pen("james").in_tree(&conn);
+    assert_eq!(parent.down(), 2, "james reaches stet and cline");
+    assert!(parent.sees("pen:stet"), "the audience says yes");
+    let hits = keys(&search::run(&conn, None, &parent, &all_q())?);
+    assert!(hits.contains(&"stets-note".to_string()), "{hits:?}");
+
+    let sibling = Reader::pen("cline").in_tree(&conn);
+    assert!(!sibling.sees("pen:stet"), "a sibling is not an ancestor");
+    let hits = keys(&search::run(&conn, None, &sibling, &all_q())?);
+    assert!(!hits.contains(&"stets-note".to_string()), "{hits:?}");
+
+    let stranger = Reader::pen("estate-other").in_tree(&conn);
+    assert_eq!(stranger.down(), 0, "a pen with no row reaches nothing");
+    assert!(!stranger.sees("pen:stet"));
+    Ok(())
+}
+
+#[test]
+fn a_grandparent_reads_and_the_predicate_agrees_with_sees() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded(dir.path());
+    tree(&conn);
+
+    let root = Reader::pen("estate").in_tree(&conn);
+    assert_eq!(root.down(), 3, "estate reaches james, stet and cline");
+    assert!(root.sees("pen:stet"));
+
+    // ★ THE ROOT'S REACH IS TOTAL, and `visible_ids` says so the strong way: `None` means NOTHING IS
+    // HIDDEN — the fast path and the statement of universal reach at once. For a sibling the same
+    // call must hand back a set, because there is something it may not see.
+    assert!(
+        root.visible_ids(&conn)?.is_none(),
+        "estate is the ancestor of every pen, so it hides nothing"
+    );
+    let sibling = Reader::pen("cline").in_tree(&conn);
+    let hidden = sibling.visible_ids(&conn)?.expect("a sibling hides a row");
+    let id: i64 = conn.query_row("SELECT id FROM memory WHERE key = 'stets-note'", [], |r| {
+        r.get(0)
+    })?;
+    assert!(
+        !hidden.contains(&id),
+        "the SQL side refuses what `sees` refuses"
+    );
+
+    // A public row stays public for everyone, tree or no tree.
+    assert!(Reader::anonymous().sees("public"));
+    Ok(())
+}

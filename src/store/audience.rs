@@ -82,6 +82,12 @@ pub fn for_write(private: bool, who: Option<&str>) -> crate::error::Result<Strin
 pub struct Reader {
     /// The proven pen, already lowercased into an audience value. `None` is an anonymous reader.
     pen: Option<String>,
+    /// The addresses this pen reaches DOWN into — its descendants' audiences, resolved from the pen
+    /// tree at the moment of use. Parentage is the grant (#109): a pen may read what its subtree
+    /// addressed to itself, which is what makes cluster-wide hygiene possible for a doctor who is
+    /// not the author of anything. Empty for a pen with no descendants, and for a reader built
+    /// without a connection — the narrow answer, never the wide one by accident.
+    down: Vec<String>,
     /// Every row, private ones included. ONLY for a process that already holds the file — the CLI,
     /// maintenance, tests. A tier that claims to stop someone holding the SQLite file would be a lie
     /// (#54 says so out loud), and pretending the CLI is subject to it would only hide that.
@@ -93,8 +99,44 @@ impl Reader {
     pub fn pen(name: &str) -> Self {
         Reader {
             pen: Some(pen(name)),
+            down: Vec::new(),
             all: false,
         }
+    }
+
+    /// ★ Widen a pen reader to its SUBTREE, read from the pen table now — not at login, so a pen
+    /// that gained a child since the session opened reaches it, and a retired one stops. Any failure
+    /// leaves the reader narrow: a store whose tree cannot be read is a store where nobody's reach
+    /// may be guessed (`a hobbled Cline is better than no Cline`).
+    pub fn in_tree(mut self, conn: &rusqlite::Connection) -> Self {
+        let Some(p) = self.pen.clone() else {
+            return self;
+        };
+        let name = p.strip_prefix(PEN).unwrap_or(&p).to_string();
+        // `UNION`, not `UNION ALL`: a cycle in provisioning must not hang a read.
+        let sql = "WITH RECURSIVE sub(id) AS (
+                       SELECT id FROM pen WHERE lower(name) = lower(?1)
+                       UNION
+                       SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
+                   )
+                   SELECT DISTINCT 'pen:' || lower(p.name) FROM pen p JOIN sub s ON p.id = s.id";
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return self;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params![name], |r| r.get::<_, String>(0)) else {
+            return self;
+        };
+        for row in rows.flatten() {
+            if Some(&row) != self.pen.as_ref() {
+                self.down.push(row);
+            }
+        }
+        self
+    }
+
+    /// How many descendant addresses this reader reaches down into (0 for a leaf).
+    pub fn down(&self) -> usize {
+        self.down.len()
     }
 
     /// The proven pen's NAME, without the audience prefix — what a boot address is spelled from.
@@ -112,6 +154,7 @@ impl Reader {
     pub fn everything() -> Self {
         Reader {
             pen: None,
+            down: Vec::new(),
             all: true,
         }
     }
@@ -126,7 +169,10 @@ impl Reader {
     /// Written as an allow-list, not a deny-list: an audience value nobody understands is visible to
     /// nobody. The opposite choice would make a typo in a writer a silent publication.
     pub fn sees(&self, audience: &str) -> bool {
-        self.all || audience == PUBLIC || Some(audience) == self.pen.as_deref()
+        self.all
+            || audience == PUBLIC
+            || Some(audience) == self.pen.as_deref()
+            || self.down.iter().any(|a| a == audience)
     }
 
     /// The SQL predicate over `memory.audience`, and the parameters it binds.
@@ -139,10 +185,17 @@ impl Reader {
             return ("1 = 1".to_string(), Vec::new());
         }
         match &self.pen {
-            Some(p) => (
-                "(audience = 'public' OR audience = ?)".to_string(),
-                vec![p.clone()],
-            ),
+            Some(p) => {
+                let mut binds = vec![p.clone()];
+                binds.extend(self.down.iter().cloned());
+                let holes = std::iter::repeat_n("?", binds.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!("(audience = 'public' OR audience IN ({holes}))"),
+                    binds,
+                )
+            }
             None => ("audience = 'public'".to_string(), Vec::new()),
         }
     }
@@ -243,8 +296,15 @@ mod tests {
         let (sql, binds) = Reader::anonymous().sql();
         assert_eq!(sql, "audience = 'public'");
         assert!(binds.is_empty());
+        // A pen with no tree behind it binds exactly its own address — the narrow answer is what a
+        // reader built without a connection gets, and it must not widen by accident.
         let (sql, binds) = Reader::pen("stet").sql();
-        assert!(sql.contains("audience = ?"));
+        assert!(sql.contains("audience IN"), "{sql}");
         assert_eq!(binds, vec!["pen:stet".to_string()]);
+        assert_eq!(Reader::pen("stet").down(), 0);
+
+        // One bind per address: the predicate's holes and its binds are one list, built together, so
+        // they cannot drift into a `SQLITE_RANGE` at runtime.
+        assert_eq!(sql.matches('?').count(), binds.len());
     }
 }

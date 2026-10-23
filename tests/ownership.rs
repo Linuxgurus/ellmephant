@@ -849,3 +849,53 @@ fn english_stops_where_it_starts_approximating() {
     assert_eq!(store::relation::word_for_public("PPSCCC"), None);
     assert_eq!(store::relation::word_for_public("PS"), Some("uncle"));
 }
+
+#[test]
+fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
+    let (_dir, conn) = subtree();
+    deeper_tree(&conn);
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "hands-work", "stet/hand");
+
+    let seen = store::whois(&conn, "stet", "stet/hand").expect("whois");
+    assert_eq!(seen.name, "stet/hand");
+    assert_eq!(seen.kind, "self");
+    assert_eq!(seen.parent.as_deref(), Some("stet"));
+    assert_eq!(
+        seen.relation.as_deref(),
+        Some("C \"child\""),
+        "what it is to me"
+    );
+    assert_eq!(seen.owns, 1, "the rows it answers for");
+    assert!(seen.ceased.is_none());
+
+    // The relation is from the ASKER's seat: the same pen is a CHILD to its parent and a NEPHEW to
+    // a sibling of that parent.
+    let from_cline = store::whois(&conn, "cline", "stet/hand").expect("whois");
+    assert_eq!(from_cline.relation.as_deref(), Some("SC \"nephew\""));
+    let from_self = store::whois(&conn, "stet/hand", "stet/hand").expect("whois");
+    assert_eq!(from_self.relation.as_deref(), Some("ME"));
+
+    // A pen from another estate is reachable by name and related to nobody here.
+    let island = store::whois(&conn, "stet", "island").expect("whois");
+    assert_eq!(
+        island.relation, None,
+        "no common root is an answer, not an error"
+    );
+
+    // And a retired pen still answers, with its tombstone.
+    store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        store::Rows::Disclaim,
+        store::History::Memorialize,
+    )
+    .expect("retire");
+    let gone = store::whois(&conn, "stet", "stet/hand").expect("whois");
+    assert!(gone.ceased.is_some(), "history outlives the thing");
+
+    // A name nobody minted is a refusal that says so.
+    let err = store::whois(&conn, "stet", "nobody-at-all").unwrap_err();
+    assert!(format!("{err}").contains("no pen named"), "{err}");
+}

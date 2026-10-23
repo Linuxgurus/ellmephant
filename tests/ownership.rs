@@ -68,6 +68,20 @@ fn a_finger_never_owns_its_parent_does() {
         Some("stet"),
         "the finger typed it; its parent is answerable"
     );
+    // ★ THIS IS THE ONLY WRITE WHERE THE TWO COLUMNS MOVE INDEPENDENTLY, so the split is only
+    // exercised if they DISAGREE here (Stet, review): `asserted_by` names the pen that did it,
+    // `owner` the pen that answers for it. If they came out equal, nothing was being tested.
+    let mem = store::get(&conn, "by-a-finger").unwrap().unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("stet/finger-3"),
+        "who did it"
+    );
+    assert_eq!(mem.owner.as_deref(), Some("stet"), "who answers for it");
+    assert_ne!(
+        mem.asserted_by, mem.owner,
+        "the split, exercised rather than assumed"
+    );
 }
 
 #[test]
@@ -440,4 +454,116 @@ fn a_synthetic_snapshot_is_marked_and_excludable() {
         0,
         "the migration's snapshot must not answer a query for observed edits"
     );
+}
+
+// ── WRITE REACH ───────────────────────────────────────────────────────────────────────────────────
+// Ownership is a rule only if the write path asks. These four tests are the rule: a peer is refused,
+// an ancestor is allowed, the commons belongs to everyone, and a finger acts for its parent.
+
+fn subtree() -> (tempfile::TempDir, rusqlite::Connection) {
+    let (dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    seed_pen(&conn, "estate", None);
+    seed_pen(&conn, "james", Some("estate"));
+    seed_pen(&conn, "stet", Some("james"));
+    seed_pen(&conn, "cline", Some("james"));
+    (dir, conn)
+}
+
+fn rewrite(
+    conn: &rusqlite::Connection,
+    embedder: &HashEmbedder,
+    key: &str,
+    author: &str,
+) -> String {
+    let mem = Memory {
+        key: key.to_string(),
+        title: format!("rewritten by {author}"),
+        body: "something else".to_string(),
+        asserted_by: Some(author.to_string()),
+        ..Default::default()
+    };
+    match common::add_now(conn, embedder, &mem) {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+#[test]
+fn a_peer_may_not_rewrite_another_pens_row() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    let err = rewrite(&conn, &embedder, "stets-note", "cline");
+    assert!(
+        err.contains("may not write") && err.contains("stet"),
+        "a sibling is refused by name: {err}"
+    );
+    let mem = store::get(&conn, "stets-note").unwrap().unwrap();
+    assert_eq!(
+        mem.title, "written by stet",
+        "the refused write changed nothing"
+    );
+    assert_eq!(mem.owner.as_deref(), Some("stet"));
+}
+
+#[test]
+fn an_ancestor_may_rewrite_a_descendants_row_without_taking_it() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    let err = rewrite(&conn, &embedder, "stets-note", "james");
+    assert!(err.is_empty(), "an ancestor reaches down: {err}");
+
+    let mem = store::get(&conn, "stets-note").unwrap().unwrap();
+    assert_eq!(mem.title, "rewritten by james");
+    assert_eq!(
+        mem.owner.as_deref(),
+        Some("stet"),
+        "editing is not adopting: responsibility stays where it was taken on"
+    );
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("james"),
+        "and the edit is named"
+    );
+}
+
+#[test]
+fn the_commons_belongs_to_every_pen() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "everyones", "stet");
+    store::disclaim(&conn, "everyones", "stet", false).expect("disclaim");
+
+    let err = rewrite(&conn, &embedder, "everyone", "cline");
+    assert!(
+        err.contains("no such memory") || err.is_empty(),
+        "a new key is anyone's: {err}"
+    );
+    let err = rewrite(&conn, &embedder, "everyones", "cline");
+    assert!(
+        err.is_empty(),
+        "nobody owns the commons, so anyone may write it: {err}"
+    );
+    assert_eq!(
+        owner(&conn, "everyones"),
+        None,
+        "and nobody becomes answerable by writing"
+    );
+}
+
+#[test]
+fn a_finger_writes_on_its_parents_rows() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    seed_pen(&conn, "stet/finger-7", Some("stet"));
+    row(&conn, &embedder, "shared-work", "stet");
+
+    // The parent's rows; the finger is of the parent, so it reaches them — and still owns nothing.
+    let err = rewrite(&conn, &embedder, "shared-work", "stet/finger-7");
+    assert!(err.is_empty(), "a finger acts as its parent: {err}");
+    assert_eq!(owner(&conn, "shared-work").as_deref(), Some("stet"));
 }

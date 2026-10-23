@@ -1184,9 +1184,30 @@ async fn the_two_doors_are_one_core() {
     if let Some(obj) = mcp_rest.as_object_mut() {
         obj.remove("visits");
     }
+
+    // ★ ONE FIELD IS ABOUT THE ASKER, NOT THE ROW (2026-10-23). `owner_relation` is the walk from the
+    // reader's proven pen to the row's owner, and in THIS test the two doors are different pens: the
+    // MCP peer declares `tester`, the HTTP call proves nobody. So it is asserted separately — present
+    // and `ME` where the pen asks about its own row, absent where nobody asked as anyone — and then
+    // dropped, because "the same core answers the same" is a claim about the ROW and it still holds.
+    assert_eq!(
+        mcp_rest.get("owner_relation").and_then(|v| v.as_str()),
+        Some("ME"),
+        "the door that proved a pen gets the walk: {mcp_body}"
+    );
+    assert!(
+        http_rest.get("owner_relation").is_none(),
+        "a door with no proven pen gets no walk, not a guess: {http_body}"
+    );
+    if let Some(obj) = http_rest.as_object_mut() {
+        obj.remove("owner_relation");
+    }
+    if let Some(obj) = mcp_rest.as_object_mut() {
+        obj.remove("owner_relation");
+    }
     assert_eq!(
         http_rest, mcp_rest,
-        "every field but the counter must match"
+        "every field but the counter and the reader-relative walk must match"
     );
 }
 

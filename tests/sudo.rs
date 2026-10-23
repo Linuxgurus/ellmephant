@@ -232,3 +232,42 @@ fn borrowing_again_replaces_the_session_instead_of_stacking_one() {
         long.id
     );
 }
+
+#[test]
+fn a_session_records_why_it_exists() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // A LEND: a pen spending its own authority downward. No policy row exists for the pair.
+    let lent = sudo::lend(&conn, "stet", "stet/hand", 60).expect("lend");
+    assert_eq!(lent.source, "lend");
+    let policies: i64 = conn
+        .query_row("SELECT count(*) FROM sudoers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(policies, 0, "a lend needs no policy, and writes none");
+
+    // A BORROW: someone else's authority, under a policy.
+    sudo::grant(&conn, "estate", "stet", 600, "test").unwrap();
+    let borrowed = sudo::sudo(&conn, "stet", "estate", 60).expect("sudo");
+    assert_eq!(borrowed.source, "policy");
+
+    // A PASSED session carries the authority it was passed from, however far down it travels.
+    let passed = sudo::pass(&conn, "stet", "estate", "stet/hand", 30).expect("pass");
+    assert_eq!(passed.source, "policy", "a borrow stays a borrow");
+    sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 30).expect("lend");
+    let lent = sudo::live(&conn, "stet/hand/finger-1", "stet/hand")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lent.source, "lend");
+
+    // And the question the column exists to answer, without a join that can lose its subject:
+    let kinds: Vec<String> = conn
+        .prepare("SELECT DISTINCT source FROM active_sudo ORDER BY source")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(kinds, vec!["lend".to_string(), "policy".to_string()]);
+}

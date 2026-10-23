@@ -37,6 +37,8 @@ pub struct Session {
     pub expires_at: String,
     /// The session it was passed from, if it was.
     pub via: Option<i64>,
+    /// `policy` (borrowed under a `sudoers` row) or `lend` (a pen lending its own authority down).
+    pub source: String,
 }
 
 /// The largest duration any single session may be granted, in seconds (24 h).
@@ -134,7 +136,8 @@ pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<
         )));
     }
     conn.execute(
-        "INSERT INTO active_sudo (powerful, weak, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
+        "INSERT INTO active_sudo (powerful, weak, expires_at, source)
+         VALUES (?1, ?2, datetime('now', ?3), 'lend')",
         params![p, w, format!("+{secs} seconds")],
     )?;
     let id = conn.last_insert_rowid();
@@ -149,6 +152,7 @@ pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<
         weak: weak.to_string(),
         expires_at,
         via: None,
+        source: "lend".to_string(),
     })
 }
 
@@ -201,8 +205,8 @@ pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<
         params![w, p],
     )?;
     tx.execute(
-        "INSERT INTO active_sudo (powerful, weak, expires_at)
-         VALUES (?1, ?2, datetime('now', ?3))",
+        "INSERT INTO active_sudo (powerful, weak, expires_at, source)
+         VALUES (?1, ?2, datetime('now', ?3), 'policy')",
         params![p, w, format!("+{secs} seconds")],
     )?;
     let id = tx.last_insert_rowid();
@@ -218,6 +222,7 @@ pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<
         weak: weak.to_string(),
         expires_at,
         via: None,
+        source: "policy".to_string(),
     })
 }
 
@@ -251,9 +256,15 @@ pub fn pass(conn: &Connection, weak: &str, powerful: &str, to: &str, secs: i64) 
         )));
     }
     conn.execute(
-        "INSERT INTO active_sudo (powerful, weak, expires_at, via)
-         VALUES ((SELECT id FROM pen WHERE name = ?1), ?2, datetime('now', ?3), ?4)",
-        params![powerful, to_id, format!("+{secs} seconds"), parent.id],
+        "INSERT INTO active_sudo (powerful, weak, expires_at, via, source)
+         VALUES ((SELECT id FROM pen WHERE name = ?1), ?2, datetime('now', ?3), ?4, ?5)",
+        params![
+            powerful,
+            to_id,
+            format!("+{secs} seconds"),
+            parent.id,
+            parent.source
+        ],
     )?;
     let id = conn.last_insert_rowid();
     let expires_at: String = conn.query_row(
@@ -267,6 +278,9 @@ pub fn pass(conn: &Connection, weak: &str, powerful: &str, to: &str, secs: i64) 
         weak: to.to_string(),
         expires_at,
         via: Some(parent.id),
+        // A passed session carries the authority it was passed from: a lend stays a lend, a borrow
+        // stays a borrow, however far down the chain it travels.
+        source: parent.source,
     })
 }
 
@@ -301,7 +315,7 @@ pub fn live(conn: &Connection, weak: &str, powerful: &str) -> Result<Option<Sess
     };
     Ok(conn
         .query_row(
-            "SELECT id, expires_at, via FROM active_sudo
+            "SELECT id, expires_at, via, source FROM active_sudo
               WHERE weak = ?1 AND powerful = ?2 AND expires_at > datetime('now')
               ORDER BY id DESC LIMIT 1",
             params![w, p],
@@ -312,6 +326,7 @@ pub fn live(conn: &Connection, weak: &str, powerful: &str) -> Result<Option<Sess
                     weak: weak.to_string(),
                     expires_at: r.get(1)?,
                     via: r.get(2)?,
+                    source: r.get(3)?,
                 })
             },
         )
@@ -359,7 +374,7 @@ pub fn held(conn: &Connection, weak: &str) -> Result<Vec<Session>> {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare(
-        "SELECT s.id, p.name, s.expires_at, s.via
+        "SELECT s.id, p.name, s.expires_at, s.via, s.source
            FROM active_sudo s JOIN pen p ON p.id = s.powerful
           WHERE s.weak = ?1 AND s.expires_at > datetime('now')
           ORDER BY s.id DESC",
@@ -371,6 +386,7 @@ pub fn held(conn: &Connection, weak: &str) -> Result<Vec<Session>> {
             weak: weak.to_string(),
             expires_at: r.get(2)?,
             via: r.get(3)?,
+            source: r.get(4)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()

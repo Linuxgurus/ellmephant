@@ -186,12 +186,27 @@ pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<
             "{weak} may borrow {powerful} for at most {ceiling}s (asked for {secs})"
         )));
     }
-    conn.execute(
+    // ★ BORROWING REPLACES TOO (Stet's catch on #126, applied to the other verb). A second `sudo`
+    // for the same pair is not a renewal on top of the old row: two live rows would mean the later
+    // deadline wins by accident, and a SHORTENED borrow would come back when the short one lapsed.
+    // So: end the pair's live sessions (cascading through `via`), then begin the new one.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE weak = ?1 AND powerful = ?2
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![w, p],
+    )?;
+    tx.execute(
         "INSERT INTO active_sudo (powerful, weak, expires_at)
          VALUES (?1, ?2, datetime('now', ?3))",
         params![p, w, format!("+{secs} seconds")],
     )?;
-    let id = conn.last_insert_rowid();
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
     let expires_at: String = conn.query_row(
         "SELECT expires_at FROM active_sudo WHERE id = ?1",
         params![id],

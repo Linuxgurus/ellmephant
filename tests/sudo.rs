@@ -203,3 +203,32 @@ fn a_boot_spec_applies_what_it_can_and_names_what_it_cannot() {
     // The loading is a policy write; borrowing still needs the verb.
     sudo::sudo(&conn, "james", "estate", 3600).expect("the good entries landed");
 }
+
+#[test]
+fn borrowing_again_replaces_the_session_instead_of_stacking_one() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::grant(&conn, "estate", "stet", 3600, "test").unwrap();
+
+    let long = sudo::sudo(&conn, "stet", "estate", 600).unwrap();
+    let short = sudo::sudo(&conn, "stet", "estate", 30).unwrap();
+    assert_eq!(
+        sudo::live(&conn, "stet", "estate").unwrap().unwrap().id,
+        short.id,
+        "the newest borrow governs"
+    );
+
+    // The hazard is the same one `lend` had: if the long row survived, shortening a borrow would
+    // silently restore the longer grant when the short one lapsed.
+    conn.execute(
+        "UPDATE active_sudo SET expires_at = datetime('now', '-1 second') WHERE id = ?1",
+        rusqlite::params![short.id],
+    )
+    .unwrap();
+    assert!(
+        sudo::live(&conn, "stet", "estate").unwrap().is_none(),
+        "a shortened borrow must not come back when it lapses (the 600s row was {})",
+        long.id
+    );
+}

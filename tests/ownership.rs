@@ -150,6 +150,7 @@ fn inherit_moves_the_rows_to_the_parent() {
     store::retire(
         &conn,
         "hand-of-stet",
+        "stet",
         store::Rows::Inherit,
         store::History::Memorialize,
     )
@@ -192,6 +193,7 @@ fn disclaim_on_retirement_publishes_private_rows() {
     store::retire(
         &conn,
         "hand-of-stet",
+        "stet",
         store::Rows::Disclaim,
         store::History::Memorialize,
     )
@@ -221,6 +223,7 @@ fn delete_on_retirement_removes_the_rows_and_can_purge_the_record() {
     store::retire(
         &conn,
         "hand-of-stet",
+        "stet",
         store::Rows::Delete,
         store::History::Purge,
     )
@@ -248,10 +251,12 @@ fn inherit_without_a_parent_is_refused() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();
     seed_pen(&conn, "lonely", None);
+    seed_pen(&conn, "bootstrap", None);
 
     let err = store::retire(
         &conn,
         "lonely",
+        "bootstrap",
         store::Rows::Inherit,
         store::History::Memorialize,
     )
@@ -272,6 +277,7 @@ fn a_pen_cannot_be_retired_twice() {
     store::retire(
         &conn,
         "hand-of-stet",
+        "stet",
         store::Rows::Disclaim,
         store::History::Memorialize,
     )
@@ -279,6 +285,7 @@ fn a_pen_cannot_be_retired_twice() {
     let err = store::retire(
         &conn,
         "hand-of-stet",
+        "stet",
         store::Rows::Disclaim,
         store::History::Memorialize,
     )

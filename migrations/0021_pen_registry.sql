@@ -33,6 +33,10 @@ SELECT name FROM (
     SELECT DISTINCT asserted_by AS name FROM mail WHERE asserted_by <> ''
 );
 
+-- The root custodian exists even if it has never spoken: a ROOT pen has no parent to retire it, so
+-- somebody must be able to (#109). This is the only pen the registry creates that may not own a row.
+INSERT OR IGNORE INTO pen (name) VALUES ('bootstrap');
+
 -- A finger writes as "<parent>/finger-<n>". The parent is a real pen; make it one, so the finger
 -- always resolves through something that outlives it.
 INSERT OR IGNORE INTO pen (name)

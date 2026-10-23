@@ -595,6 +595,20 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     Ok(id)
 }
 
+/// The pen that may retire a ROOT pen — a root has no parent to do it, and a pen that goes bad at
+/// 03:00 has to be stoppable by someone (#109).
+pub const ROOT_CUSTODIAN: &str = "bootstrap";
+
+/// The exact row for a name — no parent resolution. Ownership rules need both this and
+/// [`owner_pen_id`]: a finger acts as itself but owns as its parent.
+fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("SELECT id FROM pen WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
 /// The `pen` row that a name OWNS as: itself, or its parent when the name is a finger
 /// (`stet/finger-3` → `stet`). A finger is a mechanism by which one self does more work; it is not
 /// a party to ownership (#109).
@@ -695,6 +709,21 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
 /// Take responsibility for a row. `owner` moves to the adopting pen; a finger's parent is what
 /// actually owns, so adopting as `stet/finger-3` is adopting as `stet` (#109).
 pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
+    // You may not adopt what you cannot read: adopting somebody else's private row would be a way
+    // to take it by noticing it exists (#109, authorization).
+    let audience: Option<String> = conn
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let audience = audience.ok_or_else(|| Error::NotFound(key.to_string()))?;
+    if audience != audience::PUBLIC && audience != format!("pen:{pen}") {
+        return Err(Error::Invalid(format!(
+            "{key} is private to {audience}; a pen cannot adopt a row it cannot read"
+        )));
+    }
     let to = owner_pen_id(conn, Some(pen))?.ok_or_else(|| {
         Error::Invalid(format!(
             "no pen named {pen}; the pen registry has no such row"
@@ -721,7 +750,33 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
 /// Release a row: nobody is answerable for it any more. By the commons rule (#109) an ownerless row
 /// also loses `protected` and `private` — a disclaim is therefore a PUBLICATION, and is recorded.
 pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
-    let who = owner_pen_id(conn, Some(pen))?;
+    let who =
+        exact_pen_id(conn, pen)?.ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
+    // The owner may release its own row; its parent may release it for them. Nobody else.
+    let owner_id: Option<i64> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let owner_parent: Option<i64> = match owner_id {
+        Some(id) => conn
+            .query_row(
+                "SELECT parent_id FROM pen WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten(),
+        None => None,
+    };
+    if owner_id != Some(who) && owner_parent != Some(who) {
+        return Err(Error::Invalid(format!(
+            "{pen} may not disclaim {key}: only its owner or that owner's parent may"
+        )));
+    }
     let from: Option<i64> = conn
         .query_row(
             "SELECT owner FROM memory WHERE key = ?1",
@@ -750,7 +805,7 @@ pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
         conn,
         key,
         "disclaim",
-        who,
+        Some(who),
         from,
         None,
         Some(if was_private {
@@ -863,11 +918,31 @@ pub fn retire_preview(conn: &Connection, pen: &str) -> Result<RetirePreview> {
 ///
 /// Not wrapped in one transaction: `delete` opens its own. A failure part-way leaves the pen live and
 /// the ledger holding the events that did happen, which is the recoverable direction.
-pub fn retire(conn: &Connection, pen: &str, rows: Rows, history: History) -> Result<RetirePreview> {
+pub fn retire(
+    conn: &Connection,
+    pen: &str,
+    caller: &str,
+    rows: Rows,
+    history: History,
+) -> Result<RetirePreview> {
     let preview = retire_preview(conn, pen)?;
+    let caller_id = exact_pen_id(conn, caller)?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {caller}")))?;
     let (id, parent_id, ceased_at) = pen_row(conn, pen)?;
     if ceased_at.is_some() {
         return Err(Error::Invalid(format!("{pen} is already retired")));
+    }
+    // Authorization: a parent retires its child. A ROOT has no parent, so the root custodian may —
+    // a pen that goes bad at 03:00 must be stoppable by somebody (#109).
+    let permitted = match parent_id {
+        Some(pid) => caller_id == pid,
+        None => caller == ROOT_CUSTODIAN,
+    };
+    if !permitted {
+        return Err(Error::Invalid(match parent_id {
+            Some(_) => format!("{caller} may not retire {pen}: only its parent may"),
+            None => format!("{caller} may not retire root pen {pen}: only {ROOT_CUSTODIAN} may"),
+        }));
     }
     let parent = match (rows, parent_id) {
         (Rows::Inherit, None) => {

@@ -595,9 +595,10 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     Ok(id)
 }
 
-/// The pen that may retire a ROOT pen — a root has no parent to do it, and a pen that goes bad at
-/// 03:00 has to be stoppable by someone (#109).
-pub const ROOT_CUSTODIAN: &str = "bootstrap";
+/// The root pen: the estate itself, which is where terraform stands (a provisioning act carries the
+/// root's authority, not a human's). A root has no parent to retire it, so the root is its own
+/// custodian — a pen that goes bad at 03:00 has to be stoppable by somebody (#109).
+pub const ROOT_CUSTODIAN: &str = "estate";
 
 /// The exact row for a name — no parent resolution. Ownership rules need both this and
 /// [`owner_pen_id`]: a finger acts as itself but owns as its parent.

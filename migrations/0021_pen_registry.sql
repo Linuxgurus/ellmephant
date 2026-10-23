@@ -38,9 +38,11 @@ SELECT name FROM (
     SELECT DISTINCT asserted_by AS name FROM mail WHERE asserted_by <> ''
 );
 
--- The root custodian exists even if it has never spoken: a ROOT pen has no parent to retire it, so
--- somebody must be able to (#109). This is the only pen the registry creates that may not own a row.
-INSERT OR IGNORE INTO pen (name) VALUES ('bootstrap');
+-- The root pen is `estate` — the estate itself, which is where terraform metaphorically stands: a
+-- provisioning act carries the root's authority, not a human's. A ROOT pen has no parent to retire
+-- it, so the root is its own custodian, and it is the one pen the registry creates that may not own
+-- a row (James, 2026-10-23: "terraform's metaphorical place is estate" / "maybe rename bootstrap").
+INSERT OR IGNORE INTO pen (name) VALUES ('estate');
 
 -- SEED NAMES FROM HISTORY; NEVER SEED THE TREE FROM IT (Stet, review round 3). History knows that a
 -- name existed and what it did; it cannot know a pen's STANDING — its kind, or who its parent is.

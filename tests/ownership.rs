@@ -254,12 +254,12 @@ fn inherit_without_a_parent_is_refused() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();
     seed_pen(&conn, "lonely", None);
-    seed_pen(&conn, "bootstrap", None);
+    seed_pen(&conn, "estate", None);
 
     let err = store::retire(
         &conn,
         "lonely",
-        "bootstrap",
+        "estate",
         store::Rows::Inherit,
         store::History::Memorialize,
     )

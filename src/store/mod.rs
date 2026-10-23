@@ -201,6 +201,42 @@ fn check_body(body: &str) -> Result<()> {
 /// create it is the code holding a vector ([`crate::store::encode::settle_encoded`], via
 /// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
 /// config said rather than what the encoder actually emits.
+/// May `caller` write the row at `key`? Parentage is the grant: the owner, the pen that owns on the
+/// owner's behalf (a finger acts for its parent), or any ancestor of the owner. A row with no owner
+/// is the commons, and the commons belongs to nobody — so every pen may write it (#109).
+fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
+    let owner: Option<i64> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(owner_id) = owner else { return Ok(()) };
+    let Some(caller) = caller else {
+        return Err(Error::Invalid(format!(
+            "{key} has an owner; a write must name the pen doing it"
+        )));
+    };
+    let caller_exact = exact_pen_id(conn, caller)?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {caller}")))?;
+    if caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id) {
+        return Ok(());
+    }
+    if is_ancestor(conn, caller_exact, owner_id)? {
+        return Ok(());
+    }
+    let owner_name: String = conn.query_row(
+        "SELECT name FROM pen WHERE id = ?1",
+        params![owner_id],
+        |r| r.get(0),
+    )?;
+    Err(Error::Invalid(format!(
+        "{caller} may not write {key}: it is owned by {owner_name}, and only that pen or one of its ancestors may"
+    )))
+}
+
 fn add_impl(
     conn: &Connection,
     mem: &Memory,
@@ -225,6 +261,9 @@ fn add_impl(
             return Ok((0, prepared.key, false, Some(current)));
         }
     }
+    // ★ THE WRITE PATH CONSULTS OWNERSHIP (soma/ellmephant#109). Until now `owner` existed and
+    // nothing asked it anything, so "descendants may write" was a sentence rather than a rule.
+    may_write(&tx, &prepared.key, mem.asserted_by.as_deref())?;
     let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
     Ok((id, prepared.key, queued, None))

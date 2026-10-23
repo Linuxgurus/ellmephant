@@ -213,6 +213,11 @@ impl Session {
         }
     }
 
+    /// One pen as `viewer` sees it — the tree through this session's connection.
+    pub fn whois(&self, viewer: &str, pen: &str) -> Result<store::Whois> {
+        store::whois(&self.conn, viewer, pen)
+    }
+
     /// What this row's owner is TO THE READER, in the settled letters (`PS "uncle"`, `ME`, …).
     ///
     /// ★ A NAME IS AN ADDRESS, and this is the rest of the sentence: `owner` says who answers for a

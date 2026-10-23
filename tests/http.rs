@@ -2044,3 +2044,64 @@ async fn memory_get_names_the_owner_and_what_they_are_to_you() {
         "an anonymous reader has no walk: {body}"
     );
 }
+
+/// `whois` — the tree is configuration, not content, so an unproven reader may ask WHO a pen is;
+/// what it does not get is a walk, because it has not proved to be anybody.
+#[tokio::test]
+async fn whois_answers_on_both_doors() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A write registers the pen (`ensure_pen`), so the peer's own pen exists to be looked up.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "mine", "title": "Mine", "body": "the facts" }),
+    )
+    .await;
+
+    let got = tool(service.peer(), "whois", json!({ "pen": "tester" })).await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["name"], json!("tester"), "{got}");
+    assert_eq!(doc["kind"], json!("self"), "{got}");
+    assert_eq!(doc["owns"], json!(1), "{got}");
+    assert_eq!(doc["relation"], json!("ME"), "{got}");
+    assert!(
+        doc["ceased"].is_null(),
+        "a live pen has no tombstone: {got}"
+    );
+
+    // The same pen over HTTP, asked by nobody: same facts, and no walk.
+    let (status, body, _) = get(&app, "/whois/tester?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let over_http: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(over_http["owns"], json!(1), "{body}");
+    assert!(
+        over_http["relation"].is_null(),
+        "an unproven reader gets no walk: {body}"
+    );
+
+    // A name nobody minted is refused, not invented.
+    let (status, _, _) = get(&app, "/whois/nobody-at-all").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown pen is a refusal"
+    );
+}

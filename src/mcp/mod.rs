@@ -42,6 +42,7 @@ use crate::store::{self, project};
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
     "whoami",
+    "whois",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -514,6 +515,15 @@ pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
     pub key: String,
+}
+
+/// `whois` — the pen to look up.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WhoisParams {
+    /// The pen to look up.
+    #[schemars(description = "Pen name. Slug. `whoami` reports your own.")]
+    pub pen: String,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1529,6 +1539,37 @@ impl MemoryServer {
             }),
         };
         Ok(json_ok(body))
+    }
+
+    /// WHO a pen is, and what it is to THIS connection — the question a name alone cannot answer.
+    #[tool(
+        name = "whois",
+        description = "Look up one pen and its relationship to the pen asking. Returns `name`, `kind` (`self`/`finger`), `parent`, `created`, `ceased` (the tombstone of a retired pen), `owns` (how many rows it answers for) and `relation` — a walk in single letters from YOU to it: `ME` for yourself, `P` parent, `PP` grandparent, `C` child, `S` sibling, `PS` uncle, `SC` nephew, `PSC` cousin, with an English word in quotes only where English is exact. `relation: null` means no common root. A name is an address, never a permission; this is what the address is attached to.",
+        annotations(
+            title = "Who is this pen",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn whois(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<WhoisParams>,
+    ) -> std::result::Result<String, String> {
+        // An unproven reader may still ask WHO a pen is — the tree is configuration, not content —
+        // it simply gets no walk, because it has not proved to be anybody.
+        let viewer = pen_name(&ctx, self.declared.as_deref())
+            .unwrap_or_else(|_| crate::identity::ANONYMOUS.to_string());
+        let pen = p.pen;
+        let lookup = pen.clone();
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        let facts = self
+            .with_read("whois", reader, move |s| s.whois(&viewer, &lookup))
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&facts).map_err(|e| e.to_string())?,
+        ))
     }
 
     /// Store one atomic memory; upserts by key. See the description for the write law.
@@ -2816,6 +2857,7 @@ pub fn http_router(
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
         .route("/whoami", axum::routing::get(surface::whoami))
+        .route("/whois/{pen}", axum::routing::get(surface::whois))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

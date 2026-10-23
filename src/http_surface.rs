@@ -48,6 +48,11 @@ pub const ROUTES: &[Route] = &[
         tool: "whoami",
     },
     Route {
+        method: "GET",
+        path: "/whois/{pen}",
+        tool: "whois",
+    },
+    Route {
         method: "POST",
         path: "/memory",
         tool: "memory_upsert",
@@ -604,6 +609,56 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| format!("bad json body: {e}"))
+}
+
+/// `GET /whois/{pen}` — one pen and what it is to this request's pen (`whois`).
+pub async fn whois(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(pen): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let viewer = crate::identity::resolve(&headers)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::identity::ANONYMOUS.to_string());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("whois", reader_from(&headers), move |s| {
+            s.whois(&viewer, &pen)
+        })
+        .await
+    {
+        Ok(facts) => {
+            let value = serde_json::to_value(&facts).unwrap_or(serde_json::Value::Null);
+            let text = format!(
+                "{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{} row(s)\n  {:<10}{}\n",
+                facts.name,
+                "kind",
+                facts.kind,
+                "parent",
+                facts.parent.as_deref().unwrap_or("(root)"),
+                "created",
+                facts.created,
+                "state",
+                facts
+                    .ceased
+                    .as_deref()
+                    .map(|c| format!("retired {c}"))
+                    .unwrap_or_else(|| "live".to_string()),
+                "owns",
+                facts.owns,
+                "relation",
+                facts.relation.as_deref().unwrap_or("(no common root)"),
+            );
+            render(StatusCode::OK, json, value.to_string(), text)
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
 }
 
 /// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.

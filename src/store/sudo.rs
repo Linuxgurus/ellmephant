@@ -107,6 +107,14 @@ pub fn revoke(conn: &Connection, powerful: &str, weak: &str) -> Result<usize> {
 /// already have, and parentage already grants that. Requiring a policy row to lend downward would
 /// mean every minted finger needs a configuration entry — configuration written by code.
 ///
+/// ★ **TWO DIRECTIONS, TWO KINDS OF RISK** (James agreeing with Stet, 2026-10-23). Lending DOWN is a
+/// self extending itself into a mechanism: the finger acts with the hand's authority by construction,
+/// so the exposure is STRUCTURAL and a session bounds TIME, not trust — there is no third party to
+/// check a hand on its own work. Borrowing ACROSS or UP ([`sudo`]) is the other side: a pen reaching
+/// for authority it does not have, checked by policy and by someone else's interest. A session
+/// narrows both, and "solved" is the wrong word for either — but only on the borrowing side is the
+/// bound also a CHECK.
+///
 /// What lending keeps is the part that matters: it EXPIRES, it can be REVOKED by deleting one row,
 /// and `via` lets a lend's children die with it.
 ///

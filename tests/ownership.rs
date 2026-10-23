@@ -101,7 +101,7 @@ fn anyone_may_adopt_a_commons_row_and_the_ledger_remembers() {
     row(&conn, &embedder, "adopted", "stet");
 
     store::disclaim(&conn, "adopted", "stet").expect("disclaim");
-    store::adopt(&conn, "adopted", "cline").expect("adopt");
+    store::adopt(&conn, "adopted", "cline", false).expect("adopt");
 
     assert_eq!(owner(&conn, "adopted").as_deref(), Some("cline"));
     let events = store::pen_events(&conn, "adopted").unwrap();
@@ -123,7 +123,7 @@ fn a_finger_adopting_adopts_as_its_parent() {
     row(&conn, &embedder, "adopted-by-finger", "stet");
     store::disclaim(&conn, "adopted-by-finger", "stet").unwrap();
 
-    store::adopt(&conn, "adopted-by-finger", "stet/finger-4").expect("adopt");
+    store::adopt(&conn, "adopted-by-finger", "stet/finger-4", false).expect("adopt");
     assert_eq!(owner(&conn, "adopted-by-finger").as_deref(), Some("stet"));
 }
 
@@ -291,4 +291,43 @@ fn a_pen_cannot_be_retired_twice() {
     )
     .expect_err("already retired");
     assert!(format!("{err}").contains("already retired"));
+}
+
+#[test]
+fn an_ancestor_may_disclaim_across_generations() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let embedder = HashEmbedder::new(DIM);
+    seed_pen(&conn, "stet", None);
+    seed_pen(&conn, "stet/mid", Some("stet"));
+    seed_pen(&conn, "stet/mid/leaf", Some("stet/mid"));
+    row(&conn, &embedder, "deep-work", "stet/mid/leaf");
+
+    // Grandparent, skipping a generation: allowed, and it is the same release.
+    store::disclaim(&conn, "deep-work", "stet")
+        .expect("an ancestor may disclaim a descendant's row");
+    assert_eq!(owner(&conn, "deep-work"), None);
+}
+
+#[test]
+fn a_sibling_may_not_adopt_an_owned_row_and_an_ancestor_must_force_it() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let embedder = HashEmbedder::new(DIM);
+    seed_pen(&conn, "stet", None);
+    seed_pen(&conn, "hand-a", Some("stet"));
+    seed_pen(&conn, "hand-b", Some("stet"));
+    row(&conn, &embedder, "a-work", "hand-a");
+
+    // A sibling is not an ancestor: refused before force is even considered.
+    let err =
+        store::adopt(&conn, "a-work", "hand-b", true).expect_err("siblings may not take rows");
+    assert!(format!("{err}").contains("ancestor"));
+
+    // The parent may, but only deliberately.
+    let err = store::adopt(&conn, "a-work", "stet", false).expect_err("an owned row needs force");
+    assert!(format!("{err}").contains("force=true"));
+
+    store::adopt(&conn, "a-work", "stet", true).expect("an ancestor may force-take it");
+    assert_eq!(owner(&conn, "a-work").as_deref(), Some("stet"));
 }

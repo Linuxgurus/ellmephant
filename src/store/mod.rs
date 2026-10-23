@@ -609,6 +609,28 @@ fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// Is `ancestor` anywhere above `of` in the tree? Walks the parent chain, bounded: a cycle is a bug,
+/// not a shape, and it must not hang a request.
+fn is_ancestor(conn: &Connection, ancestor: i64, of: i64) -> Result<bool> {
+    let mut cur = of;
+    for _ in 0..64 {
+        let parent: Option<i64> = conn
+            .query_row(
+                "SELECT parent_id FROM pen WHERE id = ?1",
+                params![cur],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match parent {
+            Some(p) if p == ancestor => return Ok(true),
+            Some(p) => cur = p,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
 /// The `pen` row that a name OWNS as: itself, or its parent when the name is a finger
 /// (`stet/finger-3` → `stet`). A finger is a mechanism by which one self does more work; it is not
 /// a party to ownership (#109).
@@ -708,7 +730,7 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
 
 /// Take responsibility for a row. `owner` moves to the adopting pen; a finger's parent is what
 /// actually owns, so adopting as `stet/finger-3` is adopting as `stet` (#109).
-pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
+pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()> {
     // You may not adopt what you cannot read: adopting somebody else's private row would be a way
     // to take it by noticing it exists (#109, authorization).
     let audience: Option<String> = conn
@@ -729,6 +751,8 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
             "no pen named {pen}; the pen registry has no such row"
         ))
     })?;
+    // An OWNED row may be taken only by an ancestor, and only deliberately (#109, James): a pen's
+    // work is not up for grabs by a sibling, or a stranger, who happens to notice it.
     let from: Option<i64> = conn
         .query_row(
             "SELECT owner FROM memory WHERE key = ?1",
@@ -737,6 +761,23 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
         )
         .optional()?
         .flatten();
+    if let Some(owner_id) = from {
+        let caller_id = exact_pen_id(conn, pen)?
+            .ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
+        if caller_id == owner_id {
+            return Ok(()); // already yours; nothing to take
+        }
+        if !is_ancestor(conn, caller_id, owner_id)? {
+            return Err(Error::Invalid(format!(
+                "{pen} may not adopt {key}: only an ancestor of its owner may take an owned row"
+            )));
+        }
+        if !force {
+            return Err(Error::Invalid(format!(
+                "{key} already has an owner; taking it needs force=true"
+            )));
+        }
+    }
     let n = conn.execute(
         "UPDATE memory SET owner = ?2 WHERE key = ?1",
         params![key, to],
@@ -752,7 +793,7 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
 pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
     let who =
         exact_pen_id(conn, pen)?.ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
-    // The owner may release its own row; its parent may release it for them. Nobody else.
+    // The owner may release its own row; any ancestor may release it for them. Nobody else.
     let owner_id: Option<i64> = conn
         .query_row(
             "SELECT owner FROM memory WHERE key = ?1",
@@ -935,12 +976,12 @@ pub fn retire(
     // Authorization: a parent retires its child. A ROOT has no parent, so the root custodian may —
     // a pen that goes bad at 03:00 must be stoppable by somebody (#109).
     let permitted = match parent_id {
-        Some(pid) => caller_id == pid,
+        Some(pid) => caller_id == pid || is_ancestor(conn, caller_id, pid)?,
         None => caller == ROOT_CUSTODIAN,
     };
     if !permitted {
         return Err(Error::Invalid(match parent_id {
-            Some(_) => format!("{caller} may not retire {pen}: only its parent may"),
+            Some(_) => format!("{caller} may not retire {pen}: only an ancestor may"),
             None => format!("{caller} may not retire root pen {pen}: only {ROOT_CUSTODIAN} may"),
         }));
     }

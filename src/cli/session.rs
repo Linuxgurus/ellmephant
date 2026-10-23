@@ -132,10 +132,15 @@ impl Session {
         encoder: Arc<Encoder>,
         reader: store::audience::Reader,
     ) -> Result<Self> {
+        let conn = db::open_read_only(paths)?;
+        // ★ PARENTAGE IS THE GRANT, resolved at use (#109): the reader reaches down into its own
+        // subtree, so an ancestor may read what a descendant addressed to itself — the doctor's
+        // licence, and what makes cluster-wide hygiene possible without being the author.
+        let reader = reader.in_tree(&conn);
         Ok(Self {
             paths: paths.clone(),
             cfg,
-            conn: db::open_read_only(paths)?,
+            conn,
             encoder,
             reader,
         })

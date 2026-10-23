@@ -54,6 +54,11 @@ pub struct Memory {
     /// it; a tag-only edit leaves it alone, because filing is not writing (#107).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub edited_by: Option<String>,
+    /// WHO IS ANSWERABLE for this row — the current judgement, not the origin of the words. `None`
+    /// means nobody is: the commons (`owner IS NULL`), where `protected` and `private` do not apply
+    /// and any pen may write or adopt. A finger never owns; its parent does (#109).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub owner: Option<String>,
     /// WHERE the information came from, as the caller DECLARED it: a URL, a file, a command,
     /// "my inference". A promise, not a proof — which is why it is a separate column from
     /// `asserted_by`: a relayer names the truth's home without becoming the truth.
@@ -590,6 +595,39 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     Ok(id)
 }
 
+/// The `pen` row that a name OWNS as: itself, or its parent when the name is a finger
+/// (`stet/finger-3` → `stet`). A finger is a mechanism by which one self does more work; it is not
+/// a party to ownership (#109).
+fn owner_pen_id(tx: &Connection, name: Option<&str>) -> Result<Option<i64>> {
+    let Some(name) = name else { return Ok(None) };
+    Ok(tx
+        .query_row(
+            "SELECT COALESCE(author.parent_id, author.id) FROM pen author WHERE author.name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Append to the responsibility ledger. Content history lives in `memory_version`; this table
+/// answers who took, released or handed on a row, and when — never what was written.
+fn log_pen_event(
+    tx: &Connection,
+    key: &str,
+    action: &str,
+    pen: Option<i64>,
+    from: Option<i64>,
+    to: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO pen_event (key, action, pen_id, from_pen, to_pen, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![key, action, pen, from, to, detail],
+    )?;
+    Ok(())
+}
+
 /// The `UPDATE` half of [`add`]: the key already exists. `pending` leaves [`ENCODE_PENDING`] in
 /// `encode_hash` when this write scheduled a job, and leaves the column alone otherwise.
 fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
@@ -625,12 +663,12 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
         "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin, audience,
-                            edited_by)
+                            edited_by, owner)
          VALUES (?1, ?2, ?3, ?4, ?5,
                  COALESCE(NULLIF(?6, ''), datetime('now')),
                  COALESCE(NULLIF(?7, ''), datetime('now')),
                  COALESCE(?8, 'anonymous'), ?9, ?10,
-                 COALESCE(?11, ?8, 'anonymous'))",
+                 COALESCE(?11, ?8, 'anonymous'), ?12)",
         params![
             key,
             mem.title,
@@ -642,10 +680,121 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.asserted_by,
             mem.origin,
             audience::effective(&mem.audience),
-            mem.edited_by
+            mem.edited_by,
+            owner_pen_id(tx, mem.asserted_by.as_deref())?
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// Take responsibility for a row. `owner` moves to the adopting pen; a finger's parent is what
+/// actually owns, so adopting as `stet/finger-3` is adopting as `stet` (#109).
+pub fn adopt(conn: &Connection, key: &str, pen: &str) -> Result<()> {
+    let to = owner_pen_id(conn, Some(pen))?.ok_or_else(|| {
+        Error::Invalid(format!(
+            "no pen named {pen}; the pen registry has no such row"
+        ))
+    })?;
+    let from: Option<i64> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let n = conn.execute(
+        "UPDATE memory SET owner = ?2 WHERE key = ?1",
+        params![key, to],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    log_pen_event(conn, key, "adopt", Some(to), from, Some(to), None)
+}
+
+/// Release a row: nobody is answerable for it any more. By the commons rule (#109) an ownerless row
+/// also loses `protected` and `private` — a disclaim is therefore a PUBLICATION, and is recorded.
+pub fn disclaim(conn: &Connection, key: &str, pen: &str) -> Result<()> {
+    let who = owner_pen_id(conn, Some(pen))?;
+    let from: Option<i64> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let was_private = conn
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|a| a != audience::PUBLIC)
+        .unwrap_or(false);
+    let n = conn.execute(
+        "UPDATE memory SET owner = NULL, audience = ?2 WHERE key = ?1",
+        params![key, audience::PUBLIC],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    log_pen_event(
+        conn,
+        key,
+        "disclaim",
+        who,
+        from,
+        None,
+        Some(if was_private {
+            "private dropped: a disclaimed row is public"
+        } else {
+            "released"
+        }),
+    )
+}
+
+/// Hand a row from one pen to another. Both must be real pens; a finger resolves to its parent.
+pub fn transfer(conn: &Connection, key: &str, from: &str, to: &str) -> Result<()> {
+    let from_id = owner_pen_id(conn, Some(from))?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {from}")))?;
+    let to_id = owner_pen_id(conn, Some(to))?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {to}")))?;
+    let n = conn.execute(
+        "UPDATE memory SET owner = ?2 WHERE key = ?1",
+        params![key, to_id],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    log_pen_event(
+        conn,
+        key,
+        "transfer",
+        Some(from_id),
+        Some(from_id),
+        Some(to_id),
+        None,
+    )
+}
+
+/// The responsibility ledger for one key: who acted, on what, from whom to whom, and why.
+pub fn pen_events(
+    conn: &Connection,
+    key: &str,
+) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT at, action, (SELECT name FROM pen WHERE id = from_pen), (SELECT name FROM pen WHERE id = to_pen)
+           FROM pen_event WHERE key = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(params![key], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
@@ -757,7 +906,8 @@ const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, created, updat
      visits, times_useful, \
      (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
        WHERE type = 'memory' AND key = memory.key) AS version, \
-     asserted_by, origin, audience, edited_by";
+     asserted_by, origin, audience, edited_by, \
+     (SELECT name FROM pen WHERE pen.id = memory.owner) AS owner";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -778,6 +928,7 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         origin: r.get(12)?,
         audience: r.get(13)?,
         edited_by: r.get(14)?,
+        owner: r.get(15)?,
     })
 }
 

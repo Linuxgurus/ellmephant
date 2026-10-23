@@ -120,6 +120,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0022_edited_by.sql"),
         "`edited_by`: the author of the state in each snapshot — every record says who wrote it (#109)",
     ),
+    (
+        23,
+        include_str!("../../migrations/0023_owner.sql"),
+        "`owner`: responsibility (nullable = commons) plus the ledger of adopt/disclaim/transfer (#109)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

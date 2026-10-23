@@ -186,6 +186,12 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         .unwrap();
     // ...and predates the PEN REGISTRY (0021), which is a table of its own.
     conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
+    conn.execute("DROP INDEX IF EXISTS memory_owner", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
+        .unwrap();
+    conn.execute("DROP TABLE pen_event", []).unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -249,6 +255,12 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         .unwrap();
     // ...and predates the PEN REGISTRY (0021), which is a table of its own.
     conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
+    conn.execute("DROP INDEX IF EXISTS memory_owner", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
+        .unwrap();
+    conn.execute("DROP TABLE pen_event", []).unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
@@ -417,6 +429,12 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     )
     .unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
+    conn.execute("DROP INDEX IF EXISTS memory_owner", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
+        .unwrap();
+    conn.execute("DROP TABLE pen_event", []).unwrap();
     conn.execute("PRAGMA user_version = 20", []).unwrap();
     drop(conn);
 

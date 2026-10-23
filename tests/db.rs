@@ -467,7 +467,10 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
 
     // Nothing is tombstoned on the way in: the registry records history, it does not rewrite it.
     assert_eq!(
-        count(&conn, "SELECT count(*) FROM pen WHERE status <> 'live'"),
+        count(
+            &conn,
+            "SELECT count(*) FROM pen WHERE ceased_at IS NOT NULL"
+        ),
         0
     );
 }

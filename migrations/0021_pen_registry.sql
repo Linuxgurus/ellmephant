@@ -8,15 +8,19 @@
 -- This migration adds the row and seeds it from the authors the store already knows about. It
 -- deliberately changes NO behaviour: nothing reads `pen` yet. `owner`, the responsibility ledger
 -- and the tree land on top of this.
+--
+-- DELIBERATELY FEW COLUMNS. A retired pen is `ceased_at IS NOT NULL` — a `status` column would be
+-- the same fact written twice, and every derived field is a field that can disagree with its
+-- source. The memorial text belongs in `pen_event.detail`, where the act is recorded, not on the
+-- pen row. Session context is the scarce resource here: a field that a reader never needs is a
+-- field that costs tokens every time somebody loads the row.
 
 CREATE TABLE pen (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     name      TEXT NOT NULL UNIQUE,
     parent_id INTEGER REFERENCES pen(id),
-    status    TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('live', 'tombstoned')),
     created   TEXT NOT NULL DEFAULT (datetime('now')),
-    ceased_at TEXT,
-    note      TEXT
+    ceased_at TEXT
 );
 
 CREATE INDEX pen_parent ON pen(parent_id);

@@ -476,24 +476,30 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
 }
 
 /// A `memory_upsert` patch from a text body (`Key:` required: it is the address).
-fn memory_patch_text(text: &str) -> Result<store::Patch, String> {
+///
+/// Returns the patch and the pen to CREDIT, if any — `None` for the text door, where a front-matter
+/// `As:` field would be a second spelling of the JSON `as` with no caller asking for it yet.
+fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), String> {
     let fm = front_matter(text)?;
     let Some(key) = fm.key else {
         return Err("missing `Key:` front-matter field".to_string());
     };
-    Ok(store::Patch {
-        key: Some(key),
-        title: fm.title,
-        body: Some(fm.body),
-        source: fm.source,
-        // A text body carries no speaker: the handler stamps `asserted_by` from the request.
-        asserted_by: None,
-        origin: fm.origin,
-        tags: fm.tags,
-        private: fm.private,
-        version_note: fm.version_note,
-        expected_version: None,
-    })
+    Ok((
+        store::Patch {
+            key: Some(key),
+            title: fm.title,
+            body: Some(fm.body),
+            source: fm.source,
+            // A text body carries no speaker: the handler stamps `asserted_by` from the request.
+            asserted_by: None,
+            origin: fm.origin,
+            tags: fm.tags,
+            private: fm.private,
+            version_note: fm.version_note,
+            expected_version: None,
+        },
+        None,
+    ))
 }
 
 /// The JSON shape `POST /memory` accepts under `Content-Type: application/json`.
@@ -506,6 +512,10 @@ struct MemoryJson {
     origin: Option<String>,
     tags: Option<Vec<String>>,
     version_note: Option<String>,
+    /// Credit this write to a descendant of the calling pen (`as`), then validated against a live
+    /// lend. Both doors offer the same argument, or the door is a second, weaker store.
+    #[serde(default, rename = "as")]
+    as_pen: Option<String>,
     /// Keep this row to the writing pen alone.
     private: Option<bool>,
     /// The CAS token, as `memory_get` returns it.
@@ -513,20 +523,24 @@ struct MemoryJson {
 }
 
 /// A `memory_upsert` patch from a JSON body.
-fn memory_patch_json(bytes: &[u8]) -> Result<store::Patch, String> {
+fn memory_patch_json(bytes: &[u8]) -> Result<(store::Patch, Option<String>), String> {
     let m: MemoryJson = serde_json::from_slice(bytes).map_err(|e| format!("bad JSON: {e}"))?;
-    Ok(store::Patch {
-        key: m.key,
-        title: m.title,
-        body: m.body,
-        source: m.source,
-        asserted_by: None,
-        origin: m.origin,
-        tags: m.tags,
-        private: m.private,
-        version_note: m.version_note,
-        expected_version: m.expected_version,
-    })
+    let as_pen = m.as_pen;
+    Ok((
+        store::Patch {
+            key: m.key,
+            title: m.title,
+            body: m.body,
+            source: m.source,
+            asserted_by: None,
+            origin: m.origin,
+            tags: m.tags,
+            private: m.private,
+            version_note: m.version_note,
+            expected_version: m.expected_version,
+        },
+        as_pen,
+    ))
 }
 
 /// The JSON shape `POST /project` accepts under `Content-Type: application/json`.
@@ -1482,7 +1496,7 @@ pub async fn upsert(
     } else {
         memory_patch_text(&String::from_utf8_lossy(&bytes))
     };
-    let mut patch = match patch {
+    let (mut patch, as_pen) = match patch {
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
@@ -1490,15 +1504,28 @@ pub async fn upsert(
     // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
     // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
     // names the pen, and only a PROVEN one is stamped (#109).
-    if patch.asserted_by.is_none() {
-        patch.asserted_by = crate::identity::resolve(&headers).ok().flatten();
-    }
+    let proven = crate::identity::resolve(&headers).ok().flatten();
+    let credited = match (&as_pen, &proven) {
+        (Some(claimed), Some(caller)) if !claimed.eq_ignore_ascii_case(caller) => {
+            Some(claimed.clone())
+        }
+        _ => None,
+    };
+    patch.asserted_by = credited.clone().or_else(|| proven.clone());
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("memory_upsert", move |s| s.memory_merge(&patch))
+        .with_store("memory_upsert", move |s| {
+            // ★ A credit needs a LIVE LEND, exactly as on the MCP door: `as` is not a rename of the
+            // writer, it is a claim that this pen may act for that one, and parentage alone is not
+            // enough to make it true.
+            if let (Some(as_pen), Some(caller)) = (&credited, &proven) {
+                s.may_act_as(caller, as_pen)?;
+            }
+            s.memory_merge(&patch)
+        })
         .await
     {
         Ok(out) => {

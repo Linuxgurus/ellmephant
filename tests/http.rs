@@ -2254,3 +2254,90 @@ async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
     assert_eq!(doc["owner"], json!("tester"), "who answers for it: {got}");
     assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
 }
+
+/// `as:` on the BODY of `POST /memory` — the same claim as the MCP argument, and the same gate: a
+/// live lend, not tree shape. (The identity fixture is local to this test: it is the only one that
+/// needs a proven pen over HTTP, and it removes the table when it is done.)
+#[tokio::test]
+async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+
+    // Provisioning, outside every door: two pens and (later) a lend.
+    let paths = Paths::from_root(dir.path());
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-tester', 'self');
+             INSERT OR IGNORE INTO pen (name, kind, parent_id)
+                 VALUES ('http-as-tester/f-1', 'finger', (SELECT id FROM pen WHERE name='http-as-tester'));",
+        )
+        .unwrap();
+    }
+
+    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
+    unsafe { std::env::set_var(TABLE, "http-as-tester:as-secret-1") };
+
+    let post = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/memory")
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Stet-From", "http-as-tester")
+                .header("X-Stet-Auth", "as-secret-1")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+    };
+
+    // No lend: the claim is refused, and the refusal is the same one the MCP door gives.
+    let (status, body) = post(json!({
+        "key": "finger-note", "title": "Finger note", "body": "b",
+        "as": "http-as-tester/f-1"
+    }))
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "no lend, no credit: {status} {body}"
+    );
+    assert!(body.contains("LIVE lend"), "{status} {body}");
+
+    // With a lend it lands, credited to the finger.
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        ellmephant::store::sudo::lend(&conn, "http-as-tester", "http-as-tester/f-1", 60).unwrap();
+    }
+    let (status, body) = post(json!({
+        "key": "finger-note", "title": "Finger note", "body": "b",
+        "as": "http-as-tester/f-1"
+    }))
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(body.contains("finger-note"), "{status} {body}");
+
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let mem = ellmephant::store::get(&conn, "finger-note")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("http-as-tester/f-1"),
+        "who did it"
+    );
+    assert_eq!(
+        mem.owner.as_deref(),
+        Some("http-as-tester"),
+        "who answers for it"
+    );
+
+    unsafe { std::env::remove_var(TABLE) };
+}

@@ -196,6 +196,9 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
         .unwrap();
     conn.execute("DROP TABLE pen_event", []).unwrap();
+    // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
+    conn.execute("DROP TABLE IF EXISTS private_read", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -269,6 +272,9 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
         .unwrap();
     conn.execute("DROP TABLE pen_event", []).unwrap();
+    // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
+    conn.execute("DROP TABLE IF EXISTS private_read", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
@@ -449,6 +455,9 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
         .unwrap();
     conn.execute("DROP TABLE pen_event", []).unwrap();
+    // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
+    conn.execute("DROP TABLE IF EXISTS private_read", [])
+        .unwrap();
     conn.execute("PRAGMA user_version = 20", []).unwrap();
     drop(conn);
 
@@ -536,7 +545,10 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
         [],
     )
     .unwrap();
-    // Pretend the store stopped at v24, so only the repair runs on reopen.
+    // Pretend the store stopped at v24, so only the later steps run on reopen — and undo what those
+    // later steps create, or the migration collides with a table that never went away.
+    conn.execute("DROP TABLE IF EXISTS private_read", [])
+        .unwrap();
     conn.pragma_update(None, "user_version", 24).unwrap();
     drop(conn);
 

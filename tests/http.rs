@@ -2353,3 +2353,80 @@ async fn the_sudo_verbs_are_on_the_door() {
         "both sessions died: {released}"
     );
 }
+
+/// The audit, END TO END: an ancestor reading a descendant's private row leaves a `private_read`
+/// record naming the pen, the row and the reason. This is #120's missing half (#129).
+#[tokio::test]
+async fn reading_into_the_subtree_is_recorded_on_the_door() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A hand, one finger under it, and a lend so the finger can be credited for its own work.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/f-1", "kind": "finger" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_lend",
+        json!({ "pen": "tester/f-1", "secs": 60 }),
+    )
+    .await;
+    let wrote = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "finger-note", "title": "Finger note", "body": "private work",
+                "private": true, "as": "tester/f-1" }),
+    )
+    .await;
+    assert!(
+        wrote.contains("stored") || wrote.contains("created"),
+        "{wrote}"
+    );
+
+    // The ancestor reads it — allowed, and now RECORDED.
+    let got = tool(
+        service.peer(),
+        "memory_get",
+        json!({ "key": "finger-note" }),
+    )
+    .await;
+    assert!(
+        got.contains("private work"),
+        "an ancestor reads down its subtree: {got}"
+    );
+
+    let conn = ellmephant::db::open(&Paths::from_root(dir.path())).unwrap();
+    let rows = ellmephant::store::audit::recent(&conn, 10).unwrap();
+    let (_, pen, key, reason, _) = rows
+        .iter()
+        .find(|r| r.2.as_deref() == Some("finger-note"))
+        .unwrap_or_else(|| panic!("no audit row for the subtree read: {rows:?}"));
+    assert_eq!(pen, "tester", "who looked");
+    assert_eq!(key.as_deref(), Some("finger-note"), "which row");
+    assert_eq!(reason, "subtree", "why");
+}

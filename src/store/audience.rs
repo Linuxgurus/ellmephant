@@ -22,6 +22,8 @@
 //! explicit, one row, and recorded ([`crate::store::forensic`]). An owner who was simply exempt
 //! would make the tier a word.
 
+use rusqlite::OptionalExtension as _;
+
 /// The audience value every row starts with and most rows keep.
 pub const PUBLIC: &str = "public";
 
@@ -162,6 +164,42 @@ impl Reader {
     /// The pen as an audience value (`pen:<x>`), when there is one.
     pub fn as_audience(&self) -> Option<&str> {
         self.pen.as_deref()
+    }
+
+    /// Of these keys, which are private to a pen BELOW this reader? One query, because a search
+    /// returns a page and the audit wants a count rather than a round trip per hit.
+    pub fn crossed_keys(
+        conn: &rusqlite::Connection,
+        reader: &Reader,
+        keys: &[&str],
+    ) -> crate::error::Result<Vec<String>> {
+        if keys.is_empty() || reader.all || reader.down.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare("SELECT audience FROM memory WHERE key = ?1")?;
+        for key in keys {
+            let audience: Option<String> = stmt
+                .query_row(rusqlite::params![key], |r| r.get(0))
+                .optional()?;
+            if audience.is_some_and(|a| reader.crosses(&a)) {
+                out.push((*key).to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Is this row PRIVATE TO SOMEBODY ELSE — i.e. did showing it mean crossing a boundary?
+    ///
+    /// True only for a row that is not public and not addressed to this reader, which is exactly the
+    /// case an audit needs: an ancestor reading down its subtree (#120), or an exemption (#129). A
+    /// pen reading its own rows crossed nothing, and the process holding the file (`all`) is the
+    /// honest limit of the tier rather than an exemption within it.
+    pub fn crosses(&self, audience: &str) -> bool {
+        !self.all
+            && audience != PUBLIC
+            && Some(audience) != self.pen.as_deref()
+            && self.down.iter().any(|a| a == audience)
     }
 
     /// May this reader be shown a row with this audience?

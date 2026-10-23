@@ -213,6 +213,16 @@ impl Session {
         }
     }
 
+    /// May `proven` be credited as `claimed` on a write? (Live lend required.)
+    pub fn may_act_as(&self, proven: &str, claimed: &str) -> Result<()> {
+        store::may_act_as(&self.conn, proven, claimed)
+    }
+
+    /// Lend this pen's own authority down to a descendant, for `secs` — it expires and can be revoked.
+    pub fn lend(&self, powerful: &str, weak: &str, secs: i64) -> Result<store::sudo::Session> {
+        store::sudo::lend(&self.conn, powerful, weak, secs)
+    }
+
     /// Mint a pen under `caller` — the runtime door.
     pub fn mint(&self, caller: &str, name: &str, kind: &str) -> Result<store::Minted> {
         store::mint(&self.conn, caller, name, kind)

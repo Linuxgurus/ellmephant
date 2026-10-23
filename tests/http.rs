@@ -2177,3 +2177,80 @@ async fn pen_mint_creates_a_child_under_the_caller() {
     .await;
     assert!(bad.contains("`self` or `finger`"), "{bad}");
 }
+
+/// `as:` — a write credited to a descendant, permitted by a LIVE LEND and not by tree shape.
+#[tokio::test]
+async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/f-1", "kind": "finger" }),
+    )
+    .await;
+
+    // ★ PARENTAGE IS NOT ENOUGH: without a lend the credit is refused, and the refusal says why.
+    let refused = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "finger-work", "title": "Finger work", "body": "b", "as": "tester/f-1" }),
+    )
+    .await;
+    assert!(refused.contains("LIVE lend"), "{refused}");
+
+    // The lend is what permits it, and it is a session with an expiry.
+    let lent = tool(
+        service.peer(),
+        "pen_lend",
+        json!({ "pen": "tester/f-1", "secs": 60 }),
+    )
+    .await;
+    let session: serde_json::Value = serde_json::from_str(&lent).unwrap();
+    assert_eq!(session["powerful"], json!("tester"), "{lent}");
+    assert_eq!(session["weak"], json!("tester/f-1"), "{lent}");
+    assert!(session["expires_at"].is_string(), "a lend expires: {lent}");
+
+    let done = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "finger-work", "title": "Finger work", "body": "b", "as": "tester/f-1" }),
+    )
+    .await;
+    assert!(done.contains("\"created\""), "{done}");
+
+    // The row says WHO did it and WHO answers for it — and they are different pens.
+    let got = tool(
+        service.peer(),
+        "memory_get",
+        json!({ "key": "finger-work" }),
+    )
+    .await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["asserted_by"], json!("tester/f-1"), "who did it: {got}");
+    assert_eq!(doc["owner"], json!("tester"), "who answers for it: {got}");
+    assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
+}

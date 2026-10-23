@@ -691,10 +691,44 @@ fn a_hand_may_credit_its_finger_and_nothing_else() {
     store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
     store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
 
-    // Itself, and anything below it.
+    // Itself, always: a pen is itself without anyone's leave.
     store::may_act_as(&conn, "stet", "stet").expect("itself");
-    store::may_act_as(&conn, "stet/hand", "stet/hand/finger-1").expect("its own finger");
-    store::may_act_as(&conn, "stet", "stet/hand/finger-1").expect("down the whole subtree");
+
+    // ★ A DESCENDANT IS NOT ENOUGH (James tie-break, 2026-10-23): parentage is necessary, a LIVE
+    // LEND is what permits. Without it, a finger's authority would be a fact about tree shape and
+    // nothing could revoke it short of re-shaping the tree.
+    let err = store::may_act_as(&conn, "stet/hand", "stet/hand/finger-1").unwrap_err();
+    assert!(format!("{err}").contains("LIVE lend"), "{err}");
+
+    let lent = store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+    assert_eq!(lent.powerful, "stet/hand");
+    assert_eq!(lent.weak, "stet/hand/finger-1");
+    store::may_act_as(&conn, "stet/hand", "stet/hand/finger-1")
+        .expect("its own finger, while lent");
+    // An ancestor lends its own authority to a deeper descendant too: the walk is downward.
+    store::sudo::lend(&conn, "stet", "stet/hand/finger-1", 60).expect("lend down the subtree");
+    store::may_act_as(&conn, "stet", "stet/hand/finger-1")
+        .expect("down the whole subtree, while lent");
+
+    // Revoking is one deleted row, and the very next check refuses — with no cache in between.
+    store::sudo::release(&conn, "stet/hand/finger-1", "stet/hand").expect("release");
+    let err = store::may_act_as(&conn, "stet/hand", "stet/hand/finger-1").unwrap_err();
+    assert!(
+        format!("{err}").contains("LIVE lend"),
+        "revocation is immediate: {err}"
+    );
+
+    // And a lend expires on its own: move the clock in the row and the permission is gone.
+    conn.execute(
+        "UPDATE active_sudo SET expires_at = datetime('now', '-1 second')",
+        [],
+    )
+    .unwrap();
+    let err = store::may_act_as(&conn, "stet", "stet/hand/finger-1").unwrap_err();
+    assert!(
+        format!("{err}").contains("LIVE lend"),
+        "expiry is immediate: {err}"
+    );
 
     // Never a peer, never an ancestor, never a name nobody minted.
     let err = store::may_act_as(&conn, "stet", "cline").unwrap_err();
@@ -712,7 +746,9 @@ fn a_fingers_work_is_its_hands_and_retirement_moves_it() {
     store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
     store::mint(&conn, "stet/hand", "stet/hand/finger-2", "finger").expect("mint");
 
-    // The finger holds no credential: the hand proves, the finger is credited, the hand OWNS.
+    // The finger holds no credential: the hand proves, the finger is credited, the hand OWNS — and
+    // the right to credit it is a lend that expires, not an inheritance that does not.
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-2", 300).expect("lend");
     store::may_act_as(&conn, "stet/hand", "stet/hand/finger-2").expect("act as the finger");
     row(&conn, &embedder, "finger-work", "stet/hand/finger-2");
     assert_eq!(owner(&conn, "finger-work").as_deref(), Some("stet/hand"));

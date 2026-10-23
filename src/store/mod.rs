@@ -1125,7 +1125,7 @@ pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<M
     })
 }
 
-/// May `proven` be credited as `claimed` on a write? Itself, or anything below it.
+/// May `proven` be credited as `claimed` on a write? Itself, or anything below it ON A LIVE LEND.
 ///
 /// A finger holds no credential of its own — it is how one self does more work, not a party — so its
 /// work is written under the hand's PROOF and the finger's NAME. This is the check that keeps that
@@ -1144,12 +1144,22 @@ pub fn may_act_as(conn: &Connection, proven: &str, claimed: &str) -> Result<()> 
             "{claimed} is not a pen: a write may name itself or a pen it minted"
         ))
     })?;
-    if is_ancestor(conn, proven_id, claimed_id)? {
+    if !is_ancestor(conn, proven_id, claimed_id)? {
+        return Err(Error::Invalid(format!(
+            "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a \
+             peer and never an ancestor"
+        )));
+    }
+    // ★ PARENTAGE IS NECESSARY, NOT SUFFICIENT (James tie-break, 2026-10-23). Acting as a descendant
+    // rides on a LIVE, EXPIRING lend — so a compromised finger's authority dies on its own, and a
+    // revocation is one deleted row rather than a re-shaped tree. The check is uncached: a cached
+    // session is a revocation that has not happened yet.
+    if sudo::live(conn, claimed, proven)?.is_some() {
         return Ok(());
     }
     Err(Error::Invalid(format!(
-        "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a peer \
-         and never an ancestor"
+        "{proven} may not write as {claimed} yet: that needs a LIVE lend — open one with `lend` (it \
+         expires, and it can be revoked) rather than inheriting by tree shape"
     )))
 }
 

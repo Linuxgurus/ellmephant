@@ -59,6 +59,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/pen/lend",
+        tool: "pen_lend",
+    },
+    Route {
+        method: "POST",
         path: "/memory",
         tool: "memory_upsert",
     },
@@ -614,6 +619,72 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| format!("bad json body: {e}"))
+}
+
+/// `POST /pen/lend` — lend this request's pen's authority down to a descendant (`pen_lend`).
+pub async fn pen_lend(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let caller = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "refused: lending needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+            );
+        }
+        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        pen: String,
+        secs: i64,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("pen_lend", move |s| s.lend(&caller, &ask.pen, ask.secs))
+        .await
+    {
+        Ok(session) => {
+            tracing::info!(
+                area = scope.area,
+                weak = %session.weak,
+                powerful = %session.powerful,
+                "authority lent down over http"
+            );
+            let value = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
+            render(
+                StatusCode::CREATED,
+                json,
+                value.to_string(),
+                format!(
+                    "lent {} -> {} until {}\n",
+                    session.powerful, session.weak, session.expires_at
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
 }
 
 /// `POST /pen/mint` — create a pen under this request's pen (`pen_mint`).

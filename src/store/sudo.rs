@@ -25,7 +25,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Error, Result};
 
 /// A borrowing in progress: `weak` may act as `powerful` until `expires_at`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Session {
     /// The `active_sudo` row.
     pub id: i64,
@@ -98,6 +98,69 @@ pub fn revoke(conn: &Connection, powerful: &str, weak: &str) -> Result<usize> {
     )?;
     tx.commit()?;
     Ok(killed)
+}
+
+/// **LEND: a pen hands its own authority DOWN to a descendant** (James, 2026-10-23).
+///
+/// The mirror of [`sudo`], and the reason they are different verbs: `sudo` borrows somebody else's
+/// authority ACROSS or UPWARD and therefore needs a `sudoers` row; lending spends authority you
+/// already have, and parentage already grants that. Requiring a policy row to lend downward would
+/// mean every minted finger needs a configuration entry — configuration written by code.
+///
+/// What lending keeps is the part that matters: it EXPIRES, it can be REVOKED by deleting one row,
+/// and `via` lets a lend's children die with it. Without this, a finger's authority would be a fact
+/// about tree shape and nothing could revoke it short of re-shaping the tree.
+pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<Session> {
+    if powerful.eq_ignore_ascii_case(weak) {
+        return Err(Error::Invalid(format!(
+            "{powerful} cannot lend to itself: its own authority is not borrowed, it is had"
+        )));
+    }
+    let (p, _, ceased) = pen_identity(conn, powerful)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{powerful} has been retired: a pen that has ceased lends nothing"
+        )));
+    }
+    let (w, ..) = pen_identity(conn, weak)?;
+    if !is_below(conn, p, w)? {
+        return Err(Error::Invalid(format!(
+            "{weak} is not a descendant of {powerful}: authority is lent DOWN, never sideways or up"
+        )));
+    }
+    if !(1..=MAX_DURATION_SECS).contains(&secs) {
+        return Err(Error::Invalid(format!(
+            "a lend must last between 1 and {MAX_DURATION_SECS} seconds (asked for {secs})"
+        )));
+    }
+    conn.execute(
+        "INSERT INTO active_sudo (powerful, weak, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
+        params![p, w, format!("+{secs} seconds")],
+    )?;
+    let id = conn.last_insert_rowid();
+    let expires_at: String = conn.query_row(
+        "SELECT expires_at FROM active_sudo WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(Session {
+        id,
+        powerful: powerful.to_string(),
+        weak: weak.to_string(),
+        expires_at,
+        via: None,
+    })
+}
+
+/// `(id, parent_id, ceased_at)` for a pen, or a refusal that names it.
+fn pen_identity(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
+    conn.query_row(
+        "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+        params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
 }
 
 /// Borrow `powerful`'s authority as `weak` for `secs`. A session, not a permission: it expires.

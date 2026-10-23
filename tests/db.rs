@@ -182,8 +182,16 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
         .unwrap();
     // ...and predates LAST-WRITTEN-BY (0020), the second provenance column.
-    conn.execute("ALTER TABLE memory DROP COLUMN last_written_by", [])
+    conn.execute("ALTER TABLE memory DROP COLUMN edited_by", [])
         .unwrap();
+    // ...and predates the PEN REGISTRY (0021), which is a table of its own.
+    conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
+    conn.execute("DROP INDEX IF EXISTS memory_owner", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
+        .unwrap();
+    conn.execute("DROP TABLE pen_event", []).unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -243,8 +251,16 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
         .unwrap();
     // ...and predates LAST-WRITTEN-BY (0020), the second provenance column.
-    conn.execute("ALTER TABLE memory DROP COLUMN last_written_by", [])
+    conn.execute("ALTER TABLE memory DROP COLUMN edited_by", [])
         .unwrap();
+    // ...and predates the PEN REGISTRY (0021), which is a table of its own.
+    conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
+    conn.execute("DROP INDEX IF EXISTS memory_owner", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
+        .unwrap();
+    conn.execute("DROP TABLE pen_event", []).unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
@@ -381,6 +397,87 @@ fn key_is_unique() {
 
 /// The opposite state: the STORE IS NEWER than this binary, which is what a rollback looks like.
 /// Refusing here would make a bad deploy unrecoverable, so it is allowed — but only deliberately.
+#[test]
+fn a_v20_store_gains_the_pen_registry_on_open() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).unwrap();
+
+    // Two rows whose authors are of different shapes: a self, and a finger acting for it.
+    insert(&conn, "said-by-stet", "Said by stet", "body");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'stet' WHERE key = 'said-by-stet'",
+        [],
+    )
+    .unwrap();
+    insert(&conn, "said-by-a-finger", "Said by a finger", "body");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'stet/finger-3' WHERE key = 'said-by-a-finger'",
+        [],
+    )
+    .unwrap();
+
+    // A store from before the registry: the table gone, the version rolled back. It must also
+    // UNDO 0022 (the rename and the version column), or that migration collides with work it has
+    // already done — the same rule the v4/v5 tests follow for every later migration.
+    conn.execute("DROP INDEX IF EXISTS memory_version_editor", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory_version DROP COLUMN edited_by", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory_version DROP COLUMN synthetic", [])
+        .unwrap();
+    conn.execute(
+        "ALTER TABLE memory RENAME COLUMN edited_by TO last_written_by",
+        [],
+    )
+    .unwrap();
+    conn.execute("DROP TABLE pen", []).unwrap();
+    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
+    conn.execute("DROP INDEX IF EXISTS memory_owner", [])
+        .unwrap();
+    conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
+        .unwrap();
+    conn.execute("DROP TABLE pen_event", []).unwrap();
+    conn.execute("PRAGMA user_version = 20", []).unwrap();
+    drop(conn);
+
+    let conn = db::open(&paths).expect("reopen");
+    assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
+
+    // Every name that has ever spoken became a pen...
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM pen WHERE name = 'stet'"),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM pen WHERE name = 'stet/finger-3'"
+        ),
+        1
+    );
+
+    // ★ THE SEED NEVER INVENTS A TREE (Stet, review round 3). A history row knows a NAME existed, not
+    // a pen's standing: no parent, no kind. So a slash in a name grants nothing — the finger is
+    // seeded as a plain self with no parent, and its standing must be registered deliberately.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM pen WHERE name = 'stet/finger-3' AND kind = 'self' AND parent_id IS NULL"
+        ),
+        1,
+        "a slash is an address, never a permission"
+    );
+
+    // Nothing is tombstoned on the way in: the registry records history, it does not rewrite it.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM pen WHERE ceased_at IS NOT NULL"
+        ),
+        0
+    );
+}
+
 #[test]
 fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
     let (_dir, paths) = temp_store();

@@ -299,7 +299,7 @@ fn key_is_an_address_not_a_field() {
     // with no version to show for it.
     let (asserted, last_written, origin): (String, String, Option<String>) = conn
         .query_row(
-            "SELECT asserted_by, last_written_by, origin FROM memory WHERE id = ?1",
+            "SELECT asserted_by, edited_by, origin FROM memory WHERE id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )

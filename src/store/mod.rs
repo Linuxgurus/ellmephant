@@ -46,14 +46,19 @@ pub struct Memory {
     /// it. `anonymous` when the connection proved nothing. Stamped, not an argument.
     ///
     /// ★ WRITE-ONCE. It is set when the row is created and never changes: a later write names itself
-    /// in [`Memory::last_written_by`] instead. A tag pass may not launder authorship (#107).
+    /// in [`Memory::edited_by`] instead. A tag pass may not launder authorship (#107).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub asserted_by: Option<String>,
-    /// WHO wrote this row's current state last — the moving fact. Every write sets it; a tag-only
-    /// edit moves this and leaves `asserted_by` where it is. Same value as `asserted_by` on a row
-    /// that has only ever been written once.
+    /// WHO wrote this row's CURRENT state — the moving fact, and the one that answers "who wrote
+    /// this" (a snapshot carries the same fact for the state it holds). Every document write sets
+    /// it; a tag-only edit leaves it alone, because filing is not writing (#107).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub last_written_by: Option<String>,
+    pub edited_by: Option<String>,
+    /// WHO IS ANSWERABLE for this row — the current judgement, not the origin of the words. `None`
+    /// means nobody is: the commons (`owner IS NULL`), where `protected` and `private` do not apply
+    /// and any pen may write or adopt. A finger never owns; its parent does (#109).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub owner: Option<String>,
     /// WHERE the information came from, as the caller DECLARED it: a URL, a file, a command,
     /// "my inference". A promise, not a proof — which is why it is a separate column from
     /// `asserted_by`: a relayer names the truth's home without becoming the truth.
@@ -443,13 +448,10 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     source,
                     // ★ AUTHORSHIP IS WRITE-ONCE (#107). A patch is a write, not a claim about who
                     // asserted the document: the stored author is carried through untouched, and the
-                    // writer names itself in `last_written_by` — so re-filing a row cannot launder
+                    // writer names itself in `edited_by` — so re-filing a row cannot launder
                     // its provenance, and the move is visible without a version.
                     asserted_by: old.asserted_by.clone(),
-                    last_written_by: patch
-                        .asserted_by
-                        .clone()
-                        .or_else(|| old.last_written_by.clone()),
+                    edited_by: patch.asserted_by.clone().or_else(|| old.edited_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     audience: match patch.private {
                         None => old.audience.clone(),
@@ -481,7 +483,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     tags: patch.tags.clone().unwrap_or_default(),
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
                     asserted_by: patch.asserted_by.clone(),
-                    last_written_by: patch.asserted_by.clone(),
+                    edited_by: patch.asserted_by.clone(),
                     origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
                     audience: audience::for_write(
                         patch.private == Some(true),
@@ -593,6 +595,92 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     Ok(id)
 }
 
+/// The exact row for a name — no parent resolution. Ownership rules need both this and
+/// [`owner_pen_id`]: a finger acts as itself but owns as its parent.
+fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("SELECT id FROM pen WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Is `ancestor` anywhere above `of` in the tree? Walks the parent chain, bounded: a cycle is a bug,
+/// not a shape, and it must not hang a request.
+fn is_ancestor(conn: &Connection, ancestor: i64, of: i64) -> Result<bool> {
+    let mut cur = of;
+    for _ in 0..64 {
+        let parent: Option<i64> = conn
+            .query_row(
+                "SELECT parent_id FROM pen WHERE id = ?1",
+                params![cur],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match parent {
+            Some(p) if p == ancestor => return Ok(true),
+            Some(p) => cur = p,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// Make sure a name has a pen row, and return the id it OWNS as. The identity table is the only
+/// authenticator, so a name that can authenticate IS a pen; without this, a self that had never
+/// written would have its first row land in the commons (owner NULL) — absence-with-a-meaning it
+/// never chose (#109, review round 4).
+fn ensure_pen(conn: &Connection, name: &str) -> Result<i64> {
+    if let Some(id) = owner_pen_id(conn, Some(name))? {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO pen (name, kind) VALUES (?1, 'self')",
+        params![name],
+    )?;
+    owner_pen_id(conn, Some(name))?
+        .ok_or_else(|| Error::Invalid(format!("could not register pen {name}")))
+}
+
+/// The `pen` row that a name OWNS as: itself, or its parent when the name is a finger
+/// (`stet/finger-3` → `stet`). A finger is a mechanism by which one self does more work; it is not
+/// a party to ownership (#109).
+fn owner_pen_id(tx: &Connection, name: Option<&str>) -> Result<Option<i64>> {
+    let Some(name) = name else { return Ok(None) };
+    Ok(tx
+        .query_row(
+            // KIND decides, not the name: a finger owns as its parent, everything else owns as
+            // itself. A name is an address; a permission read from a string is a permission anyone
+            // who can register a name can forge (Stet, review round 3).
+            "SELECT CASE WHEN author.kind = 'finger' THEN COALESCE(author.parent_id, author.id)
+                         ELSE author.id END
+               FROM pen author WHERE author.name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Append to the responsibility ledger. Content history lives in `memory_version`; this table
+/// answers who took, released or handed on a row, and when — never what was written.
+fn log_pen_event(
+    tx: &Connection,
+    key: &str,
+    action: &str,
+    pen: Option<i64>,
+    from: Option<i64>,
+    to: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO pen_event (key, action, pen_id, from_pen, to_pen, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![key, action, pen, from, to, detail],
+    )?;
+    Ok(())
+}
+
 /// The `UPDATE` half of [`add`]: the key already exists. `pending` leaves [`ENCODE_PENDING`] in
 /// `encode_hash` when this write scheduled a job, and leaves the column alone otherwise.
 fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
@@ -602,7 +690,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
                 asserted_by = COALESCE(?7, asserted_by),
                 origin = COALESCE(?8, origin),
                 audience = ?9,
-                last_written_by = COALESCE(?10, ?7, last_written_by),
+                edited_by = COALESCE(?10, ?7, edited_by),
                 updated = COALESCE(NULLIF(?6, ''), datetime('now'))
           WHERE id = ?1",
         params![
@@ -615,7 +703,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             mem.asserted_by,
             mem.origin,
             audience::effective(&mem.audience),
-            mem.last_written_by
+            mem.edited_by
         ],
     )?;
     Ok(())
@@ -628,12 +716,12 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
 fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
     tx.execute(
         "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin, audience,
-                            last_written_by)
+                            edited_by, owner)
          VALUES (?1, ?2, ?3, ?4, ?5,
                  COALESCE(NULLIF(?6, ''), datetime('now')),
                  COALESCE(NULLIF(?7, ''), datetime('now')),
                  COALESCE(?8, 'anonymous'), ?9, ?10,
-                 COALESCE(?11, ?8, 'anonymous'))",
+                 COALESCE(?11, ?8, 'anonymous'), ?12)",
         params![
             key,
             mem.title,
@@ -645,10 +733,388 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.asserted_by,
             mem.origin,
             audience::effective(&mem.audience),
-            mem.last_written_by
+            mem.edited_by,
+            match mem.asserted_by.as_deref() {
+                Some(name) => Some(ensure_pen(tx, name)?),
+                None => None,
+            }
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// Take responsibility for a row. `owner` moves to the adopting pen; a finger's parent is what
+/// actually owns, so adopting as `stet/finger-3` is adopting as `stet` (#109).
+pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()> {
+    // You may not adopt what you cannot read: adopting somebody else's private row would be a way
+    // to take it by noticing it exists (#109, authorization).
+    let audience: Option<String> = conn
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let audience = audience.ok_or_else(|| Error::NotFound(key.to_string()))?;
+    if audience != audience::PUBLIC && audience != format!("pen:{pen}") {
+        return Err(Error::Invalid(format!(
+            "{key} is private to {audience}; a pen cannot adopt a row it cannot read"
+        )));
+    }
+    let to = owner_pen_id(conn, Some(pen))?.ok_or_else(|| {
+        Error::Invalid(format!(
+            "no pen named {pen}; the pen registry has no such row"
+        ))
+    })?;
+    // An OWNED row may be taken only by an ancestor, and only deliberately (#109, James): a pen's
+    // work is not up for grabs by a sibling, or a stranger, who happens to notice it.
+    let from: Option<i64> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(owner_id) = from {
+        let caller_id = exact_pen_id(conn, pen)?
+            .ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
+        if caller_id == owner_id {
+            return Ok(()); // already yours; nothing to take
+        }
+        if !is_ancestor(conn, caller_id, owner_id)? {
+            return Err(Error::Invalid(format!(
+                "{pen} may not adopt {key}: only an ancestor of its owner may take an owned row"
+            )));
+        }
+        if !force {
+            return Err(Error::Invalid(format!(
+                "{key} already has an owner; taking it needs force=true"
+            )));
+        }
+    }
+    let n = conn.execute(
+        "UPDATE memory SET owner = ?2 WHERE key = ?1",
+        params![key, to],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    log_pen_event(conn, key, "adopt", Some(to), from, Some(to), None)
+}
+
+/// Release a row: nobody is answerable for it any more. By the commons rule (#109) an ownerless row
+/// also loses `protected` and `private` — a disclaim is therefore a PUBLICATION, and is recorded.
+pub fn disclaim(conn: &Connection, key: &str, pen: &str, publish: bool) -> Result<()> {
+    let who =
+        exact_pen_id(conn, pen)?.ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
+    // The owner may release its own row; any ancestor may release it for them. Nobody else.
+    let owner_id: Option<i64> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    // Any ANCESTOR may release a descendant's row (James), not just the parent: a grandparent
+    // skipping a generation is the same act. The commons belongs to nobody, so nobody has to be
+    // asked to release it.
+    let allowed = match owner_id {
+        Some(id) => who == id || is_ancestor(conn, who, id)?,
+        None => true,
+    };
+    if !allowed {
+        return Err(Error::Invalid(format!(
+            "{pen} may not disclaim {key}: only its owner or one of that owner's ancestors may"
+        )));
+    }
+    let from = owner_id;
+    let was_private = conn
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|a| a != audience::PUBLIC)
+        .unwrap_or(false);
+    // ★ PUBLISHING ANOTHER PEN'S PRIVATE ROW IS NOT A DISCLAIM (Stet, review round 3). The private
+    // tier exists because the AUTHOR chose the audience; an ancestor releasing the row would publish
+    // words that were not its own, and nothing un-publishes. So private -> public must be named:
+    // `publish=true`, a `publish` row in the ledger (not `disclaim`), and the affected pen is the
+    // event's `from_pen`, so it can find the act by asking about itself.
+    if was_private && !publish {
+        return Err(Error::Invalid(format!(
+            "{key} is private; releasing it would publish another pen's words — pass publish=true to do that deliberately"
+        )));
+    }
+    let n = conn.execute(
+        "UPDATE memory SET owner = NULL, audience = ?2 WHERE key = ?1",
+        params![key, audience::PUBLIC],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    log_pen_event(
+        conn,
+        key,
+        if was_private { "publish" } else { "disclaim" },
+        Some(who),
+        from,
+        None,
+        Some(if was_private {
+            "published on disclaim: the row was private and is now readable by every pen"
+        } else {
+            "released"
+        }),
+    )
+}
+
+/// Hand a row from one pen to another. Both must be real pens; a finger resolves to its parent.
+pub fn transfer(conn: &Connection, key: &str, from: &str, to: &str) -> Result<()> {
+    let from_id = owner_pen_id(conn, Some(from))?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {from}")))?;
+    let to_id = owner_pen_id(conn, Some(to))?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {to}")))?;
+    let n = conn.execute(
+        "UPDATE memory SET owner = ?2 WHERE key = ?1",
+        params![key, to_id],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(key.to_string()));
+    }
+    log_pen_event(
+        conn,
+        key,
+        "transfer",
+        Some(from_id),
+        Some(from_id),
+        Some(to_id),
+        None,
+    )
+}
+
+/// What happens to a retired pen's ROWS — the first of the two choices (#109, round 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rows {
+    /// `owner` moves to the parent: the rows survive, under the parent's responsibility.
+    Inherit,
+    /// `owner` -> NULL: the commons. Private/protected drop, so a private row is PUBLISHED.
+    Disclaim,
+    /// The rows are gone; the keys stay as tombstones and the act is recorded.
+    Delete,
+}
+
+/// What survives of the RECORD — the second choice. Independent of the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum History {
+    /// Tombstone; versions listed, bodies fetchable, memorial note on the ledger.
+    Memorialize,
+    /// Tombstone; content not meant to be read again — versions go.
+    Forget,
+    /// `memory_history_erase`: the store's only true destroyer.
+    Purge,
+}
+
+/// One ledger row: when, what, from whom, to whom — the responsibility story of a key (#109).
+pub type PenEvent = (String, String, Option<String>, Option<String>);
+
+/// What a retirement would do, computed without doing it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetirePreview {
+    pub pen: String,
+    pub parent: Option<String>,
+    pub rows: i64,
+    pub private_rows: i64,
+}
+
+fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
+    conn.query_row(
+        "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+        params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
+}
+
+/// Count what retiring `pen` would touch. Read-only; safe to call before deciding.
+pub fn retire_preview(conn: &Connection, pen: &str) -> Result<RetirePreview> {
+    let (id, parent_id, _) = pen_row(conn, pen)?;
+    let rows: i64 = conn.query_row(
+        "SELECT count(*) FROM memory WHERE owner = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    let private_rows: i64 = conn.query_row(
+        "SELECT count(*) FROM memory WHERE owner = ?1 AND audience <> ?2",
+        params![id, audience::PUBLIC],
+        |r| r.get(0),
+    )?;
+    let parent: Option<String> = match parent_id {
+        Some(pid) => conn
+            .query_row("SELECT name FROM pen WHERE id = ?1", params![pid], |r| {
+                r.get(0)
+            })
+            .optional()?,
+        None => None,
+    };
+    Ok(RetirePreview {
+        pen: pen.to_string(),
+        parent,
+        rows,
+        private_rows,
+    })
+}
+
+/// Retire a pen: it ceases to be, and its rows and record go where the caller says.
+///
+/// NO DEFAULT, deliberately (#109): a retirement that does not say what happens to the rows is how
+/// ghosts are made — the pen is gone, the rows still name it, and `who_can` starts answering about a
+/// pen that officially does not exist.
+///
+/// Not wrapped in one transaction: `delete` opens its own. A failure part-way leaves the pen live and
+/// the ledger holding the events that did happen, which is the recoverable direction.
+pub fn retire(
+    conn: &Connection,
+    pen: &str,
+    caller: &str,
+    rows: Rows,
+    history: History,
+) -> Result<RetirePreview> {
+    let preview = retire_preview(conn, pen)?;
+    let caller_id = exact_pen_id(conn, caller)?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {caller}")))?;
+    let (id, parent_id, ceased_at) = pen_row(conn, pen)?;
+    if ceased_at.is_some() {
+        return Err(Error::Invalid(format!("{pen} is already retired")));
+    }
+    // ★ A ROOT PEN IS NOT RETIRABLE (James, 2026-10-23). `estate` is where terraform stands: no entity
+    // behind it, no credential — a place identities may borrow, not a party that acts. "Retire the
+    // root" is not an operation; the way to change the root is to change the configuration that
+    // defines it. Saying that beats a "no pen named estate" error, which reads as a bug.
+    let Some(parent_id) = parent_id else {
+        return Err(Error::Invalid(format!(
+            "{pen} is a root pen and is not retirable: the estate's own standing changes by configuration, not by an API call"
+        )));
+    };
+    // Authorization: a parent — or any ancestor — retires its child.
+    if !(caller_id == parent_id || is_ancestor(conn, caller_id, parent_id)?) {
+        return Err(Error::Invalid(format!(
+            "{caller} may not retire {pen}: only an ancestor may"
+        )));
+    }
+    let parent = match rows {
+        Rows::Inherit => Some(parent_id),
+        _ => None,
+    };
+
+    let keys: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT key FROM memory WHERE owner = ?1 ORDER BY key")?;
+
+        stmt.query_map(params![id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for key in &keys {
+        match rows {
+            Rows::Inherit => {
+                let to = parent.expect("checked above");
+                conn.execute(
+                    "UPDATE memory SET owner = ?2 WHERE key = ?1",
+                    params![key, to],
+                )?;
+                log_pen_event(
+                    conn,
+                    key,
+                    "transfer",
+                    Some(id),
+                    Some(id),
+                    Some(to),
+                    Some("inherited on retirement"),
+                )?;
+            }
+            Rows::Disclaim => {
+                let was_private: bool = conn
+                    .query_row(
+                        "SELECT audience FROM memory WHERE key = ?1",
+                        params![key],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|a| a != audience::PUBLIC)
+                    .unwrap_or(false);
+                conn.execute(
+                    "UPDATE memory SET owner = NULL, audience = ?2 WHERE key = ?1",
+                    params![key, audience::PUBLIC],
+                )?;
+                log_pen_event(
+                    conn,
+                    key,
+                    "disclaim",
+                    Some(id),
+                    Some(id),
+                    None,
+                    Some(if was_private {
+                        "disclaimed on retirement: private dropped, a disclaimed row is public"
+                    } else {
+                        "disclaimed on retirement"
+                    }),
+                )?;
+            }
+            Rows::Delete => {
+                log_pen_event(
+                    conn,
+                    key,
+                    "delete",
+                    Some(id),
+                    Some(id),
+                    None,
+                    Some("deleted on retirement"),
+                )?;
+                delete(conn, key)?;
+            }
+        }
+        match history {
+            History::Memorialize => {}
+            History::Forget | History::Purge => {
+                version::erase(conn, key)?;
+            }
+        }
+    }
+
+    conn.execute(
+        "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
+        params![id],
+    )?;
+    log_pen_event(
+        conn,
+        "",
+        "retire",
+        Some(id),
+        Some(id),
+        parent,
+        Some(&format!(
+            "rows: {:?} ({} rows, {} private), history: {:?}",
+            rows, preview.rows, preview.private_rows, history
+        )),
+    )?;
+    Ok(preview)
+}
+
+/// The responsibility ledger for one key: who acted, on what, from whom to whom, and why.
+pub fn pen_events(conn: &Connection, key: &str) -> Result<Vec<PenEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT at, action, (SELECT name FROM pen WHERE id = from_pen), (SELECT name FROM pen WHERE id = to_pen)
+           FROM pen_event WHERE key = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(params![key], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
@@ -760,7 +1226,8 @@ const MEMORY_COLUMNS: &str = "id, key, title, body, tags, source, created, updat
      visits, times_useful, \
      (SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version \
        WHERE type = 'memory' AND key = memory.key) AS version, \
-     asserted_by, origin, audience, last_written_by";
+     asserted_by, origin, audience, edited_by, \
+     (SELECT name FROM pen WHERE pen.id = memory.owner) AS owner";
 
 /// Map one `memory` row (the canonical column list) to a `Memory`.
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -780,7 +1247,8 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         asserted_by: r.get(11)?,
         origin: r.get(12)?,
         audience: r.get(13)?,
-        last_written_by: r.get(14)?,
+        edited_by: r.get(14)?,
+        owner: r.get(15)?,
     })
 }
 

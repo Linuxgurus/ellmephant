@@ -91,15 +91,25 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
     })
     .to_string();
 
+    // The version says who wrote the state it holds: the row's `edited_by` at this instant, i.e.
+    // before the change that is about to supersede it (#109).
+    let edited_by: Option<i64> = tx
+        .query_row(
+            "SELECT p.id FROM memory m JOIN pen p ON p.name = m.edited_by WHERE m.id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
     let n: i64 = tx.query_row(
         "SELECT COALESCE(MAX(n), 0) + 1 FROM memory_version WHERE type = ?1 AND key = ?2",
         params![MEMORY, key],
         |r| r.get(0),
     )?;
     tx.execute(
-        "INSERT INTO memory_version (type, key, n, encoding, note, content)
-         VALUES (?1, ?2, ?3, 'json', ?4, ?5)",
-        params![MEMORY, key, n, note, content],
+        "INSERT INTO memory_version (type, key, n, encoding, note, content, edited_by)
+         VALUES (?1, ?2, ?3, 'json', ?4, ?5, ?6)",
+        params![MEMORY, key, n, note, content, edited_by],
     )?;
     Ok(n)
 }

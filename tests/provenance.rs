@@ -28,7 +28,7 @@ fn seeded(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str) -> i6
 
 fn provenance(conn: &rusqlite::Connection, id: i64) -> (String, Option<String>) {
     conn.query_row(
-        "SELECT asserted_by, last_written_by FROM memory WHERE id = ?1",
+        "SELECT asserted_by, edited_by FROM memory WHERE id = ?1",
         [id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
@@ -142,11 +142,11 @@ fn an_upgraded_store_backfills_the_last_writer_from_the_author() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     seeded(&conn, &embedder, "old-row");
-    conn.execute("UPDATE memory SET last_written_by = NULL", [])
+    conn.execute("UPDATE memory SET edited_by = NULL", [])
         .unwrap();
     // Re-run the backfill the migration performs.
     conn.execute(
-        "UPDATE memory SET last_written_by = asserted_by WHERE last_written_by IS NULL",
+        "UPDATE memory SET edited_by = asserted_by WHERE edited_by IS NULL",
         [],
     )
     .unwrap();

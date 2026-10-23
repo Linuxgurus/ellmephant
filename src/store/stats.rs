@@ -46,10 +46,11 @@ pub struct Stats {
     /// Rows with NO owner because somebody released them: `owner IS NULL` but `asserted_by` names a
     /// pen. This is the commons, and anyone may write or adopt.
     pub commons: i64,
-    /// Rows with no owner AND no recorded author — nobody is answerable and nobody is named. Almost
-    /// always a WRITE BUG rather than a fact about the row (the HTTP door did not stamp
-    /// `asserted_by` until 2026-10-23, so every row it wrote landed here). They need an owner to
-    /// CLAIM them, not to be silently granted to everyone (Stet, review of #122).
+    /// Rows with no owner and no author among the pens that exist: `asserted_by` is `anonymous`, which
+    /// means **no currently existing pen wrote this** (James) — the store cannot tell "nobody wrote it"
+    /// from "a pen that is gone wrote it", and should not pretend to. Some of these are a WRITE BUG
+    /// (the HTTP door did not stamp `asserted_by` until 2026-10-23); all of them need an owner to
+    /// CLAIM them rather than being silently granted to everyone (Stet, review of #122).
     pub unattributed: i64,
     /// Total tag placements (the sum of the per-tag counts).
     pub tag_assignments: i64,

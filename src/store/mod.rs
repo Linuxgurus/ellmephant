@@ -9,6 +9,7 @@ pub mod links;
 pub mod mail;
 pub mod maintain;
 pub mod project;
+pub mod relation;
 pub mod slug;
 pub mod snapshot;
 pub mod stats;

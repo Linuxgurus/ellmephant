@@ -743,3 +743,109 @@ fn a_fingers_work_is_its_hands_and_retirement_moves_it() {
         "the pen is disposed of; the work stays where it was"
     );
 }
+
+// ── KINSHIP ──────────────────────────────────────────────────────────────────────────────────────
+// The walk between two pens: shortest, never doubling back, `S` always written. Letters are the fact,
+// the word in quotes is a courtesy.
+
+fn deeper_tree(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        // Build this tree from an empty registry (0021 seeds `estate`, so keep it and add the rest).
+        "DELETE FROM pen;
+         INSERT INTO pen (name, kind) VALUES ('estate', 'self');
+         INSERT INTO pen (name, kind, parent_id) VALUES ('james', 'self', (SELECT id FROM pen WHERE name='estate'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet', 'self', (SELECT id FROM pen WHERE name='james'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('cline', 'self', (SELECT id FROM pen WHERE name='james'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet/hand', 'self', (SELECT id FROM pen WHERE name='stet'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet/hand/f-1', 'finger', (SELECT id FROM pen WHERE name='stet/hand'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet/hand/f-1/f-2', 'finger', (SELECT id FROM pen WHERE name='stet/hand/f-1'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('island', 'self', NULL);
+         INSERT INTO pen (name, kind, parent_id) VALUES ('island/x', 'self', (SELECT id FROM pen WHERE name='island'));",
+    )
+    .expect("pen tree");
+}
+
+#[test]
+fn a_walk_names_every_relation_and_never_doubles_back() {
+    let (_dir, conn) = subtree();
+    deeper_tree(&conn);
+
+    let kin = |a: &str, b: &str| {
+        store::relation::relation(&conn, a, b)
+            .unwrap()
+            .map(|k| k.gloss())
+    };
+
+    assert_eq!(kin("stet", "stet").as_deref(), Some("ME"));
+    assert_eq!(kin("stet", "james").as_deref(), Some("P \"parent\""));
+    assert_eq!(kin("stet", "estate").as_deref(), Some("PP \"grandparent\""));
+    assert_eq!(kin("james", "stet").as_deref(), Some("C \"child\""));
+    assert_eq!(kin("estate", "stet").as_deref(), Some("CC \"grandchild\""));
+    assert_eq!(kin("stet", "cline").as_deref(), Some("S \"sibling\""));
+    assert_eq!(kin("stet", "stet/hand").as_deref(), Some("C \"child\""));
+    assert_eq!(
+        kin("stet", "stet/hand/f-1").as_deref(),
+        Some("CC \"grandchild\"")
+    );
+    // A child is below, and a grandchild two below.
+    assert_eq!(
+        kin("stet/hand/f-1", "stet/hand/f-1/f-2").as_deref(),
+        Some("C \"child\"")
+    );
+    assert_eq!(
+        kin("stet/hand", "stet/hand/f-1/f-2").as_deref(),
+        Some("CC \"grandchild\"")
+    );
+
+    // Across the tree: uncle, nephew, cousin — each the shortest walk through the common ancestor.
+    assert_eq!(kin("stet/hand", "cline").as_deref(), Some("PS \"uncle\""));
+    assert_eq!(kin("cline", "stet/hand").as_deref(), Some("SC \"nephew\""));
+    assert_eq!(
+        kin("stet/hand", "island").as_deref(),
+        None,
+        "no common root"
+    );
+
+    // And a sibling is never spelled `PC`: the walk is one token.
+    let sibling = store::relation::relation(&conn, "stet", "cline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(sibling.walk, "S");
+    assert!(!sibling.walk.contains("PC"));
+}
+
+#[test]
+fn a_cousin_is_the_walk_through_the_common_ancestor() {
+    let (_dir, conn) = subtree();
+    deeper_tree(&conn);
+
+    // f-1's parent is stet/hand; f-1/f-2 is two levels below stet. `cline` is stet's sibling, and
+    // `f-2` vs a child of cline would be cousins — build that and check the letters.
+    conn.execute(
+        "INSERT INTO pen (name, kind, parent_id) VALUES ('cline/hand', 'self', (SELECT id FROM pen WHERE name='cline'))",
+        [],
+    )
+    .unwrap();
+
+    let kin = |a: &str, b: &str| store::relation::relation(&conn, a, b).unwrap().unwrap();
+    // stet/hand vs cline/hand: common ancestor james, one step up each side → P S C.
+    assert_eq!(kin("stet/hand", "cline/hand").walk, "PSC");
+    assert_eq!(kin("stet/hand", "cline/hand").word, Some("cousin"));
+    // Four steps up to `james` and two down to `cline/hand`: three P's, the sibling step, one C.
+    // English has "first cousin once removed" for this and we do not print it — the letters are
+    // exact and the phrase is approximate.
+    let removed = kin("stet/hand/f-1/f-2", "cline/hand");
+    assert_eq!(removed.walk, "PPPSC");
+    assert_eq!(removed.word, None);
+}
+
+#[test]
+fn english_stops_where_it_starts_approximating() {
+    // A word in quotes is a claim, so it is only made where it is exact.
+    assert_eq!(
+        store::relation::word_for_public("PPSCC"),
+        Some("second cousin")
+    );
+    assert_eq!(store::relation::word_for_public("PPSCCC"), None);
+    assert_eq!(store::relation::word_for_public("PS"), Some("uncle"));
+}

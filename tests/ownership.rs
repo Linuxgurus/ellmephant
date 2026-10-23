@@ -250,24 +250,28 @@ fn delete_on_retirement_removes_the_rows_and_can_purge_the_record() {
 }
 
 #[test]
-fn inherit_without_a_parent_is_refused() {
+fn a_root_pen_is_not_retirable_by_anyone() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();
-    seed_pen(&conn, "lonely", None);
     seed_pen(&conn, "estate", None);
+    seed_pen(&conn, "james", Some("estate"));
 
-    let err = store::retire(
-        &conn,
-        "lonely",
-        "estate",
-        store::Rows::Inherit,
-        store::History::Memorialize,
-    )
-    .expect_err("a root has no parent to inherit");
-    assert!(
-        format!("{err}").contains("no parent"),
-        "the message says where to go instead"
-    );
+    // Not even its own child, and not even with `inherit`: the root's standing changes by
+    // configuration, not by a call.
+    for caller in ["james", "estate"] {
+        let err = store::retire(
+            &conn,
+            "estate",
+            caller,
+            store::Rows::Disclaim,
+            store::History::Memorialize,
+        )
+        .expect_err("the root is not retirable");
+        assert!(
+            format!("{err}").contains("not retirable"),
+            "the message says the root changes by configuration"
+        );
+    }
 }
 
 #[test]

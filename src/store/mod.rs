@@ -595,11 +595,6 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     Ok(id)
 }
 
-/// The root pen: the estate itself, which is where terraform stands (a provisioning act carries the
-/// root's authority, not a human's). A root has no parent to retire it, so the root is its own
-/// custodian — a pen that goes bad at 03:00 has to be stoppable by somebody (#109).
-pub const ROOT_CUSTODIAN: &str = "estate";
-
 /// The exact row for a name — no parent resolution. Ownership rules need both this and
 /// [`owner_pen_id`]: a finger acts as itself but owns as its parent.
 fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
@@ -630,6 +625,22 @@ fn is_ancestor(conn: &Connection, ancestor: i64, of: i64) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Make sure a name has a pen row, and return the id it OWNS as. The identity table is the only
+/// authenticator, so a name that can authenticate IS a pen; without this, a self that had never
+/// written would have its first row land in the commons (owner NULL) — absence-with-a-meaning it
+/// never chose (#109, review round 4).
+fn ensure_pen(conn: &Connection, name: &str) -> Result<i64> {
+    if let Some(id) = owner_pen_id(conn, Some(name))? {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO pen (name, kind) VALUES (?1, 'self')",
+        params![name],
+    )?;
+    owner_pen_id(conn, Some(name))?
+        .ok_or_else(|| Error::Invalid(format!("could not register pen {name}")))
 }
 
 /// The `pen` row that a name OWNS as: itself, or its parent when the name is a finger
@@ -723,7 +734,10 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.origin,
             audience::effective(&mem.audience),
             mem.edited_by,
-            owner_pen_id(tx, mem.asserted_by.as_deref())?
+            match mem.asserted_by.as_deref() {
+                Some(name) => Some(ensure_pen(tx, name)?),
+                None => None,
+            }
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -976,25 +990,23 @@ pub fn retire(
     if ceased_at.is_some() {
         return Err(Error::Invalid(format!("{pen} is already retired")));
     }
-    // Authorization: a parent retires its child. A ROOT has no parent, so the root custodian may —
-    // a pen that goes bad at 03:00 must be stoppable by somebody (#109).
-    let permitted = match parent_id {
-        Some(pid) => caller_id == pid || is_ancestor(conn, caller_id, pid)?,
-        None => caller == ROOT_CUSTODIAN,
+    // ★ A ROOT PEN IS NOT RETIRABLE (James, 2026-10-23). `estate` is where terraform stands: no entity
+    // behind it, no credential — a place identities may borrow, not a party that acts. "Retire the
+    // root" is not an operation; the way to change the root is to change the configuration that
+    // defines it. Saying that beats a "no pen named estate" error, which reads as a bug.
+    let Some(parent_id) = parent_id else {
+        return Err(Error::Invalid(format!(
+            "{pen} is a root pen and is not retirable: the estate's own standing changes by configuration, not by an API call"
+        )));
     };
-    if !permitted {
-        return Err(Error::Invalid(match parent_id {
-            Some(_) => format!("{caller} may not retire {pen}: only an ancestor may"),
-            None => format!("{caller} may not retire root pen {pen}: only {ROOT_CUSTODIAN} may"),
-        }));
+    // Authorization: a parent — or any ancestor — retires its child.
+    if !(caller_id == parent_id || is_ancestor(conn, caller_id, parent_id)?) {
+        return Err(Error::Invalid(format!(
+            "{caller} may not retire {pen}: only an ancestor may"
+        )));
     }
-    let parent = match (rows, parent_id) {
-        (Rows::Inherit, None) => {
-            return Err(Error::Invalid(format!(
-                "{pen} has no parent: `inherit` needs somewhere for the rows to go (use disclaim or delete)"
-            )));
-        }
-        (Rows::Inherit, Some(pid)) => Some(pid),
+    let parent = match rows {
+        Rows::Inherit => Some(parent_id),
         _ => None,
     };
 

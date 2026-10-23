@@ -990,6 +990,104 @@ fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<St
     .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
 }
 
+/// A pen created at runtime: whoever minted it answered for it, and it answered to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Minted {
+    /// The new pen's name.
+    pub name: String,
+    /// `self` or `finger` — what KIND of thing it is, never inferred from the name.
+    pub kind: String,
+    /// The pen that minted it: the parent, by right, never by argument.
+    pub parent: String,
+}
+
+/// **MINT: a pen creates a pen** (James, 2026-10-23). The runtime door.
+///
+/// The parent is the CALLER — you may create downward, never sideways and never upward, because
+/// parentage is the grant and a name is an address rather than a permission. A hand mints a finger;
+/// `estate`'s children are minted by provisioning, which is the other door and a different act.
+///
+/// ★ A NAME IS SPENT. A retired pen keeps its row (a tombstone, `ceased_at`) and its name stays
+/// taken, so this refuses rather than resurrecting. Two lives under one name would make every ledger
+/// row ambiguous — "who did this" cannot mean two different pens — and the whole point of the
+/// tombstone is that history outlives the thing.
+pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<Minted> {
+    if kind != "self" && kind != "finger" {
+        return Err(Error::Invalid(format!(
+            "kind must be `self` or `finger`, not `{kind}`"
+        )));
+    }
+    let (caller_id, _, ceased) = pen_row(conn, caller)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{caller} has been retired: a pen that has ceased cannot create pens"
+        )));
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Invalid("a pen needs a name".into()));
+    }
+    if let Some((_, _, ceased_at)) = conn
+        .query_row(
+            "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+            params![name],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        return Err(Error::Invalid(match ceased_at {
+            Some(at) => format!(
+                "{name} was a pen retired at {at}: a name is spent, and reusing it would make every \
+                 ledger row mean two things"
+            ),
+            None => format!("{name} is already a pen"),
+        }));
+    }
+    conn.execute(
+        "INSERT INTO pen (name, kind, parent_id) VALUES (?1, ?2, ?3)",
+        params![name, kind, caller_id],
+    )?;
+    Ok(Minted {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        parent: caller.to_string(),
+    })
+}
+
+/// May `proven` be credited as `claimed` on a write? Itself, or anything below it.
+///
+/// A finger holds no credential of its own — it is how one self does more work, not a party — so its
+/// work is written under the hand's PROOF and the finger's NAME. This is the check that keeps that
+/// honest: a hand may credit its own subtree, and nothing else. Without it the write path would take
+/// any name the transport offered, which is how a name becomes a permission.
+pub fn may_act_as(conn: &Connection, proven: &str, claimed: &str) -> Result<()> {
+    if proven.eq_ignore_ascii_case(claimed) {
+        return Ok(());
+    }
+    let (proven_id, _, ceased) = pen_row(conn, proven)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!("{proven} has been retired")));
+    }
+    let claimed_id = exact_pen_id(conn, claimed)?.ok_or_else(|| {
+        Error::Invalid(format!(
+            "{claimed} is not a pen: a write may name itself or a pen it minted"
+        ))
+    })?;
+    if is_ancestor(conn, proven_id, claimed_id)? {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a peer \
+         and never an ancestor"
+    )))
+}
+
 /// Count what retiring `pen` would touch. Read-only; safe to call before deciding.
 pub fn retire_preview(conn: &Connection, pen: &str) -> Result<RetirePreview> {
     let (id, parent_id, _) = pen_row(conn, pen)?;

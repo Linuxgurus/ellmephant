@@ -213,6 +213,20 @@ impl Session {
         }
     }
 
+    /// What this row's owner is TO THE READER, in the settled letters (`PS "uncle"`, `ME`, …).
+    ///
+    /// ★ A NAME IS AN ADDRESS, and this is the rest of the sentence: `owner` says who answers for a
+    /// row, and the walk says what that pen is to the one asking (James, 2026-10-23). `None` when
+    /// there is no owner (the commons), no proven reader, or no common root — absence, never a guess.
+    pub fn owner_relation(&self, mem: &Memory) -> Option<String> {
+        let viewer = self.reader.pen_name()?;
+        let owner = mem.owner.as_deref()?;
+        store::relation::relation(&self.conn, viewer, owner)
+            .ok()
+            .flatten()
+            .map(|k| k.gloss())
+    }
+
     /// Retire one memory into another: repoint every reference, then delete the source. The prose
     /// fold is the caller's — this never touches `into`'s body. No encoder: the graph is not
     /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch

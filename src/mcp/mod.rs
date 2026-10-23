@@ -1875,11 +1875,17 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return serde_json::to_string(&v).map_err(|e| e.to_string());
         }
         let lookup = key.clone();
-        let mut mem = match self
-            .with_read("memory_get", reader.clone(), move |s| s.show(&lookup))
+        // The relation is computed INSIDE the read, where the session's proven pen is in hand: what
+        // the owner is to the ASKER, not a property of the row.
+        let (mut mem, relation) = match self
+            .with_read("memory_get", reader.clone(), move |s| {
+                let mem = s.show(&lookup)?;
+                let relation = s.owner_relation(&mem);
+                Ok((mem, relation))
+            })
             .await
         {
-            Ok(m) => m,
+            Ok(found) => found,
             Err(e) => return Err(self.explain_miss(&key, e, reader.clone()).await),
         };
         // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
@@ -1894,6 +1900,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let mut v = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
         if let Some(obj) = v.as_object_mut() {
             obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+            if let Some(walk) = relation {
+                obj.insert("owner_relation".to_string(), serde_json::json!(walk));
+            }
         }
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }

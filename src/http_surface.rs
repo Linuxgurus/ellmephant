@@ -713,7 +713,14 @@ pub async fn memory_get(
                     obj.insert("version".to_string(), serde_json::json!(n));
                     obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
                 }
-                render(StatusCode::OK, json, value.to_string(), memory_text(&past))
+                // A PAST state is read by address: its owner rides inside `content`, and a walk is
+                // for a pen that still answers, so no relation is printed here.
+                render(
+                    StatusCode::OK,
+                    json,
+                    value.to_string(),
+                    memory_text(&past, None),
+                )
             }
             Ok(None) => error(
                 json,
@@ -725,10 +732,15 @@ pub async fn memory_get(
     }
     let lookup = key.clone();
     match server
-        .with_read("memory_get", reader, move |s| s.show(&lookup))
+        .with_read("memory_get", reader, move |s| {
+            let mem = s.show(&lookup)?;
+            // The relation belongs to the READER, so it is computed where the proven pen is known.
+            let relation = s.owner_relation(&mem);
+            Ok((mem, relation))
+        })
         .await
     {
-        Ok(mut mem) => {
+        Ok((mut mem, relation)) => {
             // Count the read best-effort (see `MemoryServer::bump_visit`): telemetry never makes a
             // reader wait, so a write in flight means this visit goes uncounted.
             if let Some(seen) = server.bump_visit(&key) {
@@ -737,8 +749,16 @@ pub async fn memory_get(
             let mut value = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+                if let Some(walk) = &relation {
+                    obj.insert("owner_relation".to_string(), serde_json::json!(walk));
+                }
             }
-            render(StatusCode::OK, json, value.to_string(), memory_text(&mem))
+            render(
+                StatusCode::OK,
+                json,
+                value.to_string(),
+                memory_text(&mem, relation.as_deref()),
+            )
         }
         Err(e) => error(json, error_status(&e), e),
     }
@@ -1868,9 +1888,17 @@ fn stats_text(s: &store::stats::Stats) -> String {
 }
 
 /// The `GET /memory/{key}` prose: the header fields, then the body.
-fn memory_text(mem: &store::Memory) -> String {
+fn memory_text(mem: &store::Memory, relation: Option<&str>) -> String {
     let mut out = format!("{}\n", mem.key);
     out.push_str(&format!("  {:<8}{}\n", "title", mem.title));
+    // Who answers for it, and what they are to the reader: a name is an address, and the walk is the
+    // rest of the sentence.
+    if let Some(owner) = &mem.owner {
+        match relation {
+            Some(walk) => out.push_str(&format!("  {:<8}{owner}  {walk}\n", "owner")),
+            None => out.push_str(&format!("  {:<8}{owner}\n", "owner")),
+        }
+    }
     out.push_str(&format!("  {:<8}{}\n", "tags", mem.tags.join(", ")));
     if let Some(source) = &mem.source {
         out.push_str(&format!("  {:<8}{source}\n", "source"));

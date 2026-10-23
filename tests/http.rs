@@ -1976,3 +1976,50 @@ async fn an_anonymous_caller_cannot_read_a_mailbox() {
         "an anonymous cursor advance must be refused"
     );
 }
+
+/// A row says who answers for it, and the walk says what that pen is to the reader — `memory_get`
+/// carries both, computed at READ time from the asker's seat (James, 2026-10-23).
+#[tokio::test]
+async fn memory_get_names_the_owner_and_what_they_are_to_you() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "mine", "title": "Mine", "body": "the facts" }),
+    )
+    .await;
+
+    // The asker IS the owner here, so the walk is `ME` — the one answer that needs no gloss.
+    let got = tool(service.peer(), "memory_get", json!({ "key": "mine" })).await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["owner"], json!("tester"), "{got}");
+    assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
+
+    // The HTTP door reached without an identity pair is NOBODY: it still learns who answers for the
+    // row, and learns nothing about what that pen is to it. Absence, never a guess.
+    let (status, body, _) = get(&app, "/memory/mine").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("owner   tester"), "{body}");
+    assert!(
+        !body.contains("ME"),
+        "an anonymous reader has no walk: {body}"
+    );
+}

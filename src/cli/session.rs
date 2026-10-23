@@ -213,6 +213,11 @@ impl Session {
         }
     }
 
+    /// Mint a pen under `caller` — the runtime door.
+    pub fn mint(&self, caller: &str, name: &str, kind: &str) -> Result<store::Minted> {
+        store::mint(&self.conn, caller, name, kind)
+    }
+
     /// One pen as `viewer` sees it — the tree through this session's connection.
     pub fn whois(&self, viewer: &str, pen: &str) -> Result<store::Whois> {
         store::whois(&self.conn, viewer, pen)

@@ -1056,7 +1056,7 @@ fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<St
 }
 
 /// A pen created at runtime: whoever minted it answered for it, and it answered to them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Minted {
     /// The new pen's name.
     pub name: String,

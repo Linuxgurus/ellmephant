@@ -2105,3 +2105,75 @@ async fn whois_answers_on_both_doors() {
         "an unknown pen is a refusal"
     );
 }
+
+/// `pen_mint` — the runtime door, on both doors. The parent is the CALLER, and a name is spent.
+#[tokio::test]
+async fn pen_mint_creates_a_child_under_the_caller() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A write first, so the caller exists as a pen (`ensure_pen`) before it mints.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "first" }),
+    )
+    .await;
+
+    let minted = tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/finger-9f3a1c", "kind": "finger" }),
+    )
+    .await;
+    let doc: serde_json::Value = serde_json::from_str(&minted).unwrap();
+    assert_eq!(doc["name"], json!("tester/finger-9f3a1c"), "{minted}");
+    assert_eq!(doc["kind"], json!("finger"), "{minted}");
+    assert_eq!(
+        doc["parent"],
+        json!("tester"),
+        "the caller is the parent: {minted}"
+    );
+
+    // The new pen is in the tree, and the walk says what it is to the minting hand.
+    let seen = tool(
+        service.peer(),
+        "whois",
+        json!({ "pen": "tester/finger-9f3a1c" }),
+    )
+    .await;
+    let seen: serde_json::Value = serde_json::from_str(&seen).unwrap();
+    assert_eq!(seen["relation"], json!("C \"child\""), "{seen}");
+
+    // A name is spent: minting it again is refused, and so is a kind nobody defined.
+    let again = tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/finger-9f3a1c", "kind": "finger" }),
+    )
+    .await;
+    assert!(again.contains("already a pen"), "{again}");
+    let bad = tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/odd", "kind": "hand" }),
+    )
+    .await;
+    assert!(bad.contains("`self` or `finger`"), "{bad}");
+}

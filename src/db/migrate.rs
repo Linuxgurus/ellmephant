@@ -115,6 +115,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0021_pen_registry.sql"),
         "the pen registry: identity as a row, with a parent and a tombstone, so `owner` can exist (#109)",
     ),
+    (
+        22,
+        include_str!("../../migrations/0022_edited_by.sql"),
+        "`edited_by`: the author of the state in each snapshot — every record says who wrote it (#109)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

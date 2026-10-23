@@ -251,8 +251,11 @@ impl Session {
     }
 
     /// Delete one memory by key; `false` means there was nothing to delete.
-    pub fn rm(&self, key: &str) -> Result<bool> {
-        store::delete(&self.conn, key)
+    ///
+    /// `acted_by` is the proven pen the door is acting for: a delete is a write of absence, so it
+    /// takes the same reach as an edit and leaves a ledger row saying who removed it.
+    pub fn rm(&self, key: &str, acted_by: Option<&str>) -> Result<bool> {
+        store::delete(&self.conn, key, acted_by)
     }
 
     /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying

@@ -1598,14 +1598,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
             .with_store("memory_delete", move |s| {
-                if !s.rm(&rm_key)? {
+                if !s.rm(&rm_key, Some(&pen))? {
                     return Ok(None);
                 }
                 Ok(Some(s.version_count(&rm_key)?))

@@ -160,13 +160,13 @@ fn delete_removes_row_and_every_derived_index() {
     )
     .expect("add");
 
-    assert!(store::delete(&conn, "anchor").unwrap(), "row existed");
+    assert!(store::delete(&conn, "anchor", None).unwrap(), "row existed");
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 0);
     assert_eq!(vec::count(&conn).unwrap(), 0, "vector gone");
     assert_eq!(count(&conn, "SELECT count(*) FROM memory_link"), 0);
 
     assert!(
-        !store::delete(&conn, "anchor").unwrap(),
+        !store::delete(&conn, "anchor", None).unwrap(),
         "second delete is a no-op"
     );
 }

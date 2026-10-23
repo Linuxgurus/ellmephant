@@ -1264,10 +1264,17 @@ pub async fn upsert(
     } else {
         memory_patch_text(&String::from_utf8_lossy(&bytes))
     };
-    let patch = match patch {
+    let mut patch = match patch {
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
+    // ★ THE COMMENT ABOVE WAS TRUE AND THE CODE WAS NOT: the parsers return `asserted_by: None` and
+    // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
+    // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
+    // names the pen, and only a PROVEN one is stamped (#109).
+    if patch.asserted_by.is_none() {
+        patch.asserted_by = crate::identity::resolve(&headers).ok().flatten();
+    }
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -1352,10 +1359,13 @@ pub async fn memory_delete(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
+    // nobody to name in the ledger, and `store::delete` will refuse it on a row somebody owns.
+    let pen = crate::identity::resolve(&headers).ok().flatten();
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
-            if !s.rm(&lookup)? {
+            if !s.rm(&lookup, pen.as_deref())? {
                 return Ok(None);
             }
             Ok(Some(s.version_count(&lookup)?))

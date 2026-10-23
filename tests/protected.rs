@@ -91,11 +91,11 @@ fn holding_the_lease_lets_the_holder_write_it() {
 fn deleting_a_protected_memory_needs_the_lease_too() {
     let (_dir, conn, _embedder) = seeded("vault");
     assert!(
-        store::delete(&conn, "vault").is_err(),
+        store::delete(&conn, "vault", None).is_err(),
         "an unleased delete must be refused"
     );
     store::claim::acquire(&conn, "vault", "hands-mail-1:1", None).expect("lease");
-    assert!(store::delete(&conn, "vault").expect("leased delete"));
+    assert!(store::delete(&conn, "vault", None).expect("leased delete"));
 }
 
 #[test]

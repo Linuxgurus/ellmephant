@@ -553,3 +553,73 @@ fn a_finger_writes_on_its_parents_rows() {
     assert!(err.is_empty(), "a finger acts as its parent: {err}");
     assert_eq!(owner(&conn, "shared-work").as_deref(), Some("stet"));
 }
+
+// ── REMOVAL IS AN ACT WITH A NAME ────────────────────────────────────────────────────────────────
+// A delete is a write of absence: it takes the same reach as an edit, and it leaves a record. A
+// removal nobody is named for is indistinguishable from a mistake.
+
+#[test]
+fn a_peer_may_not_delete_another_pens_row() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    let err = store::delete(&conn, "stets-note", Some("cline")).expect_err("a sibling is refused");
+    assert!(format!("{err}").contains("may not write"), "{err}");
+    assert!(
+        store::get(&conn, "stets-note").unwrap().is_some(),
+        "a refused delete removes nothing"
+    );
+}
+
+#[test]
+fn deleting_leaves_a_named_ledger_entry() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    assert!(store::delete(&conn, "stets-note", Some("stet")).expect("owner may delete"));
+    assert!(store::get(&conn, "stets-note").unwrap().is_none());
+
+    let events = store::pen_events(&conn, "stets-note").unwrap();
+    let delete = events
+        .iter()
+        .find(|e| e.1 == "delete")
+        .expect("the ledger keeps what happened even though the row is gone");
+    assert_eq!(delete.4.as_deref(), Some("stet"), "who removed it");
+    assert_eq!(delete.2.as_deref(), Some("stet"), "what it was before");
+    assert_eq!(
+        delete.3, None,
+        "and nothing took it on: a removal has no heir"
+    );
+}
+
+#[test]
+fn an_ancestor_may_delete_and_the_record_says_so() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    assert!(store::delete(&conn, "stets-note", Some("james")).expect("an ancestor reaches down"));
+    let events = store::pen_events(&conn, "stets-note").unwrap();
+    let delete = events
+        .iter()
+        .find(|e| e.1 == "delete")
+        .expect("delete event");
+    assert_eq!(
+        delete.4.as_deref(),
+        Some("james"),
+        "the actor is the pen that did it, not the pen that owned it"
+    );
+    assert_eq!(delete.2.as_deref(), Some("stet"), "the row was stet's");
+}
+
+#[test]
+fn a_commons_row_may_be_removed_by_anyone() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "everyones", "stet");
+    store::disclaim(&conn, "everyones", "stet", false).expect("disclaim");
+
+    assert!(store::delete(&conn, "everyones", Some("cline")).expect("the commons is anyone's"));
+}

@@ -483,7 +483,7 @@ fn reparse_makes_the_graph_agree_with_the_bodies() {
     );
 
     // Delete the target the way `memory_delete` does: the row goes, its referrers do not.
-    store::delete(&conn, "target").expect("delete");
+    store::delete(&conn, "target", None).expect("delete");
 
     // The body still names `[[target]]`, so the edge is REAL and the audit is right to report it.
     // Reparsing must agree with the text rather than with the history of edits.

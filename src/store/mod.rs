@@ -958,7 +958,18 @@ pub enum History {
 }
 
 /// One ledger row: when, what, from whom, to whom — the responsibility story of a key (#109).
-pub type PenEvent = (String, String, Option<String>, Option<String>);
+/// One row of the responsibility ledger: `(at, action, from_pen, to_pen, actor)`.
+///
+/// `from`/`to` are the row's holders before and after; `actor` is the pen that did it — which is
+/// not always either of them, because an ancestor may act on a descendant's row, and a DELETE has
+/// no `to` at all. Appended last so the older readers of this tuple keep their positions.
+pub type PenEvent = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// What a retirement would do, computed without doing it.
 #[derive(Debug, Clone, Serialize)]
@@ -1113,7 +1124,7 @@ pub fn retire(
                     None,
                     Some("deleted on retirement"),
                 )?;
-                delete(conn, key)?;
+                delete_impl(conn, key, None, false)?;
             }
         }
         match history {
@@ -1146,12 +1157,15 @@ pub fn retire(
 /// The responsibility ledger for one key: who acted, on what, from whom to whom, and why.
 pub fn pen_events(conn: &Connection, key: &str) -> Result<Vec<PenEvent>> {
     let mut stmt = conn.prepare(
-        "SELECT at, action, (SELECT name FROM pen WHERE id = from_pen), (SELECT name FROM pen WHERE id = to_pen)
+        "SELECT at, action,
+                (SELECT name FROM pen WHERE id = from_pen),
+                (SELECT name FROM pen WHERE id = to_pen),
+                (SELECT name FROM pen WHERE id = pen_id)
            FROM pen_event WHERE key = ?1 ORDER BY id",
     )?;
     let rows = stmt
         .query_map(params![key], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
@@ -1159,28 +1173,49 @@ pub fn pen_events(conn: &Connection, key: &str) -> Result<Vec<PenEvent>> {
 
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
-pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
+pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bool> {
     guard_protected_delete(conn, key)?;
+    // ★ A DELETE IS A WRITE OF ABSENCE (soma/ellmephant#109). It takes the same reach as an edit —
+    // the owner, the pen acting for the owner, or an ancestor — and it leaves the same kind of
+    // record. Removal that nobody is named for is indistinguishable from a mistake.
+    may_write(conn, key, acted_by)?;
+    delete_impl(conn, key, acted_by, true)
+}
+
+/// The removal itself, once somebody has been found to answer for it.
+///
+/// `log` is false only for the caller that keeps its OWN record — `retire`, which already writes
+/// "deleted on retirement" per row in the same act. One act, one ledger entry.
+fn delete_impl(conn: &Connection, key: &str, acted_by: Option<&str>, log: bool) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
     // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
     // rediscover. Both halves ride in one transaction, so neither undoes the other.
     encode::forget(&tx, &crate::store::links::Kind::Memory.keyslug(key))?;
-    let row: Option<(i64, String)> = tx
+    let row: Option<(i64, String, Option<i64>)> = tx
         .query_row(
-            "SELECT id, audience FROM memory WHERE key = ?1",
+            "SELECT id, audience, owner FROM memory WHERE key = ?1",
             params![key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     let existed = row.is_some();
-    if let Some((id, audience)) = row {
+    if let Some((id, audience, owner)) = row {
         // A delete SUPERSEDES the state the memory is in, so it snapshots it first — exactly as an
         // edit does, and in the same transaction. Without this, a deleted key's newest version would
         // be some earlier state and the content it actually held would be the one thing versioning
         // did not keep; with it, `erase` is the store's single true destroyer.
         version::snapshot(&tx, id, key, None)?;
         tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
+        // The ledger keeps WHAT HAPPENED even though the row is gone: an absence with no record is
+        // the one deletion nobody can review.
+        if log {
+            let actor = match acted_by {
+                Some(name) => owner_pen_id(&tx, Some(name))?,
+                None => None,
+            };
+            log_pen_event(&tx, key, "delete", actor, owner, None, None)?;
+        }
         // ★ A PRIVATE ROW'S VECTOR IS PURGED, NOT TOMBSTONED. The tombstone table is a DELIBERATE
         // search surface (`semantic_search(deleted=true)`), so moving a private document's vector
         // there would keep it findable by meaning — by anyone — after its row was gone, and a

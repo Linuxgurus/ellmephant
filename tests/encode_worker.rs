@@ -576,7 +576,7 @@ fn a_deleted_key_leaves_no_queue_entry() {
     assert_eq!(queued(&conn), ["memory:gone", "memory:kept"]);
 
     // Delete: the entry goes in the same transaction as the row.
-    assert!(ellmephant::store::delete(&conn, "gone").expect("delete"));
+    assert!(ellmephant::store::delete(&conn, "gone", None).expect("delete"));
     assert_eq!(
         queued(&conn),
         ["memory:kept"],

@@ -203,3 +203,42 @@ fn a_boot_spec_applies_what_it_can_and_names_what_it_cannot() {
     // The loading is a policy write; borrowing still needs the verb.
     sudo::sudo(&conn, "james", "estate", 3600).expect("the good entries landed");
 }
+
+#[test]
+fn a_lend_sets_the_deadline_and_never_stacks_one() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // A long lend, then a short one for the same pair: the SHORT one is the truth.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    let short = sudo::lend(&conn, "stet", "stet/hand", 30).unwrap();
+    let live = sudo::live(&conn, "stet/hand", "stet")
+        .unwrap()
+        .expect("live");
+    assert_eq!(live.id, short.id, "the newest lend is the one that governs");
+
+    // ★ THE HAZARD THIS EXISTS FOR: if the long row survived, the short lend would expire and then
+    // the 600s one would silently let the finger write again. Push the clock past the short lend and
+    // past nothing else — permission must be GONE, not resurrected.
+    conn.execute(
+        "UPDATE active_sudo SET expires_at = datetime('now', '-1 second') WHERE id = ?1",
+        rusqlite::params![short.id],
+    )
+    .unwrap();
+    assert!(
+        sudo::live(&conn, "stet/hand", "stet").unwrap().is_none(),
+        "a shortened lend must not come back when it lapses"
+    );
+
+    // And re-lending ends anything passed down from the lend it replaces: a child may not outlive
+    // the grant it was passed under.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    sudo::pass(&conn, "stet/hand", "stet", "stet/hand/finger-1", 60).expect("pass down");
+    assert!(!sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty());
+    sudo::lend(&conn, "stet", "stet/hand", 300).unwrap();
+    assert!(
+        sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty(),
+        "the finger's session was passed from the lend that just ended"
+    );
+}

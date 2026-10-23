@@ -108,7 +108,12 @@ pub fn revoke(conn: &Connection, powerful: &str, weak: &str) -> Result<usize> {
 /// mean every minted finger needs a configuration entry — configuration written by code.
 ///
 /// What lending keeps is the part that matters: it EXPIRES, it can be REVOKED by deleting one row,
-/// and `via` lets a lend's children die with it. Without this, a finger's authority would be a fact
+/// and `via` lets a lend's children die with it.
+///
+/// ★ **A lend SETS the deadline; it does not stack one on top.** Two live rows for the same pair
+/// would mean the effective deadline is whichever happens to be later, and a SHORTER lend would
+/// reappear as the longer one after it lapsed. So lending again replaces the pair's sessions (and
+/// everything passed down from them). To end one early, `release`. Without this, a finger's authority would be a fact
 /// about tree shape and nothing could revoke it short of re-shaping the tree.
 pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<Session> {
     if powerful.eq_ignore_ascii_case(weak) {
@@ -133,11 +138,28 @@ pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<
             "a lend must last between 1 and {MAX_DURATION_SECS} seconds (asked for {secs})"
         )));
     }
-    conn.execute(
+    // ★ A LEND REPLACES WHAT WAS LENT (Stet, review of #126). Two live rows for one pair are not a
+    // tightening and not a renewal — they are two deadlines, and the later one wins by accident.
+    // Worse, the SHORTER of them expiring reveals the longer one again: a lend you shortened comes
+    // back on its own. So a lend is a SET: the pair's live sessions end (with everything passed down
+    // from them, or a child would outlive the grant it was passed under), then the new one begins.
+    // To shorten without re-lending is `release`; to extend is another `lend`.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE weak = ?1 AND powerful = ?2
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![w, p],
+    )?;
+    tx.execute(
         "INSERT INTO active_sudo (powerful, weak, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
         params![p, w, format!("+{secs} seconds")],
     )?;
-    let id = conn.last_insert_rowid();
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
     let expires_at: String = conn.query_row(
         "SELECT expires_at FROM active_sudo WHERE id = ?1",
         params![id],

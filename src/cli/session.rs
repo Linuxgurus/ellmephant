@@ -102,6 +102,14 @@ pub struct Session {
     /// — the honest limit of the private tier (#54). A DOOR replaces it with the connection's proven
     /// pen, and then every read below filters through it.
     reader: store::audience::Reader,
+    /// ★ AN AUDIT IS A WRITE (#129). A read-only session still has to be able to RECORD that it
+    /// crossed a boundary, and a read-only connection cannot. Opened lazily, on the rare act that
+    /// needs it, so the ordinary read path pays nothing for the audit and the audit still happens
+    /// where it matters. `None` until then, and `Some` for a writer session, which can just use its
+    /// own connection.
+    audit_conn: std::cell::RefCell<Option<Connection>>,
+    /// True for a door's read-only session: it may READ the store and may still WRITE its audit.
+    read_only: bool,
 }
 
 impl Session {
@@ -115,6 +123,8 @@ impl Session {
             conn,
             encoder,
             reader: store::audience::Reader::everything(),
+            audit_conn: std::cell::RefCell::new(None),
+            read_only: false,
         })
     }
 
@@ -142,6 +152,8 @@ impl Session {
             cfg,
             conn,
             encoder,
+            audit_conn: std::cell::RefCell::new(None),
+            read_only: true,
             reader,
         })
     }
@@ -208,17 +220,97 @@ impl Session {
         // never written. A distinct "private" error would confirm the row exists, which is the
         // disclosure the tier is for.
         match store::get(&self.conn, key)? {
-            Some(mem) if self.reader.sees(&mem.audience) => Ok(mem),
+            Some(mem) if self.reader.sees(&mem.audience) => {
+                // ★ A READ THAT CROSSED A BOUNDARY IS RECORDED (#129). An ancestor reading down its
+                // subtree is the one act the tier allowed and did not log; best effort, never fatal.
+                if self.reader.crosses(&mem.audience) {
+                    self.audit(Some(key), store::audit::Why::Subtree, None);
+                }
+                Ok(mem)
+            }
             _ => Err(Error::NotFound(key.to_string())),
         }
+    }
+
+    /// May `proven` be credited as `claimed` on a write? (Live lend required.)
+    pub fn may_act_as(&self, proven: &str, claimed: &str) -> Result<()> {
+        store::may_act_as(&self.conn, proven, claimed)
+    }
+
+    /// Lend this pen's own authority down to a descendant, for `secs` — it expires and can be revoked.
+    pub fn lend(&self, powerful: &str, weak: &str, secs: i64) -> Result<store::sudo::Session> {
+        store::sudo::lend(&self.conn, powerful, weak, secs)
+    }
+
+    /// Borrow `powerful`'s authority for `secs` (needs a policy row).
+    pub fn sudo(&self, weak: &str, powerful: &str, secs: i64) -> Result<store::sudo::Session> {
+        store::sudo::sudo(&self.conn, weak, powerful, secs)
+    }
+
+    /// Pass a live session down to a descendant.
+    pub fn sudo_pass(
+        &self,
+        weak: &str,
+        powerful: &str,
+        to: &str,
+        secs: i64,
+    ) -> Result<store::sudo::Session> {
+        store::sudo::pass(&self.conn, weak, powerful, to, secs)
+    }
+
+    /// End a session and its pass-down chain.
+    pub fn sudo_release(&self, weak: &str, powerful: &str) -> Result<usize> {
+        store::sudo::release(&self.conn, weak, powerful)
+    }
+
+    /// End a session for `target` (defaulting to the caller) — an ancestor may end a descendant's.
+    pub fn sudo_release_of(
+        &self,
+        caller: &str,
+        target: Option<&str>,
+        powerful: &str,
+    ) -> Result<usize> {
+        match target {
+            Some(pen) => store::sudo::release_by(&self.conn, caller, pen, powerful),
+            None => store::sudo::release(&self.conn, caller, powerful),
+        }
+    }
+
+    /// Mint a pen under `caller` — the runtime door.
+    pub fn mint(&self, caller: &str, name: &str, kind: &str) -> Result<store::Minted> {
+        store::mint(&self.conn, caller, name, kind)
+    }
+
+    /// One pen as `viewer` sees it — the tree through this session's connection.
+    pub fn whois(&self, viewer: &str, pen: &str) -> Result<store::Whois> {
+        store::whois(&self.conn, viewer, pen)
+    }
+
+    /// What this row's owner is TO THE READER, in the settled letters (`PS "uncle"`, `ME`, …).
+    ///
+    /// ★ A NAME IS AN ADDRESS, and this is the rest of the sentence: `owner` says who answers for a
+    /// row, and the walk says what that pen is to the one asking (James, 2026-10-23). `None` when
+    /// there is no owner (the commons), no proven reader, or no common root — absence, never a guess.
+    pub fn owner_relation(&self, mem: &Memory) -> Option<String> {
+        let viewer = self.reader.pen_name()?;
+        let owner = mem.owner.as_deref()?;
+        store::relation::relation(&self.conn, viewer, owner)
+            .ok()
+            .flatten()
+            .map(|k| k.gloss())
     }
 
     /// Retire one memory into another: repoint every reference, then delete the source. The prose
     /// fold is the caller's — this never touches `into`'s body. No encoder: the graph is not
     /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch
     /// behind `memory_upsert`.)
-    pub fn merge_into(&self, from: &str, into: &str) -> Result<links::MergeInto> {
-        links::merge_into(&self.conn, from, into)
+    pub fn merge_into(
+        &self,
+        from: &str,
+        into: &str,
+        acted_by: Option<&str>,
+    ) -> Result<links::MergeInto> {
+        links::merge_into(&self.conn, from, into, acted_by)
     }
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
@@ -250,9 +342,17 @@ impl Session {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
+    /// Rows nobody owns, newest first — the list behind the counts, filtered by this session's reader.
+    pub fn unowned(&self, limit: i64) -> Result<Vec<store::Unowned>> {
+        store::unowned(&self.conn, &self.reader, limit)
+    }
+
     /// Delete one memory by key; `false` means there was nothing to delete.
-    pub fn rm(&self, key: &str) -> Result<bool> {
-        store::delete(&self.conn, key)
+    ///
+    /// `acted_by` is the proven pen the door is acting for: a delete is a write of absence, so it
+    /// takes the same reach as an edit and leaves a ledger row saying who removed it.
+    pub fn rm(&self, key: &str, acted_by: Option<&str>) -> Result<bool> {
+        store::delete(&self.conn, key, acted_by)
     }
 
     /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying
@@ -281,7 +381,21 @@ impl Session {
         };
         match class {
             Some(audience) if !self.reader.sees(&audience) => Err(Error::NotFound(key.to_string())),
-            _ => Ok(()),
+            Some(audience) => {
+                // ★ A PAST STATE IS STILL THE ROW (found reviewing #129). `version()` and `versions()`
+                // both come through here, and both can hand an ancestor the contents of a descendant's
+                // private row — so the boundary is crossed on this path too and must be recorded, or
+                // the audit covers `memory_get` and nothing else.
+                if self.reader.crosses(&audience) {
+                    self.audit(
+                        Some(key),
+                        store::audit::Why::Subtree,
+                        Some("version/history"),
+                    );
+                }
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 
@@ -399,12 +513,69 @@ impl Session {
             .as_deref()
             .map(str::trim)
             .is_some_and(|s| !s.is_empty());
-        if needs_embedder {
-            return self
-                .encoder
-                .with(|e| search::run(&self.conn, Some(e), &self.reader, q));
+        let bundle = if needs_embedder {
+            self.encoder
+                .with(|e| search::run(&self.conn, Some(e), &self.reader, q))?
+        } else {
+            search::run(&self.conn, None, &self.reader, q)?
+        };
+        // ★ A SEARCH IS THE COMMON WAY AN ANCESTOR LOOKS INTO ITS SUBTREE, so it is the common way a
+        // boundary gets crossed — and one row per hit would make the audit bigger than the store.
+        // One row per SEARCH, carrying how many of the hits were somebody else's private rows and a
+        // small sample, is the record of the ACT rather than of its results.
+        self.record_search_boundary(&bundle);
+        Ok(bundle)
+    }
+
+    /// Record a read that crossed a boundary, wherever this session can write.
+    ///
+    /// ★ THE READ PATH IS READ-ONLY BY DESIGN, and the audit must still land: so the record goes on
+    /// the session's own connection when it can write, and otherwise on a lazily-opened writable one.
+    /// Best effort — a read never fails because its record could not be written.
+    fn audit(&self, key: Option<&str>, why: store::audit::Why, detail: Option<&str>) {
+        let Some(pen) = self.reader.pen_name() else {
+            return;
+        };
+        if !self.read_only {
+            store::audit::record(&self.conn, pen, key, why, detail);
+            return;
         }
-        search::run(&self.conn, None, &self.reader, q)
+        let mut slot = self.audit_conn.borrow_mut();
+        if slot.is_none() {
+            match db::open_with(&self.paths, &self.cfg) {
+                Ok(c) => *slot = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not open a connection to record a boundary read");
+                    return;
+                }
+            }
+        }
+        if let Some(conn) = slot.as_ref() {
+            store::audit::record(conn, pen, key, why, detail);
+        }
+    }
+
+    /// Record the boundary a search crossed, if it crossed one. Best effort, never fails the read.
+    fn record_search_boundary(&self, bundle: &Bundle) {
+        if self.reader.pen_name().is_none() || self.reader.down() == 0 || bundle.hits.is_empty() {
+            return;
+        }
+        let keys: Vec<&str> = bundle.hits.iter().map(|h| h.key.as_str()).collect();
+        let crossed = match store::audience::Reader::crossed_keys(&self.conn, &self.reader, &keys) {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        if crossed.is_empty() {
+            return;
+        }
+        let sample: Vec<&str> = crossed.iter().take(5).map(String::as_str).collect();
+        let detail = format!(
+            "{} of {} hit(s): {}",
+            crossed.len(),
+            keys.len(),
+            sample.join(", ")
+        );
+        self.audit(None, store::audit::Why::Search, Some(&detail));
     }
 
     /// A read-only digest of the store (`stats`); `db_bytes` comes from the store file, so the

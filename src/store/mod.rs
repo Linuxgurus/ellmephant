@@ -1,6 +1,7 @@
 //! The write/read path over `memory` and its derived indexes (P4).
 
 pub mod audience;
+pub mod audit;
 pub mod claim;
 pub mod codec;
 pub mod dupes;
@@ -9,6 +10,7 @@ pub mod links;
 pub mod mail;
 pub mod maintain;
 pub mod project;
+pub mod relation;
 pub mod slug;
 pub mod snapshot;
 pub mod stats;
@@ -202,6 +204,28 @@ fn check_body(body: &str) -> Result<()> {
 /// create it is the code holding a vector ([`crate::store::encode::settle_encoded`], via
 /// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
 /// config said rather than what the encoder actually emits.
+/// Can `caller` be SHOWN a row with this audience? Public, their own, or a descendant's.
+///
+/// ★ THE PRIVATE TIER'S LAW IS ABSENCE, NOT REFUSAL (found in the final adversarial pass): a row a
+/// caller may not see must answer exactly as a key that was never written. Without this, a DELETE or a
+/// MERGE on somebody's private row replied *"it is owned by stet"* — an existence-and-ownership
+/// oracle for rows the caller cannot read.
+fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {
+    if audience == audience::PUBLIC {
+        return Ok(true);
+    }
+    let Some(addressed) = audience.strip_prefix(audience::PEN) else {
+        return Ok(false);
+    };
+    let Some(caller_id) = exact_pen_id(conn, caller)? else {
+        return Ok(false);
+    };
+    let Some(owner_id) = exact_pen_id(conn, addressed)? else {
+        return Ok(false);
+    };
+    Ok(caller_id == owner_id || is_ancestor(conn, caller_id, owner_id)?)
+}
+
 /// May `caller` write the row at `key`? Parentage is the grant: the owner, the pen that owns on the
 /// owner's behalf (a finger acts for its parent), or any ancestor of the owner.
 ///
@@ -213,15 +237,27 @@ fn check_body(body: &str) -> Result<()> {
 /// is ATTRIBUTABLE even when it was authorised, which is the property to preserve if this ever
 /// changes. A row with no owner
 /// is the commons, and the commons belongs to nobody — so every pen may write it (#109).
-fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
-    let owner: Option<i64> = conn
+pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
+    let row: Option<(Option<i64>, String)> = conn
         .query_row(
-            "SELECT owner FROM memory WHERE key = ?1",
+            "SELECT owner, audience FROM memory WHERE key = ?1",
             params![key],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?
-        .flatten();
+        .optional()?;
+    let Some((owner, audience)) = row else {
+        return Ok(()); // nothing there: a create, and creates are not gated here
+    };
+    // ★ ABSENCE FIRST (final adversarial pass). A row the caller cannot SEE does not exist for them,
+    // so a refusal must not confirm it: without this, a DELETE on somebody's private row answered
+    // *"it is owned by stet"* — an existence-and-ownership oracle for rows they cannot read.
+    let visible = match caller {
+        Some(caller) => may_read_audience(conn, caller, &audience)?,
+        None => true,
+    };
+    if !visible {
+        return Err(Error::NotFound(key.to_string()));
+    }
     let Some(owner_id) = owner else { return Ok(()) };
     let Some(caller) = caller else {
         return Err(Error::Invalid(format!(
@@ -966,7 +1002,18 @@ pub enum History {
 }
 
 /// One ledger row: when, what, from whom, to whom — the responsibility story of a key (#109).
-pub type PenEvent = (String, String, Option<String>, Option<String>);
+/// One row of the responsibility ledger: `(at, action, from_pen, to_pen, actor)`.
+///
+/// `from`/`to` are the row's holders before and after; `actor` is the pen that did it — which is
+/// not always either of them, because an ancestor may act on a descendant's row, and a DELETE has
+/// no `to` at all. Appended last so the older readers of this tuple keep their positions.
+pub type PenEvent = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// What a retirement would do, computed without doing it.
 #[derive(Debug, Clone, Serialize)]
@@ -977,6 +1024,85 @@ pub struct RetirePreview {
     pub private_rows: i64,
 }
 
+/// What one pen IS, and what it is to the pen asking — the answer to "who is this, and what are
+/// they to me" (James, 2026-10-23).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Whois {
+    /// The pen's name: an address, never a permission.
+    pub name: String,
+    /// `self` or `finger`.
+    pub kind: String,
+    /// The pen that minted it. `None` only for a root.
+    pub parent: Option<String>,
+    /// When the row was created.
+    pub created: String,
+    /// The tombstone, when it has ceased. A retired pen still answers: history outlives it.
+    pub ceased: Option<String>,
+    /// The walk from the ASKING pen to this one, `ME`, or `None` when they share no root.
+    pub relation: Option<String>,
+    /// The rows this pen answers for.
+    pub owns: i64,
+    /// How many pens hang BELOW this one. A pen asking `whois <itself>` learns how far it reaches —
+    /// the one number that says what ancestor read actually grants it, rather than leaving a reader to
+    /// infer it from a tree it cannot see (#120).
+    pub descendants: i64,
+}
+
+/// A pen row as `whois` reads it: `(id, kind, parent_id, created, ceased_at)`.
+type PenFacts = (i64, String, Option<i64>, String, Option<String>);
+
+/// Look up one pen as `viewer` sees it.
+///
+/// The relationship is the point: a name alone is an address, and "what are they to me" is the
+/// question that decides whether an act is allowed. `None` for the walk means the two share no root,
+/// which is a real answer and not an error — a pen from another estate is a pen nobody here can
+/// reach.
+pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
+    let row: Option<PenFacts> = conn
+        .query_row(
+            "SELECT id, kind, parent_id, created, ceased_at FROM pen WHERE name = ?1",
+            params![name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((id, kind, parent_id, created, ceased)) = row else {
+        return Err(Error::Invalid(format!("no pen named {name}")));
+    };
+    let parent = match parent_id {
+        Some(pid) => Some(conn.query_row(
+            "SELECT name FROM pen WHERE id = ?1",
+            params![pid],
+            |r| r.get(0),
+        )?),
+        None => None,
+    };
+    let owns: i64 = conn.query_row(
+        "SELECT count(*) FROM memory WHERE owner = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    let descendants: i64 = conn.query_row(
+        "WITH RECURSIVE sub(id) AS (
+             SELECT id FROM pen WHERE parent_id = ?1
+             UNION
+             SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
+         )
+         SELECT count(*) FROM sub",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(Whois {
+        name: name.to_string(),
+        kind,
+        parent,
+        created,
+        ceased,
+        relation: relation::relation(conn, viewer, name)?.map(|k| k.gloss()),
+        owns,
+        descendants,
+    })
+}
+
 fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
     conn.query_row(
         "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
@@ -985,6 +1111,141 @@ fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<St
     )
     .optional()?
     .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
+}
+
+/// A pen created at runtime: whoever minted it answered for it, and it answered to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Minted {
+    /// The new pen's name.
+    pub name: String,
+    /// `self` or `finger` — what KIND of thing it is, never inferred from the name.
+    pub kind: String,
+    /// The pen that minted it: the parent, by right, never by argument.
+    pub parent: String,
+}
+
+/// **MINT: a pen creates a pen** (James, 2026-10-23). The runtime door.
+///
+/// The parent is the CALLER — you may create downward, never sideways and never upward, because
+/// parentage is the grant and a name is an address rather than a permission. A hand mints a finger;
+/// `estate`'s children are minted by provisioning, which is the other door and a different act.
+///
+/// ★ A NAME IS SPENT. A retired pen keeps its row (a tombstone, `ceased_at`) and its name stays
+/// taken, so this refuses rather than resurrecting. Two lives under one name would make every ledger
+/// row ambiguous — "who did this" cannot mean two different pens — and the whole point of the
+/// tombstone is that history outlives the thing.
+pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<Minted> {
+    if kind != "self" && kind != "finger" {
+        return Err(Error::Invalid(format!(
+            "kind must be `self` or `finger`, not `{kind}`"
+        )));
+    }
+    let (caller_id, _, ceased) = pen_row(conn, caller)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{caller} has been retired: a pen that has ceased cannot create pens"
+        )));
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Invalid("a pen needs a name".into()));
+    }
+    // ★ THE RESERVED WORD IS NOT A NAME (found reviewing #123). `anonymous` means "no currently
+    // existing pen wrote this", so minting a pen by that name would make every unattributed count
+    // ambiguous again — the defect 0021 and 0025 exist to remove.
+    if name.eq_ignore_ascii_case(crate::identity::ANONYMOUS) {
+        return Err(Error::Invalid(format!(
+            "`{name}` is reserved: it means NO currently existing pen, so it can never be one"
+        )));
+    }
+    // ★ AND A NAME MUST BE ADDRESSABLE. A private row's audience is `pen:<name>`, and an audience
+    // containing a comma is refused on write — so a pen whose name holds one could never hold a
+    // private row, and nobody would learn that until the first private write failed.
+    if name.contains(',') || name.chars().any(char::is_whitespace) {
+        return Err(Error::Invalid(format!(
+            "{name} cannot be a pen name: audiences are `pen:<name>`, and a comma or a space cannot be \
+             addressed"
+        )));
+    }
+    if let Some((_, _, ceased_at)) = conn
+        .query_row(
+            "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+            params![name],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        return Err(Error::Invalid(match ceased_at {
+            Some(at) => format!(
+                "{name} was a pen retired at {at}: a name is spent, and reusing it would make every \
+                 ledger row mean two things"
+            ),
+            None => format!("{name} is already a pen"),
+        }));
+    }
+    conn.execute(
+        "INSERT INTO pen (name, kind, parent_id) VALUES (?1, ?2, ?3)",
+        params![name, kind, caller_id],
+    )?;
+    Ok(Minted {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        parent: caller.to_string(),
+    })
+}
+
+/// May `proven` be credited as `claimed` on a write? Itself, or anything below it ON A LIVE LEND.
+///
+/// A finger holds no credential of its own — it is how one self does more work, not a party — so its
+/// work is written under the hand's PROOF and the finger's NAME. This is the check that keeps that
+/// honest: a hand may credit its own subtree, and nothing else. Without it the write path would take
+/// any name the transport offered, which is how a name becomes a permission.
+pub fn may_act_as(conn: &Connection, proven: &str, claimed: &str) -> Result<()> {
+    if proven.eq_ignore_ascii_case(claimed) {
+        return Ok(());
+    }
+    let (proven_id, _, ceased) = pen_row(conn, proven)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!("{proven} has been retired")));
+    }
+    let claimed_id = exact_pen_id(conn, claimed)?.ok_or_else(|| {
+        Error::Invalid(format!(
+            "{claimed} is not a pen: a write may name itself or a pen it minted"
+        ))
+    })?;
+    // (found reviewing #126) A CEASED PEN CANNOT BE CREDITED. Retire now ends its sessions, so this
+    // is belt-and-braces — but a write credited to a pen that has ended would put new work in the
+    // record under a name that can no longer answer for it, which is the one thing the ledger must
+    // never do.
+    let (_, _, claimed_ceased) = pen_row(conn, claimed)?;
+    if claimed_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{claimed} has been retired: a ceased pen cannot be credited for new work"
+        )));
+    }
+    if !is_ancestor(conn, proven_id, claimed_id)? {
+        return Err(Error::Invalid(format!(
+            "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a \
+             peer and never an ancestor"
+        )));
+    }
+    // ★ PARENTAGE IS NECESSARY, NOT SUFFICIENT (James tie-break, 2026-10-23). Acting as a descendant
+    // rides on a LIVE, EXPIRING lend — so a compromised finger's authority dies on its own, and a
+    // revocation is one deleted row rather than a re-shaped tree. The check is uncached: a cached
+    // session is a revocation that has not happened yet.
+    if sudo::live(conn, claimed, proven)?.is_some() {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "{proven} may not write as {claimed} yet: that needs a LIVE lend — open one with `lend` (it \
+         expires, and it can be revoked) rather than inheriting by tree shape"
+    )))
 }
 
 /// Count what retiring `pen` would touch. Read-only; safe to call before deciding.
@@ -1121,7 +1382,7 @@ pub fn retire(
                     None,
                     Some("deleted on retirement"),
                 )?;
-                delete(conn, key)?;
+                delete_impl(conn, key, None, false)?;
             }
         }
         match history {
@@ -1132,6 +1393,27 @@ pub fn retire(
         }
     }
 
+    // ★ DISPOSAL INCLUDES THE AUTHORITY IT WAS GIVEN (found reviewing #126). Retiring a pen left its
+    // lends and borrows running until their TTL: a retired finger could still be credited, and a
+    // retired hand still held what it borrowed. The tree's whole promise is that a disposal is
+    // immediate, so every session naming this pen — as lender or borrower — ends here, and anything
+    // passed down from one dies with it (`via`).
+    conn.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE powerful = ?1 OR weak = ?1
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![id],
+    )?;
+    // ★ AND THE POLICY THAT AUTHORISED IT (found reviewing #127). A retired pen's `sudoers` row is
+    // authority with no pen behind it; leaving it would let the next `sudo` borrow a ghost. The live
+    // sessions themselves are ended a few lines up.
+    conn.execute(
+        "DELETE FROM sudoers WHERE powerful = ?1 OR weak = ?1",
+        params![id],
+    )?;
     conn.execute(
         "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
         params![id],
@@ -1154,41 +1436,135 @@ pub fn retire(
 /// The responsibility ledger for one key: who acted, on what, from whom to whom, and why.
 pub fn pen_events(conn: &Connection, key: &str) -> Result<Vec<PenEvent>> {
     let mut stmt = conn.prepare(
-        "SELECT at, action, (SELECT name FROM pen WHERE id = from_pen), (SELECT name FROM pen WHERE id = to_pen)
+        "SELECT at, action,
+                (SELECT name FROM pen WHERE id = from_pen),
+                (SELECT name FROM pen WHERE id = to_pen),
+                (SELECT name FROM pen WHERE id = pen_id)
            FROM pen_event WHERE key = ?1 ORDER BY id",
     )?;
     let rows = stmt
         .query_map(params![key], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
+/// One row nobody owns: the addressable half of the two counts in `memory_stats`.
+///
+/// ★ A NUMBER THAT CANNOT BECOME A LIST GETS QUOTED AND NEVER ACTED ON (Stet, review of #122). The
+/// counts say how many; this says WHICH, so somebody can look at a row and claim it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unowned {
+    /// The row's address.
+    pub key: String,
+    /// When it was written — the only ordering a claimer has to go on.
+    pub created: String,
+    /// Who typed it, as far as the store knows (`anonymous` when no currently existing pen is named).
+    pub asserted_by: String,
+    /// `disclaimed` — somebody RELEASED it, so the author is still named; or `unrecorded` — no author
+    /// is named at all, which is either a write with no pen or a pen that is gone.
+    pub why: String,
+}
+
+/// Every row with no owner, newest first, for somebody to claim.
+///
+/// ★ NOBODY OWNS IT IS A SUPPORTED STATE, NOT A BUG (James, 2026-10-23): when an ancestor retires a
+/// descendant it chooses adopt / disclaim / delete, and a DISCLAIMED row is owned by nobody on
+/// purpose — which is what "anonymous" means: no currently existing pen is answerable for it. So this
+/// listing is not a damage report; it is the place an owner goes to pick something up, and `why`
+/// keeps the two ways of arriving there apart.
+pub fn unowned(conn: &Connection, reader: &audience::Reader, limit: i64) -> Result<Vec<Unowned>> {
+    // ★ THE TIER APPLIES HERE TOO (found reviewing #122). The first version selected `owner IS NULL`
+    // with no audience filter while its own doc said the tier applied "exactly as it does to a search
+    // hit" — a control claimed and absent, which is the class this store keeps getting bitten by. No
+    // live row is affected today (all 252 ownerless rows are public), so this is a gap closed before
+    // it became a leak rather than a leak being plugged.
+    let (pred, binds) = reader.sql();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT key, created, asserted_by FROM memory
+          WHERE owner IS NULL AND {pred}
+          ORDER BY created DESC, key
+          LIMIT ?{}",
+        binds.len() + 1
+    ))?;
+    let mut all: Vec<String> = binds;
+    all.push(limit.to_string());
+    let rows = stmt.query_map(rusqlite::params_from_iter(all.iter()), |r| {
+        let asserted_by: Option<String> = r.get(2)?;
+        let asserted_by = asserted_by.unwrap_or_default();
+        let why = if asserted_by.trim().is_empty()
+            || asserted_by.eq_ignore_ascii_case(crate::identity::ANONYMOUS)
+        {
+            "unrecorded"
+        } else {
+            "disclaimed"
+        };
+        Ok(Unowned {
+            key: r.get(0)?,
+            created: r.get(1)?,
+            asserted_by,
+            why: why.to_string(),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
-pub fn delete(conn: &Connection, key: &str) -> Result<bool> {
+pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bool> {
     guard_protected_delete(conn, key)?;
+    // ★ A DELETE IS A WRITE OF ABSENCE (soma/ellmephant#109). It takes the same reach as an edit —
+    // the owner, the pen acting for the owner, or an ancestor — and it leaves the same kind of
+    // record. Removal that nobody is named for is indistinguishable from a mistake.
+    delete_impl(conn, key, acted_by, true)
+}
+
+/// The removal itself, once somebody has been found to answer for it.
+///
+/// `log` is false only for the caller that keeps its OWN record — `retire`, which already writes
+/// "deleted on retirement" per row in the same act. One act, one ledger entry.
+fn delete_impl(conn: &Connection, key: &str, acted_by: Option<&str>, log: bool) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    // ★ THE GATE IS INSIDE THE TRANSACTION, for the same reason a compare-and-swap's compare is: a
+    // check beside the write can be overtaken by an adopt or a disclaim between the two, and then the
+    // removal proceeds under an authority that no longer holds. `retire` passes `log: false` because
+    // it has already authorised the whole act by ancestry.
+    if log {
+        may_write(&tx, key, acted_by)?;
+    }
     // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
     // rediscover. Both halves ride in one transaction, so neither undoes the other.
     encode::forget(&tx, &crate::store::links::Kind::Memory.keyslug(key))?;
-    let row: Option<(i64, String)> = tx
+    let row: Option<(i64, String, Option<i64>)> = tx
         .query_row(
-            "SELECT id, audience FROM memory WHERE key = ?1",
+            "SELECT id, audience, owner FROM memory WHERE key = ?1",
             params![key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     let existed = row.is_some();
-    if let Some((id, audience)) = row {
+    if let Some((id, audience, owner)) = row {
         // A delete SUPERSEDES the state the memory is in, so it snapshots it first — exactly as an
         // edit does, and in the same transaction. Without this, a deleted key's newest version would
         // be some earlier state and the content it actually held would be the one thing versioning
         // did not keep; with it, `erase` is the store's single true destroyer.
         version::snapshot(&tx, id, key, None)?;
         tx.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
+        // The ledger keeps WHAT HAPPENED even though the row is gone: an absence with no record is
+        // the one deletion nobody can review.
+        if log {
+            // The actor is the pen that DID it — `exact_pen_id`, not `owner_pen_id`, which maps a
+            // finger to its parent for ownership. Using the owner here recorded the hand for the
+            // finger's deletions, which is the one distinction the ledger exists to keep.
+            let actor = match acted_by {
+                Some(name) => exact_pen_id(&tx, name)?,
+                None => None,
+            };
+            log_pen_event(&tx, key, "delete", actor, owner, None, None)?;
+        }
         // ★ A PRIVATE ROW'S VECTOR IS PURGED, NOT TOMBSTONED. The tombstone table is a DELIBERATE
         // search surface (`semantic_search(deleted=true)`), so moving a private document's vector
         // there would keep it findable by meaning — by anyone — after its row was gone, and a

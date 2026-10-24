@@ -1,7 +1,8 @@
 //! WHO may be shown a row: the `private` read tier (soma/ellmephant#54, #55).
 //!
-//! The ladder James named: **plain** (any reader) → **private** (the pen that wrote it, plus the
-//! owner for forensics) → **secret** (key holders; encryption, `secret-tiering`). `protected` is
+//! The ladder James named: **plain** (any reader) → **private** (the pen that wrote it **and every
+//! pen above it** — parentage is the grant, so an ancestor reads down into its subtree, #120) →
+//! **secret** (key holders; encryption, `secret-tiering`). `protected` is
 //! NOT on it — that is a write gate under a lease, live since 2026-10-17, and a row can be either
 //! without the other.
 //!
@@ -18,9 +19,21 @@
 //! ALREADY been handed; the read paths must ask it before returning anything at all.
 //!
 //! ★ THE OWNER IS NOT A READER. James's requirement is forensics — "if something goes badly wrong I
-//! must be able to look" — and that is a different act from reading: it is [`Reader::forensic`],
-//! explicit, one row, and recorded ([`crate::store::forensic`]). An owner who was simply exempt
-//! would make the tier a word.
+//! must be able to look" — and that is a different act from reading: explicit, one row, and recorded.
+//!
+//! ⚠️ **AND IT IS NOT BUILT.** This module used to describe a [`Reader::forensic`] and a
+//! `private_read` table as though they existed; they do not — there is no `forensic` constructor, no
+//! table and no `store::forensic` module (checked 2026-10-23). So today the tier ENFORCES two things
+//! and records neither: a pen reads its own rows, and an ancestor reads its subtree, both silently.
+//! The enforcement is real; the audit is a promise. Naming that is better than a citation that
+//! resolves to nothing, and it is the same class as the parity table that said 13 tools when there
+//! were 32 — prose is not guarded by any test.
+//!
+//! What a real forensic path needs deciding before it is built: what a record holds (pen, key, when,
+//! reason), whether ONE row or a whole subtree, and retention — an audit table that grows forever is
+//! a second store nobody maintains.
+
+use rusqlite::OptionalExtension as _;
 
 /// The audience value every row starts with and most rows keep.
 pub const PUBLIC: &str = "public";
@@ -162,6 +175,42 @@ impl Reader {
     /// The pen as an audience value (`pen:<x>`), when there is one.
     pub fn as_audience(&self) -> Option<&str> {
         self.pen.as_deref()
+    }
+
+    /// Of these keys, which are private to a pen BELOW this reader? One query, because a search
+    /// returns a page and the audit wants a count rather than a round trip per hit.
+    pub fn crossed_keys(
+        conn: &rusqlite::Connection,
+        reader: &Reader,
+        keys: &[&str],
+    ) -> crate::error::Result<Vec<String>> {
+        if keys.is_empty() || reader.all || reader.down.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare("SELECT audience FROM memory WHERE key = ?1")?;
+        for key in keys {
+            let audience: Option<String> = stmt
+                .query_row(rusqlite::params![key], |r| r.get(0))
+                .optional()?;
+            if audience.is_some_and(|a| reader.crosses(&a)) {
+                out.push((*key).to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Is this row PRIVATE TO SOMEBODY ELSE — i.e. did showing it mean crossing a boundary?
+    ///
+    /// True only for a row that is not public and not addressed to this reader, which is exactly the
+    /// case an audit needs: an ancestor reading down its subtree (#120), or an exemption (#129). A
+    /// pen reading its own rows crossed nothing, and the process holding the file (`all`) is the
+    /// honest limit of the tier rather than an exemption within it.
+    pub fn crosses(&self, audience: &str) -> bool {
+        !self.all
+            && audience != PUBLIC
+            && Some(audience) != self.pen.as_deref()
+            && self.down.iter().any(|a| a == audience)
     }
 
     /// May this reader be shown a row with this audience?

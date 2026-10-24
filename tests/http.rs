@@ -1184,9 +1184,30 @@ async fn the_two_doors_are_one_core() {
     if let Some(obj) = mcp_rest.as_object_mut() {
         obj.remove("visits");
     }
+
+    // ★ ONE FIELD IS ABOUT THE ASKER, NOT THE ROW (2026-10-23). `owner_relation` is the walk from the
+    // reader's proven pen to the row's owner, and in THIS test the two doors are different pens: the
+    // MCP peer declares `tester`, the HTTP call proves nobody. So it is asserted separately — present
+    // and `ME` where the pen asks about its own row, absent where nobody asked as anyone — and then
+    // dropped, because "the same core answers the same" is a claim about the ROW and it still holds.
+    assert_eq!(
+        mcp_rest.get("owner_relation").and_then(|v| v.as_str()),
+        Some("ME"),
+        "the door that proved a pen gets the walk: {mcp_body}"
+    );
+    assert!(
+        http_rest.get("owner_relation").is_none(),
+        "a door with no proven pen gets no walk, not a guess: {http_body}"
+    );
+    if let Some(obj) = http_rest.as_object_mut() {
+        obj.remove("owner_relation");
+    }
+    if let Some(obj) = mcp_rest.as_object_mut() {
+        obj.remove("owner_relation");
+    }
     assert_eq!(
         http_rest, mcp_rest,
-        "every field but the counter must match"
+        "every field but the counter and the reader-relative walk must match"
     );
 }
 
@@ -1974,5 +1995,600 @@ async fn an_anonymous_caller_cannot_read_a_mailbox() {
         response.status(),
         StatusCode::FORBIDDEN,
         "an anonymous cursor advance must be refused"
+    );
+}
+
+/// A row says who answers for it, and the walk says what that pen is to the reader — `memory_get`
+/// carries both, computed at READ time from the asker's seat (James, 2026-10-23).
+#[tokio::test]
+async fn memory_get_names_the_owner_and_what_they_are_to_you() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "mine", "title": "Mine", "body": "the facts" }),
+    )
+    .await;
+
+    // The asker IS the owner here, so the walk is `ME` — the one answer that needs no gloss.
+    let got = tool(service.peer(), "memory_get", json!({ "key": "mine" })).await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["owner"], json!("tester"), "{got}");
+    assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
+
+    // The HTTP door reached without an identity pair is NOBODY: it still learns who answers for the
+    // row, and learns nothing about what that pen is to it. Absence, never a guess.
+    let (status, body, _) = get(&app, "/memory/mine").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("owner   tester"), "{body}");
+    assert!(
+        !body.contains("ME"),
+        "an anonymous reader has no walk: {body}"
+    );
+}
+
+/// `whois` — the tree is configuration, not content, so an unproven reader may ask WHO a pen is;
+/// what it does not get is a walk, because it has not proved to be anybody.
+#[tokio::test]
+async fn whois_answers_on_both_doors() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A write registers the pen (`ensure_pen`), so the peer's own pen exists to be looked up.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "mine", "title": "Mine", "body": "the facts" }),
+    )
+    .await;
+
+    let got = tool(service.peer(), "whois", json!({ "pen": "tester" })).await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["name"], json!("tester"), "{got}");
+    assert_eq!(doc["kind"], json!("self"), "{got}");
+    assert_eq!(doc["owns"], json!(1), "{got}");
+    assert_eq!(doc["relation"], json!("ME"), "{got}");
+    assert!(
+        doc["ceased"].is_null(),
+        "a live pen has no tombstone: {got}"
+    );
+
+    // The same pen over HTTP, asked by nobody: same facts, and no walk.
+    let (status, body, _) = get(&app, "/whois/tester?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let over_http: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(over_http["owns"], json!(1), "{body}");
+    assert!(
+        over_http["relation"].is_null(),
+        "an unproven reader gets no walk: {body}"
+    );
+
+    // A name nobody minted is refused, not invented.
+    let (status, _, _) = get(&app, "/whois/nobody-at-all").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown pen is a refusal"
+    );
+}
+
+/// `pen_mint` — the runtime door, on both doors. The parent is the CALLER, and a name is spent.
+#[tokio::test]
+async fn pen_mint_creates_a_child_under_the_caller() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A write first, so the caller exists as a pen (`ensure_pen`) before it mints.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "first" }),
+    )
+    .await;
+
+    let minted = tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/finger-9f3a1c", "kind": "finger" }),
+    )
+    .await;
+    let doc: serde_json::Value = serde_json::from_str(&minted).unwrap();
+    assert_eq!(doc["name"], json!("tester/finger-9f3a1c"), "{minted}");
+    assert_eq!(doc["kind"], json!("finger"), "{minted}");
+    assert_eq!(
+        doc["parent"],
+        json!("tester"),
+        "the caller is the parent: {minted}"
+    );
+
+    // The new pen is in the tree, and the walk says what it is to the minting hand.
+    let seen = tool(
+        service.peer(),
+        "whois",
+        json!({ "pen": "tester/finger-9f3a1c" }),
+    )
+    .await;
+    let seen: serde_json::Value = serde_json::from_str(&seen).unwrap();
+    assert_eq!(seen["relation"], json!("C \"child\""), "{seen}");
+
+    // A name is spent: minting it again is refused, and so is a kind nobody defined.
+    let again = tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/finger-9f3a1c", "kind": "finger" }),
+    )
+    .await;
+    assert!(again.contains("already a pen"), "{again}");
+    let bad = tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/odd", "kind": "hand" }),
+    )
+    .await;
+    assert!(bad.contains("`self` or `finger`"), "{bad}");
+}
+
+/// `as:` — a write credited to a descendant, permitted by a LIVE LEND and not by tree shape.
+#[tokio::test]
+async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/f-1", "kind": "finger" }),
+    )
+    .await;
+
+    // ★ PARENTAGE IS NOT ENOUGH: without a lend the credit is refused, and the refusal says why.
+    let refused = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "finger-work", "title": "Finger work", "body": "b", "as": "tester/f-1" }),
+    )
+    .await;
+    assert!(refused.contains("LIVE lend"), "{refused}");
+
+    // The lend is what permits it, and it is a session with an expiry.
+    let lent = tool(
+        service.peer(),
+        "pen_lend",
+        json!({ "pen": "tester/f-1", "secs": 60 }),
+    )
+    .await;
+    let session: serde_json::Value = serde_json::from_str(&lent).unwrap();
+    assert_eq!(session["powerful"], json!("tester"), "{lent}");
+    assert_eq!(session["weak"], json!("tester/f-1"), "{lent}");
+    assert!(session["expires_at"].is_string(), "a lend expires: {lent}");
+
+    let done = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "finger-work", "title": "Finger work", "body": "b", "as": "tester/f-1" }),
+    )
+    .await;
+    assert!(done.contains("\"created\""), "{done}");
+
+    // The row says WHO did it and WHO answers for it — and they are different pens.
+    let got = tool(
+        service.peer(),
+        "memory_get",
+        json!({ "key": "finger-work" }),
+    )
+    .await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["asserted_by"], json!("tester/f-1"), "who did it: {got}");
+    assert_eq!(doc["owner"], json!("tester"), "who answers for it: {got}");
+    assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
+}
+
+/// `as:` on the BODY of `POST /memory` — the same claim as the MCP argument, and the same gate: a
+/// live lend, not tree shape. (The identity fixture is local to this test: it is the only one that
+/// needs a proven pen over HTTP, and it removes the table when it is done.)
+#[tokio::test]
+async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+
+    // Provisioning, outside every door: two pens and (later) a lend.
+    let paths = Paths::from_root(dir.path());
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-tester', 'self');
+             INSERT OR IGNORE INTO pen (name, kind, parent_id)
+                 VALUES ('http-as-tester/f-1', 'finger', (SELECT id FROM pen WHERE name='http-as-tester'));",
+        )
+        .unwrap();
+    }
+
+    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
+    unsafe { std::env::set_var(TABLE, "http-as-tester:as-secret-1") };
+
+    let post = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/memory")
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Stet-From", "http-as-tester")
+                .header("X-Stet-Auth", "as-secret-1")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+    };
+
+    // No lend: the claim is refused, and the refusal is the same one the MCP door gives.
+    let (status, body) = post(json!({
+        "key": "finger-note", "title": "Finger note", "body": "b",
+        "as": "http-as-tester/f-1"
+    }))
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "no lend, no credit: {status} {body}"
+    );
+    assert!(body.contains("LIVE lend"), "{status} {body}");
+
+    // With a lend it lands, credited to the finger.
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        ellmephant::store::sudo::lend(&conn, "http-as-tester", "http-as-tester/f-1", 60).unwrap();
+    }
+    let (status, body) = post(json!({
+        "key": "finger-note", "title": "Finger note", "body": "b",
+        "as": "http-as-tester/f-1"
+    }))
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(body.contains("finger-note"), "{status} {body}");
+
+    let conn = ellmephant::db::open(&paths).unwrap();
+    let mem = ellmephant::store::get(&conn, "finger-note")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("http-as-tester/f-1"),
+        "who did it"
+    );
+    assert_eq!(
+        mem.owner.as_deref(),
+        Some("http-as-tester"),
+        "who answers for it"
+    );
+
+    unsafe { std::env::remove_var(TABLE) };
+}
+
+/// The three sudo verbs on the door: a borrow needs POLICY, a pass goes DOWN, a release CASCADES.
+/// The policy is written outside the doors — that is what provisioning is, and it is the point.
+#[tokio::test]
+async fn the_sudo_verbs_are_on_the_door() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+
+    // No policy, no borrow — authority is granted, never assumed.
+    let refused = tool(
+        service.peer(),
+        "sudo",
+        json!({ "powerful": "estate", "secs": 60 }),
+    )
+    .await;
+    assert!(refused.contains("no sudo policy"), "{refused}");
+
+    // Provisioning writes the policy, the way terraform would: outside every door.
+    {
+        let conn = ellmephant::db::open(&Paths::from_root(dir.path())).unwrap();
+        ellmephant::store::sudo::grant(&conn, "estate", "tester", 600, "test").unwrap();
+    }
+
+    let borrowed = tool(
+        service.peer(),
+        "sudo",
+        json!({ "powerful": "estate", "secs": 300 }),
+    )
+    .await;
+    let session: serde_json::Value = serde_json::from_str(&borrowed).unwrap();
+    assert_eq!(session["weak"], json!("tester"), "{borrowed}");
+    assert_eq!(session["powerful"], json!("estate"), "{borrowed}");
+
+    // A borrow cannot outlive its policy.
+    let too_long = tool(
+        service.peer(),
+        "sudo",
+        json!({ "powerful": "estate", "secs": 601 }),
+    )
+    .await;
+    assert!(too_long.contains("at most 600s"), "{too_long}");
+
+    // Passing goes DOWN, and the receiver's session names where it came from.
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/hand", "kind": "self" }),
+    )
+    .await;
+    let passed = tool(
+        service.peer(),
+        "sudo_pass",
+        json!({ "powerful": "estate", "pen": "tester/hand", "secs": 60 }),
+    )
+    .await;
+    let passed: serde_json::Value = serde_json::from_str(&passed).unwrap();
+    assert_eq!(passed["weak"], json!("tester/hand"), "{passed}");
+    assert!(
+        passed["via"].is_i64(),
+        "a passed session names its source: {passed}"
+    );
+
+    // Releasing cascades: the hand's session and the finger's, in one act.
+    let released = tool(
+        service.peer(),
+        "sudo_release",
+        json!({ "powerful": "estate" }),
+    )
+    .await;
+    let released: serde_json::Value = serde_json::from_str(&released).unwrap();
+    assert_eq!(
+        released["sessions"],
+        json!(2),
+        "both sessions died: {released}"
+    );
+}
+
+/// The audit, END TO END: an ancestor reading a descendant's private row leaves a `private_read`
+/// record naming the pen, the row and the reason. This is #120's missing half (#129).
+#[tokio::test]
+async fn reading_into_the_subtree_is_recorded_on_the_door() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A hand, one finger under it, and a lend so the finger can be credited for its own work.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/f-1", "kind": "finger" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_lend",
+        json!({ "pen": "tester/f-1", "secs": 60 }),
+    )
+    .await;
+    let wrote = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "finger-note", "title": "Finger note", "body": "private work",
+                "private": true, "as": "tester/f-1" }),
+    )
+    .await;
+    assert!(
+        wrote.contains("stored") || wrote.contains("created"),
+        "{wrote}"
+    );
+
+    // The ancestor reads it — allowed, and now RECORDED.
+    let got = tool(
+        service.peer(),
+        "memory_get",
+        json!({ "key": "finger-note" }),
+    )
+    .await;
+    assert!(
+        got.contains("private work"),
+        "an ancestor reads down its subtree: {got}"
+    );
+
+    let conn = ellmephant::db::open(&Paths::from_root(dir.path())).unwrap();
+    let rows = ellmephant::store::audit::recent(&conn, 10).unwrap();
+    let (_, pen, key, reason, _) = rows
+        .iter()
+        .find(|r| r.2.as_deref() == Some("finger-note"))
+        .unwrap_or_else(|| panic!("no audit row for the subtree read: {rows:?}"));
+    assert_eq!(pen, "tester", "who looked");
+    assert_eq!(key.as_deref(), Some("finger-note"), "which row");
+    assert_eq!(reason, "subtree", "why");
+}
+
+/// The audit covers PAST STATES too: `memory_get?version=N` hands an ancestor the contents of a
+/// descendant's private row, so that boundary is recorded on the same table (#129, found reviewing it).
+#[tokio::test]
+async fn reading_a_past_state_of_a_descendants_private_row_is_recorded() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/f-1", "kind": "finger" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_lend",
+        json!({ "pen": "tester/f-1", "secs": 60 }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "f-note", "title": "v1", "body": "first private", "private": true, "as": "tester/f-1" }),
+    )
+    .await;
+    // A second write supersedes the first, so v1 is now history.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "f-note", "title": "v2", "body": "second private", "as": "tester/f-1" }),
+    )
+    .await;
+
+    let past = tool(
+        service.peer(),
+        "memory_get",
+        json!({ "key": "f-note", "version": 1 }),
+    )
+    .await;
+    assert!(
+        past.contains("first private"),
+        "an ancestor reads a past state: {past}"
+    );
+
+    let conn = ellmephant::db::open(&Paths::from_root(dir.path())).unwrap();
+    let rows = ellmephant::store::audit::recent(&conn, 20).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.2.as_deref() == Some("f-note") && r.4.as_deref() == Some("version/history")),
+        "no audit row for the version read: {rows:?}"
     );
 }

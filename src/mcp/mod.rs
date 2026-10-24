@@ -42,6 +42,13 @@ use crate::store::{self, project};
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
     "whoami",
+    "memory_unowned",
+    "whois",
+    "pen_mint",
+    "pen_lend",
+    "sudo",
+    "sudo_pass",
+    "sudo_release",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -299,6 +306,12 @@ pub struct UpsertParams {
         description = "Aspects of the subject, e.g. storage, gotchas. Omit to keep the stored tags; `[]` clears them."
     )]
     pub tags: Option<Vec<String>>,
+    /// Credit this write to a DESCENDANT of the calling pen.
+    #[serde(default, rename = "as")]
+    #[schemars(
+        description = "Credit this write to one of your OWN DESCENDANTS — a finger doing the work — instead of yourself. The store checks that it is below you AND that you hold a LIVE lend for it (`pen_lend`): parentage alone is not enough, because a lend expires and can be revoked, and an inheritance cannot. `asserted_by` names the descendant; `owner` stays with the pen that answers for it (a finger's work is its parent's). Omit to write as yourself."
+    )]
+    pub as_pen: Option<String>,
     /// Keep this row to the writing pen alone.
     #[serde(default)]
     #[schemars(
@@ -514,6 +527,111 @@ pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
     pub key: String,
+}
+
+/// `memory_unowned` — how many rows nobody owns, and WHICH (Stet, review of #122).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnownedParams {
+    /// How many rows to list.
+    #[schemars(description = "Maximum rows to list, newest first. Default 50.")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `whois` — the pen to look up.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WhoisParams {
+    /// The pen to look up.
+    #[schemars(description = "Pen name. Slug. `whoami` reports your own.")]
+    pub pen: String,
+}
+
+/// `pen_mint` — the pen to create, and what kind of thing it is.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MintParams {
+    /// The new pen's name — an address the minter chooses, and the store keeps forever.
+    #[schemars(
+        description = "Name of the pen to create. A name is SPENT once minted: a retired pen keeps its name, so a minting parent must generate a unique one (a hash suffix is the obvious way: `finger-9f3a1c`)."
+    )]
+    pub name: String,
+    /// `self` or `finger`.
+    #[schemars(
+        description = "`finger` for a mechanism a hand uses for one job, `self` for something that stands as itself. Never inferred from the name: a slash proves nothing."
+    )]
+    pub kind: String,
+}
+
+/// `pen_lend` — authority lent down to a descendant, for a while.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LendParams {
+    /// The descendant that may act with this pen's authority.
+    #[schemars(
+        description = "The DESCENDANT to lend to — a finger you minted. It must be below you."
+    )]
+    pub pen: String,
+    /// Seconds until it expires.
+    #[schemars(
+        description = "How long the lend lasts, in seconds. It expires on its own; `sudo_release` ends it sooner. Maximum 86400."
+    )]
+    pub secs: i64,
+}
+
+/// `sudo` — borrow one pen's authority, for a while.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SudoParams {
+    /// The pen whose authority is borrowed.
+    #[schemars(
+        description = "The pen whose authority you want — usually `estate`, which has no identity of its own and can only ever be used this way."
+    )]
+    pub powerful: String,
+    /// Seconds until the session ends.
+    #[schemars(
+        description = "How long the session lasts. It cannot outlive the policy that permits it, expires by itself, and `sudo_release` ends it sooner. No cache: revocation takes effect on the next call."
+    )]
+    pub secs: i64,
+}
+
+/// `sudo_pass` — hand a live session down to a descendant.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SudoPassParams {
+    /// The authority the session carries.
+    #[schemars(
+        description = "The authority being passed — the `powerful` pen of the session you hold."
+    )]
+    pub powerful: String,
+    /// The descendant to hand it to.
+    #[schemars(
+        description = "A DESCENDANT of yours. A session may be passed down, never sideways to a peer and never back up."
+    )]
+    pub pen: String,
+    /// Seconds until it expires — never longer than what you have left.
+    #[schemars(
+        description = "How long the receiver holds it. It cannot outlive the session it came from; asking for more is refused, not clamped."
+    )]
+    pub secs: i64,
+}
+
+/// `sudo_release` — end a session, and everything passed down from it.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SudoReleaseParams {
+    /// The authority to let go of.
+    #[schemars(
+        description = "The `powerful` pen of the session to end. Its whole pass-down chain dies with it."
+    )]
+    pub powerful: String,
+    /// Whose session to end — yourself by default, or a descendant's.
+    #[schemars(
+        description = "Whose session to end: omit for your own, or name a DESCENDANT (a finger you lent to). A pen that lent authority must be able to stop what it lent, or a runaway finger is stoppable only by the finger."
+    )]
+    #[serde(default)]
+    pub pen: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1531,6 +1649,215 @@ impl MemoryServer {
         Ok(json_ok(body))
     }
 
+    /// WHICH rows have no owner — the list behind `memory_stats`' two counts.
+    #[tool(
+        name = "memory_unowned",
+        description = "List the rows nobody owns, newest first, with WHY each is ownerless: `disclaimed` (somebody released it — the author is still named, and this is a supported, deliberate state: retiring a descendant can disclaim its rows) or `unrecorded` (no currently existing pen is named as author at all — either a write made with no pen, or a pen that is gone). These are the rows an owner can CLAIM: anyone may adopt an ownerless row. Use it after `memory_stats` says how many; a count without a list gets quoted and never acted on.",
+        annotations(
+            title = "Rows nobody owns",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_unowned(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<UnownedParams>,
+    ) -> std::result::Result<String, String> {
+        // An ownerless row is a row, so the audience tier applies exactly as it does to a search hit.
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        let limit = p.limit.unwrap_or(50).clamp(1, 500);
+        let rows = self
+            .with_read("memory_unowned", reader, move |s| s.unowned(limit))
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&rows).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// WHO a pen is, and what it is to THIS connection — the question a name alone cannot answer.
+    #[tool(
+        name = "whois",
+        description = "Look up one pen and its relationship to the pen asking. Returns `name`, `kind` (`self`/`finger`), `parent`, `created`, `ceased` (the tombstone of a retired pen), `owns` (how many rows it answers for) and `relation` — a walk in single letters from YOU to it: `ME` for yourself, `P` parent, `PP` grandparent, `C` child, `S` sibling, `PS` uncle, `SC` nephew, `PSC` cousin, with an English word in quotes only where English is exact. `relation: null` means no common root. A name is an address, never a permission; this is what the address is attached to.",
+        annotations(
+            title = "Who is this pen",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn whois(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<WhoisParams>,
+    ) -> std::result::Result<String, String> {
+        // An unproven reader may still ask WHO a pen is — the tree is configuration, not content —
+        // it simply gets no walk, because it has not proved to be anybody.
+        let viewer = pen_name(&ctx, self.declared.as_deref())
+            .unwrap_or_else(|_| crate::identity::ANONYMOUS.to_string());
+        let pen = p.pen;
+        let lookup = pen.clone();
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        let facts = self
+            .with_read("whois", reader, move |s| s.whois(&viewer, &lookup))
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&facts).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// CREATE a pen under this one — the runtime door (James, 2026-10-23).
+    #[tool(
+        name = "pen_mint",
+        description = "Create a pen under the CALLER. The parent is the pen that calls, never an argument: you may create downward, never sideways and never upward, because parentage is the grant. A hand mints a finger; `estate`'s children come from provisioning, which is a different door. Returns the new pen's name, kind and parent. `kind` is `self` or `finger` and is never inferred from the name. ★ A NAME IS SPENT: a retired pen keeps its row and its name, so minting over a dead name is refused with the retirement time — generate a unique name (e.g. `finger-9f3a1c`).",
+        annotations(
+            title = "Mint a pen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pen_mint(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MintParams>,
+    ) -> std::result::Result<String, String> {
+        // A mint is a WRITE: it needs a pen, and the pen is the parent.
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let name = p.name;
+        let kind = p.kind;
+        let minted = self
+            .with_store("pen_mint", move |s| s.mint(&caller, &name, &kind))
+            .await?;
+        tracing::info!(tool = "pen_mint", pen = %minted.name, kind = %minted.kind, parent = %minted.parent, "pen minted");
+        Ok(json_ok(
+            serde_json::to_value(&minted).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// LEND this pen's authority DOWN to a descendant — the thing that lets a finger act.
+    #[tool(
+        name = "pen_lend",
+        description = "Lend your own authority to a DESCENDANT (a finger you minted) for `secs`. This is what permits `memory_upsert` with `as: <that pen>`: parentage alone is NOT enough, because a lend EXPIRES and can be REVOKED, and an inheritance can do neither. Downward lending needs no policy row — parentage already grants it; `sudo` is for borrowing somebody else's authority across or upward, and that does need one. Returns the session: its id, the two pens, `expires_at`, and `via` (the session it was passed from, when it was).",
+        annotations(
+            title = "Lend authority down",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pen_lend(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<LendParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = p.pen;
+        let secs = p.secs;
+        let session = self
+            .with_store("pen_lend", move |s| s.lend(&caller, &pen, secs))
+            .await?;
+        tracing::info!(tool = "pen_lend", weak = %session.weak, powerful = %session.powerful, "authority lent down");
+        Ok(json_ok(
+            serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// BORROW a pen's authority — bounded by policy, expiring, revocable.
+    #[tool(
+        name = "sudo",
+        description = "Borrow `powerful`'s authority for `secs`. Needs a `sudoers` policy naming you as the borrower and this pair — authority is GRANTED, never assumed — and the duration cannot exceed the policy's ceiling. This is how `estate` is used at all: it is a real pen with no identity behind it, so nobody can authenticate as it and its universal reach is only ever somebody's borrow. Returns the session: id, both pens, `expires_at`. ★ No cache: every check reads the row, so a release or an expiry takes effect on the very next call.",
+        annotations(
+            title = "Borrow authority",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let powerful = p.powerful;
+        let secs = p.secs;
+        let session = self
+            .with_store("sudo", move |s| s.sudo(&caller, &powerful, secs))
+            .await?;
+        tracing::info!(tool = "sudo", weak = %session.weak, powerful = %session.powerful, "authority borrowed");
+        Ok(json_ok(
+            serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// PASS a live session down to a descendant.
+    #[tool(
+        name = "sudo_pass",
+        description = "Hand a live session of yours DOWN to a descendant of yours, for no longer than you have left. Downward only: passing sideways would arm a peer, and passing up would return authority to its source. The receiver's session dies with yours. Returns the new session with `via` naming the one it came from.",
+        annotations(
+            title = "Pass a session down",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo_pass(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoPassParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let powerful = p.powerful;
+        let pen = p.pen;
+        let secs = p.secs;
+        let session = self
+            .with_store("sudo_pass", move |s| {
+                s.sudo_pass(&caller, &powerful, &pen, secs)
+            })
+            .await?;
+        tracing::info!(tool = "sudo_pass", weak = %session.weak, powerful = %session.powerful, "session passed down");
+        Ok(json_ok(
+            serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// END a session, and everything passed down from it.
+    #[tool(
+        name = "sudo_release",
+        description = "End your session for `powerful`, and every session passed down from it. Revocation cascades by `via`, so a hand letting go also ends its fingers' sessions — a revocation that left copies running would not be one. Takes effect on the next call: there is no lookup cache to expire.",
+        annotations(
+            title = "Release authority",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo_release(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoReleaseParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let powerful = p.powerful;
+        let target = p.pen;
+        let killed = self
+            .with_store("sudo_release", move |s| {
+                s.sudo_release_of(&caller, target.as_deref(), &powerful)
+            })
+            .await?;
+        tracing::info!(tool = "sudo_release", killed, "authority released");
+        Ok(json_ok(
+            serde_json::json!({ "status": "released", "sessions": killed }),
+        ))
+    }
+
     /// Store one atomic memory; upserts by key. See the description for the write law.
     #[tool(
         name = "memory_upsert",
@@ -1548,13 +1875,24 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
+        let claimed = p.as_pen.clone();
         let mut patch = p.into_patch();
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
-        // no signature at all.
-        patch.asserted_by = Some(pen_name(&ctx, self.declared.as_deref())?);
+        // no signature at all. `as` may only ever name a DESCENDANT of that proven pen.
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let credited = match claimed {
+            Some(name) if !name.eq_ignore_ascii_case(&caller) => Some(name),
+            _ => None,
+        };
+        patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
         let outcome = self
-            .with_store("memory_upsert", move |s| s.memory_merge(&patch))
+            .with_store("memory_upsert", move |s| {
+                if let Some(as_pen) = &credited {
+                    s.may_act_as(&caller, as_pen)?;
+                }
+                s.memory_merge(&patch)
+            })
             .await?;
         tracing::info!(
             tool = "memory_upsert",
@@ -1598,14 +1936,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
             .with_store("memory_delete", move |s| {
-                if !s.rm(&rm_key)? {
+                if !s.rm(&rm_key, Some(&pen))? {
                     return Ok(None);
                 }
                 Ok(Some(s.version_count(&rm_key)?))
@@ -1643,13 +1981,16 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        // A merge DESTROYS the source, so it is signed like any other write.
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
-            .with_store("memory_merge", move |s| s.merge_into(&from, &into))
+            .with_store("memory_merge", move |s| {
+                s.merge_into(&from, &into, Some(&pen))
+            })
             .await?;
         tracing::info!(
             tool = "memory_merge",
@@ -1875,11 +2216,17 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return serde_json::to_string(&v).map_err(|e| e.to_string());
         }
         let lookup = key.clone();
-        let mut mem = match self
-            .with_read("memory_get", reader.clone(), move |s| s.show(&lookup))
+        // The relation is computed INSIDE the read, where the session's proven pen is in hand: what
+        // the owner is to the ASKER, not a property of the row.
+        let (mut mem, relation) = match self
+            .with_read("memory_get", reader.clone(), move |s| {
+                let mem = s.show(&lookup)?;
+                let relation = s.owner_relation(&mem);
+                Ok((mem, relation))
+            })
             .await
         {
-            Ok(m) => m,
+            Ok(found) => found,
             Err(e) => return Err(self.explain_miss(&key, e, reader.clone()).await),
         };
         // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
@@ -1894,6 +2241,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let mut v = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
         if let Some(obj) = v.as_object_mut() {
             obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+            if let Some(walk) = relation {
+                obj.insert("owner_relation".to_string(), serde_json::json!(walk));
+            }
         }
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }
@@ -2807,6 +3157,12 @@ pub fn http_router(
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
         .route("/whoami", axum::routing::get(surface::whoami))
+        .route("/whois/{pen}", axum::routing::get(surface::whois))
+        .route("/pen/mint", axum::routing::post(surface::pen_mint))
+        .route("/pen/lend", axum::routing::post(surface::pen_lend))
+        .route("/sudo", axum::routing::post(surface::sudo))
+        .route("/sudo/pass", axum::routing::post(surface::sudo_pass))
+        .route("/sudo/release", axum::routing::post(surface::sudo_release))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

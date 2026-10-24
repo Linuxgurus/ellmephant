@@ -25,7 +25,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Error, Result};
 
 /// A borrowing in progress: `weak` may act as `powerful` until `expires_at`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Session {
     /// The `active_sudo` row.
     pub id: i64,
@@ -37,6 +37,8 @@ pub struct Session {
     pub expires_at: String,
     /// The session it was passed from, if it was.
     pub via: Option<i64>,
+    /// `policy` (borrowed under a `sudoers` row) or `lend` (a pen lending its own authority down).
+    pub source: String,
 }
 
 /// The largest duration any single session may be granted, in seconds (24 h).
@@ -100,12 +102,129 @@ pub fn revoke(conn: &Connection, powerful: &str, weak: &str) -> Result<usize> {
     Ok(killed)
 }
 
+/// **LEND: a pen hands its own authority DOWN to a descendant** (James, 2026-10-23).
+///
+/// The mirror of [`sudo`], and the reason they are different verbs: `sudo` borrows somebody else's
+/// authority ACROSS or UPWARD and therefore needs a `sudoers` row; lending spends authority you
+/// already have, and parentage already grants that. Requiring a policy row to lend downward would
+/// mean every minted finger needs a configuration entry — configuration written by code.
+///
+/// ★ **TWO DIRECTIONS, TWO KINDS OF RISK** (James agreeing with Stet, 2026-10-23). Lending DOWN is a
+/// self extending itself into a mechanism: the finger acts with the hand's authority by construction,
+/// so the exposure is STRUCTURAL and a session bounds TIME, not trust — there is no third party to
+/// check a hand on its own work. Borrowing ACROSS or UP ([`sudo`]) is the other side: a pen reaching
+/// for authority it does not have, checked by policy and by someone else's interest. A session
+/// narrows both, and "solved" is the wrong word for either — but only on the borrowing side is the
+/// bound also a CHECK.
+///
+/// What lending keeps is the part that matters: it EXPIRES, it can be REVOKED by deleting one row,
+/// and `via` lets a lend's children die with it.
+///
+/// ★ **A lend SETS the deadline; it does not stack one on top.** Two live rows for the same pair
+/// would mean the effective deadline is whichever happens to be later, and a SHORTER lend would
+/// reappear as the longer one after it lapsed. So lending again replaces the pair's sessions (and
+/// everything passed down from them). To end one early, `release`. Without this, a finger's authority would be a fact
+/// about tree shape and nothing could revoke it short of re-shaping the tree.
+pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<Session> {
+    if powerful.eq_ignore_ascii_case(weak) {
+        return Err(Error::Invalid(format!(
+            "{powerful} cannot lend to itself: its own authority is not borrowed, it is had"
+        )));
+    }
+    let (p, _, ceased) = pen_identity(conn, powerful)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{powerful} has been retired: a pen that has ceased lends nothing"
+        )));
+    }
+    // (j) A lend to a pen that has CEASED is a lend to nobody, so it is refused here rather than left
+    // to a later check that might not exist on every path.
+    let (w, _, ceased) = pen_identity(conn, weak)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{weak} has been retired: authority lent to a pen that has ceased is authority lent to \
+             nobody"
+        )));
+    }
+    if !is_below(conn, p, w)? {
+        return Err(Error::Invalid(format!(
+            "{weak} is not a descendant of {powerful}: authority is lent DOWN, never sideways or up"
+        )));
+    }
+    if !(1..=MAX_DURATION_SECS).contains(&secs) {
+        return Err(Error::Invalid(format!(
+            "a lend must last between 1 and {MAX_DURATION_SECS} seconds (asked for {secs})"
+        )));
+    }
+    // ★ A LEND REPLACES WHAT WAS LENT (Stet, review of #126). Two live rows for one pair are not a
+    // tightening and not a renewal — they are two deadlines, and the later one wins by accident.
+    // Worse, the SHORTER of them expiring reveals the longer one again: a lend you shortened comes
+    // back on its own. So a lend is a SET: the pair's live sessions end (with everything passed down
+    // from them, or a child would outlive the grant it was passed under), then the new one begins.
+    // To shorten without re-lending is `release`; to extend is another `lend`.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE weak = ?1 AND powerful = ?2
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![w, p],
+    )?;
+    tx.execute(
+        "INSERT INTO active_sudo (powerful, weak, expires_at, source)
+         VALUES (?1, ?2, datetime('now', ?3), 'lend')",
+        params![p, w, format!("+{secs} seconds")],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    let expires_at: String = conn.query_row(
+        "SELECT expires_at FROM active_sudo WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(Session {
+        id,
+        powerful: powerful.to_string(),
+        weak: weak.to_string(),
+        expires_at,
+        via: None,
+        source: "lend".to_string(),
+    })
+}
+
+/// `(id, parent_id, ceased_at)` for a pen, or a refusal that names it.
+fn pen_identity(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
+    conn.query_row(
+        "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+        params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
+}
+
 /// Borrow `powerful`'s authority as `weak` for `secs`. A session, not a permission: it expires.
 pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<Session> {
     if weak == powerful {
         return Err(Error::Invalid(format!("{weak} cannot sudo to itself")));
     }
-    let (p, w) = (id_of(conn, powerful)?, id_of(conn, weak)?);
+    // ★ A CEASED PEN HAS NO AUTHORITY TO LEND OR BORROW (found reviewing #127). `retire` now ends
+    // live sessions, but a retired pen's `sudoers` row would otherwise stay borrowable forever, and a
+    // retired pen could still ask for someone else's. Both are refused where the request is made.
+    let (p, _, powerful_ceased) = pen_identity(conn, powerful)?;
+    if powerful_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{powerful} has been retired: a pen that has ceased lends no authority"
+        )));
+    }
+    let (w, _, weak_ceased) = pen_identity(conn, weak)?;
+    if weak_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{weak} has been retired: a pen that has ceased borrows nothing"
+        )));
+    }
     let ceiling: Option<i64> = conn
         .query_row(
             "SELECT max_duration_secs FROM sudoers WHERE powerful = ?1 AND weak = ?2",
@@ -123,12 +242,27 @@ pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<
             "{weak} may borrow {powerful} for at most {ceiling}s (asked for {secs})"
         )));
     }
-    conn.execute(
-        "INSERT INTO active_sudo (powerful, weak, expires_at)
-         VALUES (?1, ?2, datetime('now', ?3))",
+    // ★ BORROWING REPLACES TOO (Stet's catch on #126, applied to the other verb). A second `sudo`
+    // for the same pair is not a renewal on top of the old row: two live rows would mean the later
+    // deadline wins by accident, and a SHORTENED borrow would come back when the short one lapsed.
+    // So: end the pair's live sessions (cascading through `via`), then begin the new one.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE weak = ?1 AND powerful = ?2
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![w, p],
+    )?;
+    tx.execute(
+        "INSERT INTO active_sudo (powerful, weak, expires_at, source)
+         VALUES (?1, ?2, datetime('now', ?3), 'policy')",
         params![p, w, format!("+{secs} seconds")],
     )?;
-    let id = conn.last_insert_rowid();
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
     let expires_at: String = conn.query_row(
         "SELECT expires_at FROM active_sudo WHERE id = ?1",
         params![id],
@@ -140,6 +274,7 @@ pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<
         weak: weak.to_string(),
         expires_at,
         via: None,
+        source: "policy".to_string(),
     })
 }
 
@@ -173,9 +308,15 @@ pub fn pass(conn: &Connection, weak: &str, powerful: &str, to: &str, secs: i64) 
         )));
     }
     conn.execute(
-        "INSERT INTO active_sudo (powerful, weak, expires_at, via)
-         VALUES ((SELECT id FROM pen WHERE name = ?1), ?2, datetime('now', ?3), ?4)",
-        params![powerful, to_id, format!("+{secs} seconds"), parent.id],
+        "INSERT INTO active_sudo (powerful, weak, expires_at, via, source)
+         VALUES ((SELECT id FROM pen WHERE name = ?1), ?2, datetime('now', ?3), ?4, ?5)",
+        params![
+            powerful,
+            to_id,
+            format!("+{secs} seconds"),
+            parent.id,
+            parent.source
+        ],
     )?;
     let id = conn.last_insert_rowid();
     let expires_at: String = conn.query_row(
@@ -189,6 +330,9 @@ pub fn pass(conn: &Connection, weak: &str, powerful: &str, to: &str, secs: i64) 
         weak: to.to_string(),
         expires_at,
         via: Some(parent.id),
+        // A passed session carries the authority it was passed from: a lend stays a lend, a borrow
+        // stays a borrow, however far down the chain it travels.
+        source: parent.source,
     })
 }
 
@@ -223,7 +367,7 @@ pub fn live(conn: &Connection, weak: &str, powerful: &str) -> Result<Option<Sess
     };
     Ok(conn
         .query_row(
-            "SELECT id, expires_at, via FROM active_sudo
+            "SELECT id, expires_at, via, source FROM active_sudo
               WHERE weak = ?1 AND powerful = ?2 AND expires_at > datetime('now')
               ORDER BY id DESC LIMIT 1",
             params![w, p],
@@ -234,10 +378,25 @@ pub fn live(conn: &Connection, weak: &str, powerful: &str) -> Result<Option<Sess
                     weak: weak.to_string(),
                     expires_at: r.get(1)?,
                     via: r.get(2)?,
+                    source: r.get(3)?,
                 })
             },
         )
         .optional()?)
+}
+
+/// End one session and everything passed down from it. **`caller` must be the pen itself or an
+/// ancestor of it** — the pen that lent authority must be able to stop what it lent, or "a pen that
+/// goes bad at 03:00" is stoppable only by the pen that went bad.
+pub fn release_by(conn: &Connection, caller: &str, weak: &str, powerful: &str) -> Result<usize> {
+    let caller_id = id_of(conn, caller)?;
+    let weak_id = id_of(conn, weak)?;
+    if caller_id != weak_id && !is_below(conn, caller_id, weak_id)? {
+        return Err(Error::Invalid(format!(
+            "{caller} may not end {weak}'s session: only that pen or one of its ancestors may"
+        )));
+    }
+    release(conn, weak, powerful)
 }
 
 /// End one session, and every session passed down from it. Returns how many died.
@@ -281,7 +440,7 @@ pub fn held(conn: &Connection, weak: &str) -> Result<Vec<Session>> {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare(
-        "SELECT s.id, p.name, s.expires_at, s.via
+        "SELECT s.id, p.name, s.expires_at, s.via, s.source
            FROM active_sudo s JOIN pen p ON p.id = s.powerful
           WHERE s.weak = ?1 AND s.expires_at > datetime('now')
           ORDER BY s.id DESC",
@@ -293,6 +452,7 @@ pub fn held(conn: &Connection, weak: &str) -> Result<Vec<Session>> {
             weak: weak.to_string(),
             expires_at: r.get(2)?,
             via: r.get(3)?,
+            source: r.get(4)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()

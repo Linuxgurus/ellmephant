@@ -102,7 +102,7 @@ fn a_delete_leaves_nothing_searchable() {
     )
     .expect("add");
     assert_eq!(fts::search(&conn, "survive", 10).expect("search").len(), 1);
-    store::delete(&conn, "gone").expect("delete");
+    store::delete(&conn, "gone", None).expect("delete");
     assert!(
         fts::search(&conn, "survive", 10)
             .expect("search")

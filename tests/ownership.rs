@@ -1187,3 +1187,72 @@ fn an_ancestor_writes_a_descendants_row_and_the_attribution_says_so() {
         "responsibility did not move"
     );
 }
+
+// ── THE TREE, FROM CONFIGURATION (2026-10-24) ────────────────────────────────────────────────────
+// The seed gives names; provisioning gives standing — and "provisioning" had no mechanism: no sqlite3
+// in the image, no mounting the PVC beside a running brain, no API. A store would roll with five roots
+// and every ancestry rule would reach nothing while it reported itself ready.
+
+#[test]
+fn the_tree_attaches_from_configuration_and_becomes_one_root() {
+    let (_dir, conn) = subtree();
+    // subtree() gives estate → james → {stet, cline}; work from a flat registry instead.
+    conn.execute("UPDATE pen SET parent_id = NULL", []).unwrap();
+    let roots = |c: &rusqlite::Connection| -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM pen WHERE parent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(roots(&conn), 4, "five names, all roots");
+
+    store::set_parent(&conn, "james", "estate").expect("james under estate");
+    store::set_parent(&conn, "stet", "james").expect("stet under james");
+    store::set_parent(&conn, "cline", "james").expect("cline under james");
+
+    assert_eq!(roots(&conn), 1, "one root: the estate");
+    // And the rules that were inert are live: estate reaches stet, stet's sibling does not.
+    assert!(
+        store::relation::relation(&conn, "estate", "cline")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store::relation::relation(&conn, "stet", "cline")
+            .unwrap()
+            .unwrap()
+            .walk,
+        "S"
+    );
+}
+
+#[test]
+fn a_bad_edge_is_refused_by_name_and_the_rest_apply() {
+    let (_dir, conn) = subtree();
+    conn.execute("UPDATE pen SET parent_id = NULL", []).unwrap();
+
+    // a loop
+    store::set_parent(&conn, "james", "estate").unwrap();
+    let err = store::set_parent(&conn, "estate", "james").unwrap_err();
+    assert!(format!("{err}").contains("loop"), "{err}");
+    // itself
+    let err = store::set_parent(&conn, "stet", "stet").unwrap_err();
+    assert!(format!("{err}").contains("own parent"), "{err}");
+    // a parent nobody minted
+    let err = store::set_parent(&conn, "stet", "nobody-at-all").unwrap_err();
+    assert!(format!("{err}").contains("no pen named"), "{err}");
+
+    // idempotence: repeating an edge is not an error and writes nothing new.
+    store::set_parent(&conn, "stet", "james").unwrap();
+    store::set_parent(&conn, "stet", "james").unwrap();
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE c.name = 'stet'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent.as_deref(), Some("james"));
+}

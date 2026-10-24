@@ -33,6 +33,9 @@ pub fn open_with(paths: &Paths, cfg: &crate::config::Config) -> Result<Connectio
     // ★ SUDO POLICY IS READ AT BOOT AND NEVER FATAL (#109): authority is granted by configuration, so
     // a malformed line is a warning with a name, not a store that refuses to open.
     crate::store::sudo::load_at_boot(&conn);
+    // ★ THE TREE IS CONFIGURATION, loaded the same way (2026-10-24): a fresh store's pens are NAMES
+    // until somebody attaches them, and no door can.
+    crate::store::load_tree_at_boot(&conn);
     // ★ RETENTION THAT ACTUALLY RUNS (found reviewing #129). `audit::prune` existed and nothing called
     // it, which makes "retention is enforced" a sentence rather than a fact. Pruning at open costs one
     // DELETE on boot and needs no bell; a table that grows forever is a second store nobody maintains.

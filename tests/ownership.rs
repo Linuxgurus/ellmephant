@@ -725,6 +725,123 @@ fn the_ownerless_rows_can_be_listed_not_only_counted() {
     assert!(
         rows.iter()
             .all(|r| !r.key.is_empty() && !r.created.is_empty())
+// ── MINT AND DISPOSE ─────────────────────────────────────────────────────────────────────────────
+// A pen creates a pen, and retires it when the work is done. The parent is the CALLER, never an
+// argument: you may create downward, never sideways or upward.
+
+#[test]
+fn a_pen_mints_a_child_and_the_parent_is_the_caller() {
+    let (_dir, conn) = subtree();
+    let minted = store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+
+    assert_eq!(minted.parent, "stet", "the caller is the parent, by right");
+    assert_eq!(minted.kind, "self");
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE c.name = 'stet/hand'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("parent");
+    assert_eq!(parent.as_deref(), Some("stet"));
+
+    // And a hand mints a finger under itself.
+    store::mint(&conn, "stet/hand", "stet/hand/finger-9", "finger").expect("mint a finger");
+}
+
+#[test]
+fn a_kind_is_never_inferred_from_the_name() {
+    let (_dir, conn) = subtree();
+    // A slash does not make a finger, and a finger does not need one.
+    let minted = store::mint(&conn, "stet", "assistant", "finger").expect("mint");
+    assert_eq!(minted.kind, "finger");
+    let err = store::mint(&conn, "stet", "weird-kind", "hand").unwrap_err();
+    assert!(format!("{err}").contains("`self` or `finger`"), "{err}");
+}
+
+#[test]
+fn a_name_is_spent_and_a_retired_pen_cannot_mint() {
+    let (_dir, conn) = subtree();
+    store::mint(&conn, "stet", "stet/old-hand", "self").expect("mint");
+
+    // Minting again over a live pen is refused…
+    let err = store::mint(&conn, "stet", "stet/old-hand", "self").unwrap_err();
+    assert!(format!("{err}").contains("already a pen"), "{err}");
+
+    // …and after retirement the name is SPENT, not free: two lives under one name would make every
+    // ledger row ambiguous.
+    store::retire(
+        &conn,
+        "stet/old-hand",
+        "stet",
+        store::Rows::Disclaim,
+        store::History::Memorialize,
+    )
+    .expect("retire");
+    let err = store::mint(&conn, "stet", "stet/old-hand", "self").unwrap_err();
+    assert!(format!("{err}").contains("a name is spent"), "{err}");
+
+    // A retired pen cannot create anything either.
+    let err = store::mint(&conn, "stet/old-hand", "stet/old-hand/child", "finger").unwrap_err();
+    assert!(format!("{err}").contains("has been retired"), "{err}");
+}
+
+#[test]
+fn a_hand_may_credit_its_finger_and_nothing_else() {
+    let (_dir, conn) = subtree();
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+
+    // Itself, and anything below it.
+    store::may_act_as(&conn, "stet", "stet").expect("itself");
+    store::may_act_as(&conn, "stet/hand", "stet/hand/finger-1").expect("its own finger");
+    store::may_act_as(&conn, "stet", "stet/hand/finger-1").expect("down the whole subtree");
+
+    // Never a peer, never an ancestor, never a name nobody minted.
+    let err = store::may_act_as(&conn, "stet", "cline").unwrap_err();
+    assert!(format!("{err}").contains("never a peer"), "{err}");
+    let err = store::may_act_as(&conn, "stet/hand", "stet").unwrap_err();
+    assert!(format!("{err}").contains("never a peer"), "{err}");
+    let err = store::may_act_as(&conn, "stet", "nobody-at-all").unwrap_err();
+    assert!(format!("{err}").contains("is not a pen"), "{err}");
+}
+
+#[test]
+fn a_fingers_work_is_its_hands_and_retirement_moves_it() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-2", "finger").expect("mint");
+
+    // The finger holds no credential: the hand proves, the finger is credited, the hand OWNS.
+    store::may_act_as(&conn, "stet/hand", "stet/hand/finger-2").expect("act as the finger");
+    row(&conn, &embedder, "finger-work", "stet/hand/finger-2");
+    assert_eq!(owner(&conn, "finger-work").as_deref(), Some("stet/hand"));
+
+    // Disposing of the pen hands its work back to the hand: that is what `retire` is for.
+    store::retire(
+        &conn,
+        "stet/hand/finger-2",
+        "stet/hand",
+        store::Rows::Inherit,
+        store::History::Memorialize,
+    )
+    .expect("dispose of the finger");
+    assert_eq!(owner(&conn, "finger-work").as_deref(), Some("stet/hand"));
+    // ★ AND `inherit` IS A NO-OP HERE, correctly: the finger never owned its work, so there is
+    // nothing to hand back and nothing to record. A transfer event would be a story about a move
+    // that did not happen.
+    assert!(store::pen_events(&conn, "finger-work").unwrap().is_empty());
+    let ceased: Option<String> = conn
+        .query_row(
+            "SELECT ceased_at FROM pen WHERE name = 'stet/hand/finger-2'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("ceased_at");
+    assert!(
+        ceased.is_some(),
+        "the pen is disposed of; the work stays where it was"
     );
 }
 
@@ -820,4 +937,23 @@ fn a_merge_is_a_delete_and_is_gated_like_one() {
         "the survivor is somebody else's: {err}"
     );
     assert!(store::links::merge_into(&conn, "stets-note", "stets-other", Some("stet")).is_ok());
+fn a_pen_cannot_be_named_anonymous_or_given_an_unaddressable_name() {
+    let (_dir, conn) = subtree();
+
+    // `anonymous` is the store's word for "no currently existing pen". A pen by that name would make
+    // every unattributed count ambiguous — the defect 0021/0025 remove.
+    for name in ["anonymous", "ANONYMOUS", " anonymous "] {
+        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "{name}: {err}");
+    }
+
+    // A private row's audience is `pen:<name>`; a comma or a space cannot be addressed there, so the
+    // pen could never hold one — and nobody would find out until the first private write failed.
+    for name in ["stet/finger,1", "stet finger"] {
+        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
+        assert!(format!("{err}").contains("addressed"), "{name}: {err}");
+    }
+
+    // And a name that can be addressed still works.
+    store::mint(&conn, "stet", "stet/finger-9f3a1c", "finger").expect("a good name");
 }

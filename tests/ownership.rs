@@ -756,7 +756,7 @@ fn the_unowned_listing_obeys_the_audience_tier() {
 // source without asking anyone's leave.
 
 #[test]
-fn destroying_an_invisible_private_row_answers_as_if_it_never_existed() {
+fn destroying_an_invisible_private_row_says_forbidden_not_absent() {
     let (_dir, conn) = subtree();
     let embedder = HashEmbedder::new(DIM);
     row(&conn, &embedder, "stets-secret", "stet");
@@ -766,11 +766,19 @@ fn destroying_an_invisible_private_row_answers_as_if_it_never_existed() {
     )
     .unwrap();
 
-    // cline is a PEER: the row does not exist for it, so the refusal must not confirm it does.
+    // cline is a PEER. A READ stays absent — the tier's law — but a WRITE says plainly that the
+    // answer is no: "no such memory" for a memory that exists sends an agent hunting a bug that is not
+    // there (James, 2026-10-24).
+    let read = store::get(&conn, "stets-secret").unwrap();
+    assert!(
+        read.is_some(),
+        "the store itself can read it; the reader tier is what hides it"
+    );
+
     let err = store::delete(&conn, "stets-secret", Some("cline")).unwrap_err();
     assert!(
-        format!("{err}").contains("no such memory"),
-        "an invisible row must answer as absent, not report its owner: {err}"
+        format!("{err}").contains("forbidden"),
+        "a write refusal is FORBIDDEN, not a claim of absence: {err}"
     );
     // …and it is still there.
     assert!(store::get(&conn, "stets-secret").unwrap().is_some());
@@ -1142,4 +1150,40 @@ fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
     // A name nobody minted is a refusal that says so.
     let err = store::whois(&conn, "stet", "nobody-at-all").unwrap_err();
     assert!(format!("{err}").contains("no pen named"), "{err}");
+}
+
+#[test]
+fn an_ancestor_writes_a_descendants_row_and_the_attribution_says_so() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    // James, 2026-10-24: "an ancestor always has (rarely used) ability to write on descendant-owned
+    // data, with proper attribution". No lend is needed for that — the lend is only for CREDITING the
+    // write to the descendant. Here the writer is the ancestor, and the record says so.
+    let rewrite = Memory {
+        key: "stets-note".into(),
+        title: "rewritten by james".into(),
+        body: "the ancestor's correction".into(),
+        asserted_by: Some("james".into()),
+        ..Default::default()
+    };
+    common::add_now(&conn, &embedder, &rewrite).expect("an ancestor may write down its subtree");
+
+    let mem = store::get(&conn, "stets-note").unwrap().unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("james"),
+        "the ancestor is credited, not the owner"
+    );
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("james"),
+        "and the edit is named"
+    );
+    assert_eq!(
+        mem.owner.as_deref(),
+        Some("stet"),
+        "responsibility did not move"
+    );
 }

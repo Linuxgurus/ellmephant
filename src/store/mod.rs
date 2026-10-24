@@ -248,15 +248,20 @@ pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> R
     let Some((owner, audience)) = row else {
         return Ok(()); // nothing there: a create, and creates are not gated here
     };
-    // ★ ABSENCE FIRST (final adversarial pass). A row the caller cannot SEE does not exist for them,
-    // so a refusal must not confirm it: without this, a DELETE on somebody's private row answered
-    // *"it is owned by stet"* — an existence-and-ownership oracle for rows they cannot read.
+    // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24). Reads keep the absence rule —
+    // a read must never confirm a row it may not see — but a WRITE that answers *"no such memory"* for
+    // a memory that plainly exists sends an agent hunting a bug that is not there. The cost is that a
+    // prober learns the key exists; inside one estate, with cooperating pens, clarity is worth more
+    // than that.
     let visible = match caller {
         Some(caller) => may_read_audience(conn, caller, &audience)?,
         None => true,
     };
     if !visible {
-        return Err(Error::NotFound(key.to_string()));
+        return Err(Error::Forbidden(format!(
+            "{caller} may not write {key}: it exists and is not yours, and you are not an ancestor of its owner",
+            caller = caller.unwrap_or("nobody")
+        )));
     }
     let Some(owner_id) = owner else { return Ok(()) };
     let Some(caller) = caller else {
@@ -277,7 +282,7 @@ pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> R
         params![owner_id],
         |r| r.get(0),
     )?;
-    Err(Error::Invalid(format!(
+    Err(Error::Forbidden(format!(
         "{caller} may not write {key}: it is owned by {owner_name}, and only that pen or one of its ancestors may"
     )))
 }

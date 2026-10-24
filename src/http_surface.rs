@@ -98,6 +98,11 @@ pub const ROUTES: &[Route] = &[
         tool: "memory_merge",
     },
     Route {
+        method: "POST",
+        path: "/memory/{key}/adopt",
+        tool: "memory_adopt",
+    },
+    Route {
         method: "GET",
         path: "/search",
         tool: "memory_search",
@@ -2028,6 +2033,70 @@ pub async fn merge(
                     out.integrated.len(),
                     out.bodies
                 ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /memory/{key}/adopt` — take responsibility for a memory (`memory_adopt`).
+///
+/// Responsibility, not authorship: `asserted_by` is untouched. An ownerless row needs no `force`;
+/// an owned row needs `force=true` AND the caller to be an ancestor of its owner.
+pub async fn adopt(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let force = body
+        .as_ref()
+        .and_then(|b| b.get("force"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| matches!(params.get("force"), Some("true") | Some("1")));
+    let pen = match crate::identity::resolve(&headers) {
+        Ok(Some(pen)) => pen,
+        _ => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "adopt needs a proven identity (X-Stet-From + X-Stet-Auth)",
+            );
+        }
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let adopting = key.clone();
+    let owner = pen.clone();
+    match server
+        .with_store("memory_adopt", move |s| s.adopt(&adopting, &owner, force))
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(area = scope.area, key = %key, owner = %pen, "adopted over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({
+                    "status": "adopted",
+                    "key": key,
+                    "owner": pen,
+                })
+                .to_string(),
+                format!("adopted {key} as {pen}"),
             )
         }
         Err(e) => error(json, error_status(&e), e),

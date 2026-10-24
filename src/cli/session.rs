@@ -355,6 +355,12 @@ impl Session {
         store::delete(&self.conn, key, acted_by)
     }
 
+    /// Take responsibility for a row (`memory_adopt`). A finger's parent is what owns, so this
+    /// adopts as the parent.
+    pub fn adopt(&self, key: &str, pen: &str, force: bool) -> Result<()> {
+        store::adopt(&self.conn, key, pen, force)
+    }
+
     /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying
     /// for one (`store::version`). An empty list is a fact and not an error: a key with no history
     /// reads the same whether it never existed or never changed.

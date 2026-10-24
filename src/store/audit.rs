@@ -69,6 +69,9 @@ pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT count(*) FROM private_read", [], |r| r.get(0))?)
 }
 
+/// How long a boundary read is kept unless an operator says otherwise.
+pub const KEEP_DAYS: i64 = 180;
+
 /// Drop records older than `keep_days`. Retention is a decision — see the migration.
 pub fn prune(conn: &Connection, keep_days: i64) -> Result<usize> {
     Ok(conn.execute(

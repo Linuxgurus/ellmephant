@@ -2430,3 +2430,78 @@ async fn reading_into_the_subtree_is_recorded_on_the_door() {
     assert_eq!(key.as_deref(), Some("finger-note"), "which row");
     assert_eq!(reason, "subtree", "why");
 }
+
+/// The audit covers PAST STATES too: `memory_get?version=N` hands an ancestor the contents of a
+/// descendant's private row, so that boundary is recorded on the same table (#129, found reviewing it).
+#[tokio::test]
+async fn reading_a_past_state_of_a_descendants_private_row_is_recorded() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/f-1", "kind": "finger" }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "pen_lend",
+        json!({ "pen": "tester/f-1", "secs": 60 }),
+    )
+    .await;
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "f-note", "title": "v1", "body": "first private", "private": true, "as": "tester/f-1" }),
+    )
+    .await;
+    // A second write supersedes the first, so v1 is now history.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "f-note", "title": "v2", "body": "second private", "as": "tester/f-1" }),
+    )
+    .await;
+
+    let past = tool(
+        service.peer(),
+        "memory_get",
+        json!({ "key": "f-note", "version": 1 }),
+    )
+    .await;
+    assert!(
+        past.contains("first private"),
+        "an ancestor reads a past state: {past}"
+    );
+
+    let conn = ellmephant::db::open(&Paths::from_root(dir.path())).unwrap();
+    let rows = ellmephant::store::audit::recent(&conn, 20).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.2.as_deref() == Some("f-note") && r.4.as_deref() == Some("version/history")),
+        "no audit row for the version read: {rows:?}"
+    );
+}

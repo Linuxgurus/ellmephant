@@ -420,3 +420,36 @@ fn a_recorded_boundary_read_says_who_and_which_row() -> Result<()> {
     assert_eq!(store::audit::count(&conn)?, 0);
     Ok(())
 }
+
+#[test]
+fn retention_runs_without_a_bell() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ellmephant::config::Paths::from_root(dir.path());
+
+    // A record older than the keep window, written by the ordinary recorder.
+    {
+        let conn = db::open(&paths)?;
+        store::audit::record(
+            &conn,
+            "someone",
+            Some("a-key"),
+            store::audit::Why::Subtree,
+            None,
+        );
+        conn.execute(
+            "UPDATE private_read SET at = datetime('now', '-400 days')",
+            [],
+        )?;
+        assert_eq!(store::audit::count(&conn)?, 1);
+    }
+
+    // ★ Opening the store prunes it (found reviewing #129): `prune` existed and nothing called it, so
+    // "retention is enforced" was a sentence rather than a fact.
+    let conn = db::open(&paths)?;
+    assert_eq!(
+        store::audit::count(&conn)?,
+        0,
+        "an audit older than the window is dropped at open, with no bell to remember"
+    );
+    Ok(())
+}

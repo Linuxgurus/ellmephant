@@ -358,7 +358,21 @@ impl Session {
         };
         match class {
             Some(audience) if !self.reader.sees(&audience) => Err(Error::NotFound(key.to_string())),
-            _ => Ok(()),
+            Some(audience) => {
+                // ★ A PAST STATE IS STILL THE ROW (found reviewing #129). `version()` and `versions()`
+                // both come through here, and both can hand an ancestor the contents of a descendant's
+                // private row — so the boundary is crossed on this path too and must be recorded, or
+                // the audit covers `memory_get` and nothing else.
+                if self.reader.crosses(&audience) {
+                    self.audit(
+                        Some(key),
+                        store::audit::Why::Subtree,
+                        Some("version/history"),
+                    );
+                }
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 

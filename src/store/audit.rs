@@ -25,6 +25,10 @@ pub enum Why {
     /// An explicit exemption. **The capability is not built**; the reason is reserved so rows written
     /// later are unambiguous about which mechanism produced them.
     Forensic,
+    /// A pen spent a **held session** to reach a row no ancestry gave it (2026-10-24). A different act
+    /// from reading down one's own subtree, and the record should not blur them: one is the shape of the
+    /// tree, the other is authority borrowed and expiring.
+    Borrowed,
 }
 
 impl Why {
@@ -34,6 +38,7 @@ impl Why {
             Why::Subtree => "subtree",
             Why::Search => "search",
             Why::Forensic => "forensic",
+            Why::Borrowed => "borrowed",
         }
     }
 }

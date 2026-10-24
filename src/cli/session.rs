@@ -225,7 +225,15 @@ impl Session {
                 // ★ A READ THAT CROSSED A BOUNDARY IS RECORDED (#129). An ancestor reading down its
                 // subtree is the one act the tier allowed and did not log; best effort, never fatal.
                 if self.reader.crosses(&mem.audience) {
-                    self.audit(Some(key), store::audit::Why::Subtree, None);
+                    // ★ WHICH MECHANISM (adversarial review, 2026-10-24): reached by parentage, or by a
+                    // session this pen was lent? Recording both as `subtree` would make the log claim an
+                    // ancestor read for a read that no ancestry explains.
+                    let why = if self.reader.is_borrowed(&mem.audience) {
+                        store::audit::Why::Borrowed
+                    } else {
+                        store::audit::Why::Subtree
+                    };
+                    self.audit(Some(key), why, None);
                 }
                 Ok(mem)
             }

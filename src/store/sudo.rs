@@ -340,7 +340,7 @@ pub fn pass(conn: &Connection, weak: &str, powerful: &str, to: &str, secs: i64) 
 }
 
 /// Is `descendant` below `ancestor` in the pen tree? (A pen is not its own descendant here.)
-fn is_below(conn: &Connection, ancestor: i64, descendant: i64) -> Result<bool> {
+pub(crate) fn is_below(conn: &Connection, ancestor: i64, descendant: i64) -> Result<bool> {
     let mut cur = descendant;
     for _ in 0..64 {
         let parent: Option<i64> = conn
@@ -460,6 +460,42 @@ pub fn held(conn: &Connection, weak: &str) -> Result<Vec<Session>> {
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// ★ WHOSE AUTHORITY THIS PEN MAY SPEND **NOW** (adversarial review, 2026-10-24).
+///
+/// `held()` answers "what sessions exist". This answers the harder question: **do they still stand for
+/// anything?** A `lend` is granted only because the lender is an ANCESTOR of the borrower — so if the
+/// tree moves underneath it (an adoption, a disclaim, a repair), the session would keep handing out
+/// reach that no longer has a reason. A session that outlives its justification is a credential.
+///
+/// A `policy` borrow is different: the policy row IS the grant, and a `sudoers` ceiling does not depend
+/// on the tree, so it stands until revoked or expired.
+///
+/// Returns the powerful pens' ids for the sessions that still hold water, plus the NAME and source so a
+/// caller can record what it spent.
+pub fn reachable(conn: &Connection, weak: &str) -> Result<Vec<(i64, String, String)>> {
+    let mut out = Vec::new();
+    for s in held(conn, weak)? {
+        let (pid, _, _) = match pen_identity(conn, &s.powerful) {
+            Ok(v) => v,
+            Err(_) => continue, // a session naming a pen that no longer exists grants nothing
+        };
+        let wid = match pen_identity(conn, weak) {
+            Ok((id, _, _)) => id,
+            Err(_) => return Ok(out),
+        };
+        if s.source == "lend" && !is_below(conn, pid, wid)? {
+            tracing::warn!(
+                weak = %weak,
+                powerful = %s.powerful,
+                "a lend outlived the parentage that justified it: standing down (revoke it)"
+            );
+            continue;
+        }
+        out.push((pid, s.powerful.clone(), s.source.clone()));
+    }
+    Ok(out)
 }
 
 /// Load policy from a boot-time spec: `powerful>weak:seconds` entries, comma-separated.

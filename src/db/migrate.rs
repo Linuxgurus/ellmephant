@@ -145,6 +145,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0027_pen_name_nocase.sql"),
         "pen names are unique CASE-INSENSITIVELY while keeping their spelling — `James` and `james` are one pen",
     ),
+    (
+        28,
+        include_str!("../../migrations/0028_read_borrowed.sql"),
+        "`private_read.reason` gains `borrowed`: a read let through by a HELD SESSION is not a subtree read",
+    ),
 ];
 
 /// Current schema version recorded in the file.

@@ -272,6 +272,11 @@ impl Session {
         store::sudo::release(&self.conn, weak, powerful)
     }
 
+    /// Who holds what, right now — all pens, or one.
+    pub fn sudo_sessions(&self, weak: Option<&str>) -> Result<Vec<store::sudo::Session>> {
+        store::sudo::live_sessions(&self.conn, weak)
+    }
+
     /// End a session for `target` (defaulting to the caller) — an ancestor may end a descendant's.
     pub fn sudo_release_of(
         &self,

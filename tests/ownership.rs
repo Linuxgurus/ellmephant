@@ -1460,3 +1460,28 @@ fn a_borrowed_read_is_recorded_as_borrowed_not_as_a_subtree_read() {
     let recent = store::audit::recent(&conn, 1).unwrap();
     assert_eq!(recent[0].3, "borrowed");
 }
+
+#[test]
+fn sessions_are_listable_and_expiry_is_visible() {
+    let (_dir, conn) = subtree();
+    store::sudo::grant(&conn, "estate", "james", 60, "test").unwrap();
+    assert!(store::sudo::live_sessions(&conn, None).unwrap().is_empty());
+
+    store::sudo::sudo(&conn, "james", "estate", 30).unwrap();
+    store::sudo::lend(&conn, "james", "cline", 60).unwrap();
+
+    let all = store::sudo::live_sessions(&conn, None).unwrap();
+    assert_eq!(all.len(), 2, "both sessions are listed");
+    assert!(
+        all.iter()
+            .any(|s| s.weak == "james" && s.powerful == "estate")
+    );
+    assert!(all.iter().any(|s| s.weak == "cline" && s.source == "lend"));
+
+    let one = store::sudo::live_sessions(&conn, Some("cline")).unwrap();
+    assert_eq!(one.len(), 1, "narrowed to one pen");
+
+    store::sudo::release(&conn, "james", "estate").unwrap();
+    let after = store::sudo::live_sessions(&conn, None).unwrap();
+    assert_eq!(after.len(), 1, "a released session is gone from the list");
+}

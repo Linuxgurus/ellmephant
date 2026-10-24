@@ -49,6 +49,7 @@ pub const TOOLS: &[&str] = &[
     "sudo",
     "sudo_pass",
     "sudo_release",
+    "sudo_sessions",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -620,6 +621,17 @@ pub struct SudoPassParams {
 /// `sudo_release` — end a session, and everything passed down from it.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SudoSessionsParams {
+    /// Whose sessions to list — yours by default, or a pen you answer for.
+    #[schemars(
+        description = "Whose live sessions to list. Omit to see ALL pens — the question an operator asks before an audit; name a pen to see just that one. A session is live until it expires, and `expires_at` is the store's own clock."
+    )]
+    #[serde(default)]
+    pub pen: Option<String>,
+}
+
+/// `pen_lend` — the pen to lend to, and for how long.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SudoReleaseParams {
     /// The authority to let go of.
     #[schemars(
@@ -1855,6 +1867,32 @@ impl MemoryServer {
         tracing::info!(tool = "sudo_release", killed, "authority released");
         Ok(json_ok(
             serde_json::json!({ "status": "released", "sessions": killed }),
+        ))
+    }
+
+    /// WHO HOLDS WHAT, UNTIL WHEN — the question an agent asks before it acts on borrowed authority.
+    #[tool(
+        name = "sudo_sessions",
+        description = "List LIVE borrowed authority: every session with its borrower, the pen it is borrowing, when it expires, whether it came from a policy or a lend, and which session it was passed from. Omit `pen` to see all pens (the operator's question before an audit); name one to see only that pen's. A session that has EXPIRED is not listed — expiry is the mechanism, and this is how you see it without guessing. Read-only.",
+        annotations(
+            title = "List borrowed authority",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo_sessions(
+        &self,
+        _ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoSessionsParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = p.pen;
+        let sessions = self
+            .with_store("sudo_sessions", move |s| s.sudo_sessions(pen.as_deref()))
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&sessions).map_err(|e| e.to_string())?,
         ))
     }
 
@@ -3163,6 +3201,7 @@ pub fn http_router(
         .route("/sudo", axum::routing::post(surface::sudo))
         .route("/sudo/pass", axum::routing::post(surface::sudo_pass))
         .route("/sudo/release", axum::routing::post(surface::sudo_release))
+        .route("/sudo/sessions", axum::routing::get(surface::sudo_sessions))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

@@ -498,6 +498,35 @@ pub fn reachable(conn: &Connection, weak: &str) -> Result<Vec<(i64, String, Stri
     Ok(out)
 }
 
+/// Every LIVE session, newest last, optionally only one pen's (as the borrower).
+///
+/// The door had no way to ask "who holds what" — the CLI could, an agent could not, so an agent had to
+/// guess whether its authority had lapsed. Expiry is the mechanism; this is how you see it.
+pub fn live_sessions(conn: &Connection, weak: Option<&str>) -> Result<Vec<Session>> {
+    if let Some(w) = weak {
+        return held(conn, w);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT s.id, p.name, w.name, s.expires_at, s.via, s.source
+           FROM active_sudo s
+           JOIN pen p ON p.id = s.powerful
+           JOIN pen w ON w.id = s.weak
+          WHERE s.expires_at > datetime('now')
+          ORDER BY s.expires_at",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Session {
+            id: r.get(0)?,
+            powerful: r.get(1)?,
+            weak: r.get(2)?,
+            expires_at: r.get(3)?,
+            via: r.get(4)?,
+            source: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Load policy from a boot-time spec: `powerful>weak:seconds` entries, comma-separated.
 ///
 /// ★ NEVER FATAL. A store that refuses to open because one policy line is malformed is a store that

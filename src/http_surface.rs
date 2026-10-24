@@ -78,6 +78,11 @@ pub const ROUTES: &[Route] = &[
         tool: "sudo_release",
     },
     Route {
+        method: "GET",
+        path: "/sudo/sessions",
+        tool: "sudo_sessions",
+    },
+    Route {
         method: "POST",
         path: "/memory",
         tool: "memory_upsert",
@@ -785,6 +790,51 @@ pub async fn sudo(
                     session.powerful, session.weak, session.expires_at
                 ),
             )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /sudo/sessions` — who holds what, until when (`sudo_sessions`).
+///
+/// Read-only, and the answer to "has my authority lapsed?" without a guess. Any proven pen may ask:
+/// sessions are the estate's business — an agent that is about to act on borrowed authority should be
+/// able to see its own clock, and an operator should be able to see everyone's.
+pub async fn sudo_sessions(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let params = Params::parse(raw.as_deref());
+    let pen = params.get("pen").map(str::to_string);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("sudo_sessions", move |s| s.sudo_sessions(pen.as_deref()))
+        .await
+    {
+        Ok(sessions) => {
+            let value = serde_json::to_value(&sessions).unwrap_or(serde_json::Value::Null);
+            let text = if sessions.is_empty() {
+                "no live sessions\n".to_string()
+            } else {
+                sessions
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{} holds {} ({}) until {}\n",
+                            s.weak, s.powerful, s.source, s.expires_at
+                        )
+                    })
+                    .collect()
+            };
+            render(StatusCode::OK, json, value.to_string(), text)
         }
         Err(e) => error(json, error_status(&e), e),
     }

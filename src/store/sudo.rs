@@ -48,9 +48,12 @@ pub struct Session {
 pub const MAX_DURATION_SECS: i64 = 86_400;
 
 fn id_of(conn: &Connection, name: &str) -> Result<i64> {
-    conn.query_row("SELECT id FROM pen WHERE name = ?1", params![name], |r| {
-        r.get(0)
-    })
+    // Folds case like every other lookup (migration 0027): `james` and `James` are one pen.
+    conn.query_row(
+        "SELECT id FROM pen WHERE lower(name) = lower(?1)",
+        params![name],
+        |r| r.get(0),
+    )
     .optional()?
     .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
 }
@@ -197,7 +200,7 @@ pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<
 /// `(id, parent_id, ceased_at)` for a pen, or a refusal that names it.
 fn pen_identity(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
     conn.query_row(
-        "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+        "SELECT id, parent_id, ceased_at FROM pen WHERE lower(name) = lower(?1)",
         params![name],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
@@ -309,7 +312,7 @@ pub fn pass(conn: &Connection, weak: &str, powerful: &str, to: &str, secs: i64) 
     }
     conn.execute(
         "INSERT INTO active_sudo (powerful, weak, expires_at, via, source)
-         VALUES ((SELECT id FROM pen WHERE name = ?1), ?2, datetime('now', ?3), ?4, ?5)",
+         VALUES ((SELECT id FROM pen WHERE lower(name) = lower(?1)), ?2, datetime('now', ?3), ?4, ?5)",
         params![
             powerful,
             to_id,

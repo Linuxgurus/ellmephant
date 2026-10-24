@@ -117,6 +117,45 @@ pub enum PenCommand {
     },
     /// Print the shape and the root count.
     Tree,
+    /// A sudoers policy: `weak` may borrow `powerful` for at most `secs`.
+    Grant {
+        #[arg(value_name = "POWERFUL")]
+        powerful: String,
+        #[arg(value_name = "WEAK")]
+        weak: String,
+        #[arg(value_name = "SECS")]
+        secs: i64,
+    },
+    /// `powerful` lends its own authority DOWN to `weak`.
+    Lend {
+        #[arg(value_name = "POWERFUL")]
+        powerful: String,
+        #[arg(value_name = "WEAK")]
+        weak: String,
+        #[arg(value_name = "SECS")]
+        secs: i64,
+    },
+    /// `weak` borrows `powerful`, under a policy.
+    Sudo {
+        #[arg(value_name = "WEAK")]
+        weak: String,
+        #[arg(value_name = "POWERFUL")]
+        powerful: String,
+        #[arg(value_name = "SECS")]
+        secs: i64,
+    },
+    /// End a session early.
+    Release {
+        #[arg(value_name = "WEAK")]
+        weak: String,
+        #[arg(value_name = "POWERFUL")]
+        powerful: String,
+    },
+    /// Who holds what, and until when.
+    Sessions {
+        #[arg(value_name = "WEAK")]
+        weak: Option<String>,
+    },
 }
 
 /// `ellmephant model …` — the weights cache (SPEC §6.5).
@@ -201,6 +240,23 @@ pub fn run(cli: Cli) -> Result<()> {
                 pen::mint(&paths, &cfg, &name, &parent, &kind)
             }
             PenCommand::Tree => pen::tree(&paths, &cfg),
+            PenCommand::Grant {
+                powerful,
+                weak,
+                secs,
+            } => pen::grant(&paths, &cfg, &powerful, &weak, secs),
+            PenCommand::Lend {
+                powerful,
+                weak,
+                secs,
+            } => pen::lend(&paths, &cfg, &powerful, &weak, secs),
+            PenCommand::Sudo {
+                weak,
+                powerful,
+                secs,
+            } => pen::borrow(&paths, &cfg, &weak, &powerful, secs),
+            PenCommand::Release { weak, powerful } => pen::release(&paths, &cfg, &weak, &powerful),
+            PenCommand::Sessions { weak } => pen::sessions(&paths, &cfg, weak.as_deref()),
         },
         Command::Model { command } => model::cmd(&spec, command),
         // MCP holds the store open and serves until the client disconnects (P7).

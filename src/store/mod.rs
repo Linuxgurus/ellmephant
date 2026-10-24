@@ -746,7 +746,7 @@ fn owner_pen_id(tx: &Connection, name: Option<&str>) -> Result<Option<i64>> {
             // who can register a name can forge (Stet, review round 3).
             "SELECT CASE WHEN author.kind = 'finger' THEN COALESCE(author.parent_id, author.id)
                          ELSE author.id END
-               FROM pen author WHERE author.name = ?1",
+               FROM pen author WHERE lower(author.name) = lower(?1)",
             params![name],
             |r| r.get(0),
         )
@@ -1067,7 +1067,7 @@ type PenFacts = (i64, String, Option<i64>, String, Option<String>);
 pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
     let row: Option<PenFacts> = conn
         .query_row(
-            "SELECT id, kind, parent_id, created, ceased_at FROM pen WHERE name = ?1",
+            "SELECT id, kind, parent_id, created, ceased_at FROM pen WHERE lower(name) = lower(?1)",
             params![name],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
@@ -1389,7 +1389,7 @@ pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<M
     }
     if let Some((_, _, ceased_at)) = conn
         .query_row(
-            "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+            "SELECT id, parent_id, ceased_at FROM pen WHERE lower(name) = lower(?1)",
             params![name],
             |r| {
                 Ok((

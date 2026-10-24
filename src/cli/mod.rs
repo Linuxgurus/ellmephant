@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod embed;
 pub mod format;
 pub mod model;
+mod pen;
 pub mod session;
 
 use std::path::PathBuf;
@@ -78,11 +79,44 @@ pub enum Command {
     },
     /// Rebuild the `[[link]]` graph from every body. No model, no queue — milliseconds.
     Reparse,
+    /// The PROVISIONING door: attach | mint | tree. Standing, on purpose.
+    Pen {
+        #[command(subcommand)]
+        command: PenCommand,
+    },
     /// Weights cache: status | fetch | rm (SPEC §6.5).
     Model {
         #[command(subcommand)]
         command: ModelCommand,
     },
+}
+
+/// `ellmephant pen …` — the provisioning door (2026-10-24): the runtime door lets a live pen create a pen
+/// under itself; this one lets whoever can open the database say what a pen IS. It is not a new authority,
+/// only a way to reach `set_parent` — because until now the attach had no mechanism at all, and the tree
+/// had to be smuggled in as boot configuration.
+#[derive(Debug, Subcommand)]
+pub enum PenCommand {
+    /// Move pens: `child=parent` (overwrites what the table says — this is the deliberate act).
+    Attach {
+        /// One or more `child=parent` edges.
+        #[arg(value_name = "CHILD=PARENT", required = true)]
+        edges: Vec<String>,
+    },
+    /// Create a pen by provisioning: `--parent` is required, and `anonymous` is refused.
+    Mint {
+        /// The new pen's name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The pen it answers to.
+        #[arg(long, value_name = "PARENT")]
+        parent: String,
+        /// `self` (an identity) or `finger` (a session key). Defaults to `self`.
+        #[arg(long, value_name = "KIND", default_value = "self")]
+        kind: String,
+    },
+    /// Print the shape and the root count.
+    Tree,
 }
 
 /// `ellmephant model …` — the weights cache (SPEC §6.5).
@@ -161,6 +195,13 @@ pub fn run(cli: Cli) -> Result<()> {
     match command {
         Command::Doctor { verify } => doctor::run(&paths, &cfg, &spec, verify),
         Command::Reparse => doctor::reparse(&paths, &cfg),
+        Command::Pen { command } => match command {
+            PenCommand::Attach { edges } => pen::attach(&paths, &cfg, &edges),
+            PenCommand::Mint { name, parent, kind } => {
+                pen::mint(&paths, &cfg, &name, &parent, &kind)
+            }
+            PenCommand::Tree => pen::tree(&paths, &cfg),
+        },
         Command::Model { command } => model::cmd(&spec, command),
         // MCP holds the store open and serves until the client disconnects (P7).
         Command::Mcp { stdio, host, port } => {

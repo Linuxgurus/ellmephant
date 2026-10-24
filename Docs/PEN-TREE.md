@@ -24,12 +24,45 @@ That line is `ellmephant doctor`'s way of saying the tree is a list. **One root 
 
 ## Attaching the tree (provisioning)
 
-Idempotent, safe to re-run, and the only thing it touches is `pen.parent_id`:
+**Standing lives in the `pen` table.** Nothing else is authoritative for it — not a ConfigMap, not a
+manifest, not this document. A pen's `parent_id` is a fact about that pen, and facts belong in the row,
+for the same reason ownership does: the row answers, the configuration only admits.
+
+That matters most at the moment nobody is watching. If provisioning re-declared the tree on every
+boot, then a deliberate act — a pen re-parented, a branch adopted or disclaimed — would be silently
+undone by the next restart, and "who answers for this?" would be a question answered by whichever
+deployment file was applied last.
+
+### The seed (bootstrap only)
+
+A brand-new store's pens are NAMES, and the attach has no door: the image carries no `sqlite3`, the PVC
+cannot be mounted beside a running brain, and no API sets a parent. So the first attach may arrive as
+configuration:
+
+```
+ELLMEPHANT_PEN_TREE="James=estate,stet=James,cline=James,hands=stet"
+```
+
+It is a **seed, not a declaration**, and the difference is enforceable, not stylistic:
+
+| state of the child | what the seed does |
+|---|---|
+| `parent_id IS NULL` | attaches it — this is what a seed is for |
+| already points at the seed's parent | agrees, writes nothing |
+| points somewhere else | **stands down and logs the disagreement by name** — the table wins |
+| unknown child, unknown parent, itself, a loop, a retired pen | refused by name; the rest still apply |
+
+An entry that disagrees is drift worth *seeing*, never worth obeying. To change standing on purpose,
+use `set_parent` — the overwriting act — knowingly.
+
+### Doing it by hand
+
+Or with SQL, when you have the database open and mean it:
 
 ```sql
 -- estate is the root and keeps parent_id NULL.
-UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'estate') WHERE name = 'james';
-UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'james')  WHERE name IN ('stet', 'cline');
+UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'estate') WHERE name = 'James';
+UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'James')  WHERE name IN ('stet', 'cline');
 ```
 
 Then check, which should read **`1 root(s)`**:
@@ -38,23 +71,3 @@ Then check, which should read **`1 root(s)`**:
 $ ellmephant --home /data doctor | grep pens
   pens           5 pen(s), 1 root(s)
 ```
-
-## `anonymous` is never a pen
-
-`anonymous` means **no currently existing pen wrote this** (James, 2026-10-23). It is a statement
-about the REGISTRY, not about the writing: the row may have been written by nobody at all, or by a pen
-that no longer exists — the store cannot tell, and neither should a reader pretend to. It is a value,
-never an address: a pen owns rows, answers for them and can be retired, and a pen called `anonymous`
-would make every "unattributed" count a lie. Migration `0021` excludes it from the seed, and `0025` repairs any store that ran the earlier
-version — un-owning what the ghost had (the rows become unattributed, i.e. claimable), and deleting
-its sessions, policies and ledger references rather than pretending to reassign them.
-
-What those rows want is an **owner to claim them** (`POST /memory/{key}/adopt` style), not a
-migration that invents an answerer.
-
-## Why this is written down
-
-The pre-roll rehearsal on 2026-10-23 migrated a copy of the live store (918 memories, v20 → v25). It
-found both of these by looking: 249 rows had been handed to a pen called `anonymous`, and the "tree"
-was six roots with no edges. Neither would have failed a test; both would have shipped silently, and
-the second would have made every ancestry rule a no-op on a store that reported itself healthy.

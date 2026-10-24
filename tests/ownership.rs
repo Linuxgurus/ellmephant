@@ -1256,3 +1256,47 @@ fn a_bad_edge_is_refused_by_name_and_the_rest_apply() {
         .unwrap();
     assert_eq!(parent.as_deref(), Some("james"));
 }
+
+#[test]
+fn a_seed_never_overwrites_what_the_table_already_says() {
+    let (_dir, conn) = subtree();
+    // estate → james → {stet, cline} is the seeded shape; now somebody moves stet ON PURPOSE.
+    store::set_parent(&conn, "stet", "estate").unwrap();
+
+    // The next boot re-reads the same config. It must not undo the deliberate act: a restart is exactly
+    // when nobody is watching (James, 2026-10-24: "the estate is in an environment variable instead of a
+    // table?" — it is not, and it must not be).
+    let seeded = store::seed_parent(&conn, "stet", "james").unwrap();
+    assert_eq!(
+        seeded,
+        store::Seeded::Disagrees("estate".into()),
+        "{seeded:?}"
+    );
+
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE c.name = 'stet'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        parent.as_deref(),
+        Some("estate"),
+        "the TABLE wins, not the config"
+    );
+}
+
+#[test]
+fn a_seed_attaches_a_bare_pen_and_agrees_when_repeated() {
+    let (_dir, conn) = subtree();
+    conn.execute("UPDATE pen SET parent_id = NULL", []).unwrap();
+    assert_eq!(
+        store::seed_parent(&conn, "james", "estate").unwrap(),
+        store::Seeded::Attached
+    );
+    assert_eq!(
+        store::seed_parent(&conn, "james", "estate").unwrap(),
+        store::Seeded::Already
+    );
+}

@@ -537,9 +537,7 @@ fn a_half_deleted_row_can_be_deleted_again() {
     let vector = vec::get(&conn, id).expect("get").expect("indexed");
     vec::delete(&conn, id).expect("first half: tombstone");
     conn.execute(
-        &format!(
-            "INSERT INTO document_vec(vector_id, embedding, type, key) VALUES (?1, ?2, 'memory', 'tomb')"
-        ),
+        "INSERT INTO document_vec(vector_id, embedding, type, key) VALUES (?1, ?2, 'memory', 'tomb')",
         rusqlite::params![id, vec::to_blob(&vector)],
     )
     .expect("put the live vector back, as an interrupted delete leaves it");

@@ -859,6 +859,85 @@ fn the_unowned_listing_obeys_the_audience_tier() {
     row(&conn, &embedder, "secret", "stet");
     conn.execute(
         "UPDATE memory SET audience = 'pen:stet', owner = NULL WHERE key = 'secret'",
+// ── KINSHIP ──────────────────────────────────────────────────────────────────────────────────────
+// The walk between two pens: shortest, never doubling back, `S` always written. Letters are the fact,
+// the word in quotes is a courtesy.
+
+fn deeper_tree(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        // Build this tree from an empty registry (0021 seeds `estate`, so keep it and add the rest).
+        "DELETE FROM pen;
+         INSERT INTO pen (name, kind) VALUES ('estate', 'self');
+         INSERT INTO pen (name, kind, parent_id) VALUES ('james', 'self', (SELECT id FROM pen WHERE name='estate'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet', 'self', (SELECT id FROM pen WHERE name='james'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('cline', 'self', (SELECT id FROM pen WHERE name='james'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet/hand', 'self', (SELECT id FROM pen WHERE name='stet'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet/hand/f-1', 'finger', (SELECT id FROM pen WHERE name='stet/hand'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('stet/hand/f-1/f-2', 'finger', (SELECT id FROM pen WHERE name='stet/hand/f-1'));
+         INSERT INTO pen (name, kind, parent_id) VALUES ('island', 'self', NULL);
+         INSERT INTO pen (name, kind, parent_id) VALUES ('island/x', 'self', (SELECT id FROM pen WHERE name='island'));",
+    )
+    .expect("pen tree");
+}
+
+#[test]
+fn a_walk_names_every_relation_and_never_doubles_back() {
+    let (_dir, conn) = subtree();
+    deeper_tree(&conn);
+
+    let kin = |a: &str, b: &str| {
+        store::relation::relation(&conn, a, b)
+            .unwrap()
+            .map(|k| k.gloss())
+    };
+
+    assert_eq!(kin("stet", "stet").as_deref(), Some("ME"));
+    assert_eq!(kin("stet", "james").as_deref(), Some("P \"parent\""));
+    assert_eq!(kin("stet", "estate").as_deref(), Some("PP \"grandparent\""));
+    assert_eq!(kin("james", "stet").as_deref(), Some("C \"child\""));
+    assert_eq!(kin("estate", "stet").as_deref(), Some("CC \"grandchild\""));
+    assert_eq!(kin("stet", "cline").as_deref(), Some("S \"sibling\""));
+    assert_eq!(kin("stet", "stet/hand").as_deref(), Some("C \"child\""));
+    assert_eq!(
+        kin("stet", "stet/hand/f-1").as_deref(),
+        Some("CC \"grandchild\"")
+    );
+    // A child is below, and a grandchild two below.
+    assert_eq!(
+        kin("stet/hand/f-1", "stet/hand/f-1/f-2").as_deref(),
+        Some("C \"child\"")
+    );
+    assert_eq!(
+        kin("stet/hand", "stet/hand/f-1/f-2").as_deref(),
+        Some("CC \"grandchild\"")
+    );
+
+    // Across the tree: uncle, nephew, cousin — each the shortest walk through the common ancestor.
+    assert_eq!(kin("stet/hand", "cline").as_deref(), Some("PS \"uncle\""));
+    assert_eq!(kin("cline", "stet/hand").as_deref(), Some("SC \"nephew\""));
+    assert_eq!(
+        kin("stet/hand", "island").as_deref(),
+        None,
+        "no common root"
+    );
+
+    // And a sibling is never spelled `PC`: the walk is one token.
+    let sibling = store::relation::relation(&conn, "stet", "cline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(sibling.walk, "S");
+    assert!(!sibling.walk.contains("PC"));
+}
+
+#[test]
+fn a_cousin_is_the_walk_through_the_common_ancestor() {
+    let (_dir, conn) = subtree();
+    deeper_tree(&conn);
+
+    // f-1's parent is stet/hand; f-1/f-2 is two levels below stet. `cline` is stet's sibling, and
+    // `f-2` vs a child of cline would be cousins — build that and check the letters.
+    conn.execute(
+        "INSERT INTO pen (name, kind, parent_id) VALUES ('cline/hand', 'self', (SELECT id FROM pen WHERE name='cline'))",
         [],
     )
     .unwrap();
@@ -956,4 +1035,82 @@ fn a_pen_cannot_be_named_anonymous_or_given_an_unaddressable_name() {
 
     // And a name that can be addressed still works.
     store::mint(&conn, "stet", "stet/finger-9f3a1c", "finger").expect("a good name");
+    let kin = |a: &str, b: &str| store::relation::relation(&conn, a, b).unwrap().unwrap();
+    // stet/hand vs cline/hand: common ancestor james, one step up each side → P S C.
+    assert_eq!(kin("stet/hand", "cline/hand").walk, "PSC");
+    assert_eq!(kin("stet/hand", "cline/hand").word, Some("cousin"));
+    // Four steps up to `james` and two down to `cline/hand`: three P's, the sibling step, one C.
+    // English has "first cousin once removed" for this and we do not print it — the letters are
+    // exact and the phrase is approximate.
+    let removed = kin("stet/hand/f-1/f-2", "cline/hand");
+    assert_eq!(removed.walk, "PPPSC");
+    assert_eq!(removed.word, None);
+}
+
+#[test]
+fn english_stops_where_it_starts_approximating() {
+    // A word in quotes is a claim, so it is only made where it is exact.
+    assert_eq!(
+        store::relation::word_for_public("PPSCC"),
+        Some("second cousin")
+    );
+    assert_eq!(store::relation::word_for_public("PPSCCC"), None);
+    assert_eq!(store::relation::word_for_public("PS"), Some("uncle"));
+}
+
+#[test]
+fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
+    let (_dir, conn) = subtree();
+    deeper_tree(&conn);
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "hands-work", "stet/hand");
+
+    let seen = store::whois(&conn, "stet", "stet/hand").expect("whois");
+    assert_eq!(seen.name, "stet/hand");
+    assert_eq!(seen.kind, "self");
+    assert_eq!(seen.parent.as_deref(), Some("stet"));
+    assert_eq!(
+        seen.relation.as_deref(),
+        Some("C \"child\""),
+        "what it is to me"
+    );
+    assert_eq!(seen.owns, 1, "the rows it answers for");
+    assert_eq!(
+        seen.descendants, 2,
+        "how far it reaches: `f-1` and `f-1/f-2` hang below `stet/hand`, and that is what ancestor read grants"
+    );
+    assert!(seen.ceased.is_none());
+
+    // The relation is from the ASKER's seat: the same pen is a CHILD to its parent and a NEPHEW to
+    // a sibling of that parent.
+    let from_cline = store::whois(&conn, "cline", "stet/hand").expect("whois");
+    assert_eq!(from_cline.relation.as_deref(), Some("SC \"nephew\""));
+    let from_self = store::whois(&conn, "stet/hand", "stet/hand").expect("whois");
+    assert_eq!(from_self.relation.as_deref(), Some("ME"));
+
+    // A pen from another estate is reachable by name and related to nobody here.
+    let root = store::whois(&conn, "estate", "estate").expect("whois");
+    assert_eq!(root.descendants, 6, "the root reaches everything below it");
+
+    let island = store::whois(&conn, "stet", "island").expect("whois");
+    assert_eq!(
+        island.relation, None,
+        "no common root is an answer, not an error"
+    );
+
+    // And a retired pen still answers, with its tombstone.
+    store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        store::Rows::Disclaim,
+        store::History::Memorialize,
+    )
+    .expect("retire");
+    let gone = store::whois(&conn, "stet", "stet/hand").expect("whois");
+    assert!(gone.ceased.is_some(), "history outlives the thing");
+
+    // A name nobody minted is a refusal that says so.
+    let err = store::whois(&conn, "stet", "nobody-at-all").unwrap_err();
+    assert!(format!("{err}").contains("no pen named"), "{err}");
 }

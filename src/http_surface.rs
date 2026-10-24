@@ -48,6 +48,11 @@ pub const ROUTES: &[Route] = &[
         tool: "whoami",
     },
     Route {
+        method: "GET",
+        path: "/whois/{pen}",
+        tool: "whois",
+    },
+    Route {
         method: "POST",
         path: "/memory",
         tool: "memory_upsert",
@@ -611,6 +616,56 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
         .map_err(|e| format!("bad json body: {e}"))
 }
 
+/// `GET /whois/{pen}` — one pen and what it is to this request's pen (`whois`).
+pub async fn whois(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(pen): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let viewer = crate::identity::resolve(&headers)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::identity::ANONYMOUS.to_string());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("whois", reader_from(&headers), move |s| {
+            s.whois(&viewer, &pen)
+        })
+        .await
+    {
+        Ok(facts) => {
+            let value = serde_json::to_value(&facts).unwrap_or(serde_json::Value::Null);
+            let text = format!(
+                "{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{} row(s)\n  {:<10}{}\n",
+                facts.name,
+                "kind",
+                facts.kind,
+                "parent",
+                facts.parent.as_deref().unwrap_or("(root)"),
+                "created",
+                facts.created,
+                "state",
+                facts
+                    .ceased
+                    .as_deref()
+                    .map(|c| format!("retired {c}"))
+                    .unwrap_or_else(|| "live".to_string()),
+                "owns",
+                facts.owns,
+                "relation",
+                facts.relation.as_deref().unwrap_or("(no common root)"),
+            );
+            render(StatusCode::OK, json, value.to_string(), text)
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
 /// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
 /// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
 /// same question the model asks instead of guessing from a remembered flag.
@@ -718,7 +773,14 @@ pub async fn memory_get(
                     obj.insert("version".to_string(), serde_json::json!(n));
                     obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
                 }
-                render(StatusCode::OK, json, value.to_string(), memory_text(&past))
+                // A PAST state is read by address: its owner rides inside `content`, and a walk is
+                // for a pen that still answers, so no relation is printed here.
+                render(
+                    StatusCode::OK,
+                    json,
+                    value.to_string(),
+                    memory_text(&past, None),
+                )
             }
             Ok(None) => error(
                 json,
@@ -730,10 +792,15 @@ pub async fn memory_get(
     }
     let lookup = key.clone();
     match server
-        .with_read("memory_get", reader, move |s| s.show(&lookup))
+        .with_read("memory_get", reader, move |s| {
+            let mem = s.show(&lookup)?;
+            // The relation belongs to the READER, so it is computed where the proven pen is known.
+            let relation = s.owner_relation(&mem);
+            Ok((mem, relation))
+        })
         .await
     {
-        Ok(mut mem) => {
+        Ok((mut mem, relation)) => {
             // Count the read best-effort (see `MemoryServer::bump_visit`): telemetry never makes a
             // reader wait, so a write in flight means this visit goes uncounted.
             if let Some(seen) = server.bump_visit(&key) {
@@ -742,8 +809,16 @@ pub async fn memory_get(
             let mut value = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+                if let Some(walk) = &relation {
+                    obj.insert("owner_relation".to_string(), serde_json::json!(walk));
+                }
             }
-            render(StatusCode::OK, json, value.to_string(), memory_text(&mem))
+            render(
+                StatusCode::OK,
+                json,
+                value.to_string(),
+                memory_text(&mem, relation.as_deref()),
+            )
         }
         Err(e) => error(json, error_status(&e), e),
     }
@@ -1933,9 +2008,17 @@ fn stats_text(s: &store::stats::Stats) -> String {
 }
 
 /// The `GET /memory/{key}` prose: the header fields, then the body.
-fn memory_text(mem: &store::Memory) -> String {
+fn memory_text(mem: &store::Memory, relation: Option<&str>) -> String {
     let mut out = format!("{}\n", mem.key);
     out.push_str(&format!("  {:<8}{}\n", "title", mem.title));
+    // Who answers for it, and what they are to the reader: a name is an address, and the walk is the
+    // rest of the sentence.
+    if let Some(owner) = &mem.owner {
+        match relation {
+            Some(walk) => out.push_str(&format!("  {:<8}{owner}  {walk}\n", "owner")),
+            None => out.push_str(&format!("  {:<8}{owner}\n", "owner")),
+        }
+    }
     out.push_str(&format!("  {:<8}{}\n", "tags", mem.tags.join(", ")));
     if let Some(source) = &mem.source {
         out.push_str(&format!("  {:<8}{source}\n", "source"));

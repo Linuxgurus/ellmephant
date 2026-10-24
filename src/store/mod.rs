@@ -9,6 +9,7 @@ pub mod links;
 pub mod mail;
 pub mod maintain;
 pub mod project;
+pub mod relation;
 pub mod slug;
 pub mod snapshot;
 pub mod stats;
@@ -1020,6 +1021,85 @@ pub struct RetirePreview {
     pub parent: Option<String>,
     pub rows: i64,
     pub private_rows: i64,
+}
+
+/// What one pen IS, and what it is to the pen asking — the answer to "who is this, and what are
+/// they to me" (James, 2026-10-23).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Whois {
+    /// The pen's name: an address, never a permission.
+    pub name: String,
+    /// `self` or `finger`.
+    pub kind: String,
+    /// The pen that minted it. `None` only for a root.
+    pub parent: Option<String>,
+    /// When the row was created.
+    pub created: String,
+    /// The tombstone, when it has ceased. A retired pen still answers: history outlives it.
+    pub ceased: Option<String>,
+    /// The walk from the ASKING pen to this one, `ME`, or `None` when they share no root.
+    pub relation: Option<String>,
+    /// The rows this pen answers for.
+    pub owns: i64,
+    /// How many pens hang BELOW this one. A pen asking `whois <itself>` learns how far it reaches —
+    /// the one number that says what ancestor read actually grants it, rather than leaving a reader to
+    /// infer it from a tree it cannot see (#120).
+    pub descendants: i64,
+}
+
+/// A pen row as `whois` reads it: `(id, kind, parent_id, created, ceased_at)`.
+type PenFacts = (i64, String, Option<i64>, String, Option<String>);
+
+/// Look up one pen as `viewer` sees it.
+///
+/// The relationship is the point: a name alone is an address, and "what are they to me" is the
+/// question that decides whether an act is allowed. `None` for the walk means the two share no root,
+/// which is a real answer and not an error — a pen from another estate is a pen nobody here can
+/// reach.
+pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
+    let row: Option<PenFacts> = conn
+        .query_row(
+            "SELECT id, kind, parent_id, created, ceased_at FROM pen WHERE name = ?1",
+            params![name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((id, kind, parent_id, created, ceased)) = row else {
+        return Err(Error::Invalid(format!("no pen named {name}")));
+    };
+    let parent = match parent_id {
+        Some(pid) => Some(conn.query_row(
+            "SELECT name FROM pen WHERE id = ?1",
+            params![pid],
+            |r| r.get(0),
+        )?),
+        None => None,
+    };
+    let owns: i64 = conn.query_row(
+        "SELECT count(*) FROM memory WHERE owner = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    let descendants: i64 = conn.query_row(
+        "WITH RECURSIVE sub(id) AS (
+             SELECT id FROM pen WHERE parent_id = ?1
+             UNION
+             SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
+         )
+         SELECT count(*) FROM sub",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(Whois {
+        name: name.to_string(),
+        kind,
+        parent,
+        created,
+        ceased,
+        relation: relation::relation(conn, viewer, name)?.map(|k| k.gloss()),
+        owns,
+        descendants,
+    })
 }
 
 fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {

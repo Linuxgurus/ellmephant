@@ -1,7 +1,8 @@
 //! WHO may be shown a row: the `private` read tier (soma/ellmephant#54, #55).
 //!
-//! The ladder James named: **plain** (any reader) → **private** (the pen that wrote it, plus the
-//! owner for forensics) → **secret** (key holders; encryption, `secret-tiering`). `protected` is
+//! The ladder James named: **plain** (any reader) → **private** (the pen that wrote it **and every
+//! pen above it** — parentage is the grant, so an ancestor reads down into its subtree, #120) →
+//! **secret** (key holders; encryption, `secret-tiering`). `protected` is
 //! NOT on it — that is a write gate under a lease, live since 2026-10-17, and a row can be either
 //! without the other.
 //!
@@ -18,9 +19,19 @@
 //! ALREADY been handed; the read paths must ask it before returning anything at all.
 //!
 //! ★ THE OWNER IS NOT A READER. James's requirement is forensics — "if something goes badly wrong I
-//! must be able to look" — and that is a different act from reading: it is [`Reader::forensic`],
-//! explicit, one row, and recorded ([`crate::store::forensic`]). An owner who was simply exempt
-//! would make the tier a word.
+//! must be able to look" — and that is a different act from reading: explicit, one row, and recorded.
+//!
+//! ⚠️ **AND IT IS NOT BUILT.** This module used to describe a [`Reader::forensic`] and a
+//! `private_read` table as though they existed; they do not — there is no `forensic` constructor, no
+//! table and no `store::forensic` module (checked 2026-10-23). So today the tier ENFORCES two things
+//! and records neither: a pen reads its own rows, and an ancestor reads its subtree, both silently.
+//! The enforcement is real; the audit is a promise. Naming that is better than a citation that
+//! resolves to nothing, and it is the same class as the parity table that said 13 tools when there
+//! were 32 — prose is not guarded by any test.
+//!
+//! What a real forensic path needs deciding before it is built: what a record holds (pen, key, when,
+//! reason), whether ONE row or a whole subtree, and retention — an audit table that grows forever is
+//! a second store nobody maintains.
 
 /// The audience value every row starts with and most rows keep.
 pub const PUBLIC: &str = "public";

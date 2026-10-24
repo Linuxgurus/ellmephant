@@ -1184,9 +1184,30 @@ async fn the_two_doors_are_one_core() {
     if let Some(obj) = mcp_rest.as_object_mut() {
         obj.remove("visits");
     }
+
+    // ★ ONE FIELD IS ABOUT THE ASKER, NOT THE ROW (2026-10-23). `owner_relation` is the walk from the
+    // reader's proven pen to the row's owner, and in THIS test the two doors are different pens: the
+    // MCP peer declares `tester`, the HTTP call proves nobody. So it is asserted separately — present
+    // and `ME` where the pen asks about its own row, absent where nobody asked as anyone — and then
+    // dropped, because "the same core answers the same" is a claim about the ROW and it still holds.
+    assert_eq!(
+        mcp_rest.get("owner_relation").and_then(|v| v.as_str()),
+        Some("ME"),
+        "the door that proved a pen gets the walk: {mcp_body}"
+    );
+    assert!(
+        http_rest.get("owner_relation").is_none(),
+        "a door with no proven pen gets no walk, not a guess: {http_body}"
+    );
+    if let Some(obj) = http_rest.as_object_mut() {
+        obj.remove("owner_relation");
+    }
+    if let Some(obj) = mcp_rest.as_object_mut() {
+        obj.remove("owner_relation");
+    }
     assert_eq!(
         http_rest, mcp_rest,
-        "every field but the counter must match"
+        "every field but the counter and the reader-relative walk must match"
     );
 }
 
@@ -1974,5 +1995,113 @@ async fn an_anonymous_caller_cannot_read_a_mailbox() {
         response.status(),
         StatusCode::FORBIDDEN,
         "an anonymous cursor advance must be refused"
+    );
+}
+
+/// A row says who answers for it, and the walk says what that pen is to the reader — `memory_get`
+/// carries both, computed at READ time from the asker's seat (James, 2026-10-23).
+#[tokio::test]
+async fn memory_get_names_the_owner_and_what_they_are_to_you() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "mine", "title": "Mine", "body": "the facts" }),
+    )
+    .await;
+
+    // The asker IS the owner here, so the walk is `ME` — the one answer that needs no gloss.
+    let got = tool(service.peer(), "memory_get", json!({ "key": "mine" })).await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["owner"], json!("tester"), "{got}");
+    assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
+
+    // The HTTP door reached without an identity pair is NOBODY: it still learns who answers for the
+    // row, and learns nothing about what that pen is to it. Absence, never a guess.
+    let (status, body, _) = get(&app, "/memory/mine").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("owner   tester"), "{body}");
+    assert!(
+        !body.contains("ME"),
+        "an anonymous reader has no walk: {body}"
+    );
+}
+
+/// `whois` — the tree is configuration, not content, so an unproven reader may ask WHO a pen is;
+/// what it does not get is a walk, because it has not proved to be anybody.
+#[tokio::test]
+async fn whois_answers_on_both_doors() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    // A write registers the pen (`ensure_pen`), so the peer's own pen exists to be looked up.
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "mine", "title": "Mine", "body": "the facts" }),
+    )
+    .await;
+
+    let got = tool(service.peer(), "whois", json!({ "pen": "tester" })).await;
+    let doc: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(doc["name"], json!("tester"), "{got}");
+    assert_eq!(doc["kind"], json!("self"), "{got}");
+    assert_eq!(doc["owns"], json!(1), "{got}");
+    assert_eq!(doc["relation"], json!("ME"), "{got}");
+    assert!(
+        doc["ceased"].is_null(),
+        "a live pen has no tombstone: {got}"
+    );
+
+    // The same pen over HTTP, asked by nobody: same facts, and no walk.
+    let (status, body, _) = get(&app, "/whois/tester?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let over_http: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(over_http["owns"], json!(1), "{body}");
+    assert!(
+        over_http["relation"].is_null(),
+        "an unproven reader gets no walk: {body}"
+    );
+
+    // A name nobody minted is refused, not invented.
+    let (status, _, _) = get(&app, "/whois/nobody-at-all").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown pen is a refusal"
     );
 }

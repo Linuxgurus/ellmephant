@@ -43,6 +43,7 @@ use crate::store::{self, project};
 pub const TOOLS: &[&str] = &[
     "whoami",
     "memory_unowned",
+    "whois",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -525,6 +526,13 @@ pub struct UnownedParams {
     #[schemars(description = "Maximum rows to list, newest first. Default 50.")]
     #[serde(default)]
     pub limit: Option<i64>,
+/// `whois` — the pen to look up.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WhoisParams {
+    /// The pen to look up.
+    #[schemars(description = "Pen name. Slug. `whoami` reports your own.")]
+    pub pen: String,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1548,6 +1556,12 @@ impl MemoryServer {
         description = "List the rows nobody owns, newest first, with WHY each is ownerless: `disclaimed` (somebody released it — the author is still named, and this is a supported, deliberate state: retiring a descendant can disclaim its rows) or `unrecorded` (no currently existing pen is named as author at all — either a write made with no pen, or a pen that is gone). These are the rows an owner can CLAIM: anyone may adopt an ownerless row. Use it after `memory_stats` says how many; a count without a list gets quoted and never acted on.",
         annotations(
             title = "Rows nobody owns",
+    /// WHO a pen is, and what it is to THIS connection — the question a name alone cannot answer.
+    #[tool(
+        name = "whois",
+        description = "Look up one pen and its relationship to the pen asking. Returns `name`, `kind` (`self`/`finger`), `parent`, `created`, `ceased` (the tombstone of a retired pen), `owns` (how many rows it answers for) and `relation` — a walk in single letters from YOU to it: `ME` for yourself, `P` parent, `PP` grandparent, `C` child, `S` sibling, `PS` uncle, `SC` nephew, `PSC` cousin, with an English word in quotes only where English is exact. `relation: null` means no common root. A name is an address, never a permission; this is what the address is attached to.",
+        annotations(
+            title = "Who is this pen",
             read_only_hint = true,
             idempotent_hint = true,
             open_world_hint = false
@@ -1566,6 +1580,23 @@ impl MemoryServer {
             .await?;
         Ok(json_ok(
             serde_json::to_value(&rows).map_err(|e| e.to_string())?,
+    async fn whois(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<WhoisParams>,
+    ) -> std::result::Result<String, String> {
+        // An unproven reader may still ask WHO a pen is — the tree is configuration, not content —
+        // it simply gets no walk, because it has not proved to be anybody.
+        let viewer = pen_name(&ctx, self.declared.as_deref())
+            .unwrap_or_else(|_| crate::identity::ANONYMOUS.to_string());
+        let pen = p.pen;
+        let lookup = pen.clone();
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        let facts = self
+            .with_read("whois", reader, move |s| s.whois(&viewer, &lookup))
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&facts).map_err(|e| e.to_string())?,
         ))
     }
 
@@ -1916,11 +1947,17 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return serde_json::to_string(&v).map_err(|e| e.to_string());
         }
         let lookup = key.clone();
-        let mut mem = match self
-            .with_read("memory_get", reader.clone(), move |s| s.show(&lookup))
+        // The relation is computed INSIDE the read, where the session's proven pen is in hand: what
+        // the owner is to the ASKER, not a property of the row.
+        let (mut mem, relation) = match self
+            .with_read("memory_get", reader.clone(), move |s| {
+                let mem = s.show(&lookup)?;
+                let relation = s.owner_relation(&mem);
+                Ok((mem, relation))
+            })
             .await
         {
-            Ok(m) => m,
+            Ok(found) => found,
             Err(e) => return Err(self.explain_miss(&key, e, reader.clone()).await),
         };
         // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
@@ -1935,6 +1972,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let mut v = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
         if let Some(obj) = v.as_object_mut() {
             obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+            if let Some(walk) = relation {
+                obj.insert("owner_relation".to_string(), serde_json::json!(walk));
+            }
         }
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }
@@ -2848,6 +2888,7 @@ pub fn http_router(
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
         .route("/whoami", axum::routing::get(surface::whoami))
+        .route("/whois/{pen}", axum::routing::get(surface::whois))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

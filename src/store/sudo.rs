@@ -135,7 +135,15 @@ pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<
             "{powerful} has been retired: a pen that has ceased lends nothing"
         )));
     }
-    let (w, ..) = pen_identity(conn, weak)?;
+    // (j) A lend to a pen that has CEASED is a lend to nobody, so it is refused here rather than left
+    // to a later check that might not exist on every path.
+    let (w, _, ceased) = pen_identity(conn, weak)?;
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{weak} has been retired: authority lent to a pen that has ceased is authority lent to \
+             nobody"
+        )));
+    }
     if !is_below(conn, p, w)? {
         return Err(Error::Invalid(format!(
             "{weak} is not a descendant of {powerful}: authority is lent DOWN, never sideways or up"

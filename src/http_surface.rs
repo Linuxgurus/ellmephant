@@ -1505,6 +1505,16 @@ pub async fn upsert(
     // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
     // names the pen, and only a PROVEN one is stamped (#109).
     let proven = crate::identity::resolve(&headers).ok().flatten();
+    // ★ A SILENTLY IGNORED ARGUMENT IS A LIE ABOUT WHAT HAPPENED (found reviewing #126): with no
+    // proven pen there is nobody to check the claim against, so `as` would be dropped and the write
+    // attributed to nobody while the caller believed the finger was credited.
+    if as_pen.is_some() && proven.is_none() {
+        return error(
+            json,
+            StatusCode::UNAUTHORIZED,
+            "refused: crediting a descendant needs a PROVEN pen — send `X-Stet-From` and `X-Stet-Auth`",
+        );
+    }
     let credited = match (&as_pen, &proven) {
         (Some(claimed), Some(caller)) if !claimed.eq_ignore_ascii_case(caller) => {
             Some(claimed.clone())

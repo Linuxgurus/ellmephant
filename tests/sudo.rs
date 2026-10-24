@@ -242,3 +242,62 @@ fn a_lend_sets_the_deadline_and_never_stacks_one() {
         "the finger's session was passed from the lend that just ended"
     );
 }
+
+#[test]
+fn retiring_a_pen_ends_the_authority_it_was_given() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // A lend to the hand, and one passed further down: both exist because the hand does.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    sudo::pass(&conn, "stet/hand", "stet", "stet/hand/finger-1", 300).expect("pass down");
+    assert!(!sudo::held(&conn, "stet/hand").unwrap().is_empty());
+
+    // ★ DISPOSAL INCLUDES THE AUTHORITY (found reviewing #126): retiring the hand must end its lend
+    // AND the finger's passed session, or a retired pen keeps acting until the TTL lapses.
+    ellmephant::store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        ellmephant::store::Rows::Inherit,
+        ellmephant::store::History::Memorialize,
+    )
+    .expect("retire");
+
+    assert!(
+        sudo::held(&conn, "stet/hand").unwrap().is_empty(),
+        "the hand's lend is gone"
+    );
+    assert!(
+        sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty(),
+        "and the session passed down from it"
+    );
+}
+
+#[test]
+fn authority_cannot_be_lent_to_or_credited_for_a_ceased_pen() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    ellmephant::store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        ellmephant::store::Rows::Inherit,
+        ellmephant::store::History::Memorialize,
+    )
+    .expect("retire");
+
+    // Lending to a pen that has ceased is lending to nobody.
+    let err = sudo::lend(&conn, "stet", "stet/hand", 60).unwrap_err();
+    assert!(format!("{err}").contains("retired"), "{err}");
+
+    // And it cannot be credited for new work, whatever rows survive.
+    let err = ellmephant::store::may_act_as(&conn, "stet", "stet/hand").unwrap_err();
+    assert!(
+        format!("{err}").contains("ceased pen cannot be credited"),
+        "{err}"
+    );
+}

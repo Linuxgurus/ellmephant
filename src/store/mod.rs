@@ -1144,6 +1144,16 @@ pub fn may_act_as(conn: &Connection, proven: &str, claimed: &str) -> Result<()> 
             "{claimed} is not a pen: a write may name itself or a pen it minted"
         ))
     })?;
+    // (found reviewing #126) A CEASED PEN CANNOT BE CREDITED. Retire now ends its sessions, so this
+    // is belt-and-braces — but a write credited to a pen that has ended would put new work in the
+    // record under a name that can no longer answer for it, which is the one thing the ledger must
+    // never do.
+    let (_, _, claimed_ceased) = pen_row(conn, claimed)?;
+    if claimed_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{claimed} has been retired: a ceased pen cannot be credited for new work"
+        )));
+    }
     if !is_ancestor(conn, proven_id, claimed_id)? {
         return Err(Error::Invalid(format!(
             "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a \
@@ -1308,6 +1318,20 @@ pub fn retire(
         }
     }
 
+    // ★ DISPOSAL INCLUDES THE AUTHORITY IT WAS GIVEN (found reviewing #126). Retiring a pen left its
+    // lends and borrows running until their TTL: a retired finger could still be credited, and a
+    // retired hand still held what it borrowed. The tree's whole promise is that a disposal is
+    // immediate, so every session naming this pen — as lender or borrower — ends here, and anything
+    // passed down from one dies with it (`via`).
+    conn.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE powerful = ?1 OR weak = ?1
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![id],
+    )?;
     conn.execute(
         "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
         params![id],

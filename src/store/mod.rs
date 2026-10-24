@@ -210,6 +210,27 @@ fn check_body(body: &str) -> Result<()> {
 /// caller may not see must answer exactly as a key that was never written. Without this, a DELETE or a
 /// MERGE on somebody's private row replied *"it is owned by stet"* — an existence-and-ownership
 /// oracle for rows the caller cannot read.
+/// ★ THE SESSIONS FINALLY HAVE A READER (2026-10-24). Until now `active_sudo` was a ledger nothing in
+/// the permission path consulted: `may_read_audience` and `may_write` asked only about ANCESTRY, so a
+/// pen could hold the estate for an hour and still be refused every row outside its own branch. The
+/// verbs worked, the table filled, and the answer was always "you are not an ancestor" — which made
+/// the whole sudo model decoration.
+///
+/// So: authority is `ancestry ∪ held sessions`. A pen holding `powerful` reaches whatever `powerful`
+/// reaches, for as long as the session lasts — and the session is the record of it (who, from whom,
+/// until when). Nothing here is cached: a released or expired row stops answering immediately.
+fn held_authority(conn: &Connection, caller: &str) -> Result<Vec<i64>> {
+    // `active_sudo.weak` is a pen ID, not a name — join it, or the comparison is against an integer.
+    let mut stmt = conn.prepare(
+        "SELECT s.powerful
+           FROM active_sudo s JOIN pen w ON w.id = s.weak
+          WHERE lower(w.name) = lower(?1) AND s.expires_at > datetime('now')",
+    )?;
+    Ok(stmt
+        .query_map(params![caller], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {
     if audience == audience::PUBLIC {
         return Ok(true);
@@ -223,7 +244,15 @@ fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<
     let Some(owner_id) = exact_pen_id(conn, addressed)? else {
         return Ok(false);
     };
-    Ok(caller_id == owner_id || is_ancestor(conn, caller_id, owner_id)?)
+    if caller_id == owner_id || is_ancestor(conn, caller_id, owner_id)? {
+        return Ok(true);
+    }
+    for held in held_authority(conn, caller)? {
+        if held == owner_id || is_ancestor(conn, held, owner_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// May `caller` write the row at `key`? Parentage is the grant: the owner, the pen that owns on the
@@ -276,6 +305,14 @@ pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> R
     }
     if is_ancestor(conn, caller_exact, owner_id)? {
         return Ok(());
+    }
+    // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the root is
+    // reaching rows the tree does not put under you. `asserted_by` still names the hand that typed it,
+    // so a borrowed write is attributable; the session row says whose authority it spent.
+    for held in held_authority(conn, caller)? {
+        if held == owner_id || is_ancestor(conn, held, owner_id)? {
+            return Ok(());
+        }
     }
     let owner_name: String = conn.query_row(
         "SELECT name FROM pen WHERE id = ?1",

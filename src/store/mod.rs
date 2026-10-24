@@ -895,8 +895,17 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory, audience: &str) -> Resul
 /// Take responsibility for a row. `owner` moves to the adopting pen; a finger's parent is what
 /// actually owns, so adopting as `stet/finger-3` is adopting as `stet` (#109).
 pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()> {
-    // You may not adopt what you cannot read: adopting somebody else's private row would be a way
-    // to take it by noticing it exists (#109, authorization).
+    assign(conn, key, pen, pen, force)
+}
+
+/// Give `key` to `to`, acting as `actor`.
+///
+/// Three rules, all the store's: the actor must be able to READ the row (a private row cannot be
+/// assigned by somebody who cannot see it); a pen may name itself or a pen in its own subtree; and
+/// naming anybody else needs a LIVE borrow of `estate`, because root reach is lent, never assumed.
+/// An owned row is taken from its owner only by an ancestor of that owner (or with root reach), and
+/// only with `force`.
+pub fn assign(conn: &Connection, key: &str, actor: &str, to: &str, force: bool) -> Result<()> {
     let audience: Option<String> = conn
         .query_row(
             "SELECT audience FROM memory WHERE key = ?1",
@@ -905,21 +914,31 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()>
         )
         .optional()?;
     let audience = audience.ok_or_else(|| Error::NotFound(key.to_string()))?;
-    // ★ ASK THE READER, NOT THE STRING (2026-10-24). The old test compared the audience to exactly
-    // `pen:<self>`, which a LIST audience never equals — so a row shared to you could not be adopted
-    // even though you can read it. The question is "can this pen see it", which has one predicate.
-    if !may_read_audience(conn, pen, &audience)? {
+    if !may_read_audience(conn, actor, &audience)? {
         return Err(Error::Invalid(format!(
-            "{key} is private to {audience}; a pen cannot adopt a row it cannot read"
+            "{key} is private to {audience}; a pen cannot assign a row it cannot read"
         )));
     }
-    let to = owner_pen_id(conn, Some(pen))?.ok_or_else(|| {
+    let to_id = owner_pen_id(conn, Some(to))?.ok_or_else(|| {
         Error::Invalid(format!(
-            "no pen named {pen}; the pen registry has no such row"
+            "no pen named {to}; the pen registry has no such row"
         ))
     })?;
-    // An OWNED row may be taken only by an ancestor, and only deliberately (#109, James): a pen's
-    // work is not up for grabs by a sibling, or a stranger, who happens to notice it.
+    let actor_id = exact_pen_id(conn, actor)?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {actor}")))?;
+    // A finger's parent is what OWNS, so "assign to myself" must compare owning ids, not names.
+    let actor_owns = owner_pen_id(conn, Some(actor))?
+        .ok_or_else(|| Error::Invalid(format!("no pen named {actor}")))?;
+    // ★ ROOT REACH IS A LIVE BORROW, NEVER A NAME (2026-10-24). `estate` has no identity, so the
+    // only way to hold its reach is a session that expires and can be revoked.
+    let root = crate::store::sudo::live(conn, actor, "estate")?.is_some();
+    if actor_owns != to_id && !root && !is_ancestor(conn, actor_id, to_id)? {
+        return Err(Error::Invalid(format!(
+            "{actor} may assign only to itself or its own subtree; assigning to {to} needs a live \
+             borrow of estate"
+        )));
+    }
+    // An OWNED row may be taken only by an ancestor, and only deliberately (#109, James).
     let from: Option<i64> = conn
         .query_row(
             "SELECT owner FROM memory WHERE key = ?1",
@@ -929,14 +948,12 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()>
         .optional()?
         .flatten();
     if let Some(owner_id) = from {
-        let caller_id = exact_pen_id(conn, pen)?
-            .ok_or_else(|| Error::Invalid(format!("no pen named {pen}")))?;
-        if caller_id == owner_id {
-            return Ok(()); // already yours; nothing to take
+        if owner_id == to_id {
+            return Ok(()); // already theirs; nothing to do
         }
-        if !is_ancestor(conn, caller_id, owner_id)? {
+        if !root && !is_ancestor(conn, actor_id, owner_id)? {
             return Err(Error::Invalid(format!(
-                "{pen} may not adopt {key}: only an ancestor of its owner may take an owned row"
+                "{actor} may not reassign {key}: only an ancestor of its owner may take an owned row"
             )));
         }
         if !force {
@@ -947,12 +964,18 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()>
     }
     let n = conn.execute(
         "UPDATE memory SET owner = ?2 WHERE key = ?1",
-        params![key, to],
+        params![key, to_id],
     )?;
     if n == 0 {
         return Err(Error::NotFound(key.to_string()));
     }
-    log_pen_event(conn, key, "adopt", Some(to), from, Some(to), None)
+    // `pen_event` accepts a fixed vocabulary; `transfer` is the one that means "the holder moved".
+    let action = if actor_owns == to_id {
+        "adopt"
+    } else {
+        "transfer"
+    };
+    log_pen_event(conn, key, action, Some(actor_id), from, Some(to_id), None)
 }
 
 /// Release a row: nobody is answerable for it any more. By the commons rule (#109) an ownerless row

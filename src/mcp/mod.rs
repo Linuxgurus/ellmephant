@@ -241,7 +241,9 @@ ancestor of that owner, and only with `force: true`, because a pen's work is not
 sibling or a stranger who happens to notice it. A row you cannot read cannot be adopted: taking a \
 private row by noticing it exists is not a right. A finger adopts as its parent. Recorded in the \
 pen ledger (`adopt`, with the previous owner). An ownerless row is a legitimate state — adopting is \
-a choice, never a duty.";
+a choice, never a duty. PASS `to` TO GIVE THE ROW TO ANOTHER PEN: a pen may name itself or its own \
+subtree, and naming anyone else needs a LIVE BORROW of `estate` (root reach is lent, never assumed). \
+Taking an already-owned row needs `force: true`.";
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
@@ -731,6 +733,11 @@ pub struct AdoptParams {
         description = "Set true only when the row ALREADY has an owner and you are an ancestor of it. An ownerless row never needs this."
     )]
     pub force: Option<bool>,
+    /// Give the row to another pen instead of yourself.
+    #[schemars(
+        description = "Optional owner: give the row to this pen instead of taking it yourself. A pen may name itself or its own subtree; naming anyone else needs a live borrow of `estate`. Omit to adopt as yourself."
+    )]
+    pub to: Option<String>,
 }
 
 /// A many-key request (feedback sweep).
@@ -2095,15 +2102,19 @@ impl MemoryServer {
         let pen = pen_name(&ctx, self.declared.as_deref())?;
         let key = p.key;
         let force = p.force.unwrap_or(false);
+        let owner = p.to.unwrap_or_else(|| pen.clone());
         let adopting = key.clone();
-        let owner = pen.clone();
-        self.with_store("memory_adopt", move |s| s.adopt(&adopting, &owner, force))
-            .await?;
-        tracing::info!(tool = "memory_adopt", key = %key, owner = %pen, force, "memory adopted");
+        let actor = pen.clone();
+        let target = owner.clone();
+        self.with_store("memory_adopt", move |s| {
+            s.assign(&adopting, &actor, &target, force)
+        })
+        .await?;
+        tracing::info!(tool = "memory_adopt", key = %key, actor = %pen, owner = %owner, force, "ownership assigned");
         Ok(json_ok(serde_json::json!({
             "status": "adopted",
             "key": key,
-            "owner": pen,
+            "owner": owner,
         })))
     }
 

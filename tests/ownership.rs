@@ -1589,3 +1589,39 @@ fn an_audience_naming_a_pen_that_does_not_exist_is_refused() {
         "a row nobody can read must be refused at write, not stored: {err}"
     );
 }
+
+/// `assign` — giving a row away is bounded by the tree, and taking one back needs `force`.
+///
+/// A pen may name itself or its own subtree; a peer is refused. Root reach is deliberately NOT
+/// tested here because it must be a live borrow of `estate`, and a test that fabricated one would
+/// be testing the fixture.
+#[test]
+fn assignment_follows_the_tree_and_needs_force_to_take_it_back() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    registry(&conn, "a", None);
+    registry(&conn, "a-child", Some("a"));
+    registry(&conn, "peer", None);
+    row(&conn, &embedder, "given", "a");
+    store::disclaim(&conn, "given", "a", false).expect("disclaim");
+
+    // Downward: allowed, no force needed on an ownerless row.
+    store::assign(&conn, "given", "a", "a-child", false).expect("downward assignment");
+    assert_eq!(owner(&conn, "given").as_deref(), Some("a-child"));
+
+    // Already theirs: a no-op, not an error.
+    store::assign(&conn, "given", "a", "a-child", false).expect("idempotent");
+
+    // Taking it back to `a` crosses an owner, so it needs force.
+    let err = store::assign(&conn, "given", "a", "a", false).unwrap_err();
+    assert!(err.to_string().contains("force=true"), "{err}");
+    store::assign(&conn, "given", "a", "a", true).expect("forced take-back");
+    assert_eq!(owner(&conn, "given").as_deref(), Some("a"));
+
+    // A peer is not in the subtree: refused even when the row is ownerless.
+    conn.execute("UPDATE memory SET owner = NULL WHERE key = 'given'", [])
+        .expect("disclaim again");
+    let err = store::assign(&conn, "given", "a", "peer", false).unwrap_err();
+    assert!(err.to_string().contains("own subtree"), "{err}");
+}

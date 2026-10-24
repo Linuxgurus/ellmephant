@@ -508,3 +508,27 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
     assert_eq!(buried[0].kind, "memory");
     assert!(!buried[0].deleted_at.is_empty(), "and says when it went");
 }
+
+/// ★ A TOMBSTONE MUST BE AS IDEMPOTENT AS THE DELETE IT RECORDS (hygiene run, 2026-10-24).
+///
+/// Found on the live store: three rows answered
+/// `UNIQUE constraint failed on document_vec_deleted primary key` on DELETE, because their vector had
+/// been tombstoned by an earlier delete that did not finish. A row that cannot be deleted is a row that
+/// cannot be repaired.
+#[test]
+fn deleting_twice_is_not_an_error() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let _spec = VecSpec::of(&embedder);
+    let (id, _) = store::add(&conn, &memory("tomb", "deleted twice", &[])).expect("write");
+    common::settle(&conn, &embedder);
+    vec::delete(&conn, id).expect("first delete");
+    // The second delete used to fail with a UNIQUE violation on the tombstone table.
+    vec::delete(&conn, id).expect("a delete must be repeatable: a retry is not a new fact");
+    assert_eq!(
+        vec::count_deleted(&conn).expect("tombstones"),
+        1,
+        "and the tombstone is still one row, refreshed — not two"
+    );
+}

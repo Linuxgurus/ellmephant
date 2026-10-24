@@ -269,9 +269,15 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     // goes to the tombstone table, where no normal search can reach it (it is a different table, not a
     // filtered one) and a deliberate deleted-search can. A kind with a retention promise purges
     // instead — `purge` is the verb for that, never this one.
+    // ★ A TOMBSTONE MUST BE AS IDEMPOTENT AS THE DELETE IT RECORDS (hygiene run, 2026-10-24). A plain
+    // INSERT can only ever run once per id: a second delete — a retry, a repair, a row whose earlier
+    // delete tombstoned the vector but did not finish — then fails with `UNIQUE constraint failed on
+    // document_vec_deleted primary key`, and the memory becomes UNDELETABLE. Three rows were found in
+    // exactly that state. REPLACE keeps the newest embedding and refreshes the timestamp, which is what
+    // "deleted again, later" should mean.
     conn.execute(
         &format!(
-            "INSERT INTO {DELETED_TABLE}(vector_id, embedding, type, key, deleted_at)
+            "INSERT OR REPLACE INTO {DELETED_TABLE}(vector_id, embedding, type, key, deleted_at)
                SELECT vector_id, embedding, type, key, datetime('now') FROM {TABLE} WHERE vector_id = ?1;"
         ),
         params![id],

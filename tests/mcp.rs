@@ -1179,3 +1179,101 @@ async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }
+
+/// `memory_adopt` — responsibility, not authorship, and not a land-grab.
+///
+/// Three rules, all at the door: an ownerless row is claimable; an owned row needs `force` AND an
+/// ancestor; a row the pen cannot read cannot be adopted at all.
+#[tokio::test]
+async fn adopt_takes_responsibility_and_refuses_what_it_should() {
+    let dir = tempfile::tempdir().unwrap();
+    // Build the schema, then seed pens and rows on a second connection: the door has no way to
+    // create an ownerless row (an upsert always sets the writer as owner), and a fixture that
+    // cannot produce the state under test would be testing itself.
+    drop(session(dir.path()));
+    {
+        let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
+        for pen in ["tester", "other"] {
+            conn.execute(
+                "INSERT OR IGNORE INTO pen (name, kind) VALUES (?1, 'self')",
+                rusqlite::params![pen],
+            )
+            .expect("seed pen");
+        }
+        let mem = |key: &str| ellmephant::store::Memory {
+            key: key.to_string(),
+            title: key.to_string(),
+            body: "a fact".to_string(),
+            asserted_by: Some("other".to_string()),
+            ..Default::default()
+        };
+        ellmephant::store::add(&conn, &mem("claimable")).expect("add");
+        ellmephant::store::disclaim(&conn, "claimable", "other", false).expect("disclaim");
+        ellmephant::store::add(&conn, &mem("owned")).expect("add");
+        ellmephant::store::add(&conn, &mem("secret")).expect("add");
+        conn.execute(
+            "UPDATE memory SET audience = 'pen:other' WHERE key = 'secret'",
+            [],
+        )
+        .expect("private");
+        // `add` settles nothing, but adopt reads only the row and the pen table.
+        ellmephant::store::encode::drain(&conn, &HashEmbedder::new(DIM), 64).expect("drain");
+    }
+
+    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    // An ownerless row: no force needed.
+    let ok = call(
+        &client,
+        "memory_adopt",
+        serde_json::json!({ "key": "claimable" }),
+    )
+    .await;
+    assert!(!ok.is_error.unwrap_or(false), "{}", text(&ok));
+    let body: serde_json::Value = serde_json::from_str(&text(&ok)).expect("json");
+    assert_eq!(body["owner"], "tester");
+
+    // An owned row: refused, with or without force, because `tester` is not an ancestor of `other`.
+    // The ancestor check comes first on purpose — whether the caller passed `force` is irrelevant to
+    // a pen that had no right to ask.
+    let no_force = call(
+        &client,
+        "memory_adopt",
+        serde_json::json!({ "key": "owned" }),
+    )
+    .await;
+    assert!(no_force.is_error.unwrap_or(false), "{}", text(&no_force));
+    assert!(text(&no_force).contains("ancestor"), "{}", text(&no_force));
+    let forced = call(
+        &client,
+        "memory_adopt",
+        serde_json::json!({ "key": "owned", "force": true }),
+    )
+    .await;
+    assert!(forced.is_error.unwrap_or(false), "{}", text(&forced));
+    assert!(text(&forced).contains("ancestor"), "{}", text(&forced));
+
+    // A row this pen cannot read: refused, and the refusal must not leak the content.
+    let secret = call(
+        &client,
+        "memory_adopt",
+        serde_json::json!({ "key": "secret" }),
+    )
+    .await;
+    assert!(secret.is_error.unwrap_or(false), "{}", text(&secret));
+    assert!(text(&secret).contains("cannot read"), "{}", text(&secret));
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

@@ -53,6 +53,7 @@ pub const TOOLS: &[&str] = &[
     "memory_upsert",
     "memory_delete",
     "memory_merge",
+    "memory_adopt",
     "memory_search",
     "semantic_search",
     "memory_get",
@@ -229,6 +230,18 @@ call has nothing to integrate. Returns `integrated` — the lines it appended on
 made for you is visible. Both keys must exist: a merge into a typo would destroy the source. To \
 discard prose on purpose use `memory_delete`: a merge integrates, a delete discards. `[[prj:from]]` \
 is not rewritten (that names a project). Reports what moved.";
+
+/// `memory_adopt` description. Responsibility, not authorship — and the two rules that stop it
+/// becoming a land-grab.
+const ADOPT_DESCRIPTION: &str = "\
+Take responsibility for a memory: `owner` becomes the calling pen. This is NOT authorship — \
+`asserted_by` is frozen and unaffected, and `owner` is who is ANSWERABLE, not who typed it. You may \
+adopt an OWNERLESS row you can read; a row that already has an owner can be taken only by an \
+ancestor of that owner, and only with `force: true`, because a pen's work is not up for grabs by a \
+sibling or a stranger who happens to notice it. A row you cannot read cannot be adopted: taking a \
+private row by noticing it exists is not a right. A finger adopts as its parent. Recorded in the \
+pen ledger (`adopt`, with the previous owner). An ownerless row is a legitimate state — adopting is \
+a choice, never a duty.";
 
 /// `project_upsert` description. The project write law lives here and *only* here.
 const PROJECT_UPSERT_DESCRIPTION: &str = "\
@@ -704,6 +717,20 @@ pub struct MergeParams {
         description = "The key that survives — the stronger memory. You are judging which is which by naming it here. Any line of `from` this does not already carry is appended to it verbatim, so its information is in it when the call returns."
     )]
     pub into: String,
+}
+
+/// `memory_adopt` — take responsibility for a row.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptParams {
+    /// The memory to take responsibility for.
+    #[schemars(description = "Memory key. Slug. You must be able to read the row.")]
+    pub key: String,
+    /// Take a row that already has an owner (an ancestor of that owner only).
+    #[schemars(
+        description = "Set true only when the row ALREADY has an owner and you are an ancestor of it. An ownerless row never needs this."
+    )]
+    pub force: Option<bool>,
 }
 
 /// A many-key request (feedback sweep).
@@ -2048,6 +2075,38 @@ impl MemoryServer {
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
+    /// Take responsibility for a memory — responsibility, not authorship.
+    #[tool(
+        name = "memory_adopt",
+        description = ADOPT_DESCRIPTION,
+        annotations(
+            title = "Adopt memory",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_adopt(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<AdoptParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let key = p.key;
+        let force = p.force.unwrap_or(false);
+        let adopting = key.clone();
+        let owner = pen.clone();
+        self.with_store("memory_adopt", move |s| s.adopt(&adopting, &owner, force))
+            .await?;
+        tracing::info!(tool = "memory_adopt", key = %key, owner = %pen, force, "memory adopted");
+        Ok(json_ok(serde_json::json!({
+            "status": "adopted",
+            "key": key,
+            "owner": pen,
+        })))
+    }
+
     /// Semantic phrase search across every document type, with the graveyard behind a flag.
     #[tool(
         name = "semantic_search",
@@ -3223,6 +3282,7 @@ pub fn http_router(
         )
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
+        .route("/memory/{key}/adopt", axum::routing::post(surface::adopt))
         .route("/memory", axum::routing::post(surface::upsert))
         .route("/search", axum::routing::get(surface::search))
         .route("/dupes", axum::routing::get(surface::dupes))

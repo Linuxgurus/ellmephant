@@ -51,6 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The dev tag counts commits (`v1.2.0-dev.<n>`), so a shallow clone would always say 1.
+          fetch-depth: 0
 
       - name: Log in to Harbor
         env:
@@ -88,10 +91,18 @@ jobs:
         run: |
           set -eu
           short=$(echo "${{ github.sha }}" | cut -c1-7)
+          # ★ A VERSION ON EVERY DEV BUILD (James, 2026-10-24): `sha-` is a pin and `edge` moves,
+          # but neither says WHICH release line this is. The dev tag reads `v1.2.0-dev.329`.
+          ver=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          count=$(git rev-list --count HEAD)
+          dev="v${ver}-dev.${count}"
           docker build --platform linux/amd64 \
             --build-arg BUILDER="$(cat .builder-ref)" \
-            -t "$IMAGE:edge" -t "$IMAGE:sha-$short" .
-          # sha-<short> first: the immutable handle exists before the moving tag points at it.
+            --build-arg VERSION="$dev" \
+            --build-arg REVISION="${{ github.sha }}" \
+            -t "$IMAGE:edge" -t "$IMAGE:sha-$short" -t "$IMAGE:$dev" .
+          # Immutable handles FIRST: the pinned names exist before the moving tag points at them.
           docker push "$IMAGE:sha-$short"
+          docker push "$IMAGE:$dev"
           docker push "$IMAGE:edge"
-          echo "pushed $IMAGE:sha-$short and $IMAGE:edge"
+          echo "pushed $IMAGE:{sha-$short, $dev, edge}"

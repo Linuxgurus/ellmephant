@@ -2487,7 +2487,7 @@ async fn reading_into_the_subtree_is_recorded_on_the_door() {
         service.peer(),
         "memory_upsert",
         json!({ "key": "finger-note", "title": "Finger note", "body": "private work",
-                "private": true, "as": "tester/f-1" }),
+                "audience": "subtree:tester", "as": "tester/f-1" }),
     )
     .await;
     assert!(
@@ -2562,14 +2562,16 @@ async fn reading_a_past_state_of_a_descendants_private_row_is_recorded() {
     tool(
         service.peer(),
         "memory_upsert",
-        json!({ "key": "f-note", "title": "v1", "body": "first private", "private": true, "as": "tester/f-1" }),
+        json!({ "key": "f-note", "title": "v1", "body": "first private",
+                "audience": "subtree:tester", "as": "tester/f-1" }),
     )
     .await;
     // A second write supersedes the first, so v1 is now history.
     tool(
         service.peer(),
         "memory_upsert",
-        json!({ "key": "f-note", "title": "v2", "body": "second private", "as": "tester/f-1" }),
+        json!({ "key": "f-note", "title": "v2", "body": "second private",
+                "audience": "subtree:tester", "as": "tester/f-1" }),
     )
     .await;
 

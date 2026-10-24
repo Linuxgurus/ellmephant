@@ -319,6 +319,12 @@ pub struct UpsertParams {
         description = "Make this row PRIVATE to the writing pen (`true`), or public (`false`). Omit to keep the stored audience. Private is the READ tier: the row is invisible to every other pen — not as a hit, a title, a count or a backlink — and readable by you alone, plus the owner's recorded forensic path. The audience is derived from the PROVEN identity, so this flag cannot name someone else. Unencrypted: the file, the snapshot and the off-cluster copy hold it in plaintext, so it protects against another agent using the tools and against nothing else."
     )]
     pub private: Option<bool>,
+    /// An explicit audience — a SHARE naming others.
+    #[serde(default)]
+    #[schemars(
+        description = "An explicit AUDIENCE: `public`, or up to 8 comma-separated addresses — `pen:<name>` (exactly that pen) or `subtree:<name>` (that pen and everything below it). This NAMES others, so it is a SHARE and it is validated against the registry; `private: true` is the derived form that can only name the writer. Examples: `pen:james,pen:cline` = me and Cline and nobody else; `subtree:james` = James and his whole branch. Note that a pen above you does NOT see a `pen:` row by ancestry — ask for the ancestor explicitly if you want it. Omit to keep the stored audience."
+    )]
+    pub audience: Option<String>,
     /// Why this change is being made, for the version it supersedes.
     #[serde(default)]
     #[schemars(
@@ -347,6 +353,7 @@ impl UpsertParams {
             origin: self.origin,
             tags: self.tags,
             private: self.private,
+            audience: self.audience,
             version_note: self.version_note,
             expected_version: self.expected_version,
         }

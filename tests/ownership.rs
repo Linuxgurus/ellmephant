@@ -747,3 +747,63 @@ fn the_unowned_listing_obeys_the_audience_tier() {
     let keys: Vec<&str> = owner.iter().map(|r| r.key.as_str()).collect();
     assert!(keys.contains(&"secret"), "its own pen may see it: {keys:?}");
 }
+
+// ── ABSENCE, APPLIED TO DESTRUCTION (final adversarial pass) ─────────────────────────────────────
+// The private tier's law is "absence, not refusal". Two destructive paths were answering as oracles
+// instead: a DELETE said "owned by stet" for a row the caller could not read, and a MERGE deleted the
+// source without asking anyone's leave.
+
+#[test]
+fn destroying_an_invisible_private_row_answers_as_if_it_never_existed() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-secret", "stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet' WHERE key = 'stets-secret'",
+        [],
+    )
+    .unwrap();
+
+    // cline is a PEER: the row does not exist for it, so the refusal must not confirm it does.
+    let err = store::delete(&conn, "stets-secret", Some("cline")).unwrap_err();
+    assert!(
+        format!("{err}").contains("no such memory"),
+        "an invisible row must answer as absent, not report its owner: {err}"
+    );
+    // …and it is still there.
+    assert!(store::get(&conn, "stets-secret").unwrap().is_some());
+
+    // Its owner, and its ancestor, still reach it.
+    assert!(store::delete(&conn, "stets-secret", Some("stet")).is_ok());
+}
+
+#[test]
+fn a_merge_is_a_delete_and_is_gated_like_one() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+    row(&conn, &embedder, "clines-note", "cline");
+    row(&conn, &embedder, "stets-other", "stet");
+
+    // A peer may not destroy stet's row by "merging" it into its own.
+    let err =
+        store::links::merge_into(&conn, "stets-note", "clines-note", Some("cline")).unwrap_err();
+    assert!(
+        format!("{err}").contains("may not write") || format!("{err}").contains("no such memory"),
+        "a merge is a delete and needs the same reach: {err}"
+    );
+    assert!(
+        store::get(&conn, "stets-note").unwrap().is_some(),
+        "the source survives"
+    );
+
+    // Its owner may — into its OWN row. Merging into a peer's row would rewrite the peer's body, so
+    // `into` is gated too, and that refusal is the second half of the same rule.
+    let err =
+        store::links::merge_into(&conn, "stets-note", "clines-note", Some("stet")).unwrap_err();
+    assert!(
+        format!("{err}").contains("may not write"),
+        "the survivor is somebody else's: {err}"
+    );
+    assert!(store::links::merge_into(&conn, "stets-note", "stets-other", Some("stet")).is_ok());
+}

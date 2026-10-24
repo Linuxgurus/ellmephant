@@ -239,7 +239,7 @@ fn merge_into_repoints_every_reference_and_deletes_the_source() {
     seed(&conn, &embedder, "b", "also [[old]] here");
     let target_body = store::get(&conn, "new").unwrap().unwrap().body;
 
-    let out = links::merge_into(&conn, "old", "new").expect("merge");
+    let out = links::merge_into(&conn, "old", "new", None).expect("merge");
     assert_eq!(out.bodies, 2, "both referrers were rewritten");
     assert!(
         out.integrated.is_empty(),
@@ -283,7 +283,7 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
     // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
     seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
 
-    let out = links::merge_into(&conn, "old", "new").expect("merge");
+    let out = links::merge_into(&conn, "old", "new", None).expect("merge");
     assert_eq!(out.preloads, 1, "the project preload was repointed");
     let refs = project::preload(&conn, "p", project::Hydrate::None).unwrap();
     assert_eq!(refs.len(), 1);
@@ -312,7 +312,7 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
     // `new` already carries `old`'s prose, so there is nothing to integrate.
     seed(&conn, &embedder, "new", "see [[old]] — and deleted");
 
-    links::merge_into(&conn, "old", "new").expect("merge");
+    links::merge_into(&conn, "old", "new", None).expect("merge");
     let edges: i64 = conn
         .query_row("SELECT count(*) FROM memory_link", [], |r| r.get(0))
         .unwrap();
@@ -337,7 +337,7 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
         "new",
         "survivor line.\nalpha fact.\nan inserted line.\nbeta fact.",
     );
-    let out = links::merge_into(&conn, "old", "new").expect("an interleaved fold is a fold");
+    let out = links::merge_into(&conn, "old", "new", None).expect("an interleaved fold is a fold");
     assert!(out.integrated.is_empty(), "every line was already carried");
     assert!(
         store::get(&conn, "old").unwrap().is_none(),
@@ -359,8 +359,8 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
         "alpha fact.\nthe line only the twin carries.",
     );
     let before = store::get(&conn, "new").unwrap().unwrap().body;
-    let out =
-        links::merge_into(&conn, "twin", "new").expect("a missing line is integrated, not refused");
+    let out = links::merge_into(&conn, "twin", "new", None)
+        .expect("a missing line is integrated, not refused");
     assert_eq!(
         out.integrated,
         vec!["the line only the twin carries.".to_string()],
@@ -392,14 +392,17 @@ fn merge_into_refuses_a_missing_target_and_a_self_merge() {
     seed(&conn, &embedder, "b", "y");
 
     assert!(
-        links::merge_into(&conn, "ghost", "a").is_err(),
+        links::merge_into(&conn, "ghost", "a", None).is_err(),
         "source must exist"
     );
     assert!(
-        links::merge_into(&conn, "a", "ghost").is_err(),
+        links::merge_into(&conn, "a", "ghost", None).is_err(),
         "a merge into a typo must not destroy the source"
     );
-    assert!(links::merge_into(&conn, "a", "a").is_err(), "self-merge");
+    assert!(
+        links::merge_into(&conn, "a", "a", None).is_err(),
+        "self-merge"
+    );
 
     // A refused merge destroyed nothing.
     assert!(store::get(&conn, "a").unwrap().is_some());

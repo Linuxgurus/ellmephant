@@ -379,9 +379,20 @@ fn squash(s: &str) -> String {
 /// A caller may still fold the prose itself FIRST, and should when it wants the survivor to read as
 /// one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and
 /// the call has nothing to integrate. `[[prj:from]]` is *not* rewritten: that names a project.
-pub fn merge_into(conn: &Connection, from: &str, into: &str) -> Result<MergeInto> {
+pub fn merge_into(
+    conn: &Connection,
+    from: &str,
+    into: &str,
+    acted_by: Option<&str>,
+) -> Result<MergeInto> {
     let from = slug::slugify(from);
     let into = slug::slugify(into);
+    // ★ A MERGE IS A DELETE WEARING A REASON (found in the final adversarial pass). It repoints every
+    // reference to `from`, appends its lines to `into`, and removes it — and until now it asked
+    // nobody's leave, so any proven pen could destroy another pen's row, including a private one it
+    // could not read. Both ends are gated: the source is destroyed, and the survivor's body changes.
+    crate::store::may_write(conn, &from, acted_by)?;
+    crate::store::may_write(conn, &into, acted_by)?;
     if from == into {
         return Err(Error::Config(
             "a memory cannot be merged into itself".into(),

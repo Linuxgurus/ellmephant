@@ -1681,13 +1681,16 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        // A merge DESTROYS the source, so it is signed like any other write.
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
-            .with_store("memory_merge", move |s| s.merge_into(&from, &into))
+            .with_store("memory_merge", move |s| {
+                s.merge_into(&from, &into, Some(&pen))
+            })
             .await?;
         tracing::info!(
             tool = "memory_merge",

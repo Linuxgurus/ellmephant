@@ -1568,8 +1568,12 @@ pub async fn merge(
     };
     let from = key.clone();
     let target = into.clone();
+    // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
+    let pen = crate::identity::resolve(&headers).ok().flatten();
     match server
-        .with_store("memory_merge", move |s| s.merge_into(&from, &target))
+        .with_store("memory_merge", move |s| {
+            s.merge_into(&from, &target, pen.as_deref())
+        })
         .await
     {
         Ok(out) => {

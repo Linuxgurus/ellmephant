@@ -202,18 +202,52 @@ fn check_body(body: &str) -> Result<()> {
 /// create it is the code holding a vector ([`crate::store::encode::settle_encoded`], via
 /// `index::vec::ensure`). Deriving the width from config here would pin the store to whatever the
 /// config said rather than what the encoder actually emits.
+/// Can `caller` be SHOWN a row with this audience? Public, their own, or a descendant's.
+///
+/// ★ THE PRIVATE TIER'S LAW IS ABSENCE, NOT REFUSAL (found in the final adversarial pass): a row a
+/// caller may not see must answer exactly as a key that was never written. Without this, a DELETE or a
+/// MERGE on somebody's private row replied *"it is owned by stet"* — an existence-and-ownership
+/// oracle for rows the caller cannot read.
+fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {
+    if audience == audience::PUBLIC {
+        return Ok(true);
+    }
+    let Some(addressed) = audience.strip_prefix(audience::PEN) else {
+        return Ok(false);
+    };
+    let Some(caller_id) = exact_pen_id(conn, caller)? else {
+        return Ok(false);
+    };
+    let Some(owner_id) = exact_pen_id(conn, addressed)? else {
+        return Ok(false);
+    };
+    Ok(caller_id == owner_id || is_ancestor(conn, caller_id, owner_id)?)
+}
+
 /// May `caller` write the row at `key`? Parentage is the grant: the owner, the pen that owns on the
 /// owner's behalf (a finger acts for its parent), or any ancestor of the owner. A row with no owner
 /// is the commons, and the commons belongs to nobody — so every pen may write it (#109).
-fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
-    let owner: Option<i64> = conn
+pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
+    let row: Option<(Option<i64>, String)> = conn
         .query_row(
-            "SELECT owner FROM memory WHERE key = ?1",
+            "SELECT owner, audience FROM memory WHERE key = ?1",
             params![key],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?
-        .flatten();
+        .optional()?;
+    let Some((owner, audience)) = row else {
+        return Ok(()); // nothing there: a create, and creates are not gated here
+    };
+    // ★ ABSENCE FIRST (final adversarial pass). A row the caller cannot SEE does not exist for them,
+    // so a refusal must not confirm it: without this, a DELETE on somebody's private row answered
+    // *"it is owned by stet"* — an existence-and-ownership oracle for rows they cannot read.
+    let visible = match caller {
+        Some(caller) => may_read_audience(conn, caller, &audience)?,
+        None => true,
+    };
+    if !visible {
+        return Err(Error::NotFound(key.to_string()));
+    }
     let Some(owner_id) = owner else { return Ok(()) };
     let Some(caller) = caller else {
         return Err(Error::Invalid(format!(

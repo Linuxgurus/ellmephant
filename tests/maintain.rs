@@ -515,20 +515,42 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
 /// `UNIQUE constraint failed on document_vec_deleted primary key` on DELETE, because their vector had
 /// been tombstoned by an earlier delete that did not finish. A row that cannot be deleted is a row that
 /// cannot be repaired.
+/// ★ A TOMBSTONE MUST BE AS IDEMPOTENT AS THE DELETE IT RECORDS (hygiene run, 2026-10-24).
+///
+/// Found on the live store: three rows answered
+/// `UNIQUE constraint failed on document_vec_deleted primary key` on DELETE. Their vector had been
+/// tombstoned by an earlier delete that did not finish, while the LIVE vector was still there — so the
+/// tombstone INSERT could never run again and the memory was permanently undeletable.
+///
+/// The state must be built on purpose: tombstone the vector, keep the live one, then delete. Deleting
+/// twice in a row does NOT reproduce it (the second delete finds no live vector to copy).
 #[test]
-fn deleting_twice_is_not_an_error() {
+fn a_half_deleted_row_can_be_deleted_again() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
     let _spec = VecSpec::of(&embedder);
-    let (id, _) = store::add(&conn, &memory("tomb", "deleted twice", &[])).expect("write");
+    let (id, _) = store::add(&conn, &memory("tomb", "half deleted", &[])).expect("write");
     common::settle(&conn, &embedder);
-    vec::delete(&conn, id).expect("first delete");
-    // The second delete used to fail with a UNIQUE violation on the tombstone table.
-    vec::delete(&conn, id).expect("a delete must be repeatable: a retry is not a new fact");
+
+    // The half-copied state: the tombstone exists AND the live vector still does.
+    let vector = vec::get(&conn, id).expect("get").expect("indexed");
+    vec::delete(&conn, id).expect("first half: tombstone");
+    conn.execute(
+        "INSERT INTO document_vec(vector_id, embedding, type, key) VALUES (?1, ?2, 'memory', 'tomb')",
+        rusqlite::params![id, vec::to_blob(&vector)],
+    )
+    .expect("put the live vector back, as an interrupted delete leaves it");
+
+    // Before the fix this was `UNIQUE constraint failed on document_vec_deleted primary key`.
+    vec::delete(&conn, id).expect("a half-deleted row must still be deletable");
+    assert!(
+        vec::get(&conn, id).expect("get").is_none(),
+        "and it is gone now"
+    );
     assert_eq!(
         vec::count_deleted(&conn).expect("tombstones"),
         1,
-        "and the tombstone is still one row, refreshed — not two"
+        "one tombstone, not two"
     );
 }

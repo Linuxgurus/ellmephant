@@ -1404,6 +1404,11 @@ pub fn retire(
              SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
          )
          DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+    // ★ AND THE POLICY THAT AUTHORISED IT (found reviewing #127). A retired pen's `sudoers` row is
+    // authority with no pen behind it; leaving it would let the next `sudo` borrow a ghost. The live
+    // sessions themselves are ended a few lines up.
+    conn.execute(
+        "DELETE FROM sudoers WHERE powerful = ?1 OR weak = ?1",
         params![id],
     )?;
     conn.execute(

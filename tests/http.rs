@@ -2340,4 +2340,101 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
     );
 
     unsafe { std::env::remove_var(TABLE) };
+/// The three sudo verbs on the door: a borrow needs POLICY, a pass goes DOWN, a release CASCADES.
+/// The policy is written outside the doors — that is what provisioning is, and it is the point.
+#[tokio::test]
+async fn the_sudo_verbs_are_on_the_door() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let _app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer(mcp).await;
+
+    tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "seed", "title": "Seed", "body": "s" }),
+    )
+    .await;
+
+    // No policy, no borrow — authority is granted, never assumed.
+    let refused = tool(
+        service.peer(),
+        "sudo",
+        json!({ "powerful": "estate", "secs": 60 }),
+    )
+    .await;
+    assert!(refused.contains("no sudo policy"), "{refused}");
+
+    // Provisioning writes the policy, the way terraform would: outside every door.
+    {
+        let conn = ellmephant::db::open(&Paths::from_root(dir.path())).unwrap();
+        ellmephant::store::sudo::grant(&conn, "estate", "tester", 600, "test").unwrap();
+    }
+
+    let borrowed = tool(
+        service.peer(),
+        "sudo",
+        json!({ "powerful": "estate", "secs": 300 }),
+    )
+    .await;
+    let session: serde_json::Value = serde_json::from_str(&borrowed).unwrap();
+    assert_eq!(session["weak"], json!("tester"), "{borrowed}");
+    assert_eq!(session["powerful"], json!("estate"), "{borrowed}");
+
+    // A borrow cannot outlive its policy.
+    let too_long = tool(
+        service.peer(),
+        "sudo",
+        json!({ "powerful": "estate", "secs": 601 }),
+    )
+    .await;
+    assert!(too_long.contains("at most 600s"), "{too_long}");
+
+    // Passing goes DOWN, and the receiver's session names where it came from.
+    tool(
+        service.peer(),
+        "pen_mint",
+        json!({ "name": "tester/hand", "kind": "self" }),
+    )
+    .await;
+    let passed = tool(
+        service.peer(),
+        "sudo_pass",
+        json!({ "powerful": "estate", "pen": "tester/hand", "secs": 60 }),
+    )
+    .await;
+    let passed: serde_json::Value = serde_json::from_str(&passed).unwrap();
+    assert_eq!(passed["weak"], json!("tester/hand"), "{passed}");
+    assert!(
+        passed["via"].is_i64(),
+        "a passed session names its source: {passed}"
+    );
+
+    // Releasing cascades: the hand's session and the finger's, in one act.
+    let released = tool(
+        service.peer(),
+        "sudo_release",
+        json!({ "powerful": "estate" }),
+    )
+    .await;
+    let released: serde_json::Value = serde_json::from_str(&released).unwrap();
+    assert_eq!(
+        released["sessions"],
+        json!(2),
+        "both sessions died: {released}"
+    );
 }

@@ -221,6 +221,22 @@ fn a_lend_sets_the_deadline_and_never_stacks_one() {
     // ★ THE HAZARD THIS EXISTS FOR: if the long row survived, the short lend would expire and then
     // the 600s one would silently let the finger write again. Push the clock past the short lend and
     // past nothing else — permission must be GONE, not resurrected.
+fn borrowing_again_replaces_the_session_instead_of_stacking_one() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::grant(&conn, "estate", "stet", 3600, "test").unwrap();
+
+    let long = sudo::sudo(&conn, "stet", "estate", 600).unwrap();
+    let short = sudo::sudo(&conn, "stet", "estate", 30).unwrap();
+    assert_eq!(
+        sudo::live(&conn, "stet", "estate").unwrap().unwrap().id,
+        short.id,
+        "the newest borrow governs"
+    );
+
+    // The hazard is the same one `lend` had: if the long row survived, shortening a borrow would
+    // silently restore the longer grant when the short one lapsed.
     conn.execute(
         "UPDATE active_sudo SET expires_at = datetime('now', '-1 second') WHERE id = ?1",
         rusqlite::params![short.id],
@@ -240,11 +256,15 @@ fn a_lend_sets_the_deadline_and_never_stacks_one() {
     assert!(
         sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty(),
         "the finger's session was passed from the lend that just ended"
+        sudo::live(&conn, "stet", "estate").unwrap().is_none(),
+        "a shortened borrow must not come back when it lapses (the 600s row was {})",
+        long.id
     );
 }
 
 #[test]
 fn retiring_a_pen_ends_the_authority_it_was_given() {
+fn a_session_records_why_it_exists() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();
     tree(&conn);
@@ -281,6 +301,72 @@ fn authority_cannot_be_lent_to_or_credited_for_a_ceased_pen() {
     let conn = ellmephant::db::open(&paths).unwrap();
     tree(&conn);
     sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    // A LEND: a pen spending its own authority downward. No policy row exists for the pair.
+    let lent = sudo::lend(&conn, "stet", "stet/hand", 60).expect("lend");
+    assert_eq!(lent.source, "lend");
+    let policies: i64 = conn
+        .query_row("SELECT count(*) FROM sudoers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(policies, 0, "a lend needs no policy, and writes none");
+
+    // A BORROW: someone else's authority, under a policy.
+    sudo::grant(&conn, "estate", "stet", 600, "test").unwrap();
+    let borrowed = sudo::sudo(&conn, "stet", "estate", 60).expect("sudo");
+    assert_eq!(borrowed.source, "policy");
+
+    // A PASSED session carries the authority it was passed from, however far down it travels.
+    let passed = sudo::pass(&conn, "stet", "estate", "stet/hand", 30).expect("pass");
+    assert_eq!(passed.source, "policy", "a borrow stays a borrow");
+    sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 30).expect("lend");
+    let lent = sudo::live(&conn, "stet/hand/finger-1", "stet/hand")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lent.source, "lend");
+
+    // And the question the column exists to answer, without a join that can lose its subject:
+    let kinds: Vec<String> = conn
+        .prepare("SELECT DISTINCT source FROM active_sudo ORDER BY source")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(kinds, vec!["lend".to_string(), "policy".to_string()]);
+}
+
+#[test]
+fn a_lender_may_end_its_fingers_session_but_a_peer_may_not() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // stet lends to its hand; the hand passes it to its finger.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    sudo::pass(&conn, "stet/hand", "stet", "stet/hand/finger-1", 300).expect("pass down");
+    assert!(!sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty());
+
+    // ★ A PEER MAY NOT (found reviewing #127): cline is not the finger's ancestor.
+    let err = sudo::release_by(&conn, "cline", "stet/hand/finger-1", "stet").unwrap_err();
+    assert!(
+        format!("{err}").contains("only that pen or one of its ancestors"),
+        "{err}"
+    );
+
+    // But the ancestor CAN, and the whole chain went with raising the hand's session — here the
+    // finger's own session, which the finger could never end itself: it has no credential.
+    let killed =
+        sudo::release_by(&conn, "stet/hand", "stet/hand/finger-1", "stet").expect("release");
+    assert_eq!(killed, 1);
+    assert!(sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty());
+}
+
+#[test]
+fn a_ceased_pen_can_neither_borrow_nor_be_borrowed_from_and_its_policy_dies_with_it() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::grant(&conn, "estate", "stet/hand", 600, "test").unwrap();
+
     ellmephant::store::retire(
         &conn,
         "stet/hand",
@@ -300,4 +386,16 @@ fn authority_cannot_be_lent_to_or_credited_for_a_ceased_pen() {
         format!("{err}").contains("ceased pen cannot be credited"),
         "{err}"
     );
+    // The policy went with the pen: no ghost authority left to borrow.
+    let policies: i64 = conn
+        .query_row("SELECT count(*) FROM sudoers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        policies, 0,
+        "a retired pen's policy is authority with no pen behind it"
+    );
+
+    // And the request is refused by name rather than by its absence.
+    let err = sudo::sudo(&conn, "stet/hand", "estate", 60).unwrap_err();
+    assert!(format!("{err}").contains("retired"), "{err}");
 }

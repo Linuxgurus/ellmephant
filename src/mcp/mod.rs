@@ -46,6 +46,9 @@ pub const TOOLS: &[&str] = &[
     "whois",
     "pen_mint",
     "pen_lend",
+    "sudo",
+    "sudo_pass",
+    "sudo_release",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -573,6 +576,60 @@ pub struct LendParams {
         description = "How long the lend lasts, in seconds. It expires on its own; `sudo_release` ends it sooner. Maximum 86400."
     )]
     pub secs: i64,
+}
+
+/// `sudo` — borrow one pen's authority, for a while.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SudoParams {
+    /// The pen whose authority is borrowed.
+    #[schemars(
+        description = "The pen whose authority you want — usually `estate`, which has no identity of its own and can only ever be used this way."
+    )]
+    pub powerful: String,
+    /// Seconds until the session ends.
+    #[schemars(
+        description = "How long the session lasts. It cannot outlive the policy that permits it, expires by itself, and `sudo_release` ends it sooner. No cache: revocation takes effect on the next call."
+    )]
+    pub secs: i64,
+}
+
+/// `sudo_pass` — hand a live session down to a descendant.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SudoPassParams {
+    /// The authority the session carries.
+    #[schemars(
+        description = "The authority being passed — the `powerful` pen of the session you hold."
+    )]
+    pub powerful: String,
+    /// The descendant to hand it to.
+    #[schemars(
+        description = "A DESCENDANT of yours. A session may be passed down, never sideways to a peer and never back up."
+    )]
+    pub pen: String,
+    /// Seconds until it expires — never longer than what you have left.
+    #[schemars(
+        description = "How long the receiver holds it. It cannot outlive the session it came from; asking for more is refused, not clamped."
+    )]
+    pub secs: i64,
+}
+
+/// `sudo_release` — end a session, and everything passed down from it.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SudoReleaseParams {
+    /// The authority to let go of.
+    #[schemars(
+        description = "The `powerful` pen of the session to end. Its whole pass-down chain dies with it."
+    )]
+    pub powerful: String,
+    /// Whose session to end — yourself by default, or a descendant's.
+    #[schemars(
+        description = "Whose session to end: omit for your own, or name a DESCENDANT (a finger you lent to). A pen that lent authority must be able to stop what it lent, or a runaway finger is stoppable only by the finger."
+    )]
+    #[serde(default)]
+    pub pen: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1696,6 +1753,98 @@ impl MemoryServer {
         tracing::info!(tool = "pen_lend", weak = %session.weak, powerful = %session.powerful, "authority lent down");
         Ok(json_ok(
             serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// BORROW a pen's authority — bounded by policy, expiring, revocable.
+    #[tool(
+        name = "sudo",
+        description = "Borrow `powerful`'s authority for `secs`. Needs a `sudoers` policy naming you as the borrower and this pair — authority is GRANTED, never assumed — and the duration cannot exceed the policy's ceiling. This is how `estate` is used at all: it is a real pen with no identity behind it, so nobody can authenticate as it and its universal reach is only ever somebody's borrow. Returns the session: id, both pens, `expires_at`. ★ No cache: every check reads the row, so a release or an expiry takes effect on the very next call.",
+        annotations(
+            title = "Borrow authority",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let powerful = p.powerful;
+        let secs = p.secs;
+        let session = self
+            .with_store("sudo", move |s| s.sudo(&caller, &powerful, secs))
+            .await?;
+        tracing::info!(tool = "sudo", weak = %session.weak, powerful = %session.powerful, "authority borrowed");
+        Ok(json_ok(
+            serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// PASS a live session down to a descendant.
+    #[tool(
+        name = "sudo_pass",
+        description = "Hand a live session of yours DOWN to a descendant of yours, for no longer than you have left. Downward only: passing sideways would arm a peer, and passing up would return authority to its source. The receiver's session dies with yours. Returns the new session with `via` naming the one it came from.",
+        annotations(
+            title = "Pass a session down",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo_pass(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoPassParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let powerful = p.powerful;
+        let pen = p.pen;
+        let secs = p.secs;
+        let session = self
+            .with_store("sudo_pass", move |s| {
+                s.sudo_pass(&caller, &powerful, &pen, secs)
+            })
+            .await?;
+        tracing::info!(tool = "sudo_pass", weak = %session.weak, powerful = %session.powerful, "session passed down");
+        Ok(json_ok(
+            serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// END a session, and everything passed down from it.
+    #[tool(
+        name = "sudo_release",
+        description = "End your session for `powerful`, and every session passed down from it. Revocation cascades by `via`, so a hand letting go also ends its fingers' sessions — a revocation that left copies running would not be one. Takes effect on the next call: there is no lookup cache to expire.",
+        annotations(
+            title = "Release authority",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn sudo_release(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<SudoReleaseParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let powerful = p.powerful;
+        let target = p.pen;
+        let killed = self
+            .with_store("sudo_release", move |s| {
+                s.sudo_release_of(&caller, target.as_deref(), &powerful)
+            })
+            .await?;
+        tracing::info!(tool = "sudo_release", killed, "authority released");
+        Ok(json_ok(
+            serde_json::json!({ "status": "released", "sessions": killed }),
         ))
     }
 
@@ -3001,6 +3150,9 @@ pub fn http_router(
         .route("/whois/{pen}", axum::routing::get(surface::whois))
         .route("/pen/mint", axum::routing::post(surface::pen_mint))
         .route("/pen/lend", axum::routing::post(surface::pen_lend))
+        .route("/sudo", axum::routing::post(surface::sudo))
+        .route("/sudo/pass", axum::routing::post(surface::sudo_pass))
+        .route("/sudo/release", axum::routing::post(surface::sudo_release))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

@@ -223,6 +223,40 @@ impl Session {
         store::sudo::lend(&self.conn, powerful, weak, secs)
     }
 
+    /// Borrow `powerful`'s authority for `secs` (needs a policy row).
+    pub fn sudo(&self, weak: &str, powerful: &str, secs: i64) -> Result<store::sudo::Session> {
+        store::sudo::sudo(&self.conn, weak, powerful, secs)
+    }
+
+    /// Pass a live session down to a descendant.
+    pub fn sudo_pass(
+        &self,
+        weak: &str,
+        powerful: &str,
+        to: &str,
+        secs: i64,
+    ) -> Result<store::sudo::Session> {
+        store::sudo::pass(&self.conn, weak, powerful, to, secs)
+    }
+
+    /// End a session and its pass-down chain.
+    pub fn sudo_release(&self, weak: &str, powerful: &str) -> Result<usize> {
+        store::sudo::release(&self.conn, weak, powerful)
+    }
+
+    /// End a session for `target` (defaulting to the caller) — an ancestor may end a descendant's.
+    pub fn sudo_release_of(
+        &self,
+        caller: &str,
+        target: Option<&str>,
+        powerful: &str,
+    ) -> Result<usize> {
+        match target {
+            Some(pen) => store::sudo::release_by(&self.conn, caller, pen, powerful),
+            None => store::sudo::release(&self.conn, caller, powerful),
+        }
+    }
+
     /// Mint a pen under `caller` — the runtime door.
     pub fn mint(&self, caller: &str, name: &str, kind: &str) -> Result<store::Minted> {
         store::mint(&self.conn, caller, name, kind)

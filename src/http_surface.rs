@@ -64,6 +64,21 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/sudo",
+        tool: "sudo",
+    },
+    Route {
+        method: "POST",
+        path: "/sudo/pass",
+        tool: "sudo_pass",
+    },
+    Route {
+        method: "POST",
+        path: "/sudo/release",
+        tool: "sudo_release",
+    },
+    Route {
+        method: "POST",
         path: "/memory",
         tool: "memory_upsert",
     },
@@ -702,6 +717,175 @@ pub async fn pen_lend(
                 ),
             )
         }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
+/// because authority is always borrowed BY somebody.
+#[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as in `session`
+fn proven_pen(headers: &HeaderMap, json: bool) -> Result<String, Response> {
+    match crate::identity::resolve(headers) {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err(error(
+            json,
+            StatusCode::UNAUTHORIZED,
+            "refused: this needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+        )),
+        Err(forged) => Err(error(json, StatusCode::UNAUTHORIZED, forged.to_string())),
+    }
+}
+
+/// `POST /sudo` — borrow a pen's authority (`sudo`).
+pub async fn sudo(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let caller = match proven_pen(&headers, json) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        powerful: String,
+        secs: i64,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("sudo", move |s| s.sudo(&caller, &ask.powerful, ask.secs))
+        .await
+    {
+        Ok(session) => {
+            let value = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
+            render(
+                StatusCode::CREATED,
+                json,
+                value.to_string(),
+                format!(
+                    "borrowed {} as {} until {}\n",
+                    session.powerful, session.weak, session.expires_at
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /sudo/pass` — pass a session down (`sudo_pass`).
+pub async fn sudo_pass(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let caller = match proven_pen(&headers, json) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        powerful: String,
+        pen: String,
+        secs: i64,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("sudo_pass", move |s| {
+            s.sudo_pass(&caller, &ask.powerful, &ask.pen, ask.secs)
+        })
+        .await
+    {
+        Ok(session) => {
+            let value = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
+            render(
+                StatusCode::CREATED,
+                json,
+                value.to_string(),
+                format!(
+                    "passed {} to {} until {}\n",
+                    session.powerful, session.weak, session.expires_at
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /sudo/release` — end a session and its chain (`sudo_release`).
+pub async fn sudo_release(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let caller = match proven_pen(&headers, json) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        powerful: String,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("sudo_release", move |s| {
+            s.sudo_release(&caller, &ask.powerful)
+        })
+        .await
+    {
+        Ok(killed) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "status": "released", "sessions": killed }).to_string(),
+            format!("released: {killed} session(s)\n"),
+        ),
         Err(e) => error(json, error_status(&e), e),
     }
 }

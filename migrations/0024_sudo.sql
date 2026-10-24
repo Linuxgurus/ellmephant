@@ -35,6 +35,12 @@ CREATE TABLE active_sudo (
     -- The session this one was PASSED from, so revocation can walk back down the chain: killing a
     -- hand's session must kill every finger's session that exists only because of it.
     via        INTEGER REFERENCES active_sudo(id),
+    -- ★ WHY THIS SESSION EXISTS, recorded on the row rather than inferred (2026-10-23). `policy` is a
+    -- borrow granted by a `sudoers` row; `lend` is a pen lending its OWN authority down, which needs
+    -- no policy because parentage already grants it. Without this column "who can act as whom, and on
+    -- whose authority?" can only be answered by joining back to a policy row that may since have been
+    -- deleted — and the audit would lose the distinction exactly when it matters.
+    source     TEXT NOT NULL CHECK (source IN ('policy', 'lend')),
     CHECK (powerful <> weak)
 );
 CREATE INDEX active_sudo_weak ON active_sudo(weak, powerful);

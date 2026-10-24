@@ -125,3 +125,96 @@ pub fn tree(paths: &Paths, cfg: &Config) -> Result<()> {
     println!("{roots} root(s) — one root is the invariant");
     Ok(())
 }
+
+// ── AUTHORITY, BY HAND (2026-10-24) ──────────────────────────────────────────────────────────────
+// These are the *provisioning* half of the sudo model: the policy, the lend, the borrow. They exist
+// because `kubectl exec` is already a privilege that owns the box — so a verb here grants nothing that
+// the person typing it could not already do with the database open. What they do NOT do is decide
+// whether a *live pen* may invoke them: that is the door's question, and the door is not built.
+
+use crate::store::sudo;
+
+/// `pen grant <powerful> <weak> <secs>` — a sudoers policy: weak may borrow powerful for at most secs.
+pub fn grant(paths: &Paths, cfg: &Config, powerful: &str, weak: &str, secs: i64) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    sudo::grant(&conn, powerful, weak, secs, "cli")?;
+    println!("  policy    {weak} may borrow {powerful} for at most {secs}s");
+    Ok(())
+}
+
+/// `pen lend <powerful> <weak> <secs>` — powerful lends its own authority DOWN to weak.
+pub fn lend(paths: &Paths, cfg: &Config, powerful: &str, weak: &str, secs: i64) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let session = sudo::lend(&conn, powerful, weak, secs)?;
+    report(&session);
+    Ok(())
+}
+
+/// `pen sudo <weak> <powerful> <secs>` — weak borrows powerful, under a policy.
+pub fn borrow(paths: &Paths, cfg: &Config, weak: &str, powerful: &str, secs: i64) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let session = sudo::sudo(&conn, weak, powerful, secs)?;
+    report(&session);
+    Ok(())
+}
+
+/// `pen release <weak> <powerful>` — end a session early.
+pub fn release(paths: &Paths, cfg: &Config, weak: &str, powerful: &str) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let n = sudo::release(&conn, weak, powerful)?;
+    println!("  released  {n} session(s): {weak} no longer holds {powerful}");
+    Ok(())
+}
+
+/// `pen sessions [<weak>]` — who holds what, and until when.
+pub fn sessions(paths: &Paths, cfg: &Config, weak: Option<&str>) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let held: Vec<sudo::Session> = match weak {
+        Some(w) => sudo::held(&conn, w)?,
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, p.name, w.name, s.expires_at, s.via, s.source
+                   FROM active_sudo s
+                   JOIN pen p ON p.id = s.powerful
+                   JOIN pen w ON w.id = s.weak
+                  WHERE s.expires_at > datetime('now')
+                  ORDER BY s.expires_at",
+            )?;
+            stmt.query_map([], |r| {
+                Ok(sudo::Session {
+                    id: r.get(0)?,
+                    powerful: r.get(1)?,
+                    weak: r.get(2)?,
+                    expires_at: r.get(3)?,
+                    via: r.get(4)?,
+                    source: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        }
+    };
+    if held.is_empty() {
+        println!("  no live sessions");
+        return Ok(());
+    }
+    for s in held {
+        let via = s.via.map(|v| format!(" via #{v}")).unwrap_or_default();
+        println!(
+            "  {:<10} holds {:<10} ({:<6}) until {}{via}",
+            s.weak, s.powerful, s.source, s.expires_at
+        );
+    }
+    Ok(())
+}
+
+fn report(session: &sudo::Session) {
+    println!(
+        "  {:<9} {} holds {} ({}) until {}",
+        "session", session.weak, session.powerful, session.source, session.expires_at
+    );
+}

@@ -135,7 +135,7 @@ fn ancestry(conn: &Connection, name: &str) -> Result<Vec<String>> {
     for _ in 0..64 {
         let parent: Option<String> = conn
             .query_row(
-                "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE c.name = ?1",
+                "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE lower(c.name) = lower(?1)",
                 params![cur],
                 |r| r.get(0),
             )
@@ -195,7 +195,7 @@ pub fn relation(conn: &Connection, from: &str, to: &str) -> Result<Option<Kin>> 
     while cur != lca {
         let parent: Option<String> = conn
             .query_row(
-                "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE c.name = ?1",
+                "SELECT p.name FROM pen c JOIN pen p ON p.id = c.parent_id WHERE lower(c.name) = lower(?1)",
                 params![cur],
                 |r| r.get(0),
             )

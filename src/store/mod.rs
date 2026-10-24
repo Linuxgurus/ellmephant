@@ -216,19 +216,14 @@ fn check_body(body: &str) -> Result<()> {
 /// verbs worked, the table filled, and the answer was always "you are not an ancestor" — which made
 /// the whole sudo model decoration.
 ///
-/// So: authority is `ancestry ∪ held sessions`. A pen holding `powerful` reaches whatever `powerful`
-/// reaches, for as long as the session lasts — and the session is the record of it (who, from whom,
-/// until when). Nothing here is cached: a released or expired row stops answering immediately.
+/// So: authority is `ancestry ∪ held sessions`, and the sessions are validated AT USE (see
+/// [`sudo::reachable`]): a lend whose parentage has since moved grants nothing, and a released or
+/// expired row stops answering on the next call. Nothing here is cached.
 fn held_authority(conn: &Connection, caller: &str) -> Result<Vec<i64>> {
-    // `active_sudo.weak` is a pen ID, not a name — join it, or the comparison is against an integer.
-    let mut stmt = conn.prepare(
-        "SELECT s.powerful
-           FROM active_sudo s JOIN pen w ON w.id = s.weak
-          WHERE lower(w.name) = lower(?1) AND s.expires_at > datetime('now')",
-    )?;
-    Ok(stmt
-        .query_map(params![caller], |r| r.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<_>>()?)
+    Ok(sudo::reachable(conn, caller)?
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect())
 }
 
 fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {

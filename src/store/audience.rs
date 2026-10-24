@@ -101,6 +101,10 @@ pub struct Reader {
     /// not the author of anything. Empty for a pen with no descendants, and for a reader built
     /// without a connection — the narrow answer, never the wide one by accident.
     down: Vec<String>,
+    /// Addresses reached by BORROWING somebody's authority rather than by parentage (2026-10-24).
+    /// Kept apart from `down` so the audit can say which mechanism let the read through: "an ancestor
+    /// read down its subtree" and "a pen spent a session it was lent" are different acts.
+    borrowed: Vec<String>,
     /// Every row, private ones included. ONLY for a process that already holds the file — the CLI,
     /// maintenance, tests. A tier that claims to stop someone holding the SQLite file would be a lie
     /// (#54 says so out loud), and pretending the CLI is subject to it would only hide that.
@@ -113,6 +117,7 @@ impl Reader {
         Reader {
             pen: Some(pen(name)),
             down: Vec::new(),
+            borrowed: Vec::new(),
             all: false,
         }
     }
@@ -159,28 +164,40 @@ impl Reader {
             return self;
         };
         let me = p.strip_prefix(PEN).unwrap_or(&p).to_string();
-        // `active_sudo.weak`/`.powerful` are pen IDS, not names — the join is the point.
-        let sql = "WITH RECURSIVE sub(id) AS (
-                       SELECT s.powerful
-                         FROM active_sudo s JOIN pen w ON w.id = s.weak
-                        WHERE lower(w.name) = lower(?1)
-                          AND s.expires_at > datetime('now')
-                       UNION
-                       SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
-                   )
-                   SELECT DISTINCT 'pen:' || lower(p.name) FROM pen p JOIN sub s ON p.id = s.id";
-        let Ok(mut stmt) = conn.prepare(sql) else {
+        // ★ VALIDATED AT USE, through the same door the permission checks use (`sudo::reachable`): a
+        // lend whose parentage has since moved grants nothing, and an expired or released row stops
+        // answering on the next read. Resolving this with raw SQL here would let the reader and the
+        // writer disagree about what a session is worth.
+        let Ok(held) = crate::store::sudo::reachable(conn, &me) else {
             return self;
         };
-        let Ok(rows) = stmt.query_map(rusqlite::params![me], |r| r.get::<_, String>(0)) else {
-            return self;
-        };
-        for row in rows.flatten() {
-            if Some(&row) != self.pen.as_ref() && !self.down.contains(&row) {
-                self.down.push(row);
+        for (pid, _name, _source) in held {
+            let sql = "WITH RECURSIVE sub(id) AS (
+                           SELECT ?1
+                           UNION
+                           SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
+                       )
+                       SELECT DISTINCT 'pen:' || lower(p.name) FROM pen p JOIN sub s ON p.id = s.id";
+            let Ok(mut stmt) = conn.prepare(sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt.query_map(rusqlite::params![pid], |r| r.get::<_, String>(0)) else {
+                continue;
+            };
+            for row in rows.flatten() {
+                if Some(&row) != self.pen.as_ref() && !self.down.contains(&row) {
+                    self.borrowed.push(row.clone());
+                    self.down.push(row);
+                }
             }
         }
         self
+    }
+
+    /// The pen whose authority was spent to reach `audience`, if it was reached by borrowing rather than
+    /// by parentage. Used by the audit: a borrowed read is not a subtree read.
+    pub fn is_borrowed(&self, audience: &str) -> bool {
+        self.borrowed.iter().any(|a| a == audience)
     }
 
     /// How many descendant addresses this reader reaches down into (0 for a leaf).
@@ -203,6 +220,7 @@ impl Reader {
     pub fn everything() -> Self {
         Reader {
             pen: None,
+            borrowed: Vec::new(),
             down: Vec::new(),
             all: true,
         }

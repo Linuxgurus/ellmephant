@@ -1400,3 +1400,63 @@ fn holding_a_session_reaches_the_powerful_pens_rows_and_stops_when_released() {
     store::sudo::release(&conn, "james", "estate").unwrap();
     assert!(!sees("james"), "released means released");
 }
+
+// ── ADVERSARIAL PASS, 2026-10-24 ─────────────────────────────────────────────────────────────────
+// Two defects found by re-reading the night's own work.
+
+#[test]
+fn a_lend_dies_when_the_parentage_that_justified_it_moves() {
+    let (_dir, conn) = subtree(); // estate → james → {stet, cline}
+    let embedder = HashEmbedder::new(DIM);
+    registry(&conn, "james-secret-hand", Some("james"));
+    row(&conn, &embedder, "james-private", "james-secret-hand");
+
+    let sees = |who: &str| {
+        ellmephant::store::audience::Reader::pen(who)
+            .in_tree(&conn)
+            .with_borrowed(&conn)
+            .sees("pen:james-secret-hand")
+    };
+    assert!(
+        !sees("cline"),
+        "no session: a child does not read its parent's rows"
+    );
+
+    // James lends down to cline — legal, because cline is below him.
+    store::sudo::lend(&conn, "james", "cline", 600).unwrap();
+    assert!(sees("cline"), "the lend is live");
+
+    // ★ And now the tree moves underneath it: cline is adopted out of james's branch. The session row
+    // still exists, unexpired — and it must stop answering, because a lend is parentage PLUS a clock.
+    // A session that outlives its justification is a credential.
+    store::set_parent(&conn, "cline", "estate").unwrap();
+    assert!(
+        !sees("cline"),
+        "a lend whose parentage has moved grants nothing, even before it expires"
+    );
+}
+
+#[test]
+fn a_borrowed_read_is_recorded_as_borrowed_not_as_a_subtree_read() {
+    let (_dir, conn) = subtree();
+    // Production shape: stet is james's SIBLING, so only a borrow reaches him.
+    store::set_parent(&conn, "stet", "estate").unwrap();
+    store::sudo::grant(&conn, "estate", "james", 60, "test").unwrap();
+    store::sudo::sudo(&conn, "james", "estate", 30).unwrap();
+
+    let reader = ellmephant::store::audience::Reader::pen("james")
+        .in_tree(&conn)
+        .with_borrowed(&conn);
+    assert!(
+        reader.is_borrowed("pen:stet"),
+        "stet's rows are reached by SPENDING a session, not by ancestry"
+    );
+    assert!(
+        !reader.is_borrowed("pen:cline"),
+        "cline is below james by parentage — that read is a subtree read and must stay labelled so"
+    );
+    // The audit's vocabulary accepts the new reason (migration 0028 rebuilt the CHECK constraint).
+    store::audit::record(&conn, "james", Some("k"), store::audit::Why::Borrowed, None);
+    let recent = store::audit::recent(&conn, 1).unwrap();
+    assert_eq!(recent[0].3, "borrowed");
+}

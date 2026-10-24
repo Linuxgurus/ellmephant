@@ -203,3 +203,101 @@ fn a_boot_spec_applies_what_it_can_and_names_what_it_cannot() {
     // The loading is a policy write; borrowing still needs the verb.
     sudo::sudo(&conn, "james", "estate", 3600).expect("the good entries landed");
 }
+
+#[test]
+fn a_lend_sets_the_deadline_and_never_stacks_one() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // A long lend, then a short one for the same pair: the SHORT one is the truth.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    let short = sudo::lend(&conn, "stet", "stet/hand", 30).unwrap();
+    let live = sudo::live(&conn, "stet/hand", "stet")
+        .unwrap()
+        .expect("live");
+    assert_eq!(live.id, short.id, "the newest lend is the one that governs");
+
+    // ★ THE HAZARD THIS EXISTS FOR: if the long row survived, the short lend would expire and then
+    // the 600s one would silently let the finger write again. Push the clock past the short lend and
+    // past nothing else — permission must be GONE, not resurrected.
+    conn.execute(
+        "UPDATE active_sudo SET expires_at = datetime('now', '-1 second') WHERE id = ?1",
+        rusqlite::params![short.id],
+    )
+    .unwrap();
+    assert!(
+        sudo::live(&conn, "stet/hand", "stet").unwrap().is_none(),
+        "a shortened lend must not come back when it lapses"
+    );
+
+    // And re-lending ends anything passed down from the lend it replaces: a child may not outlive
+    // the grant it was passed under.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    sudo::pass(&conn, "stet/hand", "stet", "stet/hand/finger-1", 60).expect("pass down");
+    assert!(!sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty());
+    sudo::lend(&conn, "stet", "stet/hand", 300).unwrap();
+    assert!(
+        sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty(),
+        "the finger's session was passed from the lend that just ended"
+    );
+}
+
+#[test]
+fn retiring_a_pen_ends_the_authority_it_was_given() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // A lend to the hand, and one passed further down: both exist because the hand does.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    sudo::pass(&conn, "stet/hand", "stet", "stet/hand/finger-1", 300).expect("pass down");
+    assert!(!sudo::held(&conn, "stet/hand").unwrap().is_empty());
+
+    // ★ DISPOSAL INCLUDES THE AUTHORITY (found reviewing #126): retiring the hand must end its lend
+    // AND the finger's passed session, or a retired pen keeps acting until the TTL lapses.
+    ellmephant::store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        ellmephant::store::Rows::Inherit,
+        ellmephant::store::History::Memorialize,
+    )
+    .expect("retire");
+
+    assert!(
+        sudo::held(&conn, "stet/hand").unwrap().is_empty(),
+        "the hand's lend is gone"
+    );
+    assert!(
+        sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty(),
+        "and the session passed down from it"
+    );
+}
+
+#[test]
+fn authority_cannot_be_lent_to_or_credited_for_a_ceased_pen() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    ellmephant::store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        ellmephant::store::Rows::Inherit,
+        ellmephant::store::History::Memorialize,
+    )
+    .expect("retire");
+
+    // Lending to a pen that has ceased is lending to nobody.
+    let err = sudo::lend(&conn, "stet", "stet/hand", 60).unwrap_err();
+    assert!(format!("{err}").contains("retired"), "{err}");
+
+    // And it cannot be credited for new work, whatever rows survive.
+    let err = ellmephant::store::may_act_as(&conn, "stet", "stet/hand").unwrap_err();
+    assert!(
+        format!("{err}").contains("ceased pen cannot be credited"),
+        "{err}"
+    );
+}

@@ -45,6 +45,7 @@ pub const TOOLS: &[&str] = &[
     "memory_unowned",
     "whois",
     "pen_mint",
+    "pen_lend",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -302,6 +303,12 @@ pub struct UpsertParams {
         description = "Aspects of the subject, e.g. storage, gotchas. Omit to keep the stored tags; `[]` clears them."
     )]
     pub tags: Option<Vec<String>>,
+    /// Credit this write to a DESCENDANT of the calling pen.
+    #[serde(default, rename = "as")]
+    #[schemars(
+        description = "Credit this write to one of your OWN DESCENDANTS — a finger doing the work — instead of yourself. The store checks that it is below you AND that you hold a LIVE lend for it (`pen_lend`): parentage alone is not enough, because a lend expires and can be revoked, and an inheritance cannot. `asserted_by` names the descendant; `owner` stays with the pen that answers for it (a finger's work is its parent's). Omit to write as yourself."
+    )]
+    pub as_pen: Option<String>,
     /// Keep this row to the writing pen alone.
     #[serde(default)]
     #[schemars(
@@ -550,6 +557,22 @@ pub struct MintParams {
         description = "`finger` for a mechanism a hand uses for one job, `self` for something that stands as itself. Never inferred from the name: a slash proves nothing."
     )]
     pub kind: String,
+}
+
+/// `pen_lend` — authority lent down to a descendant, for a while.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LendParams {
+    /// The descendant that may act with this pen's authority.
+    #[schemars(
+        description = "The DESCENDANT to lend to — a finger you minted. It must be below you."
+    )]
+    pub pen: String,
+    /// Seconds until it expires.
+    #[schemars(
+        description = "How long the lend lasts, in seconds. It expires on its own; `sudo_release` ends it sooner. Maximum 86400."
+    )]
+    pub secs: i64,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1647,6 +1670,35 @@ impl MemoryServer {
         ))
     }
 
+    /// LEND this pen's authority DOWN to a descendant — the thing that lets a finger act.
+    #[tool(
+        name = "pen_lend",
+        description = "Lend your own authority to a DESCENDANT (a finger you minted) for `secs`. This is what permits `memory_upsert` with `as: <that pen>`: parentage alone is NOT enough, because a lend EXPIRES and can be REVOKED, and an inheritance can do neither. Downward lending needs no policy row — parentage already grants it; `sudo` is for borrowing somebody else's authority across or upward, and that does need one. Returns the session: its id, the two pens, `expires_at`, and `via` (the session it was passed from, when it was).",
+        annotations(
+            title = "Lend authority down",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pen_lend(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<LendParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = p.pen;
+        let secs = p.secs;
+        let session = self
+            .with_store("pen_lend", move |s| s.lend(&caller, &pen, secs))
+            .await?;
+        tracing::info!(tool = "pen_lend", weak = %session.weak, powerful = %session.powerful, "authority lent down");
+        Ok(json_ok(
+            serde_json::to_value(&session).map_err(|e| e.to_string())?,
+        ))
+    }
+
     /// Store one atomic memory; upserts by key. See the description for the write law.
     #[tool(
         name = "memory_upsert",
@@ -1664,13 +1716,24 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
+        let claimed = p.as_pen.clone();
         let mut patch = p.into_patch();
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
-        // no signature at all.
-        patch.asserted_by = Some(pen_name(&ctx, self.declared.as_deref())?);
+        // no signature at all. `as` may only ever name a DESCENDANT of that proven pen.
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let credited = match claimed {
+            Some(name) if !name.eq_ignore_ascii_case(&caller) => Some(name),
+            _ => None,
+        };
+        patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
         let outcome = self
-            .with_store("memory_upsert", move |s| s.memory_merge(&patch))
+            .with_store("memory_upsert", move |s| {
+                if let Some(as_pen) = &credited {
+                    s.may_act_as(&caller, as_pen)?;
+                }
+                s.memory_merge(&patch)
+            })
             .await?;
         tracing::info!(
             tool = "memory_upsert",
@@ -2937,6 +3000,7 @@ pub fn http_router(
         .route("/whoami", axum::routing::get(surface::whoami))
         .route("/whois/{pen}", axum::routing::get(surface::whois))
         .route("/pen/mint", axum::routing::post(surface::pen_mint))
+        .route("/pen/lend", axum::routing::post(surface::pen_lend))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

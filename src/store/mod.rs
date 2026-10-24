@@ -1199,7 +1199,7 @@ pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<M
     })
 }
 
-/// May `proven` be credited as `claimed` on a write? Itself, or anything below it.
+/// May `proven` be credited as `claimed` on a write? Itself, or anything below it ON A LIVE LEND.
 ///
 /// A finger holds no credential of its own — it is how one self does more work, not a party — so its
 /// work is written under the hand's PROOF and the finger's NAME. This is the check that keeps that
@@ -1218,12 +1218,32 @@ pub fn may_act_as(conn: &Connection, proven: &str, claimed: &str) -> Result<()> 
             "{claimed} is not a pen: a write may name itself or a pen it minted"
         ))
     })?;
-    if is_ancestor(conn, proven_id, claimed_id)? {
+    // (found reviewing #126) A CEASED PEN CANNOT BE CREDITED. Retire now ends its sessions, so this
+    // is belt-and-braces — but a write credited to a pen that has ended would put new work in the
+    // record under a name that can no longer answer for it, which is the one thing the ledger must
+    // never do.
+    let (_, _, claimed_ceased) = pen_row(conn, claimed)?;
+    if claimed_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{claimed} has been retired: a ceased pen cannot be credited for new work"
+        )));
+    }
+    if !is_ancestor(conn, proven_id, claimed_id)? {
+        return Err(Error::Invalid(format!(
+            "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a \
+             peer and never an ancestor"
+        )));
+    }
+    // ★ PARENTAGE IS NECESSARY, NOT SUFFICIENT (James tie-break, 2026-10-23). Acting as a descendant
+    // rides on a LIVE, EXPIRING lend — so a compromised finger's authority dies on its own, and a
+    // revocation is one deleted row rather than a re-shaped tree. The check is uncached: a cached
+    // session is a revocation that has not happened yet.
+    if sudo::live(conn, claimed, proven)?.is_some() {
         return Ok(());
     }
     Err(Error::Invalid(format!(
-        "{proven} may not write as {claimed}: a pen credits itself or its own subtree, never a peer \
-         and never an ancestor"
+        "{proven} may not write as {claimed} yet: that needs a LIVE lend — open one with `lend` (it \
+         expires, and it can be revoked) rather than inheriting by tree shape"
     )))
 }
 
@@ -1372,6 +1392,20 @@ pub fn retire(
         }
     }
 
+    // ★ DISPOSAL INCLUDES THE AUTHORITY IT WAS GIVEN (found reviewing #126). Retiring a pen left its
+    // lends and borrows running until their TTL: a retired finger could still be credited, and a
+    // retired hand still held what it borrowed. The tree's whole promise is that a disposal is
+    // immediate, so every session naming this pen — as lender or borrower — ends here, and anything
+    // passed down from one dies with it (`via`).
+    conn.execute(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT id FROM active_sudo WHERE powerful = ?1 OR weak = ?1
+             UNION
+             SELECT child.id FROM active_sudo child JOIN chain ON child.via = chain.id
+         )
+         DELETE FROM active_sudo WHERE id IN (SELECT id FROM chain)",
+        params![id],
+    )?;
     conn.execute(
         "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
         params![id],

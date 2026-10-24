@@ -375,6 +375,12 @@ impl Session {
         store::adopt(&self.conn, key, pen, force)
     }
 
+    /// Give a row to another pen (`memory_adopt` with `to`). Authorization lives in
+    /// `store::assign`: self or subtree, or a live borrow of `estate`.
+    pub fn assign(&self, key: &str, actor: &str, to: &str, force: bool) -> Result<()> {
+        store::assign(&self.conn, key, actor, to, force)
+    }
+
     /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying
     /// for one (`store::version`). An empty list is a fact and not an error: a key with no history
     /// reads the same whether it never existed or never changed.

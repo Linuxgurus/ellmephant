@@ -1109,14 +1109,13 @@ pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
 }
 
 fn pen_row_by_id(conn: &Connection, id: i64) -> Result<(i64, Option<i64>, Option<String>)> {
-    Ok(conn
-        .query_row(
-            "SELECT id, parent_id, ceased_at FROM pen WHERE id = ?1",
-            params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?
-        .ok_or_else(|| Error::Invalid(format!("no pen with id {id}")))?)
+    conn.query_row(
+        "SELECT id, parent_id, ceased_at FROM pen WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::Invalid(format!("no pen with id {id}")))
 }
 
 fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
@@ -1152,7 +1151,7 @@ pub const TREE_ENV: &str = "ELLMEPHANT_PEN_TREE";
 /// spelled `James` — found by rehearsing the roll, not by reading the code.
 fn pen_id_named(conn: &Connection, name: &str) -> Result<i64> {
     let mut stmt = conn.prepare("SELECT id, name FROM pen WHERE lower(name) = lower(?1)")?;
-    let rows = stmt.query_map(params![name], |r| Ok(r.get::<_, i64>(0)?))?;
+    let rows = stmt.query_map(params![name], |r| r.get::<_, i64>(0))?;
     let ids: Vec<i64> = rows.collect::<rusqlite::Result<_>>()?;
     match ids.as_slice() {
         [] => Err(Error::Invalid(format!("no pen named {name}"))),

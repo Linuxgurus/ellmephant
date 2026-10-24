@@ -139,7 +139,9 @@ jobs:
           echo "building $VERSION as:$tags"
           # shellcheck disable=SC2086
           docker build --platform linux/amd64 \
-            --build-arg BUILDER="$(cat .builder-ref)" $tags .
+            --build-arg BUILDER="$(cat .builder-ref)" \
+            --build-arg VERSION="$VERSION" \
+            --build-arg REVISION="${GITHUB_SHA:-unknown}" $tags .
 
           # The base name of every tag, so the push loop needs no re-derivation.
           for t in "$@"; do

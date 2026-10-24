@@ -37,6 +37,19 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 # ---------- runtime ----------
 FROM debian:bookworm-slim AS runtime
 
+# ★ A DIGEST IS HONEST AND UNREADABLE (James, 2026-10-24): "hashes don't show version".
+# Every image carries its version, revision and source as OCI labels, so Harbor can answer
+# "which build is this?" without a lookup table. CI passes all three.
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG SOURCE=https://git.vn.linuxguru.net/soma/ellmephant
+LABEL org.opencontainers.image.title="ellmephant" \
+      org.opencontainers.image.description="Single-binary, SQLite-backed long-term memory for AI agents" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.licenses="MIT"
+
 # ca-certificates is only needed for the first-run HuggingFace download; the binary
 # itself needs no interpreter, no Python, no Node.
 RUN apt-get update \

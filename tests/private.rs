@@ -342,3 +342,114 @@ fn a_grandparent_reads_and_the_predicate_agrees_with_sees() -> Result<()> {
     assert!(Reader::anonymous().sees("public"));
     Ok(())
 }
+
+// ── THE AUDIT (#129) ─────────────────────────────────────────────────────────────────────────────
+// The tier ENFORCED and did not RECORD: an ancestor reading down its subtree left no trace, while the
+// module claimed "the audit is the point". These are the rows that make the claim true.
+
+#[test]
+fn reading_a_descendants_private_row_is_recorded() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded(dir.path());
+    tree(&conn);
+
+    // james is an ANCESTOR of stet, so `stet`'s private row is his to read — and the read is the act
+    // worth recording, not the permission.
+    let parent = Reader::pen("james").in_tree(&conn);
+    let _ = store::get(&conn, "stets-note")?; // the plain read below is what the session audits
+    let hits = keys(&search::run(&conn, None, &parent, &all_q())?);
+    assert!(hits.contains(&"stets-note".to_string()));
+
+    // No record from `store::get` (it is the raw read); the session is what audits. So assert the
+    // seam instead: `crosses` is true for the ancestor and false for the row's own pen and a peer.
+    assert!(
+        parent.crosses("pen:stet"),
+        "an ancestor crosses into a descendant's private row"
+    );
+    assert!(
+        !Reader::pen("stet").crosses("pen:stet"),
+        "a pen does not cross its own boundary"
+    );
+    assert!(
+        !Reader::pen("cline").in_tree(&conn).crosses("pen:stet"),
+        "a sibling crosses nothing"
+    );
+    assert!(
+        !parent.crosses("public"),
+        "a public row is nobody's boundary"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_recorded_boundary_read_says_who_and_which_row() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded(dir.path());
+    tree(&conn);
+
+    store::audit::record(
+        &conn,
+        "james",
+        Some("stets-note"),
+        store::audit::Why::Subtree,
+        None,
+    );
+    store::audit::record(
+        &conn,
+        "james",
+        None,
+        store::audit::Why::Search,
+        Some("1 of 3 hit(s): stets-note"),
+    );
+
+    let rows = store::audit::recent(&conn, 10)?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].3, "search", "newest first");
+    assert_eq!(rows[0].1, "james", "who looked");
+    assert_eq!(rows[1].2.as_deref(), Some("stets-note"), "which row");
+    assert_eq!(rows[1].3, "subtree", "why");
+    assert_eq!(store::audit::count(&conn)?, 2);
+
+    // Retention is a decision, and it is enforced rather than hoped for.
+    conn.execute(
+        "UPDATE private_read SET at = datetime('now', '-400 days')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(store::audit::prune(&conn, 180)?, 2);
+    assert_eq!(store::audit::count(&conn)?, 0);
+    Ok(())
+}
+
+#[test]
+fn retention_runs_without_a_bell() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ellmephant::config::Paths::from_root(dir.path());
+
+    // A record older than the keep window, written by the ordinary recorder.
+    {
+        let conn = db::open(&paths)?;
+        store::audit::record(
+            &conn,
+            "someone",
+            Some("a-key"),
+            store::audit::Why::Subtree,
+            None,
+        );
+        conn.execute(
+            "UPDATE private_read SET at = datetime('now', '-400 days')",
+            [],
+        )?;
+        assert_eq!(store::audit::count(&conn)?, 1);
+    }
+
+    // ★ Opening the store prunes it (found reviewing #129): `prune` existed and nothing called it, so
+    // "retention is enforced" was a sentence rather than a fact.
+    let conn = db::open(&paths)?;
+    assert_eq!(
+        store::audit::count(&conn)?,
+        0,
+        "an audit older than the window is dropped at open, with no bell to remember"
+    );
+    Ok(())
+}

@@ -102,6 +102,14 @@ pub struct Session {
     /// — the honest limit of the private tier (#54). A DOOR replaces it with the connection's proven
     /// pen, and then every read below filters through it.
     reader: store::audience::Reader,
+    /// ★ AN AUDIT IS A WRITE (#129). A read-only session still has to be able to RECORD that it
+    /// crossed a boundary, and a read-only connection cannot. Opened lazily, on the rare act that
+    /// needs it, so the ordinary read path pays nothing for the audit and the audit still happens
+    /// where it matters. `None` until then, and `Some` for a writer session, which can just use its
+    /// own connection.
+    audit_conn: std::cell::RefCell<Option<Connection>>,
+    /// True for a door's read-only session: it may READ the store and may still WRITE its audit.
+    read_only: bool,
 }
 
 impl Session {
@@ -115,6 +123,8 @@ impl Session {
             conn,
             encoder,
             reader: store::audience::Reader::everything(),
+            audit_conn: std::cell::RefCell::new(None),
+            read_only: false,
         })
     }
 
@@ -142,6 +152,8 @@ impl Session {
             cfg,
             conn,
             encoder,
+            audit_conn: std::cell::RefCell::new(None),
+            read_only: true,
             reader,
         })
     }
@@ -208,7 +220,14 @@ impl Session {
         // never written. A distinct "private" error would confirm the row exists, which is the
         // disclosure the tier is for.
         match store::get(&self.conn, key)? {
-            Some(mem) if self.reader.sees(&mem.audience) => Ok(mem),
+            Some(mem) if self.reader.sees(&mem.audience) => {
+                // ★ A READ THAT CROSSED A BOUNDARY IS RECORDED (#129). An ancestor reading down its
+                // subtree is the one act the tier allowed and did not log; best effort, never fatal.
+                if self.reader.crosses(&mem.audience) {
+                    self.audit(Some(key), store::audit::Why::Subtree, None);
+                }
+                Ok(mem)
+            }
             _ => Err(Error::NotFound(key.to_string())),
         }
     }
@@ -362,7 +381,21 @@ impl Session {
         };
         match class {
             Some(audience) if !self.reader.sees(&audience) => Err(Error::NotFound(key.to_string())),
-            _ => Ok(()),
+            Some(audience) => {
+                // ★ A PAST STATE IS STILL THE ROW (found reviewing #129). `version()` and `versions()`
+                // both come through here, and both can hand an ancestor the contents of a descendant's
+                // private row — so the boundary is crossed on this path too and must be recorded, or
+                // the audit covers `memory_get` and nothing else.
+                if self.reader.crosses(&audience) {
+                    self.audit(
+                        Some(key),
+                        store::audit::Why::Subtree,
+                        Some("version/history"),
+                    );
+                }
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 
@@ -480,12 +513,69 @@ impl Session {
             .as_deref()
             .map(str::trim)
             .is_some_and(|s| !s.is_empty());
-        if needs_embedder {
-            return self
-                .encoder
-                .with(|e| search::run(&self.conn, Some(e), &self.reader, q));
+        let bundle = if needs_embedder {
+            self.encoder
+                .with(|e| search::run(&self.conn, Some(e), &self.reader, q))?
+        } else {
+            search::run(&self.conn, None, &self.reader, q)?
+        };
+        // ★ A SEARCH IS THE COMMON WAY AN ANCESTOR LOOKS INTO ITS SUBTREE, so it is the common way a
+        // boundary gets crossed — and one row per hit would make the audit bigger than the store.
+        // One row per SEARCH, carrying how many of the hits were somebody else's private rows and a
+        // small sample, is the record of the ACT rather than of its results.
+        self.record_search_boundary(&bundle);
+        Ok(bundle)
+    }
+
+    /// Record a read that crossed a boundary, wherever this session can write.
+    ///
+    /// ★ THE READ PATH IS READ-ONLY BY DESIGN, and the audit must still land: so the record goes on
+    /// the session's own connection when it can write, and otherwise on a lazily-opened writable one.
+    /// Best effort — a read never fails because its record could not be written.
+    fn audit(&self, key: Option<&str>, why: store::audit::Why, detail: Option<&str>) {
+        let Some(pen) = self.reader.pen_name() else {
+            return;
+        };
+        if !self.read_only {
+            store::audit::record(&self.conn, pen, key, why, detail);
+            return;
         }
-        search::run(&self.conn, None, &self.reader, q)
+        let mut slot = self.audit_conn.borrow_mut();
+        if slot.is_none() {
+            match db::open_with(&self.paths, &self.cfg) {
+                Ok(c) => *slot = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not open a connection to record a boundary read");
+                    return;
+                }
+            }
+        }
+        if let Some(conn) = slot.as_ref() {
+            store::audit::record(conn, pen, key, why, detail);
+        }
+    }
+
+    /// Record the boundary a search crossed, if it crossed one. Best effort, never fails the read.
+    fn record_search_boundary(&self, bundle: &Bundle) {
+        if self.reader.pen_name().is_none() || self.reader.down() == 0 || bundle.hits.is_empty() {
+            return;
+        }
+        let keys: Vec<&str> = bundle.hits.iter().map(|h| h.key.as_str()).collect();
+        let crossed = match store::audience::Reader::crossed_keys(&self.conn, &self.reader, &keys) {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        if crossed.is_empty() {
+            return;
+        }
+        let sample: Vec<&str> = crossed.iter().take(5).map(String::as_str).collect();
+        let detail = format!(
+            "{} of {} hit(s): {}",
+            crossed.len(),
+            keys.len(),
+            sample.join(", ")
+        );
+        self.audit(None, store::audit::Why::Search, Some(&detail));
     }
 
     /// A read-only digest of the store (`stats`); `db_bytes` comes from the store file, so the

@@ -275,9 +275,16 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     // document_vec_deleted primary key`, and the memory becomes UNDELETABLE. Three rows were found in
     // exactly that state. REPLACE keeps the newest embedding and refreshes the timestamp, which is what
     // "deleted again, later" should mean.
+    // ★ `OR REPLACE` DOES NOT WORK HERE: the tombstone is a vec0 VIRTUAL table, and a conflict clause
+    // is advisory to a virtual table's xUpdate — vec0 ignores it and the UNIQUE violation still fires.
+    // So the row is removed first, then written: explicit, and honest about what a repeat means.
+    conn.execute(
+        &format!("DELETE FROM {DELETED_TABLE} WHERE vector_id = ?1"),
+        params![id],
+    )?;
     conn.execute(
         &format!(
-            "INSERT OR REPLACE INTO {DELETED_TABLE}(vector_id, embedding, type, key, deleted_at)
+            "INSERT INTO {DELETED_TABLE}(vector_id, embedding, type, key, deleted_at)
                SELECT vector_id, embedding, type, key, datetime('now') FROM {TABLE} WHERE vector_id = ?1;"
         ),
         params![id],

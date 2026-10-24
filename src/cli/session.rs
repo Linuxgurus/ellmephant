@@ -244,6 +244,19 @@ impl Session {
         store::sudo::release(&self.conn, weak, powerful)
     }
 
+    /// End a session for `target` (defaulting to the caller) — an ancestor may end a descendant's.
+    pub fn sudo_release_of(
+        &self,
+        caller: &str,
+        target: Option<&str>,
+        powerful: &str,
+    ) -> Result<usize> {
+        match target {
+            Some(pen) => store::sudo::release_by(&self.conn, caller, pen, powerful),
+            None => store::sudo::release(&self.conn, caller, powerful),
+        }
+    }
+
     /// Mint a pen under `caller` — the runtime door.
     pub fn mint(&self, caller: &str, name: &str, kind: &str) -> Result<store::Minted> {
         store::mint(&self.conn, caller, name, kind)

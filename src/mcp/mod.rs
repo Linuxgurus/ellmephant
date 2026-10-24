@@ -615,6 +615,12 @@ pub struct SudoReleaseParams {
         description = "The `powerful` pen of the session to end. Its whole pass-down chain dies with it."
     )]
     pub powerful: String,
+    /// Whose session to end — yourself by default, or a descendant's.
+    #[schemars(
+        description = "Whose session to end: omit for your own, or name a DESCENDANT (a finger you lent to). A pen that lent authority must be able to stop what it lent, or a runaway finger is stoppable only by the finger."
+    )]
+    #[serde(default)]
+    pub pen: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1802,8 +1808,11 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let caller = pen_name(&ctx, self.declared.as_deref())?;
         let powerful = p.powerful;
+        let target = p.pen;
         let killed = self
-            .with_store("sudo_release", move |s| s.sudo_release(&caller, &powerful))
+            .with_store("sudo_release", move |s| {
+                s.sudo_release_of(&caller, target.as_deref(), &powerful)
+            })
             .await?;
         tracing::info!(tool = "sudo_release", killed, "authority released");
         Ok(json_ok(

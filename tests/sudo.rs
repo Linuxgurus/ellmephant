@@ -271,3 +271,59 @@ fn a_session_records_why_it_exists() {
         .unwrap();
     assert_eq!(kinds, vec!["lend".to_string(), "policy".to_string()]);
 }
+
+#[test]
+fn a_lender_may_end_its_fingers_session_but_a_peer_may_not() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // stet lends to its hand; the hand passes it to its finger.
+    sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    sudo::pass(&conn, "stet/hand", "stet", "stet/hand/finger-1", 300).expect("pass down");
+    assert!(!sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty());
+
+    // ★ A PEER MAY NOT (found reviewing #127): cline is not the finger's ancestor.
+    let err = sudo::release_by(&conn, "cline", "stet/hand/finger-1", "stet").unwrap_err();
+    assert!(
+        format!("{err}").contains("only that pen or one of its ancestors"),
+        "{err}"
+    );
+
+    // But the ancestor CAN, and the whole chain went with raising the hand's session — here the
+    // finger's own session, which the finger could never end itself: it has no credential.
+    let killed =
+        sudo::release_by(&conn, "stet/hand", "stet/hand/finger-1", "stet").expect("release");
+    assert_eq!(killed, 1);
+    assert!(sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty());
+}
+
+#[test]
+fn a_ceased_pen_can_neither_borrow_nor_be_borrowed_from_and_its_policy_dies_with_it() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::grant(&conn, "estate", "stet/hand", 600, "test").unwrap();
+
+    ellmephant::store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        ellmephant::store::Rows::Inherit,
+        ellmephant::store::History::Memorialize,
+    )
+    .expect("retire");
+
+    // The policy went with the pen: no ghost authority left to borrow.
+    let policies: i64 = conn
+        .query_row("SELECT count(*) FROM sudoers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        policies, 0,
+        "a retired pen's policy is authority with no pen behind it"
+    );
+
+    // And the request is refused by name rather than by its absence.
+    let err = sudo::sudo(&conn, "stet/hand", "estate", 60).unwrap_err();
+    assert!(format!("{err}").contains("retired"), "{err}");
+}

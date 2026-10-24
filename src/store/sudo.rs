@@ -172,7 +172,21 @@ pub fn sudo(conn: &Connection, weak: &str, powerful: &str, secs: i64) -> Result<
     if weak == powerful {
         return Err(Error::Invalid(format!("{weak} cannot sudo to itself")));
     }
-    let (p, w) = (id_of(conn, powerful)?, id_of(conn, weak)?);
+    // ★ A CEASED PEN HAS NO AUTHORITY TO LEND OR BORROW (found reviewing #127). `retire` now ends
+    // live sessions, but a retired pen's `sudoers` row would otherwise stay borrowable forever, and a
+    // retired pen could still ask for someone else's. Both are refused where the request is made.
+    let (p, _, powerful_ceased) = pen_identity(conn, powerful)?;
+    if powerful_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{powerful} has been retired: a pen that has ceased lends no authority"
+        )));
+    }
+    let (w, _, weak_ceased) = pen_identity(conn, weak)?;
+    if weak_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{weak} has been retired: a pen that has ceased borrows nothing"
+        )));
+    }
     let ceiling: Option<i64> = conn
         .query_row(
             "SELECT max_duration_secs FROM sudoers WHERE powerful = ?1 AND weak = ?2",
@@ -331,6 +345,20 @@ pub fn live(conn: &Connection, weak: &str, powerful: &str) -> Result<Option<Sess
             },
         )
         .optional()?)
+}
+
+/// End one session and everything passed down from it. **`caller` must be the pen itself or an
+/// ancestor of it** — the pen that lent authority must be able to stop what it lent, or "a pen that
+/// goes bad at 03:00" is stoppable only by the pen that went bad.
+pub fn release_by(conn: &Connection, caller: &str, weak: &str, powerful: &str) -> Result<usize> {
+    let caller_id = id_of(conn, caller)?;
+    let weak_id = id_of(conn, weak)?;
+    if caller_id != weak_id && !is_below(conn, caller_id, weak_id)? {
+        return Err(Error::Invalid(format!(
+            "{caller} may not end {weak}'s session: only that pen or one of its ancestors may"
+        )));
+    }
+    release(conn, weak, powerful)
 }
 
 /// End one session, and every session passed down from it. Returns how many died.

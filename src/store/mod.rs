@@ -1308,6 +1308,13 @@ pub fn retire(
         }
     }
 
+    // ★ AND THE POLICY THAT AUTHORISED IT (found reviewing #127). A retired pen's `sudoers` row is
+    // authority with no pen behind it; leaving it would let the next `sudo` borrow a ghost. The live
+    // sessions themselves are ended a few lines up.
+    conn.execute(
+        "DELETE FROM sudoers WHERE powerful = ?1 OR weak = ?1",
+        params![id],
+    )?;
     conn.execute(
         "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
         params![id],

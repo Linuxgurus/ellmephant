@@ -1893,7 +1893,7 @@ fn stats_text(s: &store::stats::Stats) -> String {
             match s.unattributed {
                 0 => "0".to_string(),
                 n => format!(
-                    "{n} (no author RECORDED — a write bug, not a commons; they need claiming)"
+                    "{n} (no currently existing pen wrote these — no owner, no author; claim them)"
                 ),
             },
         ),

@@ -688,7 +688,7 @@ fn the_ownerless_rows_can_be_listed_not_only_counted() {
     )
     .unwrap();
 
-    let rows = store::unowned(&conn, 50).expect("list");
+    let rows = store::unowned(&conn, &store::audience::Reader::everything(), 50).expect("list");
     assert_eq!(rows.len(), 2);
     let by_key: std::collections::HashMap<_, _> =
         rows.iter().map(|r| (r.key.as_str(), r)).collect();
@@ -712,4 +712,38 @@ fn the_ownerless_rows_can_be_listed_not_only_counted() {
         rows.iter()
             .all(|r| !r.key.is_empty() && !r.created.is_empty())
     );
+}
+
+#[test]
+fn the_unowned_listing_obeys_the_audience_tier() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A public ownerless row: visible to anyone, as the commons should be.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // A PRIVATE row that is also ownerless — the case the first version of this listing would have
+    // leaked: nobody owns it, but it is still addressed to one pen.
+    row(&conn, &embedder, "secret", "stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet', owner = NULL WHERE key = 'secret'",
+        [],
+    )
+    .unwrap();
+
+    let anon = store::unowned(&conn, &store::audience::Reader::anonymous(), 50).expect("list");
+    let keys: Vec<&str> = anon.iter().map(|r| r.key.as_str()).collect();
+    assert!(
+        keys.contains(&"released"),
+        "the commons is anybody's: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"secret"),
+        "a private row's ADDRESS is not the commons: {keys:?}"
+    );
+
+    let owner = store::unowned(&conn, &store::audience::Reader::pen("stet"), 50).expect("list");
+    let keys: Vec<&str> = owner.iter().map(|r| r.key.as_str()).collect();
+    assert!(keys.contains(&"secret"), "its own pen may see it: {keys:?}");
 }

@@ -1195,14 +1195,23 @@ pub struct Unowned {
 /// purpose — which is what "anonymous" means: no currently existing pen is answerable for it. So this
 /// listing is not a damage report; it is the place an owner goes to pick something up, and `why`
 /// keeps the two ways of arriving there apart.
-pub fn unowned(conn: &Connection, limit: i64) -> Result<Vec<Unowned>> {
-    let mut stmt = conn.prepare(
+pub fn unowned(conn: &Connection, reader: &audience::Reader, limit: i64) -> Result<Vec<Unowned>> {
+    // ★ THE TIER APPLIES HERE TOO (found reviewing #122). The first version selected `owner IS NULL`
+    // with no audience filter while its own doc said the tier applied "exactly as it does to a search
+    // hit" — a control claimed and absent, which is the class this store keeps getting bitten by. No
+    // live row is affected today (all 252 ownerless rows are public), so this is a gap closed before
+    // it became a leak rather than a leak being plugged.
+    let (pred, binds) = reader.sql();
+    let mut stmt = conn.prepare(&format!(
         "SELECT key, created, asserted_by FROM memory
-          WHERE owner IS NULL
+          WHERE owner IS NULL AND {pred}
           ORDER BY created DESC, key
-          LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit], |r| {
+          LIMIT ?{}",
+        binds.len() + 1
+    ))?;
+    let mut all: Vec<String> = binds;
+    all.push(limit.to_string());
+    let rows = stmt.query_map(rusqlite::params_from_iter(all.iter()), |r| {
         let asserted_by: Option<String> = r.get(2)?;
         let asserted_by = asserted_by.unwrap_or_default();
         let why = if asserted_by.trim().is_empty()
@@ -1230,7 +1239,6 @@ pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bo
     // ★ A DELETE IS A WRITE OF ABSENCE (soma/ellmephant#109). It takes the same reach as an edit —
     // the owner, the pen acting for the owner, or an ancestor — and it leaves the same kind of
     // record. Removal that nobody is named for is indistinguishable from a mistake.
-    may_write(conn, key, acted_by)?;
     delete_impl(conn, key, acted_by, true)
 }
 
@@ -1240,6 +1248,13 @@ pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bo
 /// "deleted on retirement" per row in the same act. One act, one ledger entry.
 fn delete_impl(conn: &Connection, key: &str, acted_by: Option<&str>, log: bool) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    // ★ THE GATE IS INSIDE THE TRANSACTION, for the same reason a compare-and-swap's compare is: a
+    // check beside the write can be overtaken by an adopt or a disclaim between the two, and then the
+    // removal proceeds under an authority that no longer holds. `retire` passes `log: false` because
+    // it has already authorised the whole act by ancestry.
+    if log {
+        may_write(&tx, key, acted_by)?;
+    }
     // The queue entry goes whatever the memory row does: an entry naming a row that no longer exists
     // is a document that can never be embedded, so leaving one behind is a leak the worker can only
     // rediscover. Both halves ride in one transaction, so neither undoes the other.
@@ -1262,8 +1277,11 @@ fn delete_impl(conn: &Connection, key: &str, acted_by: Option<&str>, log: bool) 
         // The ledger keeps WHAT HAPPENED even though the row is gone: an absence with no record is
         // the one deletion nobody can review.
         if log {
+            // The actor is the pen that DID it — `exact_pen_id`, not `owner_pen_id`, which maps a
+            // finger to its parent for ownership. Using the owner here recorded the hand for the
+            // finger's deletions, which is the one distinction the ledger exists to keep.
             let actor = match acted_by {
-                Some(name) => owner_pen_id(&tx, Some(name))?,
+                Some(name) => exact_pen_id(&tx, name)?,
                 None => None,
             };
             log_pen_event(&tx, key, "delete", actor, owner, None, None)?;

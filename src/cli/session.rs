@@ -250,9 +250,9 @@ impl Session {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
-    /// Rows nobody owns, newest first — the list behind the counts.
+    /// Rows nobody owns, newest first — the list behind the counts, filtered by this session's reader.
     pub fn unowned(&self, limit: i64) -> Result<Vec<store::Unowned>> {
-        store::unowned(&self.conn, limit)
+        store::unowned(&self.conn, &self.reader, limit)
     }
 
     /// Delete one memory by key; `false` means there was nothing to delete.

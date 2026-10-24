@@ -116,7 +116,7 @@ fn print_index_health(conn: &Connection) -> Result<()> {
     )?;
     println!("  commons        {commons} row(s) released to nobody, author still named");
     println!(
-        "  unattributed   {unattributed} row(s) with no owner AND no author — claim them, do not assume a commons"
+        "  unattributed   {unattributed} row(s) no currently existing pen wrote — no owner, no author; claim them"
     );
     // The vec0 table only exists once something has been written; `stored_dim` is the tell.
     let dim = index::vec::stored_dim(conn)?;

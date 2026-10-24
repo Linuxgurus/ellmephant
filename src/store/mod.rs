@@ -1108,6 +1108,16 @@ pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
     })
 }
 
+fn pen_row_by_id(conn: &Connection, id: i64) -> Result<(i64, Option<i64>, Option<String>)> {
+    conn.query_row(
+        "SELECT id, parent_id, ceased_at FROM pen WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()?
+    .ok_or_else(|| Error::Invalid(format!("no pen with id {id}")))
+}
+
 fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
     conn.query_row(
         "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
@@ -1116,6 +1126,104 @@ fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<St
     )
     .optional()?
     .ok_or_else(|| Error::Invalid(format!("no pen named {name}")))
+}
+
+/// ★ ATTACH THE TREE FROM CONFIGURATION (2026-10-24). The seed gives NAMES, provisioning gives
+/// STANDING — and until now "provisioning" meant "somebody runs SQL", which nothing could do: the image
+/// has no sqlite3, the PVC cannot be mounted beside a running brain, and no API sets a parent. A store
+/// would roll with five roots, report itself ready, and every ancestry rule would reach nothing.
+///
+/// So the attach is configuration, in the same shape as `ELLMEPHANT_SUDOERS`:
+///
+/// ```text
+/// ELLMEPHANT_PEN_TREE="james=estate,stet=james,cline=james"
+/// ```
+///
+/// Read at open, idempotent, and NEVER FATAL — a typo costs one refused edge with a named reason, not
+/// an outage.
+pub const TREE_ENV: &str = "ELLMEPHANT_PEN_TREE";
+
+/// A pen's id by NAME, folding case — because everything else does.
+///
+/// The identity table matches claims case-insensitively and `audience::pen()` lowercases for the
+/// audience, so `James` and `james` are ONE pen to every layer above this one. A case-sensitive lookup
+/// here is how a config line (`james=estate`) silently attaches nothing while the store's own pen is
+/// spelled `James` — found by rehearsing the roll, not by reading the code.
+fn pen_id_named(conn: &Connection, name: &str) -> Result<i64> {
+    let mut stmt = conn.prepare("SELECT id, name FROM pen WHERE lower(name) = lower(?1)")?;
+    let rows = stmt.query_map(params![name], |r| r.get::<_, i64>(0))?;
+    let ids: Vec<i64> = rows.collect::<rusqlite::Result<_>>()?;
+    match ids.as_slice() {
+        [] => Err(Error::Invalid(format!("no pen named {name}"))),
+        [one] => Ok(*one),
+        _ => Err(Error::Invalid(format!(
+            "{name} matches more than one pen (case differs): the registry must be repaired first"
+        ))),
+    }
+}
+
+/// Point one pen at a parent, refusing the mistakes that would make the tree a lie.
+pub fn set_parent(conn: &Connection, child: &str, parent: &str) -> Result<()> {
+    let child_id = pen_id_named(conn, child)?;
+    let (_, child_parent, child_ceased) = pen_row_by_id(conn, child_id)?;
+    if child_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{child} has been retired: a tombstone is not re-parented"
+        )));
+    }
+    let parent_id = pen_id_named(conn, parent)?;
+    let (_, _, parent_ceased) = pen_row_by_id(conn, parent_id)?;
+    if parent_ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{parent} has been retired: a ceased pen cannot be a parent"
+        )));
+    }
+    if child_id == parent_id {
+        return Err(Error::Invalid(format!("{child} cannot be its own parent")));
+    }
+    // A cycle would make `is_ancestor` walk forever and the root unnameable.
+    if is_ancestor(conn, child_id, parent_id)? {
+        return Err(Error::Invalid(format!(
+            "{parent} is below {child}: that edge would make the tree a loop"
+        )));
+    }
+    if child_parent == Some(parent_id) {
+        return Ok(()); // already attached: idempotent, and not worth a write
+    }
+    conn.execute(
+        "UPDATE pen SET parent_id = ?2 WHERE id = ?1",
+        params![child_id, parent_id],
+    )?;
+    Ok(())
+}
+
+/// Apply [`TREE_ENV`]. Returns `(attached, rejected)`; the rejections are logged by name.
+pub fn load_tree_at_boot(conn: &Connection) -> (usize, usize) {
+    let Ok(spec) = std::env::var(TREE_ENV) else {
+        return (0, 0);
+    };
+    let mut attached = 0;
+    let mut rejected = 0;
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((child, parent)) = entry.split_once('=') else {
+            tracing::warn!(spec = %entry, "pen tree: expected `child=parent`");
+            rejected += 1;
+            continue;
+        };
+        match set_parent(conn, child.trim(), parent.trim()) {
+            Ok(()) => attached += 1,
+            Err(e) => {
+                tracing::warn!(spec = %entry, error = %e, "pen tree: edge rejected, the rest applied");
+                rejected += 1;
+            }
+        }
+    }
+    tracing::info!(
+        attached,
+        rejected,
+        "pen tree: {attached} edge(s) attached, {rejected} rejected"
+    );
+    (attached, rejected)
 }
 
 /// A pen created at runtime: whoever minted it answered for it, and it answered to them.

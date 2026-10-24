@@ -58,6 +58,11 @@ pub const ROUTES: &[Route] = &[
         tool: "memory_delete",
     },
     Route {
+        method: "GET",
+        path: "/unowned",
+        tool: "memory_unowned",
+    },
+    Route {
         method: "POST",
         path: "/memory/{key}/merge",
         tool: "memory_merge",
@@ -744,6 +749,51 @@ pub async fn memory_get(
     }
 }
 
+/// `GET /unowned` — the rows nobody owns, and why (`memory_unowned`).
+pub async fn unowned(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let limit = params
+        .parse_as::<i64>("limit")
+        .map(|v| v.unwrap_or(50))
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("memory_unowned", reader_from(&headers), move |s| {
+            s.unowned(limit)
+        })
+        .await
+    {
+        Ok(rows) => {
+            let mut out = String::new();
+            for r in &rows {
+                out.push_str(&format!(
+                    "  {}  {:<12} {:<10} {}\n",
+                    r.key, r.why, r.asserted_by, r.created
+                ));
+            }
+            if rows.is_empty() {
+                out.push_str("  (no ownerless rows)\n");
+            }
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&rows).unwrap_or_default(),
+                out,
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
 /// `GET /memory/{key}/backlinks` — incoming `[[…]]` edges (`memory_backlinks`).
 pub async fn backlinks(
     State(state): State<HttpState>,
@@ -1264,10 +1314,17 @@ pub async fn upsert(
     } else {
         memory_patch_text(&String::from_utf8_lossy(&bytes))
     };
-    let patch = match patch {
+    let mut patch = match patch {
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
+    // ★ THE COMMENT ABOVE WAS TRUE AND THE CODE WAS NOT: the parsers return `asserted_by: None` and
+    // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
+    // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
+    // names the pen, and only a PROVEN one is stamped (#109).
+    if patch.asserted_by.is_none() {
+        patch.asserted_by = crate::identity::resolve(&headers).ok().flatten();
+    }
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -1352,10 +1409,13 @@ pub async fn memory_delete(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
+    // nobody to name in the ledger, and `store::delete` will refuse it on a row somebody owns.
+    let pen = crate::identity::resolve(&headers).ok().flatten();
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
-            if !s.rm(&lookup)? {
+            if !s.rm(&lookup, pen.as_deref())? {
                 return Ok(None);
             }
             Ok(Some(s.version_count(&lookup)?))
@@ -1508,8 +1568,12 @@ pub async fn merge(
     };
     let from = key.clone();
     let target = into.clone();
+    // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
+    let pen = crate::identity::resolve(&headers).ok().flatten();
     match server
-        .with_store("memory_merge", move |s| s.merge_into(&from, &target))
+        .with_store("memory_merge", move |s| {
+            s.merge_into(&from, &target, pen.as_deref())
+        })
         .await
     {
         Ok(out) => {
@@ -1826,6 +1890,17 @@ fn stats_text(s: &store::stats::Stats) -> String {
         ("link edges", s.edges.to_string()),
         ("orphans", s.orphans.to_string()),
         ("dangling", s.dangling.to_string()),
+        // Two numbers, because they are two facts that share one value (owner NULL).
+        ("commons", s.commons.to_string()),
+        (
+            "unattributed",
+            match s.unattributed {
+                0 => "0".to_string(),
+                n => format!(
+                    "{n} (no currently existing pen wrote these — no owner, no author; claim them)"
+                ),
+            },
+        ),
         ("visits", s.visits_total.to_string()),
         ("useful", s.useful_total.to_string()),
         (

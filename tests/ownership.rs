@@ -567,3 +567,257 @@ fn a_finger_writes_on_its_parents_rows() {
     assert!(err.is_empty(), "a finger acts as its parent: {err}");
     assert_eq!(owner(&conn, "shared-work").as_deref(), Some("stet"));
 }
+
+// ── REMOVAL IS AN ACT WITH A NAME ────────────────────────────────────────────────────────────────
+// A delete is a write of absence: it takes the same reach as an edit, and it leaves a record. A
+// removal nobody is named for is indistinguishable from a mistake.
+
+#[test]
+fn a_peer_may_not_delete_another_pens_row() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    let err = store::delete(&conn, "stets-note", Some("cline")).expect_err("a sibling is refused");
+    assert!(format!("{err}").contains("may not write"), "{err}");
+    assert!(
+        store::get(&conn, "stets-note").unwrap().is_some(),
+        "a refused delete removes nothing"
+    );
+}
+
+#[test]
+fn deleting_leaves_a_named_ledger_entry() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    assert!(store::delete(&conn, "stets-note", Some("stet")).expect("owner may delete"));
+    assert!(store::get(&conn, "stets-note").unwrap().is_none());
+
+    let events = store::pen_events(&conn, "stets-note").unwrap();
+    let delete = events
+        .iter()
+        .find(|e| e.1 == "delete")
+        .expect("the ledger keeps what happened even though the row is gone");
+    assert_eq!(delete.4.as_deref(), Some("stet"), "who removed it");
+    assert_eq!(delete.2.as_deref(), Some("stet"), "what it was before");
+    assert_eq!(
+        delete.3, None,
+        "and nothing took it on: a removal has no heir"
+    );
+}
+
+#[test]
+fn an_ancestor_may_delete_and_the_record_says_so() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+
+    assert!(store::delete(&conn, "stets-note", Some("james")).expect("an ancestor reaches down"));
+    let events = store::pen_events(&conn, "stets-note").unwrap();
+    let delete = events
+        .iter()
+        .find(|e| e.1 == "delete")
+        .expect("delete event");
+    assert_eq!(
+        delete.4.as_deref(),
+        Some("james"),
+        "the actor is the pen that did it, not the pen that owned it"
+    );
+    assert_eq!(delete.2.as_deref(), Some("stet"), "the row was stet's");
+}
+
+#[test]
+fn a_commons_row_may_be_removed_by_anyone() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "everyones", "stet");
+    store::disclaim(&conn, "everyones", "stet", false).expect("disclaim");
+
+    assert!(store::delete(&conn, "everyones", Some("cline")).expect("the commons is anyone's"));
+}
+
+#[test]
+fn stats_separate_the_commons_from_the_unattributed() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A released row: no owner, but the author is NAMED. That is the commons, and a decision.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // A row with no author at all — what the HTTP door produced for every write until 2026-10-23.
+    // Nobody is answerable AND nobody is named: a bug, and it must not be counted as a commons.
+    // `asserted_by` is NOT NULL and defaults to `anonymous`, so "nobody is named" is spelled with
+    // the reserved word rather than NULL — which is what makes the two cases separable at all.
+    conn.execute(
+        "INSERT INTO memory (key, title, body, created, updated, audience)
+         VALUES ('ghost', 'a ghost', 'no author', datetime('now'), datetime('now'), 'public')",
+        [],
+    )
+    .unwrap();
+
+    let stats = store::stats::compute(&conn).expect("stats");
+    assert_eq!(stats.commons, 1, "one released row, author still named");
+    assert_eq!(
+        stats.unattributed, 1,
+        "one row nobody wrote and nobody owns"
+    );
+}
+
+#[test]
+fn a_deletion_of_an_owned_row_records_a_retire_in_effect() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "owned-note", "stet");
+
+    // Stet's rule: "delete for what has no owner, retire for what has one — and if an owned row is
+    // deleted it needs a ledger row anyway, at which point it IS a retire". This is that ledger row.
+    assert!(store::delete(&conn, "owned-note", Some("stet")).expect("delete"));
+    let events = store::pen_events(&conn, "owned-note").unwrap();
+    let entry = events
+        .iter()
+        .find(|e| e.1 == "delete")
+        .expect("a ledger row");
+    assert_eq!(entry.2.as_deref(), Some("stet"), "who held it");
+    assert_eq!(entry.4.as_deref(), Some("stet"), "who ended it");
+}
+
+#[test]
+fn the_ownerless_rows_can_be_listed_not_only_counted() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // Disclaimed BY CHOICE — what an ancestor does to a retiring descendant's rows when it does not
+    // want them. The author stays named; nobody owns it. A supported state, not damage.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // No author at all: a write made with no pen, or a pen that is gone.
+    conn.execute(
+        "INSERT INTO memory (key, title, body, created, updated, audience)
+         VALUES ('unwitnessed', 't', 'b', datetime('now'), datetime('now'), 'public')",
+        [],
+    )
+    .unwrap();
+
+    let rows = store::unowned(&conn, &store::audience::Reader::everything(), 50).expect("list");
+    assert_eq!(rows.len(), 2);
+    let by_key: std::collections::HashMap<_, _> =
+        rows.iter().map(|r| (r.key.as_str(), r)).collect();
+
+    let released = by_key["released"];
+    assert_eq!(
+        released.why, "disclaimed",
+        "released by a pen, author still named"
+    );
+    assert_eq!(released.asserted_by, "stet");
+
+    let unwitnessed = by_key["unwitnessed"];
+    assert_eq!(
+        unwitnessed.why, "unrecorded",
+        "no currently existing pen wrote it"
+    );
+    assert_eq!(unwitnessed.asserted_by, "anonymous");
+
+    // And the listing is the point: a claimer needs the ADDRESS, not the total.
+    assert!(
+        rows.iter()
+            .all(|r| !r.key.is_empty() && !r.created.is_empty())
+    );
+}
+
+#[test]
+fn the_unowned_listing_obeys_the_audience_tier() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A public ownerless row: visible to anyone, as the commons should be.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // A PRIVATE row that is also ownerless — the case the first version of this listing would have
+    // leaked: nobody owns it, but it is still addressed to one pen.
+    row(&conn, &embedder, "secret", "stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet', owner = NULL WHERE key = 'secret'",
+        [],
+    )
+    .unwrap();
+
+    let anon = store::unowned(&conn, &store::audience::Reader::anonymous(), 50).expect("list");
+    let keys: Vec<&str> = anon.iter().map(|r| r.key.as_str()).collect();
+    assert!(
+        keys.contains(&"released"),
+        "the commons is anybody's: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"secret"),
+        "a private row's ADDRESS is not the commons: {keys:?}"
+    );
+
+    let owner = store::unowned(&conn, &store::audience::Reader::pen("stet"), 50).expect("list");
+    let keys: Vec<&str> = owner.iter().map(|r| r.key.as_str()).collect();
+    assert!(keys.contains(&"secret"), "its own pen may see it: {keys:?}");
+}
+
+// ── ABSENCE, APPLIED TO DESTRUCTION (final adversarial pass) ─────────────────────────────────────
+// The private tier's law is "absence, not refusal". Two destructive paths were answering as oracles
+// instead: a DELETE said "owned by stet" for a row the caller could not read, and a MERGE deleted the
+// source without asking anyone's leave.
+
+#[test]
+fn destroying_an_invisible_private_row_answers_as_if_it_never_existed() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-secret", "stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet' WHERE key = 'stets-secret'",
+        [],
+    )
+    .unwrap();
+
+    // cline is a PEER: the row does not exist for it, so the refusal must not confirm it does.
+    let err = store::delete(&conn, "stets-secret", Some("cline")).unwrap_err();
+    assert!(
+        format!("{err}").contains("no such memory"),
+        "an invisible row must answer as absent, not report its owner: {err}"
+    );
+    // …and it is still there.
+    assert!(store::get(&conn, "stets-secret").unwrap().is_some());
+
+    // Its owner, and its ancestor, still reach it.
+    assert!(store::delete(&conn, "stets-secret", Some("stet")).is_ok());
+}
+
+#[test]
+fn a_merge_is_a_delete_and_is_gated_like_one() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+    row(&conn, &embedder, "clines-note", "cline");
+    row(&conn, &embedder, "stets-other", "stet");
+
+    // A peer may not destroy stet's row by "merging" it into its own.
+    let err =
+        store::links::merge_into(&conn, "stets-note", "clines-note", Some("cline")).unwrap_err();
+    assert!(
+        format!("{err}").contains("may not write") || format!("{err}").contains("no such memory"),
+        "a merge is a delete and needs the same reach: {err}"
+    );
+    assert!(
+        store::get(&conn, "stets-note").unwrap().is_some(),
+        "the source survives"
+    );
+
+    // Its owner may — into its OWN row. Merging into a peer's row would rewrite the peer's body, so
+    // `into` is gated too, and that refusal is the second half of the same rule.
+    let err =
+        store::links::merge_into(&conn, "stets-note", "clines-note", Some("stet")).unwrap_err();
+    assert!(
+        format!("{err}").contains("may not write"),
+        "the survivor is somebody else's: {err}"
+    );
+    assert!(store::links::merge_into(&conn, "stets-note", "stets-other", Some("stet")).is_ok());
+}

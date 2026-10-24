@@ -217,8 +217,13 @@ impl Session {
     /// fold is the caller's — this never touches `into`'s body. No encoder: the graph is not
     /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch
     /// behind `memory_upsert`.)
-    pub fn merge_into(&self, from: &str, into: &str) -> Result<links::MergeInto> {
-        links::merge_into(&self.conn, from, into)
+    pub fn merge_into(
+        &self,
+        from: &str,
+        into: &str,
+        acted_by: Option<&str>,
+    ) -> Result<links::MergeInto> {
+        links::merge_into(&self.conn, from, into, acted_by)
     }
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
@@ -250,9 +255,17 @@ impl Session {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
+    /// Rows nobody owns, newest first — the list behind the counts, filtered by this session's reader.
+    pub fn unowned(&self, limit: i64) -> Result<Vec<store::Unowned>> {
+        store::unowned(&self.conn, &self.reader, limit)
+    }
+
     /// Delete one memory by key; `false` means there was nothing to delete.
-    pub fn rm(&self, key: &str) -> Result<bool> {
-        store::delete(&self.conn, key)
+    ///
+    /// `acted_by` is the proven pen the door is acting for: a delete is a write of absence, so it
+    /// takes the same reach as an edit and leaves a ledger row saying who removed it.
+    pub fn rm(&self, key: &str, acted_by: Option<&str>) -> Result<bool> {
+        store::delete(&self.conn, key, acted_by)
     }
 
     /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying

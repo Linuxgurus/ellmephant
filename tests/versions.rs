@@ -94,7 +94,7 @@ fn history_survives_a_delete_so_erasure_is_a_policy() -> Result<()> {
     common::add_now(&conn, &embedder, &memory("gone", "Title", "second"))?;
     assert_eq!(count(&conn, "SELECT count(*) FROM memory_version"), 1);
 
-    assert!(store::delete(&conn, "gone")?);
+    assert!(store::delete(&conn, "gone", None)?);
     assert_eq!(count(&conn, "SELECT count(*) FROM memory"), 0);
 
     // No FK on the version table, so history OUTLIVES the row. That is deliberate: the evidence of
@@ -131,7 +131,7 @@ fn the_index_finds_history_whose_row_is_gone() -> Result<()> {
     common::add_now(&conn, &embedder, &memory("kept", "Kept", "second"))?;
     common::add_now(&conn, &embedder, &memory("gone", "Gone", "first"))?;
     common::add_now(&conn, &embedder, &memory("gone", "Gone", "second"))?;
-    assert!(store::delete(&conn, "gone")?);
+    assert!(store::delete(&conn, "gone", None)?);
 
     let idx = store::version::index(&conn)?;
     assert_eq!(idx.len(), 2, "two keys hold history");

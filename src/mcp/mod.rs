@@ -42,6 +42,7 @@ use crate::store::{self, project};
 /// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
     "whoami",
+    "memory_unowned",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -514,6 +515,16 @@ pub struct KeyParams {
     /// The memory's key.
     #[schemars(description = "Memory key. Slug.")]
     pub key: String,
+}
+
+/// `memory_unowned` — how many rows nobody owns, and WHICH (Stet, review of #122).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnownedParams {
+    /// How many rows to list.
+    #[schemars(description = "Maximum rows to list, newest first. Default 50.")]
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1531,6 +1542,33 @@ impl MemoryServer {
         Ok(json_ok(body))
     }
 
+    /// WHICH rows have no owner — the list behind `memory_stats`' two counts.
+    #[tool(
+        name = "memory_unowned",
+        description = "List the rows nobody owns, newest first, with WHY each is ownerless: `disclaimed` (somebody released it — the author is still named, and this is a supported, deliberate state: retiring a descendant can disclaim its rows) or `unrecorded` (no currently existing pen is named as author at all — either a write made with no pen, or a pen that is gone). These are the rows an owner can CLAIM: anyone may adopt an ownerless row. Use it after `memory_stats` says how many; a count without a list gets quoted and never acted on.",
+        annotations(
+            title = "Rows nobody owns",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_unowned(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<UnownedParams>,
+    ) -> std::result::Result<String, String> {
+        // An ownerless row is a row, so the audience tier applies exactly as it does to a search hit.
+        let reader = reader_of(&ctx, self.declared.as_deref());
+        let limit = p.limit.unwrap_or(50).clamp(1, 500);
+        let rows = self
+            .with_read("memory_unowned", reader, move |s| s.unowned(limit))
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&rows).map_err(|e| e.to_string())?,
+        ))
+    }
+
     /// Store one atomic memory; upserts by key. See the description for the write law.
     #[tool(
         name = "memory_upsert",
@@ -1598,14 +1636,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
             .with_store("memory_delete", move |s| {
-                if !s.rm(&rm_key)? {
+                if !s.rm(&rm_key, Some(&pen))? {
                     return Ok(None);
                 }
                 Ok(Some(s.version_count(&rm_key)?))
@@ -1643,13 +1681,16 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        // A merge DESTROYS the source, so it is signed like any other write.
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
-            .with_store("memory_merge", move |s| s.merge_into(&from, &into))
+            .with_store("memory_merge", move |s| {
+                s.merge_into(&from, &into, Some(&pen))
+            })
             .await?;
         tracing::info!(
             tool = "memory_merge",

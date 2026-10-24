@@ -315,7 +315,7 @@ fn a_delete_moves_the_vector_to_the_tombstone_index() {
     common::settle(&conn, &embedder);
     assert!(vec::get(&conn, id).expect("get").is_some(), "indexed");
 
-    assert!(store::delete(&conn, "gone").expect("delete"));
+    assert!(store::delete(&conn, "gone", None).expect("delete"));
 
     assert!(
         vec::get(&conn, id).expect("get").is_none(),
@@ -488,7 +488,7 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
         "no tombstones before a delete"
     );
 
-    assert!(store::delete(&conn, "buried").expect("delete"));
+    assert!(store::delete(&conn, "buried", None).expect("delete"));
 
     // The LIVE index no longer answers, and the vector count says so.
     assert_eq!(

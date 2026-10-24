@@ -43,6 +43,15 @@ pub struct Stats {
     pub title_chars: i64,
     /// Memories carrying a `source`.
     pub with_source: i64,
+    /// Rows with NO owner because somebody released them: `owner IS NULL` but `asserted_by` names a
+    /// pen. This is the commons, and anyone may write or adopt.
+    pub commons: i64,
+    /// Rows with no owner and no author among the pens that exist: `asserted_by` is `anonymous`, which
+    /// means **no currently existing pen wrote this** (James) — the store cannot tell "nobody wrote it"
+    /// from "a pen that is gone wrote it", and should not pretend to. Some of these are a WRITE BUG
+    /// (the HTTP door did not stamp `asserted_by` until 2026-10-23); all of them need an owner to
+    /// CLAIM them rather than being silently granted to everyone (Stet, review of #122).
+    pub unattributed: i64,
     /// Total tag placements (the sum of the per-tag counts).
     pub tag_assignments: i64,
     /// Distinct tags.
@@ -189,6 +198,21 @@ pub fn compute_seen(conn: &Connection, reader: &crate::store::audience::Reader) 
             })?,
         )
     };
+    // ★ "NOBODY OWNS IT" AND "NOBODY IS NAMED" ARE DIFFERENT FACTS that share one value (`owner`
+    // NULL). A disclaimed row keeps its `asserted_by`, so the two are separable without a new column
+    // — and a report that merged them would call a bug a commons.
+    let (commons, unattributed): (i64, i64) = conn.query_row(
+        "SELECT sum(CASE WHEN lower(trim(asserted_by)) NOT IN ('', 'anonymous') THEN 1 ELSE 0 END),
+                sum(CASE WHEN lower(trim(asserted_by)) IN ('', 'anonymous') THEN 1 ELSE 0 END)
+           FROM memory WHERE owner IS NULL",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
+        },
+    )?;
     let db_bytes = conn.path().map(|p| disk_bytes(Path::new(p))).unwrap_or(0);
     let memories: i64 = conn.query_row(
         &format!("SELECT count(*) FROM memory WHERE {pred}"),
@@ -393,6 +417,8 @@ pub fn compute_seen(conn: &Connection, reader: &crate::store::audience::Reader) 
         versions,
         version_bytes,
         version_orphans,
+        commons,
+        unattributed,
     })
 }
 
@@ -517,6 +543,8 @@ mod tests {
             versions: 0,
             version_bytes: 0,
             version_orphans: 0,
+            commons: 0,
+            unattributed: 0,
         }
     }
 

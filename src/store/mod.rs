@@ -1027,6 +1027,23 @@ pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<M
     if name.is_empty() {
         return Err(Error::Invalid("a pen needs a name".into()));
     }
+    // ★ THE RESERVED WORD IS NOT A NAME (found reviewing #123). `anonymous` means "no currently
+    // existing pen wrote this", so minting a pen by that name would make every unattributed count
+    // ambiguous again — the defect 0021 and 0025 exist to remove.
+    if name.eq_ignore_ascii_case(crate::identity::ANONYMOUS) {
+        return Err(Error::Invalid(format!(
+            "`{name}` is reserved: it means NO currently existing pen, so it can never be one"
+        )));
+    }
+    // ★ AND A NAME MUST BE ADDRESSABLE. A private row's audience is `pen:<name>`, and an audience
+    // containing a comma is refused on write — so a pen whose name holds one could never hold a
+    // private row, and nobody would learn that until the first private write failed.
+    if name.contains(',') || name.chars().any(char::is_whitespace) {
+        return Err(Error::Invalid(format!(
+            "{name} cannot be a pen name: audiences are `pen:<name>`, and a comma or a space cannot be \
+             addressed"
+        )));
+    }
     if let Some((_, _, ceased_at)) = conn
         .query_row(
             "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",

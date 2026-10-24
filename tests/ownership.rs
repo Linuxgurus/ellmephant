@@ -743,3 +743,25 @@ fn a_fingers_work_is_its_hands_and_retirement_moves_it() {
         "the pen is disposed of; the work stays where it was"
     );
 }
+
+#[test]
+fn a_pen_cannot_be_named_anonymous_or_given_an_unaddressable_name() {
+    let (_dir, conn) = subtree();
+
+    // `anonymous` is the store's word for "no currently existing pen". A pen by that name would make
+    // every unattributed count ambiguous — the defect 0021/0025 remove.
+    for name in ["anonymous", "ANONYMOUS", " anonymous "] {
+        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "{name}: {err}");
+    }
+
+    // A private row's audience is `pen:<name>`; a comma or a space cannot be addressed there, so the
+    // pen could never hold one — and nobody would find out until the first private write failed.
+    for name in ["stet/finger,1", "stet finger"] {
+        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
+        assert!(format!("{err}").contains("addressed"), "{name}: {err}");
+    }
+
+    // And a name that can be addressed still works.
+    store::mint(&conn, "stet", "stet/finger-9f3a1c", "finger").expect("a good name");
+}

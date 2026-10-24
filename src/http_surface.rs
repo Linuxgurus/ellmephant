@@ -54,6 +54,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/pen/mint",
+        tool: "pen_mint",
+    },
+    Route {
+        method: "POST",
         path: "/memory",
         tool: "memory_upsert",
     },
@@ -614,6 +619,73 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| format!("bad json body: {e}"))
+}
+
+/// `POST /pen/mint` — create a pen under this request's pen (`pen_mint`).
+pub async fn pen_mint(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    // A mint is a WRITE: the caller is the parent, and an unproven caller is nobody.
+    let caller = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "refused: minting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+            );
+        }
+        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        name: String,
+        kind: String,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("pen_mint", move |s| s.mint(&caller, &ask.name, &ask.kind))
+        .await
+    {
+        Ok(minted) => {
+            tracing::info!(
+                area = scope.area,
+                pen = %minted.name,
+                parent = %minted.parent,
+                "pen minted over http"
+            );
+            let value = serde_json::to_value(&minted).unwrap_or(serde_json::Value::Null);
+            render(
+                StatusCode::CREATED,
+                json,
+                value.to_string(),
+                format!(
+                    "minted {} ({}) under {}\n",
+                    minted.name, minted.kind, minted.parent
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
 }
 
 /// `GET /whois/{pen}` — one pen and what it is to this request's pen (`whois`).

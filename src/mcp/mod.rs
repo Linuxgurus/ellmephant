@@ -44,6 +44,7 @@ pub const TOOLS: &[&str] = &[
     "whoami",
     "memory_unowned",
     "whois",
+    "pen_mint",
     "memory_upsert",
     "memory_delete",
     "memory_merge",
@@ -533,6 +534,22 @@ pub struct WhoisParams {
     /// The pen to look up.
     #[schemars(description = "Pen name. Slug. `whoami` reports your own.")]
     pub pen: String,
+}
+
+/// `pen_mint` — the pen to create, and what kind of thing it is.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MintParams {
+    /// The new pen's name — an address the minter chooses, and the store keeps forever.
+    #[schemars(
+        description = "Name of the pen to create. A name is SPENT once minted: a retired pen keeps its name, so a minting parent must generate a unique one (a hash suffix is the obvious way: `finger-9f3a1c`)."
+    )]
+    pub name: String,
+    /// `self` or `finger`.
+    #[schemars(
+        description = "`finger` for a mechanism a hand uses for one job, `self` for something that stands as itself. Never inferred from the name: a slash proves nothing."
+    )]
+    pub kind: String,
 }
 
 /// Parameters for [`MemoryServer::memory_get`].
@@ -1597,6 +1614,36 @@ impl MemoryServer {
             .await?;
         Ok(json_ok(
             serde_json::to_value(&facts).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// CREATE a pen under this one — the runtime door (James, 2026-10-23).
+    #[tool(
+        name = "pen_mint",
+        description = "Create a pen under the CALLER. The parent is the pen that calls, never an argument: you may create downward, never sideways and never upward, because parentage is the grant. A hand mints a finger; `estate`'s children come from provisioning, which is a different door. Returns the new pen's name, kind and parent. `kind` is `self` or `finger` and is never inferred from the name. ★ A NAME IS SPENT: a retired pen keeps its row and its name, so minting over a dead name is refused with the retirement time — generate a unique name (e.g. `finger-9f3a1c`).",
+        annotations(
+            title = "Mint a pen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pen_mint(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MintParams>,
+    ) -> std::result::Result<String, String> {
+        // A mint is a WRITE: it needs a pen, and the pen is the parent.
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let name = p.name;
+        let kind = p.kind;
+        let minted = self
+            .with_store("pen_mint", move |s| s.mint(&caller, &name, &kind))
+            .await?;
+        tracing::info!(tool = "pen_mint", pen = %minted.name, kind = %minted.kind, parent = %minted.parent, "pen minted");
+        Ok(json_ok(
+            serde_json::to_value(&minted).map_err(|e| e.to_string())?,
         ))
     }
 
@@ -2889,6 +2936,7 @@ pub fn http_router(
         .route("/health", axum::routing::get(crate::http::health))
         .route("/whoami", axum::routing::get(surface::whoami))
         .route("/whois/{pen}", axum::routing::get(surface::whois))
+        .route("/pen/mint", axum::routing::post(surface::pen_mint))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))

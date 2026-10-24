@@ -1355,3 +1355,48 @@ fn the_case_folded_index_is_built_once_the_table_is_clean() {
         "a case-colliding INSERT must be refused by the trigger"
     );
 }
+
+// ── A HELD SESSION IS AUTHORITY THE CHECKS CAN SEE (2026-10-24) ──────────────────────────────────
+// Before this, `active_sudo` was a ledger nothing consulted: a pen could hold the estate for an hour and
+// still be refused every row outside its own branch. Found by running the verbs live and watching them
+// change nothing.
+
+#[test]
+fn holding_a_session_reaches_the_powerful_pens_rows_and_stops_when_released() {
+    let (_dir, conn) = subtree();
+    // The PRODUCTION shape (James, 2026-10-24): estate → (james → cline, stet → …). `subtree()` still
+    // builds the older one; moved here so the test is about the live tree, where stet is cline's UNCLE.
+    store::set_parent(&conn, "stet", "estate").unwrap();
+    let embedder = HashEmbedder::new(DIM);
+    // A private row deep in stet's branch: cline is stet's NEPHEW, so it cannot see it.
+    registry(&conn, "stets-hand", Some("stet"));
+    row(&conn, &embedder, "stets-private", "stets-hand");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stets-hand',
+                           owner = (SELECT id FROM pen WHERE name = 'stets-hand')
+          WHERE key = 'stets-private'",
+        [],
+    )
+    .unwrap();
+
+    let sees = |who: &str| {
+        ellmephant::store::audience::Reader::pen(who)
+            .in_tree(&conn)
+            .with_borrowed(&conn)
+            .sees("pen:stets-hand")
+    };
+    assert!(!sees("cline"), "with no session, a nephew is refused");
+    assert!(
+        !sees("james"),
+        "and so is an uncle-of-nobody: james is not an ancestor of stet"
+    );
+
+    // James borrows the estate (a policy is required for sudo).
+    store::sudo::grant(&conn, "estate", "james", 60, "test").unwrap();
+    store::sudo::sudo(&conn, "james", "estate", 30).unwrap();
+    assert!(sees("james"), "holding the estate reaches every branch");
+
+    // Released: the reach stops with the row, not with a cache.
+    store::sudo::release(&conn, "james", "estate").unwrap();
+    assert!(!sees("james"), "released means released");
+}

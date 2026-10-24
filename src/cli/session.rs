@@ -146,7 +146,8 @@ impl Session {
         // ★ PARENTAGE IS THE GRANT, resolved at use (#109): the reader reaches down into its own
         // subtree, so an ancestor may read what a descendant addressed to itself — the doctor's
         // licence, and what makes cluster-wide hygiene possible without being the author.
-        let reader = reader.in_tree(&conn);
+        // …and a held session widens it to the pen being borrowed, for as long as the row says so.
+        let reader = reader.in_tree(&conn).with_borrowed(&conn);
         Ok(Self {
             paths: paths.clone(),
             cfg,

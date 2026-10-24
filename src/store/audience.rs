@@ -147,6 +147,42 @@ impl Reader {
         self
     }
 
+    /// ★ A HELD SESSION IS REACH (2026-10-24). A pen holding `powerful` for a while reads what
+    /// `powerful` reads — the whole point of borrowing the root, and the reason `active_sudo` stops being
+    /// a ledger nothing consults. Resolved at use, like [`Reader::in_tree`]: a released, expired or
+    /// revoked session stops answering on the next read, and nothing is cached in the reader.
+    ///
+    /// A failure leaves the reader NARROW — a store whose sessions cannot be read is not a store where
+    /// anyone's extra reach may be assumed.
+    pub fn with_borrowed(mut self, conn: &rusqlite::Connection) -> Self {
+        let Some(p) = self.pen.clone() else {
+            return self;
+        };
+        let me = p.strip_prefix(PEN).unwrap_or(&p).to_string();
+        // `active_sudo.weak`/`.powerful` are pen IDS, not names — the join is the point.
+        let sql = "WITH RECURSIVE sub(id) AS (
+                       SELECT s.powerful
+                         FROM active_sudo s JOIN pen w ON w.id = s.weak
+                        WHERE lower(w.name) = lower(?1)
+                          AND s.expires_at > datetime('now')
+                       UNION
+                       SELECT c.id FROM pen c JOIN sub s ON c.parent_id = s.id
+                   )
+                   SELECT DISTINCT 'pen:' || lower(p.name) FROM pen p JOIN sub s ON p.id = s.id";
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return self;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params![me], |r| r.get::<_, String>(0)) else {
+            return self;
+        };
+        for row in rows.flatten() {
+            if Some(&row) != self.pen.as_ref() && !self.down.contains(&row) {
+                self.down.push(row);
+            }
+        }
+        self
+    }
+
     /// How many descendant addresses this reader reaches down into (0 for a leaf).
     pub fn down(&self) -> usize {
         self.down.len()

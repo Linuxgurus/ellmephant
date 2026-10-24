@@ -20,6 +20,13 @@ pub enum Error {
 
     #[error("no such memory: {0}")]
     NotFound(String),
+    /// The row EXISTS and the caller may not do this to it. Distinct from [`Error::NotFound`] on
+    /// purpose (James, 2026-10-24): telling an agent *"no such memory"* when the memory is there and
+    /// the caller simply lacks the reach is a lie that costs it a debugging session. Reads keep the
+    /// absence rule — a read must not confirm a row it may not see — but a WRITE says plainly that
+    /// the answer is no.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     /// A write the store refuses: a field that may not be empty, or a create missing its minimum.
     /// The message is written to be read by the caller — it says what to do instead.

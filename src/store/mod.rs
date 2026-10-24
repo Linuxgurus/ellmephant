@@ -688,9 +688,11 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
 /// [`owner_pen_id`]: a finger acts as itself but owns as its parent.
 fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
     Ok(conn
-        .query_row("SELECT id FROM pen WHERE name = ?1", params![name], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM pen WHERE lower(name) = lower(?1)",
+            params![name],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
@@ -1120,7 +1122,7 @@ fn pen_row_by_id(conn: &Connection, id: i64) -> Result<(i64, Option<i64>, Option
 
 fn pen_row(conn: &Connection, name: &str) -> Result<(i64, Option<i64>, Option<String>)> {
     conn.query_row(
-        "SELECT id, parent_id, ceased_at FROM pen WHERE name = ?1",
+        "SELECT id, parent_id, ceased_at FROM pen WHERE lower(name) = lower(?1)",
         params![name],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
@@ -1147,22 +1149,44 @@ pub const TREE_ENV: &str = "ELLMEPHANT_PEN_TREE";
 ///
 /// The identity table matches claims case-insensitively and `audience::pen()` lowercases for the
 /// audience, so `James` and `james` are ONE pen to every layer above this one. A case-sensitive lookup
-/// here is how a config line (`james=estate`) silently attaches nothing while the store's own pen is
-/// spelled `James` — found by rehearsing the roll, not by reading the code.
+/// is how a config line (`james=estate`) silently attaches nothing while the store's own pen is spelled
+/// `James` — found by rehearsing the roll, not by reading the code. Since migration 0027 the registry
+/// cannot hold two names that differ only in case, so this can no longer be ambiguous.
 fn pen_id_named(conn: &Connection, name: &str) -> Result<i64> {
-    let mut stmt = conn.prepare("SELECT id, name FROM pen WHERE lower(name) = lower(?1)")?;
-    let rows = stmt.query_map(params![name], |r| r.get::<_, i64>(0))?;
-    let ids: Vec<i64> = rows.collect::<rusqlite::Result<_>>()?;
-    match ids.as_slice() {
-        [] => Err(Error::Invalid(format!("no pen named {name}"))),
-        [one] => Ok(*one),
-        _ => Err(Error::Invalid(format!(
-            "{name} matches more than one pen (case differs): the registry must be repaired first"
-        ))),
+    Ok(pen_row(conn, name)?.0)
+}
+
+/// ★ THE INDEX IS THE FAST PATH, NOT THE GUARANTEE (migration 0027 holds the triggers). Created here,
+/// guarded, because a unique index REFUSES to be built over a store that already holds a case-collision
+/// — and a store that will not open is worse than one with a warning in it. When the table is clean this
+/// is one statement; when it is not, the collision is NAMED and left for a human, and the triggers still
+/// refuse every new write.
+pub fn ensure_name_uniqueness(conn: &Connection) -> Result<()> {
+    let collisions: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT group_concat(name, ' / ') FROM pen GROUP BY lower(name) HAVING count(*) > 1",
+        )?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if collisions.is_empty() {
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS pen_name_nocase ON pen(lower(name))",
+            [],
+        )?;
+    } else {
+        tracing::warn!(
+            collisions = %collisions.join("; "),
+            "pen names collide regardless of case: new writes are refused, and a human must decide which row answers"
+        );
     }
+    Ok(())
 }
 
 /// Point one pen at a parent, refusing the mistakes that would make the tree a lie.
+///
+/// The DELIBERATE act: it overwrites whatever the table says. The seed ([`seed_parent`]) only fills a
+/// blank; a human or a verb that means it calls this.
 pub fn set_parent(conn: &Connection, child: &str, parent: &str) -> Result<()> {
     let child_id = pen_id_named(conn, child)?;
     let (_, child_parent, child_ceased) = pen_row_by_id(conn, child_id)?;
@@ -1333,6 +1357,30 @@ pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<M
     // ★ AND A NAME MUST BE ADDRESSABLE. A private row's audience is `pen:<name>`, and an audience
     // containing a comma is refused on write — so a pen whose name holds one could never hold a
     // private row, and nobody would learn that until the first private write failed.
+    // ★ CASE-INSENSITIVE, CASE-PRESERVING (James, 2026-10-24; migration 0027). The trigger enforces it,
+    // but a constraint abort names the index, not the pen — and the useful sentence is "that name is
+    // already taken, spelled like this".
+    if let Some((existing, ceased)) = conn
+        .query_row(
+            "SELECT name, ceased_at FROM pen WHERE lower(name) = lower(?1)",
+            params![name],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    {
+        // A RETIRED pen's name has its own, better refusal ("spent") further down; this one is about the
+        // live collision the schema cannot see.
+        if ceased.is_some() {
+            return Err(Error::Invalid(format!(
+                "`{name}` is already a pen, spelled `{existing}`, and it has been retired: a name is \
+                 spent — two lives under one name make every ledger row ambiguous"
+            )));
+        }
+        return Err(Error::Invalid(format!(
+            "`{name}` is already a pen, spelled `{existing}`: names are unique regardless of case, and the \
+             spelling is preserved rather than folded"
+        )));
+    }
     if name.contains(',') || name.chars().any(char::is_whitespace) {
         return Err(Error::Invalid(format!(
             "{name} cannot be a pen name: audiences are `pen:<name>`, and a comma or a space cannot be \
@@ -1423,6 +1471,12 @@ pub fn may_act_as(conn: &Connection, proven: &str, claimed: &str) -> Result<()> 
 /// Count what retiring `pen` would touch. Read-only; safe to call before deciding.
 pub fn retire_preview(conn: &Connection, pen: &str) -> Result<RetirePreview> {
     let (id, parent_id, _) = pen_row(conn, pen)?;
+    // ★ THE STORED SPELLING, NOT THE ARGUMENT (migration 0027). Lookups fold case, so `james` finds the
+    // pen spelled `James` — and a preview that echoes what you typed is a preview of the wrong row.
+    let stored: String =
+        conn.query_row("SELECT name FROM pen WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })?;
     let rows: i64 = conn.query_row(
         "SELECT count(*) FROM memory WHERE owner = ?1",
         params![id],
@@ -1442,7 +1496,7 @@ pub fn retire_preview(conn: &Connection, pen: &str) -> Result<RetirePreview> {
         None => None,
     };
     Ok(RetirePreview {
-        pen: pen.to_string(),
+        pen: stored,
         parent,
         rows,
         private_rows,

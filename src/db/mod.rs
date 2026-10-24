@@ -36,6 +36,8 @@ pub fn open_with(paths: &Paths, cfg: &crate::config::Config) -> Result<Connectio
     // ★ THE TREE IS CONFIGURATION, loaded the same way (2026-10-24): a fresh store's pens are NAMES
     // until somebody attaches them, and no door can.
     crate::store::load_tree_at_boot(&conn);
+    // Case-folded uniqueness: the index when the table is clean, a named warning when it is not.
+    crate::store::ensure_name_uniqueness(&conn)?;
     // ★ RETENTION THAT ACTUALLY RUNS (found reviewing #129). `audit::prune` existed and nothing called
     // it, which makes "retention is enforced" a sentence rather than a fact. Pruning at open costs one
     // DELETE on boot and needs no bell; a table that grows forever is a second store nobody maintains.

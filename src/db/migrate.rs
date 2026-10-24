@@ -140,6 +140,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0026_read_audit.sql"),
         "`private_read`: a read that crosses a boundary is RECORDED, not merely allowed (#129, half of #120)",
     ),
+    (
+        27,
+        include_str!("../../migrations/0027_pen_name_nocase.sql"),
+        "pen names are unique CASE-INSENSITIVELY while keeping their spelling — `James` and `james` are one pen",
+    ),
 ];
 
 /// Current schema version recorded in the file.

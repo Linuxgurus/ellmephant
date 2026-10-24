@@ -1300,3 +1300,58 @@ fn a_seed_attaches_a_bare_pen_and_agrees_when_repeated() {
         store::Seeded::Already
     );
 }
+
+// ── CASE: INSENSITIVE, PRESERVING (James, 2026-10-24) ────────────────────────────────────────────
+// The identity table matches claims with `eq_ignore_ascii_case` and `audience::pen()` lowercases, so every
+// layer above treats `James` and `james` as one pen. The table must agree, or the row you authenticated as
+// need not be the row that owns your memories.
+
+#[test]
+fn a_second_pen_differing_only_in_case_cannot_be_minted() {
+    let (_dir, conn) = subtree();
+    let err = store::mint(&conn, "estate", "JAMES", "self").unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("case"),
+        "the refusal should NAME the reason, not be a bare constraint error: {err}"
+    );
+}
+
+#[test]
+fn lookups_fold_case_and_the_spelling_is_preserved() {
+    let (_dir, conn) = subtree();
+    registry(&conn, "MixedCase", None);
+    // `retire_preview` goes through `pen_row`, which is the lookup every verb uses.
+    let preview = store::retire_preview(&conn, "mixedcase").expect("a folded lookup finds the row");
+    assert_eq!(preview.pen, "MixedCase", "and reports the stored spelling");
+    let spelling: String = conn
+        .query_row(
+            "SELECT name FROM pen WHERE lower(name) = 'mixedcase'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(spelling, "MixedCase", "the stored spelling is untouched");
+}
+
+#[test]
+fn the_case_folded_index_is_built_once_the_table_is_clean() {
+    let (_dir, conn) = subtree();
+    store::ensure_name_uniqueness(&conn).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'pen_name_nocase'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "the index exists on a clean table");
+    // And the triggers hold even without the index: a direct INSERT differing only in case is refused.
+    let bad = conn.execute(
+        "INSERT INTO pen (name, kind, created) VALUES ('STET', 'self', datetime('now'))",
+        [],
+    );
+    assert!(
+        bad.is_err(),
+        "a case-colliding INSERT must be refused by the trigger"
+    );
+}

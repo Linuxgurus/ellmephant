@@ -218,3 +218,41 @@ fn report(session: &sudo::Session) {
         "session", session.weak, session.powerful, session.source, session.expires_at
     );
 }
+
+/// `pen revoke <powerful> <weak>` — remove a policy AND every session it authorised, in one act.
+///
+/// A policy removed while its sessions keep running is a revocation that has not happened yet, and the
+/// sessions would be indistinguishable from permission.
+pub fn revoke(paths: &Paths, cfg: &Config, powerful: &str, weak: &str) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let killed = sudo::revoke(&conn, powerful, weak)?;
+    println!("  revoked   {weak} may no longer borrow {powerful}; {killed} live session(s) ended");
+    Ok(())
+}
+
+/// `pen policies` — every standing grant, and where it came from.
+pub fn policies(paths: &Paths, cfg: &Config) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let mut stmt = conn.prepare(
+        "SELECT p.name, w.name, s.max_duration_secs, s.source, s.granted_at
+           FROM sudoers s
+           JOIN pen p ON p.id = s.powerful
+           JOIN pen w ON w.id = s.weak
+          ORDER BY w.name COLLATE NOCASE, p.name COLLATE NOCASE",
+    )?;
+    let rows: Vec<(String, String, i64, String, String)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        println!("  no standing grants");
+        return Ok(());
+    }
+    for (powerful, weak, secs, source, at) in rows {
+        println!("  {weak:<10} may borrow {powerful:<10} for at most {secs}s  ({source}, {at})");
+    }
+    Ok(())
+}

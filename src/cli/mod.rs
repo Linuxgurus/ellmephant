@@ -156,6 +156,15 @@ pub enum PenCommand {
         #[arg(value_name = "WEAK")]
         weak: Option<String>,
     },
+    /// Remove a policy AND every session it authorised, in one act.
+    Revoke {
+        #[arg(value_name = "POWERFUL")]
+        powerful: String,
+        #[arg(value_name = "WEAK")]
+        weak: String,
+    },
+    /// Every standing grant, and where it came from.
+    Policies,
 }
 
 /// `ellmephant model …` — the weights cache (SPEC §6.5).
@@ -257,6 +266,8 @@ pub fn run(cli: Cli) -> Result<()> {
             } => pen::borrow(&paths, &cfg, &weak, &powerful, secs),
             PenCommand::Release { weak, powerful } => pen::release(&paths, &cfg, &weak, &powerful),
             PenCommand::Sessions { weak } => pen::sessions(&paths, &cfg, weak.as_deref()),
+            PenCommand::Revoke { powerful, weak } => pen::revoke(&paths, &cfg, &powerful, &weak),
+            PenCommand::Policies => pen::policies(&paths, &cfg),
         },
         Command::Model { command } => model::cmd(&spec, command),
         // MCP holds the store open and serves until the client disconnects (P7).

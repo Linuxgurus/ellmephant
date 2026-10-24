@@ -1197,21 +1197,78 @@ pub fn set_parent(conn: &Connection, child: &str, parent: &str) -> Result<()> {
     Ok(())
 }
 
-/// Apply [`TREE_ENV`]. Returns `(attached, rejected)`; the rejections are logged by name.
-pub fn load_tree_at_boot(conn: &Connection) -> (usize, usize) {
+/// What a SEED found: attached a bare pen, agreed with the table, or disagreed and stood down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seeded {
+    Attached,
+    Already,
+    /// The table says `Some(current)`; the seed says something else. **The table wins.**
+    Disagrees(String),
+}
+
+/// ★ A SEED IS NOT AN AUTHORITY (James, 2026-10-24: *"the estate is in an environment variable instead of
+/// a table?"*). It is not, and it must not be. The env var exists only because nothing could run the
+/// attach at all; it must not become the place where the estate LIVES, or a deliberate re-parenting, an
+/// adopt, or a disclaim would be silently undone by the next restart — and a restart is exactly when
+/// nobody is watching.
+///
+/// So: seed only a pen that has **no parent yet**. Once the table has an opinion, the table wins forever,
+/// and a disagreeing seed is reported as drift rather than obeyed. `set_parent` remains the deliberate,
+/// overwriting act — the one you reach for on purpose.
+pub fn seed_parent(conn: &Connection, child: &str, parent: &str) -> Result<Seeded> {
+    let child_id = pen_id_named(conn, child)?;
+    let (_, current, ceased) = pen_row_by_id(conn, child_id)?;
+    if current.is_some() {
+        let current_name: String = conn.query_row(
+            "SELECT name FROM pen WHERE id = ?1",
+            params![current],
+            |r| r.get(0),
+        )?;
+        let agrees = pen_id_named(conn, parent)
+            .map(|id| Some(id) == current)
+            .unwrap_or(false);
+        return Ok(if agrees {
+            Seeded::Already
+        } else {
+            Seeded::Disagrees(current_name)
+        });
+    }
+    if ceased.is_some() {
+        return Err(Error::Invalid(format!(
+            "{child} has been retired: a tombstone is not re-parented"
+        )));
+    }
+    set_parent(conn, child, parent)?;
+    Ok(Seeded::Attached)
+}
+
+/// Apply [`TREE_ENV`] as a SEED. Returns `(attached, already, disagreed, rejected)`.
+///
+/// Disagreements are logged **by name and both sides** — configuration drift is worth seeing, never worth
+/// obeying.
+pub fn load_tree_at_boot(conn: &Connection) -> (usize, usize, usize, usize) {
     let Ok(spec) = std::env::var(TREE_ENV) else {
-        return (0, 0);
+        return (0, 0, 0, 0);
     };
-    let mut attached = 0;
-    let mut rejected = 0;
+    let (mut attached, mut already, mut disagreed, mut rejected) = (0, 0, 0, 0);
     for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
         let Some((child, parent)) = entry.split_once('=') else {
             tracing::warn!(spec = %entry, "pen tree: expected `child=parent`");
             rejected += 1;
             continue;
         };
-        match set_parent(conn, child.trim(), parent.trim()) {
-            Ok(()) => attached += 1,
+        match seed_parent(conn, child.trim(), parent.trim()) {
+            Ok(Seeded::Attached) => attached += 1,
+            Ok(Seeded::Already) => already += 1,
+            Ok(Seeded::Disagrees(current)) => {
+                tracing::warn!(
+                    child = %child.trim(),
+                    seed = %parent.trim(),
+                    table = %current,
+                    "pen tree: seed disagrees with the TABLE — the table wins; change it on purpose with `set_parent`"
+                );
+                disagreed += 1;
+            }
             Err(e) => {
                 tracing::warn!(spec = %entry, error = %e, "pen tree: edge rejected, the rest applied");
                 rejected += 1;
@@ -1220,10 +1277,12 @@ pub fn load_tree_at_boot(conn: &Connection) -> (usize, usize) {
     }
     tracing::info!(
         attached,
+        already,
+        disagreed,
         rejected,
-        "pen tree: {attached} edge(s) attached, {rejected} rejected"
+        "pen tree: {attached} seeded, {already} already attached, {disagreed} refused in favour of the table, {rejected} malformed"
     );
-    (attached, rejected)
+    (attached, already, disagreed, rejected)
 }
 
 /// A pen created at runtime: whoever minted it answered for it, and it answered to them.

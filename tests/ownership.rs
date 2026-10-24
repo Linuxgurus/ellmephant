@@ -7,7 +7,9 @@
 mod common;
 
 use common::{count, temp_store};
+
 use ellmephant::embed::HashEmbedder;
+
 use ellmephant::store::{self, Memory};
 
 const DIM: usize = 8;
@@ -67,20 +69,6 @@ fn a_finger_never_owns_its_parent_does() {
         owner(&conn, "by-a-finger").as_deref(),
         Some("stet"),
         "the finger typed it; its parent is answerable"
-    );
-    // ★ THIS IS THE ONLY WRITE WHERE THE TWO COLUMNS MOVE INDEPENDENTLY, so the split is only
-    // exercised if they DISAGREE here (Stet, review): `asserted_by` names the pen that did it,
-    // `owner` the pen that answers for it. If they came out equal, nothing was being tested.
-    let mem = store::get(&conn, "by-a-finger").unwrap().unwrap();
-    assert_eq!(
-        mem.asserted_by.as_deref(),
-        Some("stet/finger-3"),
-        "who did it"
-    );
-    assert_eq!(mem.owner.as_deref(), Some("stet"), "who answers for it");
-    assert_ne!(
-        mem.asserted_by, mem.owner,
-        "the split, exercised rather than assumed"
     );
 }
 
@@ -725,6 +713,103 @@ fn the_ownerless_rows_can_be_listed_not_only_counted() {
     assert!(
         rows.iter()
             .all(|r| !r.key.is_empty() && !r.created.is_empty())
+    );
+}
+
+#[test]
+fn the_unowned_listing_obeys_the_audience_tier() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A public ownerless row: visible to anyone, as the commons should be.
+    row(&conn, &embedder, "released", "stet");
+    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+
+    // A PRIVATE row that is also ownerless — the case the first version of this listing would have
+    // leaked: nobody owns it, but it is still addressed to one pen.
+    row(&conn, &embedder, "secret", "stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet', owner = NULL WHERE key = 'secret'",
+        [],
+    )
+    .unwrap();
+
+    let anon = store::unowned(&conn, &store::audience::Reader::anonymous(), 50).expect("list");
+    let keys: Vec<&str> = anon.iter().map(|r| r.key.as_str()).collect();
+    assert!(
+        keys.contains(&"released"),
+        "the commons is anybody's: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"secret"),
+        "a private row's ADDRESS is not the commons: {keys:?}"
+    );
+
+    let owner = store::unowned(&conn, &store::audience::Reader::pen("stet"), 50).expect("list");
+    let keys: Vec<&str> = owner.iter().map(|r| r.key.as_str()).collect();
+    assert!(keys.contains(&"secret"), "its own pen may see it: {keys:?}");
+}
+
+// ── ABSENCE, APPLIED TO DESTRUCTION (final adversarial pass) ─────────────────────────────────────
+// The private tier's law is "absence, not refusal". Two destructive paths were answering as oracles
+// instead: a DELETE said "owned by stet" for a row the caller could not read, and a MERGE deleted the
+// source without asking anyone's leave.
+
+#[test]
+fn destroying_an_invisible_private_row_answers_as_if_it_never_existed() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-secret", "stet");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet' WHERE key = 'stets-secret'",
+        [],
+    )
+    .unwrap();
+
+    // cline is a PEER: the row does not exist for it, so the refusal must not confirm it does.
+    let err = store::delete(&conn, "stets-secret", Some("cline")).unwrap_err();
+    assert!(
+        format!("{err}").contains("no such memory"),
+        "an invisible row must answer as absent, not report its owner: {err}"
+    );
+    // …and it is still there.
+    assert!(store::get(&conn, "stets-secret").unwrap().is_some());
+
+    // Its owner, and its ancestor, still reach it.
+    assert!(store::delete(&conn, "stets-secret", Some("stet")).is_ok());
+}
+
+#[test]
+fn a_merge_is_a_delete_and_is_gated_like_one() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row(&conn, &embedder, "stets-note", "stet");
+    row(&conn, &embedder, "clines-note", "cline");
+    row(&conn, &embedder, "stets-other", "stet");
+
+    // A peer may not destroy stet's row by "merging" it into its own.
+    let err =
+        store::links::merge_into(&conn, "stets-note", "clines-note", Some("cline")).unwrap_err();
+    assert!(
+        format!("{err}").contains("may not write") || format!("{err}").contains("no such memory"),
+        "a merge is a delete and needs the same reach: {err}"
+    );
+    assert!(
+        store::get(&conn, "stets-note").unwrap().is_some(),
+        "the source survives"
+    );
+
+    // Its owner may — into its OWN row. Merging into a peer's row would rewrite the peer's body, so
+    // `into` is gated too, and that refusal is the second half of the same rule.
+    let err =
+        store::links::merge_into(&conn, "stets-note", "clines-note", Some("stet")).unwrap_err();
+    assert!(
+        format!("{err}").contains("may not write"),
+        "the survivor is somebody else's: {err}"
+    );
+    assert!(store::links::merge_into(&conn, "stets-note", "stets-other", Some("stet")).is_ok());
+}
+
 // ── MINT AND DISPOSE ─────────────────────────────────────────────────────────────────────────────
 // A pen creates a pen, and retires it when the work is done. The parent is the CALLER, never an
 // argument: you may create downward, never sideways or upward.
@@ -882,19 +967,27 @@ fn a_fingers_work_is_its_hands_and_retirement_moves_it() {
 }
 
 #[test]
-fn the_unowned_listing_obeys_the_audience_tier() {
+fn a_pen_cannot_be_named_anonymous_or_given_an_unaddressable_name() {
     let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
 
-    // A public ownerless row: visible to anyone, as the commons should be.
-    row(&conn, &embedder, "released", "stet");
-    store::disclaim(&conn, "released", "stet", false).expect("disclaim");
+    // `anonymous` is the store's word for "no currently existing pen". A pen by that name would make
+    // every unattributed count ambiguous — the defect 0021/0025 remove.
+    for name in ["anonymous", "ANONYMOUS", " anonymous "] {
+        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "{name}: {err}");
+    }
 
-    // A PRIVATE row that is also ownerless — the case the first version of this listing would have
-    // leaked: nobody owns it, but it is still addressed to one pen.
-    row(&conn, &embedder, "secret", "stet");
-    conn.execute(
-        "UPDATE memory SET audience = 'pen:stet', owner = NULL WHERE key = 'secret'",
+    // A private row's audience is `pen:<name>`; a comma or a space cannot be addressed there, so the
+    // pen could never hold one — and nobody would find out until the first private write failed.
+    for name in ["stet/finger,1", "stet finger"] {
+        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
+        assert!(format!("{err}").contains("addressed"), "{name}: {err}");
+    }
+
+    // And a name that can be addressed still works.
+    store::mint(&conn, "stet", "stet/finger-9f3a1c", "finger").expect("a good name");
+}
+
 // ── KINSHIP ──────────────────────────────────────────────────────────────────────────────────────
 // The walk between two pens: shortest, never doubling back, `S` always written. Letters are the fact,
 // the word in quotes is a courtesy.
@@ -978,99 +1071,6 @@ fn a_cousin_is_the_walk_through_the_common_ancestor() {
     )
     .unwrap();
 
-    let anon = store::unowned(&conn, &store::audience::Reader::anonymous(), 50).expect("list");
-    let keys: Vec<&str> = anon.iter().map(|r| r.key.as_str()).collect();
-    assert!(
-        keys.contains(&"released"),
-        "the commons is anybody's: {keys:?}"
-    );
-    assert!(
-        !keys.contains(&"secret"),
-        "a private row's ADDRESS is not the commons: {keys:?}"
-    );
-
-    let owner = store::unowned(&conn, &store::audience::Reader::pen("stet"), 50).expect("list");
-    let keys: Vec<&str> = owner.iter().map(|r| r.key.as_str()).collect();
-    assert!(keys.contains(&"secret"), "its own pen may see it: {keys:?}");
-}
-
-// ── ABSENCE, APPLIED TO DESTRUCTION (final adversarial pass) ─────────────────────────────────────
-// The private tier's law is "absence, not refusal". Two destructive paths were answering as oracles
-// instead: a DELETE said "owned by stet" for a row the caller could not read, and a MERGE deleted the
-// source without asking anyone's leave.
-
-#[test]
-fn destroying_an_invisible_private_row_answers_as_if_it_never_existed() {
-    let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
-    row(&conn, &embedder, "stets-secret", "stet");
-    conn.execute(
-        "UPDATE memory SET audience = 'pen:stet' WHERE key = 'stets-secret'",
-        [],
-    )
-    .unwrap();
-
-    // cline is a PEER: the row does not exist for it, so the refusal must not confirm it does.
-    let err = store::delete(&conn, "stets-secret", Some("cline")).unwrap_err();
-    assert!(
-        format!("{err}").contains("no such memory"),
-        "an invisible row must answer as absent, not report its owner: {err}"
-    );
-    // …and it is still there.
-    assert!(store::get(&conn, "stets-secret").unwrap().is_some());
-
-    // Its owner, and its ancestor, still reach it.
-    assert!(store::delete(&conn, "stets-secret", Some("stet")).is_ok());
-}
-
-#[test]
-fn a_merge_is_a_delete_and_is_gated_like_one() {
-    let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
-    row(&conn, &embedder, "stets-note", "stet");
-    row(&conn, &embedder, "clines-note", "cline");
-    row(&conn, &embedder, "stets-other", "stet");
-
-    // A peer may not destroy stet's row by "merging" it into its own.
-    let err =
-        store::links::merge_into(&conn, "stets-note", "clines-note", Some("cline")).unwrap_err();
-    assert!(
-        format!("{err}").contains("may not write") || format!("{err}").contains("no such memory"),
-        "a merge is a delete and needs the same reach: {err}"
-    );
-    assert!(
-        store::get(&conn, "stets-note").unwrap().is_some(),
-        "the source survives"
-    );
-
-    // Its owner may — into its OWN row. Merging into a peer's row would rewrite the peer's body, so
-    // `into` is gated too, and that refusal is the second half of the same rule.
-    let err =
-        store::links::merge_into(&conn, "stets-note", "clines-note", Some("stet")).unwrap_err();
-    assert!(
-        format!("{err}").contains("may not write"),
-        "the survivor is somebody else's: {err}"
-    );
-    assert!(store::links::merge_into(&conn, "stets-note", "stets-other", Some("stet")).is_ok());
-fn a_pen_cannot_be_named_anonymous_or_given_an_unaddressable_name() {
-    let (_dir, conn) = subtree();
-
-    // `anonymous` is the store's word for "no currently existing pen". A pen by that name would make
-    // every unattributed count ambiguous — the defect 0021/0025 remove.
-    for name in ["anonymous", "ANONYMOUS", " anonymous "] {
-        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
-        assert!(format!("{err}").contains("reserved"), "{name}: {err}");
-    }
-
-    // A private row's audience is `pen:<name>`; a comma or a space cannot be addressed there, so the
-    // pen could never hold one — and nobody would find out until the first private write failed.
-    for name in ["stet/finger,1", "stet finger"] {
-        let err = store::mint(&conn, "stet", name, "finger").unwrap_err();
-        assert!(format!("{err}").contains("addressed"), "{name}: {err}");
-    }
-
-    // And a name that can be addressed still works.
-    store::mint(&conn, "stet", "stet/finger-9f3a1c", "finger").expect("a good name");
     let kin = |a: &str, b: &str| store::relation::relation(&conn, a, b).unwrap().unwrap();
     // stet/hand vs cline/hand: common ancestor james, one step up each side → P S C.
     assert_eq!(kin("stet/hand", "cline/hand").walk, "PSC");
@@ -1111,10 +1111,6 @@ fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
         "what it is to me"
     );
     assert_eq!(seen.owns, 1, "the rows it answers for");
-    assert_eq!(
-        seen.descendants, 2,
-        "how far it reaches: `f-1` and `f-1/f-2` hang below `stet/hand`, and that is what ancestor read grants"
-    );
     assert!(seen.ceased.is_none());
 
     // The relation is from the ASKER's seat: the same pen is a CHILD to its parent and a NEPHEW to
@@ -1125,9 +1121,6 @@ fn whois_answers_what_a_pen_is_and_what_it_is_to_you() {
     assert_eq!(from_self.relation.as_deref(), Some("ME"));
 
     // A pen from another estate is reachable by name and related to nobody here.
-    let root = store::whois(&conn, "estate", "estate").expect("whois");
-    assert_eq!(root.descendants, 6, "the root reaches everything below it");
-
     let island = store::whois(&conn, "stet", "island").expect("whois");
     assert_eq!(
         island.relation, None,

@@ -9,6 +9,7 @@
 mod common;
 
 use common::temp_store;
+
 use ellmephant::store::sudo;
 
 /// `estate` → `james` → {`stet`, `cline`} → `stet`'s hand → its finger.
@@ -221,22 +222,6 @@ fn a_lend_sets_the_deadline_and_never_stacks_one() {
     // ★ THE HAZARD THIS EXISTS FOR: if the long row survived, the short lend would expire and then
     // the 600s one would silently let the finger write again. Push the clock past the short lend and
     // past nothing else — permission must be GONE, not resurrected.
-fn borrowing_again_replaces_the_session_instead_of_stacking_one() {
-    let (_dir, paths) = temp_store();
-    let conn = ellmephant::db::open(&paths).unwrap();
-    tree(&conn);
-    sudo::grant(&conn, "estate", "stet", 3600, "test").unwrap();
-
-    let long = sudo::sudo(&conn, "stet", "estate", 600).unwrap();
-    let short = sudo::sudo(&conn, "stet", "estate", 30).unwrap();
-    assert_eq!(
-        sudo::live(&conn, "stet", "estate").unwrap().unwrap().id,
-        short.id,
-        "the newest borrow governs"
-    );
-
-    // The hazard is the same one `lend` had: if the long row survived, shortening a borrow would
-    // silently restore the longer grant when the short one lapsed.
     conn.execute(
         "UPDATE active_sudo SET expires_at = datetime('now', '-1 second') WHERE id = ?1",
         rusqlite::params![short.id],
@@ -256,15 +241,11 @@ fn borrowing_again_replaces_the_session_instead_of_stacking_one() {
     assert!(
         sudo::held(&conn, "stet/hand/finger-1").unwrap().is_empty(),
         "the finger's session was passed from the lend that just ended"
-        sudo::live(&conn, "stet", "estate").unwrap().is_none(),
-        "a shortened borrow must not come back when it lapses (the 600s row was {})",
-        long.id
     );
 }
 
 #[test]
 fn retiring_a_pen_ends_the_authority_it_was_given() {
-fn a_session_records_why_it_exists() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();
     tree(&conn);
@@ -301,6 +282,62 @@ fn authority_cannot_be_lent_to_or_credited_for_a_ceased_pen() {
     let conn = ellmephant::db::open(&paths).unwrap();
     tree(&conn);
     sudo::lend(&conn, "stet", "stet/hand", 600).unwrap();
+    ellmephant::store::retire(
+        &conn,
+        "stet/hand",
+        "stet",
+        ellmephant::store::Rows::Inherit,
+        ellmephant::store::History::Memorialize,
+    )
+    .expect("retire");
+
+    // Lending to a pen that has ceased is lending to nobody.
+    let err = sudo::lend(&conn, "stet", "stet/hand", 60).unwrap_err();
+    assert!(format!("{err}").contains("retired"), "{err}");
+
+    // And it cannot be credited for new work, whatever rows survive.
+    let err = ellmephant::store::may_act_as(&conn, "stet", "stet/hand").unwrap_err();
+    assert!(
+        format!("{err}").contains("ceased pen cannot be credited"),
+        "{err}"
+    );
+}
+
+#[test]
+fn borrowing_again_replaces_the_session_instead_of_stacking_one() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+    sudo::grant(&conn, "estate", "stet", 3600, "test").unwrap();
+
+    let long = sudo::sudo(&conn, "stet", "estate", 600).unwrap();
+    let short = sudo::sudo(&conn, "stet", "estate", 30).unwrap();
+    assert_eq!(
+        sudo::live(&conn, "stet", "estate").unwrap().unwrap().id,
+        short.id,
+        "the newest borrow governs"
+    );
+
+    // The hazard is the same one `lend` had: if the long row survived, shortening a borrow would
+    // silently restore the longer grant when the short one lapsed.
+    conn.execute(
+        "UPDATE active_sudo SET expires_at = datetime('now', '-1 second') WHERE id = ?1",
+        rusqlite::params![short.id],
+    )
+    .unwrap();
+    assert!(
+        sudo::live(&conn, "stet", "estate").unwrap().is_none(),
+        "a shortened borrow must not come back when it lapses (the 600s row was {})",
+        long.id
+    );
+}
+
+#[test]
+fn a_session_records_why_it_exists() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
     // A LEND: a pen spending its own authority downward. No policy row exists for the pair.
     let lent = sudo::lend(&conn, "stet", "stet/hand", 60).expect("lend");
     assert_eq!(lent.source, "lend");
@@ -376,16 +413,6 @@ fn a_ceased_pen_can_neither_borrow_nor_be_borrowed_from_and_its_policy_dies_with
     )
     .expect("retire");
 
-    // Lending to a pen that has ceased is lending to nobody.
-    let err = sudo::lend(&conn, "stet", "stet/hand", 60).unwrap_err();
-    assert!(format!("{err}").contains("retired"), "{err}");
-
-    // And it cannot be credited for new work, whatever rows survive.
-    let err = ellmephant::store::may_act_as(&conn, "stet", "stet/hand").unwrap_err();
-    assert!(
-        format!("{err}").contains("ceased pen cannot be credited"),
-        "{err}"
-    );
     // The policy went with the pen: no ghost authority left to borrow.
     let policies: i64 = conn
         .query_row("SELECT count(*) FROM sudoers", [], |r| r.get(0))

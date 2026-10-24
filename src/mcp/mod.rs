@@ -537,6 +537,8 @@ pub struct UnownedParams {
     #[schemars(description = "Maximum rows to list, newest first. Default 50.")]
     #[serde(default)]
     pub limit: Option<i64>,
+}
+
 /// `whois` — the pen to look up.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1653,12 +1655,6 @@ impl MemoryServer {
         description = "List the rows nobody owns, newest first, with WHY each is ownerless: `disclaimed` (somebody released it — the author is still named, and this is a supported, deliberate state: retiring a descendant can disclaim its rows) or `unrecorded` (no currently existing pen is named as author at all — either a write made with no pen, or a pen that is gone). These are the rows an owner can CLAIM: anyone may adopt an ownerless row. Use it after `memory_stats` says how many; a count without a list gets quoted and never acted on.",
         annotations(
             title = "Rows nobody owns",
-    /// WHO a pen is, and what it is to THIS connection — the question a name alone cannot answer.
-    #[tool(
-        name = "whois",
-        description = "Look up one pen and its relationship to the pen asking. Returns `name`, `kind` (`self`/`finger`), `parent`, `created`, `ceased` (the tombstone of a retired pen), `owns` (how many rows it answers for) and `relation` — a walk in single letters from YOU to it: `ME` for yourself, `P` parent, `PP` grandparent, `C` child, `S` sibling, `PS` uncle, `SC` nephew, `PSC` cousin, with an English word in quotes only where English is exact. `relation: null` means no common root. A name is an address, never a permission; this is what the address is attached to.",
-        annotations(
-            title = "Who is this pen",
             read_only_hint = true,
             idempotent_hint = true,
             open_world_hint = false
@@ -1677,6 +1673,20 @@ impl MemoryServer {
             .await?;
         Ok(json_ok(
             serde_json::to_value(&rows).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// WHO a pen is, and what it is to THIS connection — the question a name alone cannot answer.
+    #[tool(
+        name = "whois",
+        description = "Look up one pen and its relationship to the pen asking. Returns `name`, `kind` (`self`/`finger`), `parent`, `created`, `ceased` (the tombstone of a retired pen), `owns` (how many rows it answers for) and `relation` — a walk in single letters from YOU to it: `ME` for yourself, `P` parent, `PP` grandparent, `C` child, `S` sibling, `PS` uncle, `SC` nephew, `PSC` cousin, with an English word in quotes only where English is exact. `relation: null` means no common root. A name is an address, never a permission; this is what the address is attached to.",
+        annotations(
+            title = "Who is this pen",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn whois(
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,

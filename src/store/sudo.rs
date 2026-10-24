@@ -173,8 +173,6 @@ pub fn lend(conn: &Connection, powerful: &str, weak: &str, secs: i64) -> Result<
         params![w, p],
     )?;
     tx.execute(
-        "INSERT INTO active_sudo (powerful, weak, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
-    conn.execute(
         "INSERT INTO active_sudo (powerful, weak, expires_at, source)
          VALUES (?1, ?2, datetime('now', ?3), 'lend')",
         params![p, w, format!("+{secs} seconds")],

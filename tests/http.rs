@@ -2340,6 +2340,8 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
     );
 
     unsafe { std::env::remove_var(TABLE) };
+}
+
 /// The three sudo verbs on the door: a borrow needs POLICY, a pass goes DOWN, a release CASCADES.
 /// The policy is written outside the doors — that is what provisioning is, and it is the point.
 #[tokio::test]

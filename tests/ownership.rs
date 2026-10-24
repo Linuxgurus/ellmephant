@@ -361,7 +361,19 @@ fn an_ancestor_may_not_publish_a_descendants_private_row_without_saying_so() {
         .expect_err("publishing needs the flag");
     assert!(format!("{err}").contains("publish=true"));
 
-    // Named explicitly, it is allowed — and the ledger calls it a publish, not a disclaim.
+    // ★ AND `publish=true` IS NOT ENOUGH IF YOU CANNOT READ IT (James, 2026-10-24: `pen:` is EXACT).
+    // `stet` is the ancestor, but the row is addressed `pen:stet/mid/leaf`, so stet cannot see one
+    // word of it. Publishing unread words is a leak with extra steps.
+    let err = store::disclaim(&conn, "private-work", "stet", true)
+        .expect_err("an ancestor may not publish what it cannot read");
+    assert!(format!("{err}").contains("cannot publish"), "{err}");
+
+    // Shared with the ancestor by name, the same act is allowed — and the ledger calls it a publish.
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet/mid/leaf,pen:stet' WHERE key = 'private-work'",
+        [],
+    )
+    .unwrap();
     store::disclaim(&conn, "private-work", "stet", true).expect("publish deliberately");
     let mem = store::get(&conn, "private-work").unwrap().unwrap();
     assert_eq!(mem.audience, "public");
@@ -1409,13 +1421,20 @@ fn a_lend_dies_when_the_parentage_that_justified_it_moves() {
     let (_dir, conn) = subtree(); // estate → james → {stet, cline}
     let embedder = HashEmbedder::new(DIM);
     registry(&conn, "james-secret-hand", Some("james"));
-    row(&conn, &embedder, "james-private", "james-secret-hand");
+    // Addressed EXACTLY to james: `pen:` names one pen, so nothing but a lend (or the pen itself)
+    // can reach it.
+    row(&conn, &embedder, "james-private", "james");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james' WHERE key = 'james-private'",
+        [],
+    )
+    .unwrap();
 
     let sees = |who: &str| {
         ellmephant::store::audience::Reader::pen(who)
             .in_tree(&conn)
             .with_borrowed(&conn)
-            .sees("pen:james-secret-hand")
+            .sees("pen:james")
     };
     assert!(
         !sees("cline"),
@@ -1451,9 +1470,11 @@ fn a_borrowed_read_is_recorded_as_borrowed_not_as_a_subtree_read() {
         reader.is_borrowed("pen:stet"),
         "stet's rows are reached by SPENDING a session, not by ancestry"
     );
+    // A row shared to the reader's own branch is a SUBTREE read, not a borrowed one — cline is below
+    // james, so `subtree:james` reaches it with no session at all.
     assert!(
-        !reader.is_borrowed("pen:cline"),
-        "cline is below james by parentage — that read is a subtree read and must stay labelled so"
+        !reader.is_borrowed("subtree:james"),
+        "a share aimed at the reader's own branch is a subtree read and must stay labelled so"
     );
     // The audit's vocabulary accepts the new reason (migration 0028 rebuilt the CHECK constraint).
     store::audit::record(&conn, "james", Some("k"), store::audit::Why::Borrowed, None);
@@ -1484,4 +1505,87 @@ fn sessions_are_listable_and_expiry_is_visible() {
     store::sudo::release(&conn, "james", "estate").unwrap();
     let after = store::sudo::live_sessions(&conn, None).unwrap();
     assert_eq!(after.len(), 1, "a released session is gone from the list");
+}
+
+// ── SHARED PRIVATE AUDIENCES (James, 2026-10-24) ────────────────────────────────────────────────
+// "I could set all my tax stuff private, visible only to either me or you."
+// Grammar: `pen:<name>` is EXACTLY that pen; `subtree:<name>` is that pen and everything below it.
+// A pen above you no longer reads your private rows by ancestry — that was the old law and he
+// removed it: an ancestor must be named, or use `subtree:`.
+
+fn shared(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str, audience: &str) {
+    let mem = Memory {
+        key: key.into(),
+        title: "shared".into(),
+        body: "one fact, two readers".into(),
+        asserted_by: Some("james".into()),
+        audience: audience.into(),
+        ..Default::default()
+    };
+    common::add_now(conn, embedder, &mem).expect("write");
+}
+
+fn sees(conn: &rusqlite::Connection, who: &str, key: &str) -> bool {
+    let mem = store::get(conn, key).unwrap().unwrap();
+    ellmephant::store::audience::Reader::pen(who)
+        .in_tree(conn)
+        .with_borrowed(conn)
+        .sees(&mem.audience)
+}
+
+#[test]
+fn a_row_shared_to_two_pens_is_readable_by_those_two_and_no_others() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::set_parent(&conn, "stet", "estate").unwrap(); // production shape
+    shared(&conn, &embedder, "tax", "pen:james,pen:cline");
+
+    assert!(sees(&conn, "james", "tax"), "the writer");
+    assert!(sees(&conn, "cline", "tax"), "the one it was shared with");
+    assert!(!sees(&conn, "stet", "tax"), "a sibling is not on the list");
+    assert!(
+        !sees(&conn, "estate", "tax"),
+        "and NOT an ancestor: `pen:` is exact now — ask for it by name"
+    );
+}
+
+#[test]
+fn a_subtree_share_reaches_the_branch_and_an_exact_share_does_not_reach_up() {
+    let (_dir, conn) = subtree();
+    store::set_parent(&conn, "stet", "estate").unwrap(); // production shape: stet is a sibling
+    let embedder = HashEmbedder::new(DIM);
+    shared(&conn, &embedder, "branch", "subtree:james");
+    shared(&conn, &embedder, "exact", "pen:cline");
+
+    assert!(sees(&conn, "james", "branch"), "the branch's head");
+    assert!(sees(&conn, "cline", "branch"), "and everything below it");
+    assert!(
+        !sees(&conn, "stet", "branch"),
+        "another branch is not this subtree"
+    );
+
+    assert!(sees(&conn, "cline", "exact"), "addressed exactly to cline");
+    assert!(
+        !sees(&conn, "james", "exact"),
+        "and NOT to the pen above it — that is the law he chose"
+    );
+}
+
+#[test]
+fn an_audience_naming_a_pen_that_does_not_exist_is_refused() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    let mem = Memory {
+        key: "ghost".into(),
+        title: "ghost".into(),
+        body: "addressed to nobody".into(),
+        asserted_by: Some("james".into()),
+        audience: "pen:nobody-at-all".into(),
+        ..Default::default()
+    };
+    let err = common::add_now(&conn, &embedder, &mem).unwrap_err();
+    assert!(
+        format!("{err}").contains("names no pen"),
+        "a row nobody can read must be refused at write, not stored: {err}"
+    );
 }

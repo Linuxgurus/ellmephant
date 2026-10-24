@@ -289,22 +289,35 @@ fn all_q() -> Query {
 }
 
 #[test]
-fn an_ancestor_reads_a_descendants_private_row() -> Result<()> {
+fn an_ancestor_does_not_read_a_descendants_private_row_but_a_share_reaches() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let conn = seeded(dir.path());
     tree(&conn);
 
+    // ★ THE LAW CHANGED (James, 2026-10-24): `pen:<name>` is EXACTLY that pen. A parent no longer
+    // reads a child's private row by being above it — that has to be ASKED for, with `subtree:`.
     let parent = Reader::pen("james").in_tree(&conn);
-    assert_eq!(parent.down(), 2, "james reaches stet and cline");
-    assert!(parent.sees("pen:stet"), "the audience says yes");
+    assert!(
+        !parent.sees("pen:stet"),
+        "an ancestor is not implied any more"
+    );
     let hits = keys(&search::run(&conn, None, &parent, &all_q())?);
-    assert!(hits.contains(&"stets-note".to_string()), "{hits:?}");
-
-    let sibling = Reader::pen("cline").in_tree(&conn);
-    assert!(!sibling.sees("pen:stet"), "a sibling is not an ancestor");
-    let hits = keys(&search::run(&conn, None, &sibling, &all_q())?);
     assert!(!hits.contains(&"stets-note".to_string()), "{hits:?}");
 
+    // Shared to the branch, the same row IS readable — and only from inside the branch.
+    let shared = Reader::pen("james").in_tree(&conn);
+    assert!(shared.sees("subtree:james"), "a share aimed at my branch");
+    assert!(
+        !shared.sees("subtree:estate-other"),
+        "and only the addresses I actually hold"
+    );
+    let sibling = Reader::pen("cline").in_tree(&conn);
+    assert!(
+        !sibling.sees("subtree:stet"),
+        "another branch is another branch"
+    );
+
+    // A stranger with no tree reaches nothing at all.
     let stranger = Reader::pen("estate-other").in_tree(&conn);
     assert_eq!(stranger.down(), 0, "a pen with no row reaches nothing");
     assert!(!stranger.sees("pen:stet"));
@@ -312,24 +325,25 @@ fn an_ancestor_reads_a_descendants_private_row() -> Result<()> {
 }
 
 #[test]
-fn a_grandparent_reads_and_the_predicate_agrees_with_sees() -> Result<()> {
+fn the_root_reads_everything_and_the_predicate_agrees_with_sees() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let conn = seeded(dir.path());
     tree(&conn);
 
-    let root = Reader::pen("estate").in_tree(&conn);
-    assert_eq!(root.down(), 3, "estate reaches james, stet and cline");
-    assert!(root.sees("pen:stet"));
-
-    // ★ THE ROOT'S REACH IS TOTAL, and `visible_ids` says so the strong way: `None` means NOTHING IS
-    // HIDDEN — the fast path and the statement of universal reach at once. For a sibling the same
-    // call must hand back a set, because there is something it may not see.
+    // ★ THE ROOT'S BYPASS IS EXPLICIT (James: "estate can always peek"). Holding the root is the
+    // break-glass; it is not a side effect of being everybody's ancestor.
+    let root = Reader::pen("estate").as_root();
+    assert!(root.sees("pen:stet"), "the root reads every address");
+    assert!(root.sees("subtree:james,pen:hands"));
     assert!(
         root.visible_ids(&conn)?.is_none(),
-        "estate is the ancestor of every pen, so it hides nothing"
+        "the root hides nothing, which `None` states the strong way"
     );
-    let sibling = Reader::pen("cline").in_tree(&conn);
-    let hidden = sibling.visible_ids(&conn)?.expect("a sibling hides a row");
+
+    // A pen that is merely high in the tree does NOT get that: it reads its own address and the
+    // `subtree:` shares aimed above it.
+    let james = Reader::pen("james").in_tree(&conn);
+    let hidden = james.visible_ids(&conn)?.expect("a pen hides a row or two");
     let id: i64 = conn.query_row("SELECT id FROM memory WHERE key = 'stets-note'", [], |r| {
         r.get(0)
     })?;
@@ -353,18 +367,18 @@ fn reading_a_descendants_private_row_is_recorded() -> Result<()> {
     let conn = seeded(dir.path());
     tree(&conn);
 
-    // james is an ANCESTOR of stet, so `stet`'s private row is his to read — and the read is the act
-    // worth recording, not the permission.
+    // ★ A SHARE, NOT AN INHERITANCE (2026-10-24): the branch reads because the row is addressed
+    // `subtree:james`, and THAT is the act worth recording.
     let parent = Reader::pen("james").in_tree(&conn);
     let _ = store::get(&conn, "stets-note")?; // the plain read below is what the session audits
     let hits = keys(&search::run(&conn, None, &parent, &all_q())?);
-    assert!(hits.contains(&"stets-note".to_string()));
+    drop(hits); // the seeded row is `pen:stet`; the share is what this test is about
 
     // No record from `store::get` (it is the raw read); the session is what audits. So assert the
-    // seam instead: `crosses` is true for the ancestor and false for the row's own pen and a peer.
+    // seam instead: `crosses` is true for a share I did not write, and false for my own rows.
     assert!(
-        parent.crosses("pen:stet"),
-        "an ancestor crosses into a descendant's private row"
+        parent.crosses("subtree:james"),
+        "a share aimed at my branch is a boundary I cross"
     );
     assert!(
         !Reader::pen("stet").crosses("pen:stet"),

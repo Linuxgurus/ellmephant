@@ -287,6 +287,7 @@ fn key_is_an_address_not_a_field() {
             origin: Some("https://example.com/record".into()),
             tags: Some(vec!["moved".into()]),
             private: None,
+            audience: None,
             version_note: None,
             expected_version: None,
         },

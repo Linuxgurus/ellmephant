@@ -227,27 +227,13 @@ fn held_authority(conn: &Connection, caller: &str) -> Result<Vec<i64>> {
 }
 
 fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {
-    if audience == audience::PUBLIC {
-        return Ok(true);
-    }
-    let Some(addressed) = audience.strip_prefix(audience::PEN) else {
-        return Ok(false);
-    };
-    let Some(caller_id) = exact_pen_id(conn, caller)? else {
-        return Ok(false);
-    };
-    let Some(owner_id) = exact_pen_id(conn, addressed)? else {
-        return Ok(false);
-    };
-    if caller_id == owner_id || is_ancestor(conn, caller_id, owner_id)? {
-        return Ok(true);
-    }
-    for held in held_authority(conn, caller)? {
-        if held == owner_id || is_ancestor(conn, held, owner_id)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    // ★ ONE PREDICATE, ONE PLACE (2026-10-24). This used to hand-roll the rule; now it asks the very
+    // same [`Reader`] the read paths ask, so a write's visibility check and a read cannot disagree
+    // about a list audience, a `subtree:` share, or a borrowed root.
+    let reader = crate::store::audience::Reader::pen(caller)
+        .in_tree(conn)
+        .with_borrowed(conn);
+    Ok(reader.sees(audience))
 }
 
 /// May `caller` write the row at `key`? Parentage is the grant: the owner, the pen that owns on the
@@ -397,6 +383,9 @@ pub struct Patch {
     /// ★ The value is not a name: the store derives the audience from the PROVEN identity, so a
     /// caller cannot make a row private to somebody else, or publish a row it did not write.
     pub private: Option<bool>,
+    /// An explicit audience: `public`, or addresses (`pen:<name>` exact, `subtree:<name>` inclusive).
+    /// Unlike `private`, this NAMES others, so it is validated against the registry at write time.
+    pub audience: Option<String>,
     /// Why THIS change is being made. Not a field of the memory: it rides beside the version the
     /// write supersedes, so a later reader learns the intent without reconstructing it. It creates
     /// no version on its own — only a DOCUMENT change does (see `store::version`).
@@ -510,11 +499,37 @@ fn guard_audience(existing: Option<&Memory>, patch: &Patch) -> Result<()> {
     if old.audience == audience::PUBLIC {
         return Ok(());
     }
-    let Some(private) = patch.private else {
+    // ★ BOTH FORMS OF AUDIENCE CHANGE ARE GUARDED (adversarial review, 2026-10-24). This checked
+    // only `private`; the explicit `audience` argument I just added would have walked straight past
+    // it, letting any pen re-classify a row it cannot read. The boundary is the boundary whichever
+    // door the change arrives at.
+    if patch.private.is_none() && patch.audience.is_none() {
         return Ok(());
-    };
-    let already_private = audience::for_write(true, patch.asserted_by.as_deref()).ok();
-    if private && already_private.as_deref() == Some(old.audience.as_str()) {
+    }
+    // The pen a row is ADDRESSED to may re-classify it — that pen owns the boundary.
+    let writer = patch.asserted_by.as_deref().unwrap_or_default();
+    let addressed_exactly = audience::parse(&old.audience)
+        .is_some_and(|targets| targets.iter().any(|t| t.token() == audience::pen(writer)));
+    if addressed_exactly {
+        return Ok(());
+    }
+    // Re-asserting the identical audience is a no-op, not a change.
+    let unchanged = patch
+        .audience
+        .as_deref()
+        .and_then(audience::parse)
+        .is_some_and(|t| {
+            let mut a: Vec<String> = t.iter().map(|x| x.token()).collect();
+            let mut b: Vec<String> = audience::parse(&old.audience)
+                .unwrap_or_default()
+                .iter()
+                .map(|x| x.token())
+                .collect();
+            a.sort();
+            b.sort();
+            a == b
+        });
+    if unchanged {
         return Ok(());
     }
     Err(Error::Invalid(format!(
@@ -574,12 +589,15 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     asserted_by: old.asserted_by.clone(),
                     edited_by: patch.asserted_by.clone().or_else(|| old.edited_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
-                    audience: match patch.private {
-                        None => old.audience.clone(),
-                        Some(p) => audience::for_write(
+                    audience: match (&patch.audience, patch.private) {
+                        // An explicit audience is a SHARE (it names others), so it is checked against
+                        // the registry; `private` is derived from the proven pen and cannot.
+                        (Some(spec), _) => audience::validated(conn, spec)?,
+                        (None, Some(p)) => audience::for_write(
                             p,
                             patch.asserted_by.as_deref().or(old.asserted_by.as_deref()),
                         )?,
+                        (None, None) => old.audience.clone(),
                     },
                     ..Default::default()
                 },
@@ -606,10 +624,13 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     asserted_by: patch.asserted_by.clone(),
                     edited_by: patch.asserted_by.clone(),
                     origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
-                    audience: audience::for_write(
-                        patch.private == Some(true),
-                        patch.asserted_by.as_deref(),
-                    )?,
+                    audience: match &patch.audience {
+                        Some(spec) => audience::validated(conn, spec)?,
+                        None => audience::for_write(
+                            patch.private == Some(true),
+                            patch.asserted_by.as_deref(),
+                        )?,
+                    },
                     ..Default::default()
                 },
                 true,
@@ -687,6 +708,11 @@ pub(crate) fn prepare(conn: &Connection, mem: &Memory, note: Option<&str>) -> Re
 /// explains itself at the moment it is read.
 pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Result<i64> {
     let pending = prepared.changes_document(mem);
+    // ★ ONE PLACE FOR THE BOUNDARY (adversarial review, 2026-10-24): `merge` validated a caller's
+    // `audience`, but `add` (tests, imports, the CLI) took whatever `Memory` carried. An audience that
+    // names no pen is a row NOBODY can read, and failing silently CLOSED is the worst direction. Every
+    // write goes through here.
+    let checked_audience = audience::validated(tx, audience::effective(&mem.audience))?;
     let id = match prepared.existing {
         Some((id, _, _)) => {
             if pending {
@@ -696,10 +722,10 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
                 // filing, not meaning.
                 version::snapshot(tx, id, &prepared.key, prepared.note.as_deref())?;
             }
-            update_row(tx, id, mem)?;
+            update_row(tx, id, mem, &checked_audience)?;
             id
         }
-        None => insert_row(tx, &prepared.key, mem)?,
+        None => insert_row(tx, &prepared.key, mem, &checked_audience)?,
     };
     write_links(tx, id, &prepared.key, &mem.body)?;
     if pending {
@@ -806,7 +832,7 @@ fn log_pen_event(
 
 /// The `UPDATE` half of [`add`]: the key already exists. `pending` leaves [`ENCODE_PENDING`] in
 /// `encode_hash` when this write scheduled a job, and leaves the column alone otherwise.
-fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
+fn update_row(tx: &Connection, id: i64, mem: &Memory, audience: &str) -> Result<()> {
     tx.execute(
         "UPDATE memory
             SET title = ?2, body = ?3, tags = ?4, source = ?5,
@@ -825,7 +851,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
             mem.updated,
             mem.asserted_by,
             mem.origin,
-            audience::effective(&mem.audience),
+            audience,
             mem.edited_by
         ],
     )?;
@@ -836,7 +862,7 @@ fn update_row(tx: &Connection, id: i64, mem: &Memory) -> Result<()> {
 ///
 /// `encode_hash` starts at [`ENCODE_PENDING`] — a fresh row always owes an encode — and the worker
 /// settles it with the real hash of the vector it writes.
-fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
+fn insert_row(tx: &Connection, key: &str, mem: &Memory, audience: &str) -> Result<i64> {
     tx.execute(
         "INSERT INTO memory (key, title, body, tags, source, created, updated, asserted_by, origin, audience,
                             edited_by, owner)
@@ -855,7 +881,7 @@ fn insert_row(tx: &Connection, key: &str, mem: &Memory) -> Result<i64> {
             mem.updated,
             mem.asserted_by,
             mem.origin,
-            audience::effective(&mem.audience),
+            audience,
             mem.edited_by,
             match mem.asserted_by.as_deref() {
                 Some(name) => Some(ensure_pen(tx, name)?),
@@ -879,7 +905,10 @@ pub fn adopt(conn: &Connection, key: &str, pen: &str, force: bool) -> Result<()>
         )
         .optional()?;
     let audience = audience.ok_or_else(|| Error::NotFound(key.to_string()))?;
-    if audience != audience::PUBLIC && audience != format!("pen:{pen}") {
+    // ★ ASK THE READER, NOT THE STRING (2026-10-24). The old test compared the audience to exactly
+    // `pen:<self>`, which a LIST audience never equals — so a row shared to you could not be adopted
+    // even though you can read it. The question is "can this pen see it", which has one predicate.
+    if !may_read_audience(conn, pen, &audience)? {
         return Err(Error::Invalid(format!(
             "{key} is private to {audience}; a pen cannot adopt a row it cannot read"
         )));
@@ -971,6 +1000,22 @@ pub fn disclaim(conn: &Connection, key: &str, pen: &str, publish: bool) -> Resul
         return Err(Error::Invalid(format!(
             "{key} is private; releasing it would publish another pen's words — pass publish=true to do that deliberately"
         )));
+    }
+    // ★ AND PUBLISHING WHAT YOU CANNOT READ IS WORSE (2026-10-24). With `pen:` now exact, an ancestor
+    // may reach a descendant's row without being able to see it. Publishing words you have never read
+    // is not oversight, it is a leak with extra steps.
+    if was_private {
+        let audience: String = conn.query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )?;
+        if !may_read_audience(conn, pen, &audience)? {
+            return Err(Error::Invalid(format!(
+                "{pen} cannot publish {key}: the row is addressed in a way that does not include \
+                 {pen}, so releasing it would publish words it cannot read"
+            )));
+        }
     }
     let n = conn.execute(
         "UPDATE memory SET owner = NULL, audience = ?2 WHERE key = ?1",

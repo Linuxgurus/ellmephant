@@ -444,6 +444,7 @@ struct FrontMatter {
     origin: Option<String>,
     version_note: Option<String>,
     private: Option<bool>,
+    audience: Option<String>,
     body: String,
 }
 
@@ -486,6 +487,7 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
                     other => return Err(format!("`Private: {other}` is not true|false")),
                 })
             }
+            "Audience" => out.audience = Some(value.to_string()),
             "Tags" => {
                 out.tags = Some(
                     value
@@ -522,6 +524,7 @@ fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), Strin
             origin: fm.origin,
             tags: fm.tags,
             private: fm.private,
+            audience: fm.audience,
             version_note: fm.version_note,
             expected_version: None,
         },
@@ -545,6 +548,10 @@ struct MemoryJson {
     as_pen: Option<String>,
     /// Keep this row to the writing pen alone.
     private: Option<bool>,
+    /// An explicit audience — a SHARE: `public`, or `pen:<name>` / `subtree:<name>` addresses
+    /// (comma-separated, at most 8). Validated against the registry; unlike `private`, it names others
+    /// on purpose. Omit to keep the stored audience.
+    audience: Option<String>,
     /// The CAS token, as `memory_get` returns it.
     expected_version: Option<i64>,
 }
@@ -563,6 +570,7 @@ fn memory_patch_json(bytes: &[u8]) -> Result<(store::Patch, Option<String>), Str
             origin: m.origin,
             tags: m.tags,
             private: m.private,
+            audience: m.audience,
             version_note: m.version_note,
             expected_version: m.expected_version,
         },

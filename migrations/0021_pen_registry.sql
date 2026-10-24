@@ -30,6 +30,13 @@ CREATE TABLE pen (
 
 CREATE INDEX pen_parent ON pen(parent_id);
 
+-- ★ EDITED AFTER MERGE, and only because nothing had run it (2026-10-23). The seed below no longer
+-- takes `anonymous` — it means NO currently existing pen, so seeding it manufactured an owner out of a
+-- vote of no confidence. `0025_pen_repair.sql` repairs any store that already ran the earlier version,
+-- and this file was changed at the source so a fresh store never creates the ghost at all. Editing a
+-- merged migration is normally forbidden; the justification is that no store in existence had applied
+-- it, which is a fact about the day, not a habit.
+--
 -- Every name that has ever spoken in this store, from memories and from mail.
 --
 -- ★ EXCEPT `anonymous`, WHICH IS NOT A NAME (found in the pre-roll rehearsal, 2026-10-23). It means

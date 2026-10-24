@@ -30,7 +30,6 @@ Idempotent, safe to re-run, and the only thing it touches is `pen.parent_id`:
 -- estate is the root and keeps parent_id NULL.
 UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'estate') WHERE name = 'james';
 UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'james')  WHERE name IN ('stet', 'cline');
-UPDATE pen SET parent_id = (SELECT id FROM pen WHERE name = 'hands')  WHERE name = 'hands';   -- no-op, shown for shape
 ```
 
 Then check, which should read **`1 root(s)`**:

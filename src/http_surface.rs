@@ -3416,7 +3416,7 @@ pub async fn mail_surrogate_grant(
                 json,
                 StatusCode::UNAUTHORIZED,
                 "refused: granting a name needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
-            )
+            );
         }
         Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
     };
@@ -3468,7 +3468,12 @@ pub async fn mail_surrogate_grant(
     {
         Ok(grant) => {
             let value = serde_json::to_value(&grant).unwrap_or(serde_json::Value::Null);
-            render(StatusCode::CREATED, json, value.to_string(), "granted\n".to_string())
+            render(
+                StatusCode::CREATED,
+                json,
+                value.to_string(),
+                "granted\n".to_string(),
+            )
         }
         Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
     }
@@ -3492,7 +3497,7 @@ pub async fn mail_surrogate_revoke(
                 json,
                 StatusCode::UNAUTHORIZED,
                 "refused: revoking needs a proven pen",
-            )
+            );
         }
         Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
     };
@@ -3554,7 +3559,7 @@ pub async fn mail_surrogate_list(
                 json,
                 StatusCode::UNAUTHORIZED,
                 "refused: listing grants needs a proven pen",
-            )
+            );
         }
         Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
     };
@@ -3576,7 +3581,12 @@ pub async fn mail_surrogate_list(
     {
         Ok(rows) => {
             let value = serde_json::to_value(&rows).unwrap_or(serde_json::Value::Null);
-            render(StatusCode::OK, json, value.to_string(), format!("{}\n", rows.len()))
+            render(
+                StatusCode::OK,
+                json,
+                value.to_string(),
+                format!("{}\n", rows.len()),
+            )
         }
         Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
     }

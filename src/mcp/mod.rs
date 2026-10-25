@@ -3488,7 +3488,10 @@ pub fn http_router(
             "/mail/surrogate/revoke",
             axum::routing::post(surface::mail_surrogate_revoke),
         )
-        .route("/mail/surrogate", axum::routing::get(surface::mail_surrogate_list))
+        .route(
+            "/mail/surrogate",
+            axum::routing::get(surface::mail_surrogate_list),
+        )
         .route("/mail/ack", axum::routing::post(surface::mail_ack))
         .route("/mail/{seq}", axum::routing::get(surface::mail_read))
         .route("/reembed", axum::routing::post(surface::reembed))

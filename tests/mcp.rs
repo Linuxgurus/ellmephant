@@ -190,6 +190,21 @@ async fn tools_round_trip_over_the_transport() {
     assert_eq!(mixed["upvoted"][0]["key"], serde_json::json!("infra-logs"));
     assert_eq!(mixed["upvoted"][0]["times_useful"], serde_json::json!(2));
     assert_eq!(mixed["missing"], serde_json::json!(["ghost"]));
+
+    // ★ ONE KEY AS A BARE STRING: the common case is one memory, and the caller should not have to
+    // wrap it in an array. Same tool, same reply, one code path.
+    let single = call(
+        &client,
+        "memory_upvote",
+        serde_json::json!({ "keys": "infra-logs" }),
+    )
+    .await;
+    assert!(!single.is_error.unwrap_or(false), "{}", text(&single));
+    assert!(
+        text(&single).contains("\"times_useful\":3"),
+        "a string key upvotes exactly like a one-element array: {}",
+        text(&single)
+    );
     settle(dir.path());
 
     let found = call(

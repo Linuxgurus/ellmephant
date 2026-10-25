@@ -1293,6 +1293,23 @@ async fn upvote_route_honours_the_mcp_batch_body() {
     let (_, b, _) = get(&app, "/memory/uv-b?format=json").await;
     assert_eq!(times_useful(&b), serde_json::json!(1), "{b}");
 
+    // ★ A SINGLE KEY AS A BARE STRING: the same request as `{"keys":["uv-b"]}`, and the same reply.
+    let (status, body, _) = request(
+        &app,
+        Method::POST,
+        "/memory/uv-a/upvote?format=json",
+        Some("tok"),
+        Some("application/json"),
+        r#"{"keys":"uv-b"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        doc["upvoted"][0]["key"], "uv-b",
+        "a string key works: {body}"
+    );
+
     // A batch reports the keys it could NOT find, exactly as the tool does.
     let (status, body, _) = request(
         &app,

@@ -2026,30 +2026,19 @@ pub async fn upvote(
         Ok(b) => b,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
+    // ★ ONE KEY OR MANY (#mem): the tool takes either shape, so the route must too — a client that
+    // sends `{"keys":"one"}` is asking the same question as `{"keys":["one"]}`.
     let keys = match body.as_ref().and_then(|b| b.get("keys")) {
-        Some(serde_json::Value::Array(items)) => {
-            let mut keys = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(k) => keys.push(k.to_string()),
-                    None => {
-                        return error(
-                            json,
-                            StatusCode::BAD_REQUEST,
-                            format!("bad `keys` entry: {item} (a string expected)"),
-                        );
-                    }
-                }
+        Some(value) => match serde_json::from_value::<crate::mcp::OneOrMany>(value.clone()) {
+            Ok(parsed) => parsed.into_vec(),
+            Err(_) => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    format!("bad `keys`: {value} (a string or an array of strings expected)"),
+                );
             }
-            keys
-        }
-        Some(other) => {
-            return error(
-                json,
-                StatusCode::BAD_REQUEST,
-                format!("bad `keys`: {other} (an array of keys expected)"),
-            );
-        }
+        },
         None => vec![key.clone()],
     };
     let named = keys.join(", ");

@@ -1161,46 +1161,6 @@ pub struct MemoryServer {
     /// construction; every write it makes is stamped with that name instead of being refused as
     /// anonymous. HTTP transports ignore this — their headers decide.
     declared: Option<String>,
-    /// ★ WHO MAY READ WHOSE MAIL, stated out loud: `(from, to)` pairs from
-    /// `ELLMEPHANT_MAIL_SURROGATES=hands=stet`. The hand that serves `stet` authenticates as `hands`,
-    /// so without a declared surrogate the recipient-only rule would lock my own hand out of the
-    /// mail it exists to read. Every exception is written here instead of being implied.
-    surrogates: Vec<(String, String)>,
-}
-
-/// Parse `a=b,c=d` into pairs. Blank or malformed entries are dropped rather than guessed at.
-pub(crate) fn parse_surrogates(raw: &str) -> Vec<(String, String)> {
-    raw.split(',')
-        .filter_map(|pair| {
-            let (from, to) = pair.split_once('=')?;
-            let (from, to) = (from.trim(), to.trim());
-            (!from.is_empty() && !to.is_empty()).then(|| (from.to_string(), to.to_string()))
-        })
-        .collect()
-}
-
-/// The surrogates declared for this process (`ELLMEPHANT_MAIL_SURROGATES`), read once per call so a
-/// door that is asked twice in one process still agrees with itself.
-pub(crate) fn surrogates_from_env() -> Vec<(String, String)> {
-    parse_surrogates(&std::env::var("ELLMEPHANT_MAIL_SURROGATES").unwrap_or_default())
-}
-
-/// ★ MAY `reader` READ `requested`'s MAIL? The one answer, used by BOTH doors.
-///
-/// The rule is the issue's: only the recipient, or a surrogate the store was told about. It lives
-/// here rather than beside each handler because the HTTP surface had no copy of it at all
-/// (soma/ellmephant#92) while the MCP tool had one — and a rule with two homes drifts.
-pub(crate) fn may_read_mail(
-    reader: &str,
-    requested: &str,
-    surrogates: &[(String, String)],
-) -> bool {
-    if reader.eq_ignore_ascii_case(requested) {
-        return true;
-    }
-    surrogates
-        .iter()
-        .any(|(from, to)| from.eq_ignore_ascii_case(reader) && to.eq_ignore_ascii_case(requested))
 }
 
 impl MemoryServer {
@@ -1229,26 +1189,38 @@ impl MemoryServer {
             cfg,
             encoder,
             declared: None,
-            surrogates: parse_surrogates(
-                &std::env::var("ELLMEPHANT_MAIL_SURROGATES").unwrap_or_default(),
-            ),
         }
     }
 
     /// ★ ONLY THE RECIPIENT READS ITS MAIL. `mail_inbox` takes a recipient as an argument, so without
     /// this any caller could read any box. A proven identity reads its own box, or a box an explicit
     /// surrogate map hands it; anonymous is refused before the box is even considered.
-    fn mail_box_for(
+    async fn mail_box_for(
         &self,
         ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
         requested: &str,
+        scope: &'static str,
     ) -> std::result::Result<String, String> {
         let who = pen_name(ctx, self.declared.as_deref())?;
-        if may_read_mail(&who, requested, &self.surrogates) {
+        let (reader, box_name) = (who.clone(), requested.to_string());
+        let allowed = self
+            .with_read(
+                "mail_box_for",
+                reader_of(ctx, self.declared.as_deref()),
+                move |s| {
+                    if scope == "ack" {
+                        s.mail_may_ack(&reader, &box_name)
+                    } else {
+                        s.mail_may_read(&reader, &box_name)
+                    }
+                },
+            )
+            .await?;
+        if allowed {
             return Ok(who);
         }
         Err(format!(
-            "refused: `{who}` may not read `{requested}`'s mail — only the recipient, or a declared surrogate, may"
+            "refused: `{who}` may not {scope} `{requested}`'s mail — only the recipient, or a live              `{scope}` grant, may"
         ))
     }
 
@@ -3095,7 +3067,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         // ★ THE BOX AND THE READER ARE CHECKED BEFORE THE LONG POLL: waiting 25 seconds to be told you
         // may not read it is a worse answer than being told now. The reader is the PROVEN pen, which
         // is also the cursor's key — never an argument.
-        let reader = self.mail_box_for(&ctx, &recipient)?;
+        let reader = self.mail_box_for(&ctx, &recipient, "read").await?;
         let limit = limit.unwrap_or(50).clamp(1, 500);
         let wait = wait_seconds
             .unwrap_or(0)
@@ -3161,7 +3133,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Parameters(p): Parameters<MailAckParams>,
     ) -> std::result::Result<String, String> {
         let MailAckParams { recipient, seq } = p;
-        let reader = self.mail_box_for(&ctx, &recipient)?;
+        let reader = self.mail_box_for(&ctx, &recipient, "ack").await?;
         let (log_reader, log_recipient) = (reader.clone(), recipient.clone());
         let out = self
             .with_store("mail_ack", move |s| {
@@ -3288,7 +3260,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         // ★ A LETTER IS PRIVATE CORRESPONDENCE: the box it is addressed to decides who may read it,
         // and the check happens on the LETTER, not on an argument the caller chose.
         if let Some(letter) = &found {
-            self.mail_box_for(&ctx, &letter.recipient)?;
+            self.mail_box_for(&ctx, &letter.recipient, "read").await?;
         }
         match found {
             Some(letter) => serde_json::to_string(&letter).map_err(|e| e.to_string()),
@@ -3832,28 +3804,5 @@ mod tests {
         let cfg = Config::default();
         let spec = crate::model::Spec::from_config(&cfg, &paths);
         Session::open(paths, cfg, spec).expect("open store")
-    }
-    /// ★ ONE RULE, BOTH DOORS (soma/ellmephant#92): only the recipient, or a declared surrogate.
-    #[test]
-    fn only_the_recipient_or_a_declared_surrogate_may_read_a_box() {
-        let surrogates = vec![("hands".to_string(), "stet".to_string())];
-        assert!(may_read_mail("stet", "stet", &surrogates), "own box");
-        assert!(may_read_mail("STET", "stet", &surrogates), "case folds");
-        assert!(
-            may_read_mail("hands", "stet", &surrogates),
-            "the hand serves stet's box by declaration"
-        );
-        assert!(
-            !may_read_mail("twine", "stet", &surrogates),
-            "not a recipient"
-        );
-        assert!(
-            !may_read_mail("hands", "twine", &surrogates),
-            "the surrogate map is one-way and one-pair"
-        );
-        assert!(
-            !may_read_mail("stet", "twine", &surrogates),
-            "boxes are not shared"
-        );
     }
 }

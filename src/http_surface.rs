@@ -3157,8 +3157,23 @@ fn mail_reader_identity(headers: &HeaderMap, json: bool) -> Result<String, Respo
 /// to find the reader's CURSOR and then served any box to anyone. One rule, one place, both doors —
 /// `mail box?recipient=stet` answered 49 envelopes to an anonymous caller, measured 2026-10-22.
 #[allow(clippy::result_large_err)] // same: a refusal is returned whole, as on every other handler here.
-fn mail_guard(reader: &str, requested: &str, json: bool) -> Result<(), Response> {
-    if crate::mcp::may_read_mail(reader, requested, &crate::mcp::surrogates_from_env()) {
+async fn mail_guard(
+    state: &HttpState,
+    reader: &str,
+    requested: &str,
+    json: bool,
+) -> Result<(), Response> {
+    let server = session(state)?;
+    let (r, q) = (reader.to_string(), requested.to_string());
+    let allowed = server
+        .with_read(
+            "mail_guard",
+            crate::store::audience::Reader::pen(&r),
+            move |s| s.mail_may_read(&r, &q),
+        )
+        .await
+        .map_err(|e| error(json, StatusCode::BAD_REQUEST, &e))?;
+    if allowed {
         Ok(())
     } else {
         Err(error(
@@ -3166,7 +3181,7 @@ fn mail_guard(reader: &str, requested: &str, json: bool) -> Result<(), Response>
             StatusCode::FORBIDDEN,
             format!(
                 "refused: `{reader}` may not read `{requested}`'s mail — only the recipient, or a \
-                 declared surrogate, may"
+                 live `read` grant, may"
             ),
         ))
     }
@@ -3191,7 +3206,7 @@ pub async fn mail_inbox(
         Ok(name) => name,
         Err(r) => return r,
     };
-    if let Err(r) = mail_guard(&reader, &recipient, json) {
+    if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
         return r;
     }
     let server = match session(&state) {
@@ -3295,7 +3310,7 @@ pub async fn mail_ack(
         }
         Err(forged) => return error(json, StatusCode::FORBIDDEN, forged.to_string()),
     };
-    if let Err(r) = mail_guard(&reader, &recipient, json) {
+    if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
         return r;
     }
     let server = match session(&state) {
@@ -3348,7 +3363,7 @@ pub async fn mail_read(
     {
         Ok(Some(letter)) => {
             // The LETTER decides its box: the check is on the row, not on an argument.
-            if let Err(r) = mail_guard(&reader, &letter.recipient, json) {
+            if let Err(r) = mail_guard(&state, &reader, &letter.recipient, json).await {
                 return r;
             }
             render(

@@ -802,6 +802,16 @@ impl Session {
         mail::revoke(&self.conn, grantor, surrogate)
     }
 
+    /// May this pen read that box? (own box, or a live `read` grant)
+    pub fn mail_may_read(&self, reader: &str, requested: &str) -> Result<bool> {
+        mail::may_read_box(&self.conn, reader, requested)
+    }
+
+    /// May this pen advance that box's cursor? (own box, or a live `ack` grant)
+    pub fn mail_may_ack(&self, reader: &str, requested: &str) -> Result<bool> {
+        mail::may_ack_box(&self.conn, reader, requested)
+    }
+
     /// Every grant a pen holds, live or not.
     pub fn mail_surrogates_of(&self, surrogate: &str) -> Result<Vec<mail::Surrogate>> {
         mail::surrogates_of(&self.conn, surrogate)

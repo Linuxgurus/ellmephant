@@ -1,7 +1,8 @@
 //! Ellmechat's ledger: fan-out, listening, and the gate (#151).
 //!
-//! The rules these tests exist to protect, in James's words: the gate is the consequence of **not
-//! listening**, never of being asleep, and it is the pen the effect is attributed to that carries it.
+//! The rules these tests exist to protect, in James's words: the gate is a seatbelt — the unread
+//! message is the news a pen needs before it acts — and it is the pen the effect is attributed to
+//! that carries it.
 
 use ellmephant::db;
 use ellmephant::store::channel::{self, Class};
@@ -29,10 +30,22 @@ fn seed(conn: &Connection, name: &str, parent: Option<&str>) {
     .expect("seed pen");
 }
 
-fn set_policy(conn: &Connection, key: &str, gate: &str, grace: i64, clock: &str) {
+/// Rewrite a channel's policy. Explicit on every axis so a test reads as the rule it checks.
+fn set_policy(
+    conn: &Connection,
+    key: &str,
+    gate: &str,
+    grace: i64,
+    clock: &str,
+    misses_to_gate: i64,
+    lock_max_secs: i64,
+) {
     conn.execute(
-        "UPDATE channel SET gate = ?2, grace_secs = ?3, clock = ?4 WHERE key = ?1",
-        params![key, gate, grace, clock],
+        "UPDATE channel
+            SET gate = ?2, grace_secs = ?3, clock = ?4,
+                misses_to_gate = ?5, lock_max_secs = ?6
+          WHERE key = ?1",
+        params![key, gate, grace, clock, misses_to_gate, lock_max_secs],
     )
     .expect("set policy");
 }
@@ -48,6 +61,16 @@ fn delivered(conn: &Connection, seq: i64, pen: &str) -> (Option<String>, Option<
     .expect("delivery row")
 }
 
+fn backdate_presentation(conn: &Connection, seq: i64, pen: &str, minutes: i64) {
+    conn.execute(
+        "UPDATE channel_delivery
+            SET presented_at = datetime('now', ?3)
+          WHERE seq = ?1 AND pen_id = (SELECT id FROM pen WHERE name = ?2)",
+        params![seq, pen, format!("-{minutes} minutes")],
+    )
+    .expect("backdate");
+}
+
 // ── FAN-OUT ──────────────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -56,7 +79,6 @@ fn a_message_is_told_to_every_member_except_its_sender() {
     let m = channel::send(&conn, "james", "general", "roll in five", None).expect("send");
 
     assert_eq!(m.pen, "james");
-    // stet and cline were told; the sender and `estate` were not.
     delivered(&conn, m.seq, "stet");
     delivered(&conn, m.seq, "cline");
     let own: i64 = conn
@@ -105,8 +127,8 @@ fn a_reply_must_belong_to_the_same_channel() {
 #[test]
 fn being_asleep_is_not_ignoring() {
     let (_dir, conn) = store();
-    // `ops` gates on delivery: the clock starts when a turn starts, not when the message was sent.
-    set_policy(&conn, "ops", "writes", 0, "delivery");
+    // `ops` gates on delivery: the clock starts at a turn boundary, not when the message was sent.
+    set_policy(&conn, "ops", "writes", 0, "delivery", 1, 0);
     channel::send(&conn, "james", "ops", "we are rolling", None).expect("send");
 
     channel::gate(&conn, "cline", Class::Record).expect("no turn has begun; not a breach");
@@ -114,26 +136,51 @@ fn being_asleep_is_not_ignoring() {
 }
 
 #[test]
-fn an_opportunity_that_passes_gates_the_record_and_not_the_conversation() {
+fn one_missed_boundary_is_not_a_pattern() {
     let (_dir, conn) = store();
-    set_policy(&conn, "ops", "writes", 0, "delivery");
+    set_policy(&conn, "ops", "writes", 0, "delivery", 2, 0);
     channel::send(&conn, "james", "ops", "we are rolling", None).expect("send");
 
-    channel::present(&conn, "cline").expect("present");
+    channel::present(&conn, "cline").expect("first boundary");
+    channel::gate(&conn, "cline", Class::Record)
+        .expect("a message that arrived mid-turn is not a crime");
+}
+
+#[test]
+fn two_missed_boundaries_lock_the_record_and_not_the_conversation() {
+    let (_dir, conn) = store();
+    set_policy(&conn, "ops", "writes", 0, "delivery", 2, 0);
+    channel::send(&conn, "james", "ops", "we are rolling", None).expect("send");
+
+    channel::present(&conn, "cline").expect("first");
+    channel::present(&conn, "cline").expect("second");
+
     let b = channel::breach(&conn, "cline")
         .expect("breach")
         .expect("a breach");
     assert_eq!(b.channel, "ops");
+    assert_eq!(b.misses, 2);
 
     let err = channel::gate(&conn, "cline", Class::Record).expect_err("record is gated");
     assert!(err.to_string().contains("#ops"), "{err}");
-    assert!(err.to_string().contains("not been fetched"), "{err}");
+    assert!(err.to_string().contains("has not been fetched"), "{err}");
+}
+
+#[test]
+fn an_emergency_locks_after_a_single_boundary() {
+    let (_dir, conn) = store();
+    set_policy(&conn, "emergency", "all", 0, "delivery", 1, 0);
+    channel::send(&conn, "james", "emergency", "cluster down in five", None).expect("send");
+
+    channel::present(&conn, "cline").expect("boundary");
+    channel::gate(&conn, "cline", Class::Record).expect_err("record gated");
+    channel::gate(&conn, "cline", Class::Acting).expect_err("acting gated too");
 }
 
 #[test]
 fn listening_clears_the_gate() {
     let (_dir, conn) = store();
-    set_policy(&conn, "ops", "writes", 0, "delivery");
+    set_policy(&conn, "ops", "writes", 0, "delivery", 1, 0);
     channel::send(&conn, "james", "ops", "heads up", None).expect("send");
     channel::present(&conn, "cline").expect("present");
     channel::gate(&conn, "cline", Class::Record).expect_err("gated before the fetch");
@@ -144,17 +191,42 @@ fn listening_clears_the_gate() {
 }
 
 #[test]
-fn a_send_clock_judges_from_the_message_not_the_turn() {
+fn a_send_clock_judges_from_the_message_not_the_boundary() {
     let (_dir, conn) = store();
-    set_policy(&conn, "ops", "writes", 0, "send");
-    channel::send(&conn, "james", "ops", "immediate", None).expect("send");
+    set_policy(&conn, "ops", "writes", 0, "send", 1, 0);
+    let m = channel::send(&conn, "james", "ops", "immediate", None).expect("send");
+    // The message is ten minutes old; the boundary is now. On a send clock the breach must be
+    // measured from the message, so the age proves which timestamp the case expression chose.
+    conn.execute(
+        "UPDATE channel_delivery SET available_at = datetime('now', '-10 minutes') WHERE seq = ?1",
+        params![m.seq],
+    )
+    .expect("backdate");
+    channel::present(&conn, "cline").expect("boundary");
 
-    // No `present` at all: on a send clock the pen is late from the moment it was told.
-    let err = channel::gate(&conn, "cline", Class::Record).expect_err("gated");
+    let b = channel::breach(&conn, "cline")
+        .expect("breach")
+        .expect("breach");
+    assert_eq!(b.seq, m.seq);
     assert!(
-        err.to_string().contains("immediate") || err.to_string().contains("#ops"),
-        "{err}"
+        b.age_secs >= 600,
+        "the clock must start at available_at, got {}",
+        b.age_secs
     );
+}
+
+#[test]
+fn a_lock_expires_and_says_so() {
+    let (_dir, conn) = store();
+    set_policy(&conn, "ops", "writes", 0, "delivery", 1, 60);
+    let m = channel::send(&conn, "james", "ops", "an hour ago", None).expect("send");
+    channel::present(&conn, "cline").expect("boundary");
+    channel::gate(&conn, "cline", Class::Record).expect_err("locked");
+
+    // Age the lock past its ceiling: the gate releases, because a lock nobody can clear is a lock
+    // forever when both the fetch and the ancestor are asleep.
+    backdate_presentation(&conn, m.seq, "cline", 2);
+    channel::gate(&conn, "cline", Class::Record).expect("expired locks release");
 }
 
 #[test]
@@ -162,6 +234,7 @@ fn general_never_gates() {
     let (_dir, conn) = store();
     channel::send(&conn, "james", "general", "chatter", None).expect("send");
     channel::present(&conn, "cline").expect("present");
+    channel::present(&conn, "cline").expect("present again");
 
     assert!(channel::breach(&conn, "cline").expect("breach").is_none());
     channel::gate(&conn, "cline", Class::Record).expect("general is a conversation");
@@ -170,14 +243,13 @@ fn general_never_gates() {
 #[test]
 fn writes_does_not_stop_acting_but_all_does() {
     let (_dir, conn) = store();
-    set_policy(&conn, "ops", "writes", 0, "delivery");
+    set_policy(&conn, "ops", "writes", 0, "delivery", 1, 0);
     channel::send(&conn, "james", "ops", "notice", None).expect("send");
     channel::present(&conn, "cline").expect("present");
 
     channel::gate(&conn, "cline", Class::Acting).expect("writes leaves acting alone");
     channel::gate(&conn, "cline", Class::Record).expect_err("writes gates the record");
 
-    // Now the hard lock.
     conn.execute("UPDATE channel SET gate = 'all' WHERE key = 'ops'", [])
         .expect("raise gate");
     channel::gate(&conn, "cline", Class::Acting).expect_err("all stops acting too");
@@ -194,7 +266,7 @@ fn an_unreadable_ledger_fails_open() {
 #[test]
 fn the_gate_follows_the_pen_the_effect_lands_on() {
     let (_dir, conn) = store();
-    set_policy(&conn, "ops", "writes", 0, "delivery");
+    set_policy(&conn, "ops", "writes", 0, "delivery", 1, 0);
     channel::send(&conn, "james", "ops", "roll", None).expect("send");
     channel::present(&conn, "cline").expect("present");
 

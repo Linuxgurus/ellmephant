@@ -7,15 +7,20 @@
 -- point of the design:
 --
 --   available_at  the message exists for this pen — it was TOLD
---   presented_at  a turn started; the pen had the chance to fetch — an OPPORTUNITY
+--   presented_at  the harness OFFERED the inbox at a turn boundary — an OPPORTUNITY
 --   fetched_at    the pen actually pulled it in — it LISTENED
 --
--- The gate (§gate) is the consequence of the second-to-third gap, never of the sender's timing:
--- a pen that was asleep was told nothing it could act on, so `clock = 'delivery'` measures from the
--- opportunity and not from `available_at`.
+-- `presented_at` is set by whatever owns the turn (the spine, the harness), not by the model, and
+-- the normal path is present-then-fetch in the same turn: a turn should never *begin* gated. The
+-- gate is the backstop for the turn that offered nothing — which is exactly the turn that should be
+-- stopped, because the unread message is the news it is missing.
 --
--- Records outlive bodies: pruning a message may empty `body`, but its delivery rows stay, because
--- "you were told" must remain answerable after the text is gone.
+-- `misses` counts how many turn boundaries offered this message without a fetch, and a channel
+-- decides how many are tolerated before the lock. One is a coincidence (or a message that arrived
+-- mid-turn); two is a pattern.
+--
+-- Records outlive bodies: pruning a message may empty `body` and set `pruned_at`, but its delivery
+-- rows stay, because "you were told" must remain answerable after the text is gone.
 
 CREATE TABLE channel (
     key        TEXT PRIMARY KEY,
@@ -26,6 +31,12 @@ CREATE TABLE channel (
     gate       TEXT NOT NULL DEFAULT 'none' CHECK (gate IN ('none', 'writes', 'all')),
     grace_secs INTEGER NOT NULL DEFAULT 0 CHECK (grace_secs >= 0),
     clock      TEXT NOT NULL DEFAULT 'delivery' CHECK (clock IN ('send', 'delivery')),
+    -- How many turn boundaries may offer a message without a fetch before it locks. 1 = the first
+    -- miss is enough (`emergency`); 2 = a mid-turn arrival is not a crime (`ops`).
+    misses_to_gate  INTEGER NOT NULL DEFAULT 1 CHECK (misses_to_gate >= 1),
+    -- A lock that can only be cleared by a fetch or an ancestor is a lock forever if both are
+    -- asleep. 0 = no expiry; anything else releases the lock after that many seconds, loudly.
+    lock_max_secs   INTEGER NOT NULL DEFAULT 0 CHECK (lock_max_secs >= 0),
     created    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -36,6 +47,8 @@ CREATE TABLE channel_message (
     body     TEXT NOT NULL,
     -- Threading light: one nullable pointer, so four people in a room do not become a wall.
     reply_to INTEGER REFERENCES channel_message(seq),
+    -- Set when the body was pruned; the receipt and the seq survive.
+    pruned_at TEXT,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX channel_message_by_channel ON channel_message(channel, seq);
@@ -47,13 +60,20 @@ CREATE TABLE channel_delivery (
     available_at TEXT NOT NULL,
     presented_at TEXT,
     fetched_at   TEXT,
+    -- Consecutive turn boundaries that offered this message without it being fetched.
+    misses       INTEGER NOT NULL DEFAULT 0 CHECK (misses >= 0),
     PRIMARY KEY (seq, pen_id)
 );
 CREATE INDEX channel_delivery_pending ON channel_delivery(pen_id, fetched_at);
 
 -- The two channels that gate, and the one that never does. `general` is deliberately `none`:
 -- the vast majority of channels should carry no lock at all.
-INSERT INTO channel (key, title, gate, grace_secs, clock) VALUES
-    ('general',   'General',   'none',   0,    'delivery'),
-    ('ops',       'Ops',       'writes', 60,   'delivery'),
-    ('emergency', 'Emergency', 'all',    60,   'delivery');
+--
+-- `ops` is the soft lock: information that may change the work you are doing, two turn boundaries
+-- to read it, half an hour before the lock releases itself.
+-- `emergency` is the hard lock: the incident is happening now, one boundary, and a quarter of an
+-- hour before the release — long enough that a release means something went wrong.
+INSERT INTO channel (key, title, gate, grace_secs, clock, misses_to_gate, lock_max_secs) VALUES
+    ('general',   'General',   'none',   0,  'delivery', 1, 0),
+    ('ops',       'Ops',       'writes', 60, 'delivery', 2, 1800),
+    ('emergency', 'Emergency', 'all',    0,  'delivery', 1, 900);

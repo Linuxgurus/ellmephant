@@ -6,7 +6,7 @@
 //! Three events per recipient (see `migrations/0029_ellmechat.sql`):
 //!
 //! - `available_at` — the message exists for this pen: it was **told**;
-//! - `presented_at` — a turn started, so it had the chance to fetch: an **opportunity**;
+//! - `presented_at` — the harness offered the inbox at a turn boundary: an **opportunity**;
 //! - `fetched_at` — it actually pulled it in: it **listened**.
 //!
 //! The gate is the consequence of the gap between *opportunity* and *listened*. Never of the
@@ -14,15 +14,23 @@
 //! `clock = 'delivery'` measures from `presented_at`, and a message that was never presented never
 //! gates.
 //!
-//! ★ THE GATE FAILS OPEN ON ITS OWN ERRORS. Only a *confirmed* unread message past its grace holds
-//! the lock. If this module cannot read its own ledger — a missing row, a corrupt seq, a schema
-//! surprise — the pen is not gated, because a false lock is indistinguishable from a broken store
-//! and the pen has no way to tell which it is.
+//! ★ IT IS A SEATBELT, NOT A PENALTY. The unread message from a locking channel is exactly the news
+//! a pen needs before it acts — a deployment went out, a server crashed, an incident is live. An
+//! agent writing the record on a world it has not been told about is the thing this prevents. The
+//! normal path is present-then-fetch in the same turn, so a well-behaved harness never meets the
+//! lock; it exists for the turn that offered nothing.
+//!
+//! ★ `misses` makes one boundary a coincidence and two a pattern: `ops` tolerates one (a message can
+//! arrive mid-turn), `emergency` does not.
+//!
+//! ★ The gate fails open on its own errors. Only a *confirmed* unread message past its grace holds
+//! the lock — a false lock is indistinguishable from a broken store, and the pen cannot tell which
+//! it is. It also expires: a lock that only a fetch or an ancestor can clear is a lock forever when
+//! both are asleep, so `lock_max_secs` releases it loudly.
 //!
 //! ★ The gate is evaluated on the pen the effect is **attributed to**, not the one holding the
 //! keyboard. A `sudo`-borrowed write therefore cannot launder a breach. That rule lives at the call
-//! site (the tool wrapper), which is why it is stated here as the contract and not enforced in a
-//! query.
+//! site (the tool wrapper); this module is the ledger it reads.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -33,8 +41,7 @@ use crate::error::{Error, Result};
 pub const GATE_NONE: &str = "none";
 /// The record is blocked (`memory_upsert`, delete, merge, adopt, project writes); talking is not.
 pub const GATE_WRITES: &str = "writes";
-/// Everything except recovery is blocked. Reserved for messages where acting without them is a
-/// danger to the pen or the estate.
+/// Everything except recovery is blocked. Reserved for a live incident.
 pub const GATE_ALL: &str = "all";
 
 /// Which tools a breach is allowed to stop.
@@ -68,6 +75,8 @@ pub struct Channel {
     pub gate: String,
     pub grace_secs: i64,
     pub clock: String,
+    pub misses_to_gate: i64,
+    pub lock_max_secs: i64,
 }
 
 /// One message as a reader sees it.
@@ -79,6 +88,9 @@ pub struct Message {
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i64>,
+    /// Set when the body was pruned. The receipt survives the text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pruned_at: Option<String>,
     pub created: String,
 }
 
@@ -90,6 +102,12 @@ pub struct Breach {
     pub gate: String,
     /// The instant the clock started: `available_at` on `send`, `presented_at` on `delivery`.
     pub since: String,
+    /// Turn boundaries that offered this message without a fetch.
+    pub misses: i64,
+    /// Seconds since `since`, measured by the store's own clock.
+    pub age_secs: i64,
+    /// 0 = the lock never expires.
+    pub lock_max_secs: i64,
 }
 
 fn pen_id(conn: &Connection, name: &str) -> Result<i64> {
@@ -104,7 +122,8 @@ fn pen_id(conn: &Connection, name: &str) -> Result<i64> {
 
 fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
     conn.query_row(
-        "SELECT key, title, gate, grace_secs, clock FROM channel WHERE lower(key) = lower(?1)",
+        "SELECT key, title, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+           FROM channel WHERE lower(key) = lower(?1)",
         params![key],
         |r| {
             Ok(Channel {
@@ -113,6 +132,8 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
                 gate: r.get(2)?,
                 grace_secs: r.get(3)?,
                 clock: r.get(4)?,
+                misses_to_gate: r.get(5)?,
+                lock_max_secs: r.get(6)?,
             })
         },
     )
@@ -122,8 +143,10 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
 
 /// Every channel, in creation order.
 pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
-    let mut stmt =
-        conn.prepare("SELECT key, title, gate, grace_secs, clock FROM channel ORDER BY rowid")?;
+    let mut stmt = conn.prepare(
+        "SELECT key, title, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+           FROM channel ORDER BY rowid",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok(Channel {
             key: r.get(0)?,
@@ -131,6 +154,8 @@ pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
             gate: r.get(2)?,
             grace_secs: r.get(3)?,
             clock: r.get(4)?,
+            misses_to_gate: r.get(5)?,
+            lock_max_secs: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -182,7 +207,7 @@ pub fn send(
                     "reply_to {parent} does not exist; a reply to nothing is a new message"
                 )));
             }
-            Some(key) if !key.eq_ignore_ascii_case(&channel_row.key) => {
+            Some(key) if !key.eq_ignore_ascii_case(&channel_name) => {
                 return Err(Error::Invalid(format!(
                     "reply_to {parent} is in #{key}, not #{channel_name}"
                 )));
@@ -218,7 +243,7 @@ pub fn send(
 
 fn message_by_seq(conn: &Connection, seq: i64) -> Result<Message> {
     conn.query_row(
-        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.created
+        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.pruned_at, m.created
            FROM channel_message m JOIN pen p ON p.id = m.pen_id
           WHERE m.seq = ?1",
         params![seq],
@@ -229,24 +254,29 @@ fn message_by_seq(conn: &Connection, seq: i64) -> Result<Message> {
                 pen: r.get(2)?,
                 body: r.get(3)?,
                 reply_to: r.get(4)?,
-                created: r.get(5)?,
+                pruned_at: r.get(5)?,
+                created: r.get(6)?,
             })
         },
     )
     .map_err(Into::into)
 }
 
-/// Mark that a turn has started for this pen: the opportunity exists from now.
+/// Mark that the harness offered the inbox at a turn boundary.
 ///
-/// Called by whatever owns the turn (the harness, the spine), not by the model. A pen that is never
-/// presented is never judged — absence is not a crime — which is the whole reason this is separate
-/// from [`fetch`].
+/// Called by whatever owns the turn (the spine, the harness), never by the model, and normally
+/// followed by [`fetch`] in the same turn. Each call is one **miss** while the message stays
+/// unfetched; a channel decides how many misses it tolerates before the lock.
+///
+/// A pen that is never presented is never judged — absence is not a crime — which is why this is
+/// separate from [`fetch`].
 pub fn present(conn: &Connection, pen: &str) -> Result<usize> {
     let id = pen_id(conn, pen)?;
     let n = conn.execute(
         "UPDATE channel_delivery
-            SET presented_at = datetime('now')
-          WHERE pen_id = ?1 AND fetched_at IS NULL AND presented_at IS NULL",
+            SET presented_at = COALESCE(presented_at, datetime('now')),
+                misses = misses + 1
+          WHERE pen_id = ?1 AND fetched_at IS NULL",
         params![id],
     )?;
     Ok(n)
@@ -265,7 +295,7 @@ pub fn fetch(
     let id = pen_id(conn, pen)?;
     let limit = limit.clamp(1, 500);
     let mut stmt = conn.prepare(
-        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.created
+        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.pruned_at, m.created
            FROM channel_delivery d
            JOIN channel_message m ON m.seq = d.seq
            JOIN pen p ON p.id = m.pen_id
@@ -283,7 +313,8 @@ pub fn fetch(
                 pen: r.get(2)?,
                 body: r.get(3)?,
                 reply_to: r.get(4)?,
-                created: r.get(5)?,
+                pruned_at: r.get(5)?,
+                created: r.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -295,7 +326,8 @@ pub fn fetch(
             tx.execute(
                 "UPDATE channel_delivery
                     SET fetched_at = datetime('now'),
-                        presented_at = COALESCE(presented_at, datetime('now'))
+                        presented_at = COALESCE(presented_at, datetime('now')),
+                        misses = 0
                   WHERE seq = ?1 AND pen_id = ?2",
                 params![m.seq, id],
             )?;
@@ -309,7 +341,7 @@ pub fn fetch(
 pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Result<Vec<Message>> {
     let limit = limit.clamp(1, 500);
     let mut stmt = conn.prepare(
-        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.created
+        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.pruned_at, m.created
            FROM channel_message m
            JOIN pen p ON p.id = m.pen_id
           WHERE lower(m.channel) = lower(?1) AND m.seq > ?2
@@ -324,7 +356,8 @@ pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Resu
                 pen: r.get(2)?,
                 body: r.get(3)?,
                 reply_to: r.get(4)?,
-                created: r.get(5)?,
+                pruned_at: r.get(5)?,
+                created: r.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -334,19 +367,26 @@ pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Resu
 /// The oldest message holding this pen behind, if any.
 ///
 /// `clock = 'send'` measures from `available_at`; `clock = 'delivery'` measures from
-/// `presented_at` and ignores a message that was never presented.
+/// `presented_at` and ignores a message that was never presented. A channel's own
+/// `misses_to_gate` decides how many offered-but-unfetched boundaries are tolerated.
 pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
     let id = pen_id(conn, pen)?;
     let found = conn
         .query_row(
             "SELECT c.key, m.seq, c.gate,
-                    CASE WHEN c.clock = 'send' THEN d.available_at ELSE d.presented_at END
+                    CASE WHEN c.clock = 'send' THEN d.available_at ELSE d.presented_at END AS since,
+                    d.misses,
+                    strftime('%s', 'now')
+                      - strftime('%s', CASE WHEN c.clock = 'send' THEN d.available_at
+                                            ELSE d.presented_at END) AS age_secs,
+                    c.lock_max_secs
                FROM channel_delivery d
                JOIN channel_message m ON m.seq = d.seq
                JOIN channel c ON c.key = m.channel
               WHERE d.pen_id = ?1
                 AND d.fetched_at IS NULL
                 AND c.gate <> 'none'
+                AND d.misses >= c.misses_to_gate
                 AND (
                       (c.clock = 'send'
                        AND strftime('%s', 'now') - strftime('%s', d.available_at) >= c.grace_secs)
@@ -363,6 +403,9 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
                     seq: r.get(1)?,
                     gate: r.get(2)?,
                     since: r.get(3)?,
+                    misses: r.get(4)?,
+                    age_secs: r.get(5)?,
+                    lock_max_secs: r.get(6)?,
                 })
             },
         )
@@ -375,13 +418,29 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
 /// Fail open: a ledger this module cannot read does not gate. That is not leniency — a pen cannot
 /// distinguish "you are late" from "the store is broken", and punishing the second as if it were the
 /// first is how a chat bug locks the record.
+///
+/// Expire loudly: a lock past its channel's `lock_max_secs` releases, but says so, because an
+/// emergency lock that aged out in silence is worse than one that held.
 pub fn gate(conn: &Connection, pen: &str, class: Class) -> Result<()> {
     match breach(conn, pen) {
-        Ok(Some(b)) if class.gated_by(&b.gate) => Err(Error::Invalid(format!(
-            "refused: #{} message {} was available at {} and has not been fetched. \
-             Fetch the channel before writing the record; reading is always allowed.",
-            b.channel, b.seq, b.since
-        ))),
+        Ok(Some(b)) if class.gated_by(&b.gate) => {
+            if b.lock_max_secs > 0 && b.age_secs >= b.lock_max_secs {
+                tracing::warn!(
+                    pen,
+                    channel = %b.channel,
+                    seq = b.seq,
+                    age_secs = b.age_secs,
+                    "ellmechat lock expired without a fetch; releasing and recording the expiry"
+                );
+                return Ok(());
+            }
+            Err(Error::Invalid(format!(
+                "refused: #{} message {} was offered {} time(s) and has not been fetched \
+                 (since {}). The store has moved since you last listened; fetch the channel \
+                 before changing the record. Reading is always allowed.",
+                b.channel, b.seq, b.misses, b.since
+            )))
+        }
         Ok(_) => Ok(()),
         Err(e) => {
             tracing::warn!(pen, error = %e, "gate could not read its ledger; failing open");

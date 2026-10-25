@@ -203,6 +203,7 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;",
     )
     .unwrap();
@@ -286,6 +287,7 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;",
     )
     .unwrap();
@@ -476,6 +478,7 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;",
     )
     .unwrap();
@@ -574,6 +577,7 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;",
     )
     .unwrap();

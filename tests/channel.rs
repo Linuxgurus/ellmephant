@@ -433,3 +433,39 @@ fn since_returns_what_arrived_after_a_cursor_without_moving_a_receipt() {
     let still_unread = channel::unread(&conn, "cline").expect("unread");
     assert_eq!(still_unread[0].count, 2);
 }
+
+#[test]
+fn the_roster_is_effective_membership_not_override_rows() {
+    let (_dir, conn) = store();
+    // `general` is open: every live self, minus whoever left on purpose.
+    let open = channel::members(&conn, "general").expect("members");
+    let names: Vec<&str> = open.iter().map(|m| m.pen.as_str()).collect();
+    assert!(
+        names.contains(&"stet") && names.contains(&"cline"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"estate"), "estate is never a member");
+    assert!(open.iter().all(|m| m.state == "in"));
+
+    channel::leave(&conn, "stet", "general").expect("leave");
+    let after = channel::members(&conn, "general").expect("members");
+    assert!(
+        !after.iter().any(|m| m.pen == "stet"),
+        "leaving an open channel removes the pen from its roster"
+    );
+
+    // `ops_team` is a list: only invitations, and joining it brings `emergency` with it.
+    let empty = channel::members(&conn, "ops_team").expect("members");
+    assert!(empty.is_empty(), "nobody is on the team until invited");
+    channel::join(&conn, "cline", "ops_team").expect("join");
+    let team = channel::members(&conn, "ops_team").expect("members");
+    assert_eq!(team.len(), 1);
+    assert!(team[0].explicit, "a list member is always explicit");
+    assert!(
+        channel::members(&conn, "emergency")
+            .expect("members")
+            .iter()
+            .any(|m| m.pen == "cline"),
+        "joining the team joins emergency: a team that runs the cluster must be reachable"
+    );
+}

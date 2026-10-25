@@ -820,6 +820,33 @@ impl Session {
         channel::fetch(&self.conn, pen, channel, limit)
     }
 
+    /// Create a channel. A LOCKED channel needs `estate` or `james` — the store enforces it.
+    pub fn channel_create(
+        &self,
+        pen: &str,
+        key: &str,
+        title: &str,
+        members: &str,
+        gate: &str,
+    ) -> Result<channel::Channel> {
+        channel::create(&self.conn, pen, key, title, members, gate)
+    }
+
+    /// Change a channel's gate. Writes the `channel_event` row in the same transaction.
+    pub fn channel_set_gate(
+        &self,
+        pen: &str,
+        channel: &str,
+        gate: &str,
+    ) -> Result<channel::Channel> {
+        channel::set_gate(&self.conn, pen, channel, gate)
+    }
+
+    /// The recorded changes to a channel: who made this dangerous, and when.
+    pub fn channel_events(&self, channel: &str) -> Result<Vec<channel::Event>> {
+        channel::events(&self.conn, channel)
+    }
+
     /// WHO is in a channel: effective membership, not the override rows.
     pub fn channel_members(&self, channel: &str) -> Result<Vec<channel::Member>> {
         channel::members(&self.conn, channel)

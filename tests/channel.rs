@@ -469,3 +469,43 @@ fn the_roster_is_effective_membership_not_override_rows() {
         "joining the team joins emergency: a team that runs the cluster must be reachable"
     );
 }
+
+// ── ADMINISTRATION (#161) ────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_locked_channel_needs_a_keeper_and_the_change_is_a_row() {
+    let (_dir, conn) = store();
+
+    // An ordinary pen may make a room; it may not make a LOCK.
+    let made = channel::create(&conn, "stet", "builds", "Build notices", "open", "none")
+        .expect("an open channel costs nobody anything");
+    assert_eq!(made.gate, "none");
+
+    let refused = channel::create(&conn, "stet", "quiet", "Quiet", "list", "writes")
+        .expect_err("a lock needs a name on it");
+    let msg = refused.to_string();
+    assert!(msg.contains("estate") && msg.contains("james"), "{msg}");
+
+    // James may, and creating writes the first event.
+    channel::create(&conn, "james", "quiet", "Quiet", "list", "writes").expect("james may lock");
+    let events = channel::events(&conn, "quiet").expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, "create");
+    assert_eq!(events[0].pen.as_deref(), Some("james"));
+
+    // Changing the gate is a row too: who, from what, to what.
+    channel::set_gate(&conn, "james", "quiet", "all").expect("re-gate");
+    let events = channel::events(&conn, "quiet").expect("events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].action, "gate");
+    assert_eq!(events[1].was.as_deref(), Some("writes"));
+    assert_eq!(events[1].now.as_deref(), Some("all"));
+
+    // And a pen that is not a keeper cannot re-gate, with a refusal that says why.
+    let err = channel::set_gate(&conn, "stet", "quiet", "none").expect_err("no keeper, no gate");
+    assert!(err.to_string().contains("refused"), "{err}");
+
+    // A key is created once, and a bad key is refused before anything is written.
+    assert!(channel::create(&conn, "james", "quiet", "Again", "open", "none").is_err());
+    assert!(channel::create(&conn, "james", "Bad Key!", "x", "open", "none").is_err());
+}

@@ -2,6 +2,7 @@
 
 pub mod audience;
 pub mod audit;
+pub mod channel;
 pub mod claim;
 pub mod codec;
 pub mod dupes;

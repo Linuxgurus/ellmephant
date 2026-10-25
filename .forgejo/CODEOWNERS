@@ -1,0 +1,3 @@
+# Every PR asks the soma team to review (Forgejo 16 reads .forgejo/CODEOWNERS).
+# The team is the org Owners: jblack, stet, cline.
+* @soma/Owners

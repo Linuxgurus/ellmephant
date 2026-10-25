@@ -2255,6 +2255,22 @@ async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
     assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
 }
 
+/// The identity fixture for HTTP writes.
+///
+/// ★ ONE TABLE, SET ONCE, AS A SUPERSET: cargo runs the tests in this binary in parallel threads, and
+/// `ELLMEPHANT_IDENTITIES` is process-global. A per-test table that each test removes would make
+/// whichever test finished last decide the identity of the one still running. Every HTTP test that
+/// needs a proven pen calls this and none of them removes it.
+fn identity_fixture() {
+    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
+    unsafe {
+        std::env::set_var(
+            TABLE,
+            "http-as-tester:as-secret-1,http-as-gated:as-secret-g",
+        )
+    };
+}
+
 /// `as:` on the BODY of `POST /memory` — the same claim as the MCP argument, and the same gate: a
 /// live lend, not tree shape. (The identity fixture is local to this test: it is the only one that
 /// needs a proven pen over HTTP, and it removes the table when it is done.)
@@ -2276,8 +2292,7 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
         .unwrap();
     }
 
-    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
-    unsafe { std::env::set_var(TABLE, "http-as-tester:as-secret-1") };
+    identity_fixture();
 
     let post = |body: serde_json::Value| {
         let app = app.clone();
@@ -2338,8 +2353,6 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
         Some("http-as-tester"),
         "who answers for it"
     );
-
-    unsafe { std::env::remove_var(TABLE) };
 }
 
 /// The three sudo verbs on the door: a borrow needs POLICY, a pass goes DOWN, a release CASCADES.
@@ -2592,5 +2605,95 @@ async fn reading_a_past_state_of_a_descendants_private_row_is_recorded() {
         rows.iter()
             .any(|r| r.2.as_deref() == Some("f-note") && r.4.as_deref() == Some("version/history")),
         "no audit row for the version read: {rows:?}"
+    );
+}
+
+/// ★ THE GATE, THROUGH THE DOOR (#151): a pen that was TOLD something in a gated channel and did not
+/// listen cannot change the record — and fetching is what reopens it.
+///
+/// This is the half that makes ellmechat worth building: the schema and the ledger were already
+/// tested; what was untested is that a *write* is actually refused.
+#[tokio::test]
+async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
+    use serde_json::json;
+    identity_fixture();
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let paths = Paths::from_root(dir.path());
+
+    // Provisioning, outside every door: the pen, its membership, and an unread incident.
+    let seq;
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-gated', 'self');
+             INSERT OR IGNORE INTO pen (name, kind) VALUES ('james', 'self');",
+        )
+        .unwrap();
+        ellmephant::store::channel::join(&conn, "http-as-gated", "ops_team").unwrap();
+        let m = ellmephant::store::channel::send(
+            &conn,
+            "james",
+            "ops_team",
+            "the cluster is on fire",
+            None,
+        )
+        .expect("send");
+        seq = m.seq;
+        // Two boundaries offered it and the pen did not fetch: `ops_team` tolerates one, not two.
+        ellmephant::store::channel::present(&conn, "http-as-gated").unwrap();
+        ellmephant::store::channel::present(&conn, "http-as-gated").unwrap();
+        // The grace is 60s from the FIRST OPPORTUNITY; backdate the opportunity, not the message.
+        conn.execute(
+            "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+              WHERE seq = ?1 AND pen_id = (SELECT id FROM pen WHERE name = 'http-as-gated')",
+            [seq],
+        )
+        .unwrap();
+    }
+
+    let post = |app: axum::Router| async move {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/memory")
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Stet-From", "http-as-gated")
+            .header("X-Stet-Auth", "as-secret-g")
+            .body(Body::from(
+                json!({ "key": "after-incident", "title": "t", "body": "b" }).to_string(),
+            ))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    };
+
+    let (status, body) = post(app.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a behind pen must not write: {status} {body}"
+    );
+    assert!(
+        body.contains("ops_team") && body.contains("not been fetched"),
+        "and the refusal names the channel and the reason: {body}"
+    );
+
+    // LISTEN. Fetching is the only thing that clears it, and it clears it for the whole ledger.
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        let heard = ellmephant::store::channel::fetch(&conn, "http-as-gated", None, 50).unwrap();
+        assert_eq!(heard.len(), 1, "one message was waiting");
+        assert!(heard[0].body.contains("on fire"));
+    }
+
+    let (status, body) = post(app).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "after fetching, the record opens: {status} {body}"
     );
 }

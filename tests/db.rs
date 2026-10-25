@@ -199,6 +199,14 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
+    // ...and predates ELLMECHAT (0029), whose three tables are its own.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS channel_delivery;
+         DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
+         DROP TABLE IF EXISTS channel;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -275,6 +283,14 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
+    // ...and predates ELLMECHAT (0029), whose three tables are its own.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS channel_delivery;
+         DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
+         DROP TABLE IF EXISTS channel;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
@@ -458,6 +474,14 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
+    // ...and predates ELLMECHAT (0029), whose three tables are its own.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS channel_delivery;
+         DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
+         DROP TABLE IF EXISTS channel;",
+    )
+    .unwrap();
     conn.execute("PRAGMA user_version = 20", []).unwrap();
     drop(conn);
 
@@ -549,6 +573,14 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
     // later steps create, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
+    // ...and predates ELLMECHAT (0029), whose three tables are its own.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS channel_delivery;
+         DROP TABLE IF EXISTS channel_message;
+         DROP TABLE IF EXISTS channel_member;
+         DROP TABLE IF EXISTS channel;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 24).unwrap();
     drop(conn);
 

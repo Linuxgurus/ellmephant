@@ -150,6 +150,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0028_read_borrowed.sql"),
         "`private_read.reason` gains `borrowed`: a read let through by a HELD SESSION is not a subtree read",
     ),
+    (
+        29,
+        include_str!("../../migrations/0029_ellmechat.sql"),
+        "ellmechat: channels, the message log, and the delivery ledger — told, presented, listened (#151)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

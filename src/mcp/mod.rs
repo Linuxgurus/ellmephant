@@ -748,8 +748,39 @@ pub struct AdoptParams {
 #[serde(deny_unknown_fields)]
 pub struct KeysParams {
     /// The memories' keys.
-    #[schemars(description = "Memory keys (one or more). Slugs.")]
-    pub keys: Vec<String>,
+    #[schemars(
+        description = "Memory keys: ONE key as a string, or several as an array. Both are accepted, because a single upvote is the common case and making the caller wrap it in a one-element array is ceremony."
+    )]
+    pub keys: OneOrMany,
+}
+
+/// One key or many, from either door.
+///
+/// ★ A ONE-ELEMENT ARRAY IS NOT A BATCH. Most upvotes are for a single memory, and a client that has
+/// one key should not have to remember a shape. `#[serde(untagged)]` keeps both spellings valid and
+/// the store still receives a list, so exactly one code path runs.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    /// A single key.
+    One(String),
+    /// Several keys.
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    /// Flatten to the shape the store takes. Blank entries are dropped, so `[""]` is "no keys"
+    /// rather than a key named "".
+    pub fn into_vec(self) -> Vec<String> {
+        let raw = match self {
+            OneOrMany::One(k) => vec![k],
+            OneOrMany::Many(keys) => keys,
+        };
+        raw.into_iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect()
+    }
 }
 
 /// Parameters for [`MemoryServer::memory_stats`].
@@ -2455,7 +2486,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     ) -> std::result::Result<String, String> {
         pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let reader = reader_of(&ctx, self.declared.as_deref());
-        upvote_sweep(self, reader, p.keys).await
+        upvote_sweep(self, reader, p.keys.into_vec()).await
     }
 
     /// List the memories whose bodies link to `key`.

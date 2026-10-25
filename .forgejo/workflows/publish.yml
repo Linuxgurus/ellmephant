@@ -50,6 +50,13 @@ env:
   BUILDER_PROFILE: rust-lean
   SOURCE_URL: https://git.vn.linuxguru.net/soma/ellmephant
 
+# ★ ONE PUBLISH AT A TIME, PER REPO (2026-10-25). A release tag pushed seconds after the merge that
+# triggers a trunk build started both runs at once; neither saw the other's `sha-` handle and the same
+# commit was built twice. Serialising makes the second run find the first build and promote it.
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   # ★ THE GATE (issue #45, decided 2026-10-21: option (b)). `test.yml` records a status on the commit,
   # but a SEPARATE workflow starts independently and cannot fail this one — so publishing waited on

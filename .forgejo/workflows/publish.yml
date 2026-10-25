@@ -1,22 +1,34 @@
 name: publish
 
-# Publish a RELEASE: build the image and the chart once, tag them with the version from `Cargo.toml`,
-# and push BOTH to BOTH registries.
+# Publish a RELEASE from `main` (or from a `v*` tag on it):
+#
+#   :X.Y.Z     a named version — immutable, and SPENT ONCE
+#   :latest    the newest stable release (never a prerelease)
+#
+# and push the chart with the same version. Both the image and the chart go to BOTH registries:
 #
 #   Harbor  harbor.vn.linuxguru.net/library/...   PRIVATE -- LAN-only, what the cluster pulls
 #   GHCR    ghcr.io/jdblack/...                   PUBLIC  -- the same bytes, mirrored
 #
-# The two paths are deliberately different:
-#   dev   -> publish-dev.yml, `edge` + `sha-<commit>`, Harbor only (the cluster's dev tag)
-#   main  -> here: versioned release + chart, both registries
-# Neither publishes the other's tags.
+# ★ THE TWO LINES, AND WHO OWNS WHICH NAME (James, 2026-10-25):
+#     dev  -> publish-dev.yml   v<X.Y.Z>-dev.<n>  +  sha-<commit>  +  edge
+#     main -> here              X.Y.Z             +  sha-<commit>  +  latest
+#   A release NEVER moves `edge`. `edge` means "newest dev" and only dev moves it.
 #
-# ARCHITECTURE: amd64 only, for now. The dependency image (Dockerfile.builder, ~250 crates) is
-# amd64-only, so a multi-platform release needs an arm64 dependency image FIRST -- and building that
-# means compiling every crate under QEMU once, which is a project rather than a flag. The path when
-# it matters: build `ellmephant-builder` for linux/arm64 once, then switch the build step to buildx
-# with `--platform linux/amd64,linux/arm64` and let the same `--push` carry both registries (the
-# digests stay identical exactly as they do today). Until then arm64 hosts pull amd64 and emulate.
+# ★ A RELEASE IS A PROMOTION, NOT A REBUILD. `dev` already built and tested this commit, so the
+# release job COPIES the manifest (`sha-<commit>` -> `X.Y.Z`, `latest`) by digest. Rebuilding the same
+# commit on `main` would produce different bytes (base image drift, timestamps) and give you two
+# artifacts claiming one source. A rebuild happens only when `main` has a commit `dev` never built --
+# which is exactly the hotfix case.
+#
+# ★ A VERSION IS SPENT ONCE. If `X.Y.Z` already exists at a different digest the job FAILS and names
+# the version; the fix is to bump `Cargo.toml`, not to re-point a tag. Re-running the SAME commit is
+# idempotent and succeeds.
+#
+# ★ SO A MERGE TO `main` MUST CARRY A VERSION BUMP. Bump `version = "x.y.z"` in `Cargo.toml` on `dev`
+# as the last commit before the release merge: that keeps `main` a fast-forward of `dev` (no back-merge
+# tangle) and makes the version a REVIEWED DECISION in the PR, not a counter that increments itself.
+# A merge that does not bump fails here, loudly, with the version it refused.
 on:
   push:
     branches: [main]
@@ -36,27 +48,89 @@ env:
   # has node + git + docker and no helm.
   HELM_VERSION: v3.16.3
   BUILDER_PROFILE: rust-lean
+  SOURCE_URL: https://git.vn.linuxguru.net/soma/ellmephant
 
 jobs:
+  # ★ THE GATE (issue #45, decided 2026-10-21: option (b)). `test.yml` records a status on the commit,
+  # but a SEPARATE workflow starts independently and cannot fail this one — so publishing waited on
+  # nothing. This job WAITS for that status instead: it polls until the test run for THIS commit is no
+  # longer pending, then passes only if it is green.
+  #
+  # Why option (b) rather than merging the tests in here: releases stay fast (the test runs in
+  # parallel, gated only on its result), and the test stays a workflow anyone can read without reading
+  # the release path. The cost is this guard: it is code, and anyone editing this file can remove it.
+  # The trade is stated here on purpose — the next reader should not have to re-derive it.
+  #
+  # ★ FAIL LOUDLY ON ABSENCE. A commit with NO test status is not "green": it means the test never ran
+  # (a broken `test.yml`, a commit pushed before this gate existed). Treating absence as success is
+  # exactly how a gate gates nothing, so it exits non-zero with a message that says which it was.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the test status on this commit
+        env:
+          TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}
+        run: |
+          set -eu
+          [ -n "${TOKEN:-}" ] || { echo "no GITHUB_TOKEN: cannot read commit statuses"; exit 1; }
+          deadline=$(( $(date +%s) + 2400 ))   # 40 min: a cold dependency build is minutes, not seconds
+          # ABSENCE IS NOT PENDING. A commit with no test status at all will never grow one, so waiting
+          # the full deadline for it is 40 minutes of pretending. Two minutes of nothing = say so.
+          missing=0
+          while :; do
+            body=$(curl -fsS -H "Authorization: token $TOKEN" \
+              "$API/api/v1/repos/$REPO/commits/$SHA/status") || {
+              echo "could not read the status for $SHA"; exit 1; }
+            state=$(printf '%s' "$body" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+            test_state=$(printf '%s' "$body" | tr '}' '\n' \
+              | grep '"context":"test / test' | sed -n 's/.*"status":"\([a-z]*\)".*/\1/p' | head -1)
+            echo "combined=$state test=${test_state:-<none>} at $SHA"
+            case "${test_state:-}" in
+              success) echo "the test gate passed"; exit 0 ;;
+              failure|error) echo "the test gate FAILED: refusing to publish"; exit 1 ;;
+              "")
+                missing=$((missing + 1))
+                if [ "$missing" -ge 8 ]; then
+                  echo "no test status for $SHA after $((missing * 15))s: the test never ran on this"
+                  echo "commit. Is .forgejo/workflows/test.yml present on this branch, and does it"
+                  echo "trigger for this event? Refusing to publish on an unproven commit."
+                  exit 1
+                fi ;;
+              *) missing=0 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "timed out waiting for the test status (test=${test_state:-<none>}, combined=$state)"
+              exit 1
+            fi
+            sleep 15
+          done
+
   publish:
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The release's whole identity comes from the one source of truth. `1.1.0` also implies `1.1`,
-      # `1` and `latest` -- unless it is a pre-release, which publishes only its own tag so a broken
-      # candidate can never take the moving ones (`latest` above all).
+      # The release's identity comes from the one source of truth: the TAG if this run is a tag push,
+      # otherwise `Cargo.toml`. A tag wins because a tag is the deliberate act; the file is the
+      # version a normal merge carries.
       - name: Read the release version
         id: ver
         run: |
           set -eu
-          ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
-          if [ -z "$ver" ]; then
-            echo "no version found in Cargo.toml"
-            exit 1
-          fi
+          ref="${GITHUB_REF_NAME:-main}"
+          case "$ref" in
+            v[0-9]*) ver="${ref#v}" ;;
+            *)       ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1) ;;
+          esac
+          [ -n "$ver" ] || { echo "no version found (ref=$ref, Cargo.toml)"; exit 1; }
+          short=$(git rev-parse --short=7 HEAD)
           echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "releasing $ver"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "releasing $ver from $ref (sha-$short)"
 
       - name: Log in to Harbor
         env:
@@ -83,6 +157,32 @@ jobs:
           fi
           echo "$GHCR_TOKEN" | docker login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
 
+      # ★ A VERSION IS SPENT ONCE. Checked BEFORE anything is built, so a spent version costs seconds
+      # rather than a full build, and the message names the fix (bump Cargo.toml).
+      - name: Refuse to reuse a spent version
+        run: |
+          set -eu
+          B="$IMAGE"
+          VER="${{ steps.ver.outputs.version }}"
+          SHORT="${{ steps.ver.outputs.short }}"
+          if docker buildx imagetools inspect "$B:$VER" > /dev/null 2>&1; then
+            have=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$VER")
+            if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
+              same=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:sha-$SHORT")
+            else
+              same=""
+            fi
+            if [ -n "$same" ] && [ "$same" = "$have" ]; then
+              echo "$B:$VER already points at this commit's build ($have) -- nothing to do."
+            else
+              echo "REFUSING: $B:$VER is already published ($have) and this commit is not it."
+              echo "A published version never changes. Bump the version in Cargo.toml."
+              exit 1
+            fi
+          else
+            echo "releasing $VER for the first time"
+          fi
+
       # Same dependency layer as the dev workflow: ~250 crates compiled once, reused as the builder
       # stage. The tag fingerprints Cargo.toml + Cargo.lock + Dockerfile.builder, so it moves by
       # itself when the dependency set or profile changes.
@@ -102,57 +202,76 @@ jobs:
           fi
           echo "$ref" > .builder-ref
 
-      # One build, tagged per registry: `docker tag`/multiple `-t` never rebuild, so the image the
-      # cluster runs and the image anyone can pull are provably the same bytes.
-      #
-      # Pre-releases publish ONLY their own tag (`1.1.0-rc.1`): never `latest`, `1` or `1.1`, so a
-      # candidate cannot leak into ordinary pulls. Promote by bumping Cargo.toml to the final version.
-      - name: Build and push the release image (both registries)
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
+      # ★ PROMOTE, DO NOT REBUILD. If `dev` already built this commit, the manifest is copied by
+      # digest and the release ships the exact bytes that were tested. Only a commit `dev` never saw
+      # (a hotfix merged straight to main) is built here.
+      - name: Publish the release image (promote the dev build, or build a hotfix)
         run: |
           set -eu
-          short=$(echo "${{ github.sha }}" | cut -c1-7)
-          maj=${VERSION%%.*}
-          rest=${VERSION#*.}
-          min=${rest%%.*}
+          B="$IMAGE"
+          VER="${{ steps.ver.outputs.version }}"
+          SHORT="${{ steps.ver.outputs.short }}"
+          G="$GHCR_IMAGE"
+          SHA=$(git rev-parse HEAD)
 
-          # Tag list, in the order they are pushed: immutable handle first, then the version, then
-          # the moving aliases.
-          set -- "$IMAGE:sha-$short" "$IMAGE:$VERSION" "$GHCR_IMAGE:sha-$short" "$GHCR_IMAGE:$VERSION"
-          case "$VERSION" in
-            *-*)
-              echo "pre-release $VERSION: publishing only its own tag"
-              ;;
-            *)
-              set -- "$@" \
-                "$IMAGE:$maj.$min" "$IMAGE:$maj" "$IMAGE:latest" \
-                "$GHCR_IMAGE:$maj.$min" "$GHCR_IMAGE:$maj" "$GHCR_IMAGE:latest"
-              ;;
-          esac
+          # `latest` never moves for a prerelease.
+          case "$VER" in *-*) stable=0 ;; *) stable=1 ;; esac
 
-          # Every -t is a local tag on the same build; the push loop below sends them all.
-          tags=""
-          for t in "$@"; do
-            tags="$tags -t $t"
-          done
-          echo "building $VERSION as:$tags"
-          # shellcheck disable=SC2086
-          docker build --platform linux/amd64 \
-            --build-arg BUILDER="$(cat .builder-ref)" \
-            --build-arg VERSION="$VERSION" \
-            --build-arg REVISION="${GITHUB_SHA:-unknown}" $tags .
+          if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
+            echo "promoting $B:sha-$SHORT -- built and tested on dev, not rebuilt"
+            docker buildx imagetools create -t "$B:$VER" "$B:sha-$SHORT"
+            # The public mirror is a copy of the same manifest, never a second build.
+            docker buildx imagetools create -t "$G:$VER" "$B:sha-$SHORT"
+          else
+            echo "no dev build for sha-$SHORT -- building the release here (hotfix path)"
+            docker build --platform linux/amd64 \
+              --build-arg BUILDER="$(cat .builder-ref)" \
+              --build-arg VERSION="$VER" \
+              --build-arg REVISION="$SHA" \
+              --label org.opencontainers.image.version="$VER" \
+              --label org.opencontainers.image.revision="$SHA" \
+              --label org.opencontainers.image.source="$SOURCE_URL" \
+              -t "$B:sha-$SHORT" -t "$B:$VER" -t "$G:$VER" .
+            docker push "$B:sha-$SHORT"
+            docker push "$B:$VER"
+            docker push "$G:$VER"
+          fi
 
-          # The base name of every tag, so the push loop needs no re-derivation.
-          for t in "$@"; do
-            docker push "$t"
-          done
-          echo "published $VERSION to $REGISTRY ($IMAGE) and $GHCR_REGISTRY ($GHCR_IMAGE)"
+          if [ "$stable" = "1" ]; then
+            docker buildx imagetools create -t "$B:latest" -t "$G:latest" "$B:$VER"
+          else
+            echo "prerelease $VER: not moving latest (by design)"
+          fi
+
+      # ★ MEASURED, not declared: read every tag back and prove it resolves to one digest. A partial
+      # publish (an artifact with some tags and not others) is exactly the defect this replaces.
+      - name: Verify the published tags agree
+        run: |
+          set -eu
+          B="$IMAGE"
+          G="$GHCR_IMAGE"
+          VER="${{ steps.ver.outputs.version }}"
+          SHORT="${{ steps.ver.outputs.short }}"
+          want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$VER")
+          check() { got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1") \
+                     || { echo "MISSING: $1"; exit 1; }
+                     [ "$got" = "$want" ] || { echo "MISMATCH: $1 is $got, expected $want"; exit 1; }
+                     echo "verified $1 -> $got"; }
+          check "$B:$VER"
+          check "$B:sha-$SHORT"
+          check "$G:$VER"
+          case "$VER" in *-*) echo "prerelease: latest not expected" ;;
+                     *) check "$B:latest" ; check "$G:latest" ;; esac
+          {
+            echo "published $VER"
+            echo "index digest $want"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # After the image, so a chart whose defaults name a tag is never ahead of that tag existing.
       # The chart's own `version` is its OCI tag; `appVersion` is what the chart defaults to.
       - name: Package and push the chart (both registries)
         env:
+          VERSION: ${{ steps.ver.outputs.version }}
           HARBOR_USER: ${{ secrets.HARBOR_USER }}
           HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
           GHCR_USER: ${{ secrets.GHCR_USER }}

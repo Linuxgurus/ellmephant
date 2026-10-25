@@ -532,3 +532,33 @@ pub fn may_ack_box(conn: &Connection, reader: &str, requested: &str) -> Result<b
     }
     live_grant(conn, requested, reader, "ack")
 }
+
+/// Import `ELLMEPHANT_MAIL_SURROGATES=hands=stet,…` as `read` grants, once.
+///
+/// The environment is the wrong home for a relationship: it cannot be dated, scoped, revoked or
+/// audited. It stays readable for exactly one release so a deployment that predates the grant table
+/// keeps working, and every pair becomes a row the store can answer questions about.
+///
+/// `INSERT OR IGNORE`, not an upsert: re-running this on every boot must not revive a grant someone
+/// revoked. A revocation is a decision, and a boot is not a contrary one.
+pub fn import_env_surrogates(conn: &Connection) -> Result<usize> {
+    let raw = std::env::var("ELLMEPHANT_MAIL_SURROGATES").unwrap_or_default();
+    let mut imported = 0;
+    let tx = conn.unchecked_transaction()?;
+    for pair in raw.split(',') {
+        let Some((surrogate, grantor)) = pair.split_once('=') else {
+            continue;
+        };
+        let (surrogate, grantor) = (surrogate.trim(), grantor.trim());
+        if surrogate.is_empty() || grantor.is_empty() {
+            continue;
+        }
+        imported += tx.execute(
+            "INSERT OR IGNORE INTO mail_surrogate (grantor, surrogate, scopes, note)
+             VALUES (?1, ?2, 'read', 'imported from ELLMEPHANT_MAIL_SURROGATES')",
+            params![grantor, surrogate],
+        )?;
+    }
+    tx.commit()?;
+    Ok(imported)
+}

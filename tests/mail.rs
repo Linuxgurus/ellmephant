@@ -386,3 +386,40 @@ fn ordinary_letters_carry_no_sent_by() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn an_ack_grant_does_not_confer_reading() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    mail::grant(&conn, "james", "cline", "ack", None, None)?;
+
+    assert!(mail::may_ack_box(&conn, "cline", "james")?, "ack scope");
+    assert!(
+        !mail::may_read_box(&conn, "cline", "james")?,
+        "but not read"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_pairs_import_once_and_a_revocation_survives_a_reimport() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+
+    // The hand that serves stet's box is `hands`; the old env pair was `hands=stet`.
+    unsafe { std::env::set_var("ELLMEPHANT_MAIL_SURROGATES", "hands=stet") };
+    assert!(mail::import_env_surrogates(&conn)? >= 1);
+    assert!(mail::may_read_box(&conn, "hands", "stet")?);
+
+    // A second import changes nothing (INSERT OR IGNORE), and a revoke is not undone by boot.
+    assert_eq!(mail::import_env_surrogates(&conn)?, 0);
+    mail::revoke(&conn, "stet", "hands")?;
+    let _ = mail::import_env_surrogates(&conn);
+    assert!(
+        !mail::may_read_box(&conn, "hands", "stet")?,
+        "revoked stays revoked"
+    );
+
+    unsafe { std::env::remove_var("ELLMEPHANT_MAIL_SURROGATES") };
+    Ok(())
+}

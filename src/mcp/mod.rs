@@ -76,6 +76,9 @@ pub const TOOLS: &[&str] = &[
     "mail_read",
     "mail_ack",
     "mail_prune",
+    "mail_surrogate_grant",
+    "mail_surrogate_revoke",
+    "mail_surrogate_list",
 ];
 
 /// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
@@ -843,6 +846,53 @@ pub struct MailSendParams {
         description = "How the body is encoded: `text` (default), `json`, `gzip+base64`. Declared so the reader does not spend a finger decoding gibberish."
     )]
     pub encoding: Option<String>,
+}
+
+/// A grant: `surrogate` may send letters whose `sender` is `grantor`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailGrantParams {
+    /// Whose name is lent.
+    #[schemars(
+        description = "Whose name is lent. The caller's OWN name: a pen grants itself, never another pen."
+    )]
+    pub grantor: String,
+    /// Who may use it.
+    #[schemars(description = "The pen that may send as `grantor`.")]
+    pub surrogate: String,
+    /// What they may do with it.
+    #[serde(default)]
+    #[schemars(description = "Comma list of `send`, `read`, `ack`. Default `send`.")]
+    pub scopes: Option<String>,
+    /// When it lapses.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional ISO datetime after which the grant lapses. Omit for standing until revoked."
+    )]
+    pub expires_at: Option<String>,
+    /// Why it exists.
+    #[serde(default)]
+    #[schemars(description = "One line, so a later reader knows why the name was lent.")]
+    pub note: Option<String>,
+}
+
+/// Revoke a grant by name.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailRevokeParams {
+    /// Whose name was lent.
+    pub grantor: String,
+    /// Whose grant is being taken back.
+    pub surrogate: String,
+}
+
+/// List the grants held by a pen.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailSurrogatesParams {
+    #[serde(default)]
+    #[schemars(description = "The pen whose grants to list. Omit for your own.")]
+    pub surrogate: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::mail_inbox`].
@@ -2876,14 +2926,22 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             body,
             encoding,
         } = p;
-        // A PROVEN identity outranks the argument. `sender` is asserted text — the one field a chat
-        // could use to speak as someone else — so the header pair, when it verifies, decides it.
-        let _asserted_sender = sender; // the argument is history; the pen decides
-        let sender = pen_name(&ctx, self.declared.as_deref())?;
+        // The PROVEN pen decides who is speaking; the argument decides whose NAME is on the letter.
+        // They may differ only while the proven pen holds a live `send` grant from the named pen, and
+        // the store refuses otherwise. It used to discard the argument and stamp the typist — a
+        // silent override that produced a real misattribution (2026-10-25, seq 566).
+        let proven = pen_name(&ctx, self.declared.as_deref())?;
+        let sender = sender.trim();
+        let sender = if sender.is_empty() {
+            proven.clone()
+        } else {
+            sender.to_string()
+        };
         let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
         let out = self
             .with_store("mail_send", move |s| {
                 s.mail_send(
+                    &proven,
                     &sender,
                     &recipient,
                     subject.as_deref().unwrap_or(""),
@@ -2901,6 +2959,114 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             "letter written"
         );
         serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// Lend your OWN name to another pen for mail.
+    #[tool(
+        name = "mail_surrogate_grant",
+        description = "Lend your OWN name: `surrogate` may then send letters whose `sender` is you. A grant is a row — scoped, dated, revocable — and every letter it produces records `sent_by`, so delegated mail is visible rather than assumed.",
+        annotations(
+            title = "Lend your name for mail",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_surrogate_grant(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailGrantParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        if !caller.eq_ignore_ascii_case(p.grantor.trim()) {
+            return Err(format!(
+                "refused: `{caller}` may grant its OWN name only; `{}` must grant itself",
+                p.grantor
+            ));
+        }
+        let grantor = p.grantor;
+        let surrogate = p.surrogate;
+        let scopes = p.scopes.unwrap_or_else(|| "send".to_string());
+        let expires_at = p.expires_at;
+        let note = p.note;
+        let out = self
+            .with_store("mail_surrogate_grant", move |s| {
+                s.mail_grant(
+                    &grantor,
+                    &surrogate,
+                    &scopes,
+                    expires_at.as_deref(),
+                    note.as_deref(),
+                )
+            })
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&out).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// Take a lent name back.
+    #[tool(
+        name = "mail_surrogate_revoke",
+        description = "Take a lent name back. Effective on the next call — nothing is cached.",
+        annotations(
+            title = "Revoke a mail surrogate",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_surrogate_revoke(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailRevokeParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        if !caller.eq_ignore_ascii_case(p.grantor.trim()) {
+            return Err(format!(
+                "refused: `{caller}` may revoke its OWN grants only"
+            ));
+        }
+        let (grantor, surrogate) = (p.grantor, p.surrogate);
+        let n = self
+            .with_store("mail_surrogate_revoke", move |s| {
+                s.mail_revoke(&grantor, &surrogate)
+            })
+            .await?;
+        Ok(json_ok(serde_json::json!({ "revoked": n })))
+    }
+
+    /// Whose names may this pen speak under?
+    #[tool(
+        name = "mail_surrogate_list",
+        description = "Every grant a pen holds, live or not — the question a reader asks before trusting a letter.",
+        annotations(
+            title = "List mail surrogates",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mail_surrogate_list(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<MailSurrogatesParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let subject = p.surrogate.unwrap_or(caller);
+        let rows = self
+            .with_read(
+                "mail_surrogate_list",
+                reader_of(&ctx, self.declared.as_deref()),
+                move |s| s.mail_surrogates_of(&subject),
+            )
+            .await?;
+        Ok(json_ok(
+            serde_json::to_value(&rows).map_err(|e| e.to_string())?,
+        ))
     }
 
     /// What is in a box after a cursor. Bodies omitted; `wait_seconds` long-polls.
@@ -3314,6 +3480,18 @@ pub fn http_router(
             axum::routing::get(surface::mail_inbox).post(surface::mail_send),
         )
         .route("/mail/prune", axum::routing::post(surface::mail_prune))
+        .route(
+            "/mail/surrogate/grant",
+            axum::routing::post(surface::mail_surrogate_grant),
+        )
+        .route(
+            "/mail/surrogate/revoke",
+            axum::routing::post(surface::mail_surrogate_revoke),
+        )
+        .route(
+            "/mail/surrogate",
+            axum::routing::get(surface::mail_surrogate_list),
+        )
         .route("/mail/ack", axum::routing::post(surface::mail_ack))
         .route("/mail/{seq}", axum::routing::get(surface::mail_read))
         .route("/reembed", axum::routing::post(surface::reembed))

@@ -773,13 +773,38 @@ impl Session {
     /// Write one letter into `recipient`'s box. Nothing is delivered: this is the whole event.
     pub fn mail_send(
         &self,
+        proven: &str,
         sender: &str,
         recipient: &str,
         subject: &str,
         body: &str,
         encoding: &str,
     ) -> Result<mail::Envelope> {
-        mail::send(&self.conn, sender, recipient, subject, body, encoding)
+        mail::send(
+            &self.conn, proven, sender, recipient, subject, body, encoding,
+        )
+    }
+
+    /// Lend this pen's name to another (mail surrogate). Self-only is enforced at the tool.
+    pub fn mail_grant(
+        &self,
+        grantor: &str,
+        surrogate: &str,
+        scopes: &str,
+        expires_at: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<mail::Surrogate> {
+        mail::grant(&self.conn, grantor, surrogate, scopes, expires_at, note)
+    }
+
+    /// Take the grant back. Effective on the next call.
+    pub fn mail_revoke(&self, grantor: &str, surrogate: &str) -> Result<usize> {
+        mail::revoke(&self.conn, grantor, surrogate)
+    }
+
+    /// Every grant a pen holds, live or not.
+    pub fn mail_surrogates_of(&self, surrogate: &str) -> Result<Vec<mail::Surrogate>> {
+        mail::surrogates_of(&self.conn, surrogate)
     }
 
     /// Everything in `recipient`'s box after `since`, oldest first, bodies omitted.

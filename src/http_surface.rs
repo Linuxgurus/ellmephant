@@ -217,6 +217,21 @@ pub const ROUTES: &[Route] = &[
         path: "/mail/prune",
         tool: "mail_prune",
     },
+    Route {
+        method: "POST",
+        path: "/mail/surrogate/grant",
+        tool: "mail_surrogate_grant",
+    },
+    Route {
+        method: "POST",
+        path: "/mail/surrogate/revoke",
+        tool: "mail_surrogate_revoke",
+    },
+    Route {
+        method: "GET",
+        path: "/mail/surrogate",
+        tool: "mail_surrogate_list",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -3099,7 +3114,7 @@ pub async fn mail_send(
     };
     match server
         .with_store("mail_send", move |s| {
-            s.mail_send(&sender, &recipient, &subject, &letter, &encoding)
+            s.mail_send(&sender, &sender, &recipient, &subject, &letter, &encoding)
         })
         .await
     {
@@ -3378,5 +3393,201 @@ pub async fn mail_prune(
             format!("pruned {removed} letter(s) older than {keep_days}d"),
         ),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+// ── MAIL SURROGATES (#153) ───────────────────────────────────────────────────────────────────────
+
+/// `POST /mail/surrogate/grant` — lend your OWN name for mail.
+pub async fn mail_surrogate_grant(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let caller = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "refused: granting a name needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+            );
+        }
+        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        grantor: String,
+        surrogate: String,
+        #[serde(default)]
+        scopes: Option<String>,
+        #[serde(default)]
+        expires_at: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    if !caller.eq_ignore_ascii_case(ask.grantor.trim()) {
+        return error(
+            json,
+            StatusCode::FORBIDDEN,
+            format!(
+                "refused: `{caller}` may grant its OWN name only; `{}` must grant itself",
+                ask.grantor
+            ),
+        );
+    }
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let scopes = ask.scopes.unwrap_or_else(|| "send".to_string());
+    match server
+        .with_store("mail_surrogate_grant", move |s| {
+            s.mail_grant(
+                &ask.grantor,
+                &ask.surrogate,
+                &scopes,
+                ask.expires_at.as_deref(),
+                ask.note.as_deref(),
+            )
+        })
+        .await
+    {
+        Ok(grant) => {
+            let value = serde_json::to_value(&grant).unwrap_or(serde_json::Value::Null);
+            render(
+                StatusCode::CREATED,
+                json,
+                value.to_string(),
+                "granted\n".to_string(),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+/// `POST /mail/surrogate/revoke` — take a lent name back.
+pub async fn mail_surrogate_revoke(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let caller = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "refused: revoking needs a proven pen",
+            );
+        }
+        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        grantor: String,
+        surrogate: String,
+    }
+    let ask: Ask = match serde_json::from_slice(&bytes) {
+        Ok(a) => a,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+    };
+    if !caller.eq_ignore_ascii_case(ask.grantor.trim()) {
+        return error(
+            json,
+            StatusCode::FORBIDDEN,
+            format!("refused: `{caller}` may revoke its OWN grants only"),
+        );
+    }
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("mail_surrogate_revoke", move |s| {
+            s.mail_revoke(&ask.grantor, &ask.surrogate)
+        })
+        .await
+    {
+        Ok(n) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "revoked": n }).to_string(),
+            format!("revoked {n}\n"),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+/// `GET /mail/surrogate` — every grant this pen holds, live or not.
+pub async fn mail_surrogate_list(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let caller = match crate::identity::resolve(&headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "refused: listing grants needs a proven pen",
+            );
+        }
+        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+    };
+    let subject = params
+        .maybe("surrogate")
+        .map(str::to_string)
+        .unwrap_or(caller);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read(
+            "mail_surrogate_list",
+            crate::store::audience::Reader::pen(&subject),
+            move |s| s.mail_surrogates_of(&subject),
+        )
+        .await
+    {
+        Ok(rows) => {
+            let value = serde_json::to_value(&rows).unwrap_or(serde_json::Value::Null);
+            render(
+                StatusCode::OK,
+                json,
+                value.to_string(),
+                format!("{}\n", rows.len()),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
     }
 }

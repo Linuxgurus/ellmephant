@@ -1,0 +1,15 @@
+-- MAIL: `sent_under` — WHICH GRANT authorised a surrogate letter (#154 review).
+--
+-- `sent_by` proves the sender and the typist are different pens. It does not, by itself, prove a
+-- grant existed: `sender` is self-asserted, so a reader looking at `sender = james` and
+-- `asserted_by = cline` cannot tell a delegated letter from a forged one written before the check
+-- existed.
+--
+-- The send path refuses unless `may_send_as` passes, so every NEW surrogate row is authorised — but
+-- a fact a reader has to know the code to trust is a fact the schema should carry. This column does.
+--
+-- It holds the `granted_at` of the `mail_surrogate` row that was live at send time, which is the
+-- audit link back to the grant: `SELECT * FROM mail_surrogate WHERE grantor = sender AND
+-- surrogate = asserted_by AND granted_at = sent_under`. NULL on an ordinary letter, and NULL is
+-- meaningful — it means "the sender wrote as itself".
+ALTER TABLE mail ADD COLUMN sent_under TEXT;

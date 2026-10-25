@@ -295,7 +295,7 @@ fn an_unauthorized_sender_is_refused_by_name() -> Result<()> {
 fn a_granted_surrogate_sends_and_the_letter_says_who_typed_it() -> Result<()> {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
-    mail::grant(&conn, "james", "cline", "send", None, Some("asleep"))?;
+    let grant = mail::grant(&conn, "james", "cline", "send", None, Some("asleep"))?;
 
     let env = mail::send(&conn, "cline", "james", "stet", "s", "b", "text")?;
     assert_eq!(env.sender, "james", "the letter is from the grantor");
@@ -305,8 +305,18 @@ fn a_granted_surrogate_sends_and_the_letter_says_who_typed_it() -> Result<()> {
         "and it says who typed it"
     );
 
+    assert_eq!(
+        env.sent_under.as_deref(),
+        Some(grant.granted_at.as_str()),
+        "the receipt names the grant that authorised it"
+    );
+
     let letter = mail::read(&conn, env.seq)?.expect("letter");
     assert_eq!(letter.envelope.sent_by.as_deref(), Some("cline"));
+    assert_eq!(
+        letter.envelope.sent_under.as_deref(),
+        Some(grant.granted_at.as_str())
+    );
     Ok(())
 }
 
@@ -370,5 +380,9 @@ fn ordinary_letters_carry_no_sent_by() -> Result<()> {
     let conn = db::open(&paths)?;
     let env = mail::send(&conn, "stet", "stet", "twine", "s", "b", "text")?;
     assert!(env.sent_by.is_none());
+    assert!(
+        env.sent_under.is_none(),
+        "nothing authorised, nothing to cite"
+    );
     Ok(())
 }

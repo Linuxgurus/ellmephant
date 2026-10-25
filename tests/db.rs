@@ -36,6 +36,20 @@ fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     .expect("insert memory");
 }
 
+/// A v4 store predates `mail` entirely, so the column drop has to tolerate a missing table.
+fn drop_sent_under(conn: &Connection) {
+    let has_mail: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mail'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if has_mail > 0 {
+        let _ = conn.execute("ALTER TABLE mail DROP COLUMN sent_under", []);
+    }
+}
+
 #[test]
 fn fresh_store_is_at_latest_schema_with_every_object() {
     let (_dir, paths) = temp_store();
@@ -208,6 +222,7 @@ fn a_v4_store_gains_the_project_tables_on_open() {
          DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
+    drop_sent_under(&conn);
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -293,6 +308,7 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
          DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
+    drop_sent_under(&conn);
     conn.pragma_update(None, "user_version", 5).unwrap();
     // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
@@ -485,6 +501,7 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
          DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
+    drop_sent_under(&conn);
     conn.execute("PRAGMA user_version = 20", []).unwrap();
     drop(conn);
 
@@ -585,6 +602,7 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
          DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
+    drop_sent_under(&conn);
     conn.pragma_update(None, "user_version", 24).unwrap();
     drop(conn);
 

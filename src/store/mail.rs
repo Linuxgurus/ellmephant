@@ -54,6 +54,11 @@ pub struct Envelope {
     /// Absent on an ordinary letter, so every existing reader is unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sent_by: Option<String>,
+    /// The `granted_at` of the grant that authorised the send, when there was one. `sent_by` shows
+    /// that the names DIFFER; this shows that a live grant backed it, which is the fact a reader
+    /// actually needs and cannot infer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sent_under: Option<String>,
 }
 
 /// One letter WITH its body.
@@ -97,6 +102,13 @@ pub fn send(
         ));
     }
     may_send_as(conn, proven, sender)?;
+    // A receipt a reader can check: WHICH grant authorised this, if any. `sent_by` shows the names
+    // differ; this shows a live grant backed the difference.
+    let sent_under = if proven.eq_ignore_ascii_case(sender) {
+        None
+    } else {
+        grant_at(conn, sender, proven, "send")?
+    };
     if recipient.is_empty() {
         return Err(Error::Invalid(
             "`recipient` cannot be empty: address a SELF (`stet`, `twine`), never a finger".into(),
@@ -114,8 +126,8 @@ pub fn send(
     }
 
     conn.execute(
-        "INSERT INTO mail (sender, recipient, subject, body, encoding, bytes, asserted_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO mail (sender, recipient, subject, body, encoding, bytes, asserted_by, sent_under)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             sender,
             recipient,
@@ -123,7 +135,8 @@ pub fn send(
             body,
             encoding,
             bytes as i64,
-            proven
+            proven,
+            sent_under
         ],
     )?;
     let seq = conn.last_insert_rowid();
@@ -140,7 +153,8 @@ pub fn inbox(
     let mut stmt = conn.prepare(
         "SELECT seq, at, sender, subject, encoding, bytes,
                 CASE WHEN asserted_by IS NOT NULL AND lower(asserted_by) <> lower(sender)
-                     THEN asserted_by END
+                     THEN asserted_by END,
+                sent_under
            FROM mail
           WHERE recipient = ?1 AND seq > ?2
           ORDER BY seq
@@ -157,6 +171,7 @@ pub fn inbox(
                 encoding: r.get(4)?,
                 bytes: r.get(5)?,
                 sent_by: r.get(6)?,
+                sent_under: r.get(7)?,
             })
         },
     )?;
@@ -169,7 +184,8 @@ pub fn read(conn: &Connection, seq: i64) -> Result<Option<Letter>> {
         .query_row(
             "SELECT seq, at, sender, recipient, subject, encoding, bytes, body,
                     CASE WHEN asserted_by IS NOT NULL AND lower(asserted_by) <> lower(sender)
-                         THEN asserted_by END
+                         THEN asserted_by END,
+                    sent_under
                FROM mail WHERE seq = ?1",
             params![seq],
             |r| {
@@ -182,6 +198,7 @@ pub fn read(conn: &Connection, seq: i64) -> Result<Option<Letter>> {
                         encoding: r.get(5)?,
                         bytes: r.get(6)?,
                         sent_by: r.get(8)?,
+                        sent_under: r.get(9)?,
                     },
                     recipient: r.get(3)?,
                     body: r.get(7)?,
@@ -457,18 +474,29 @@ pub fn surrogates_of(conn: &Connection, surrogate: &str) -> Result<Vec<Surrogate
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn live_grant(conn: &Connection, grantor: &str, surrogate: &str, scope: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS (
-             SELECT 1 FROM mail_surrogate
+/// The `granted_at` of the live grant, if one exists — the audit link `sent_under` stores.
+fn grant_at(
+    conn: &Connection,
+    grantor: &str,
+    surrogate: &str,
+    scope: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT granted_at FROM mail_surrogate
               WHERE lower(grantor) = lower(?1)
                 AND lower(surrogate) = lower(?2)
                 AND revoked_at IS NULL
                 AND (expires_at IS NULL OR expires_at > datetime('now'))
-                AND instr(',' || replace(scopes, ' ', '') || ',', ',' || ?3 || ',') > 0)",
-        params![grantor.trim(), surrogate.trim(), scope],
-        |r| r.get(0),
-    )?)
+                AND instr(',' || replace(scopes, ' ', '') || ',', ',' || ?3 || ',') > 0",
+            params![grantor.trim(), surrogate.trim(), scope],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn live_grant(conn: &Connection, grantor: &str, surrogate: &str, scope: &str) -> Result<bool> {
+    Ok(grant_at(conn, grantor, surrogate, scope)?.is_some())
 }
 
 /// May `proven` send a letter whose `sender` is `sender`?

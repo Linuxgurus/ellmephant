@@ -1,19 +1,26 @@
 name: publish-dev
 
-# Publish `dev`: build the runtime image and push it to Harbor as `edge` + `sha-<commit>`.
+# Publish `dev`: build the runtime image and push it to Harbor as
+#
+#   :v<X.Y.Z>-dev.<n>   the dev LINE — a prerelease of the next release, `n` commits past the last tag
+#   :sha-<commit>       the immutable handle; pin THIS in a deployment
+#   :edge               the moving name for "newest dev"
+#
+# ★ ONE WORD, ONE MEANING (James, 2026-10-25): `edge` only ever moves from `dev` in this repo. A release
+# on `main` publishes `X.Y.Z` + `latest` and never touches `edge`, so "edge" cannot mean two things.
+#
+# ★ WHY <n> IS "COMMITS SINCE THE LAST TAG": a lifetime commit count (`-dev.394`) grows for ever and
+# answers nothing. `v1.2.0-dev.7` says "seven commits toward 1.2.0", which is the question anyone
+# actually asks when deciding whether to roll.
+#
+# ★ A VERSION IS SPENT ONCE. The dev tag is derived from the commit, so re-running this job for the
+# same commit REUSES the build (the `sha-` handle exists) instead of producing a second artifact for
+# one version. If the tag exists pointing at different bytes, the job FAILS rather than re-pointing it:
+# a version-shaped name that moves is the defect this whole change is meant to remove.
 #
 # This file is ALSO the CI gate. Two jobs: `test` (the gate) then `publish`. `publish` needs `test`
 # and is skipped on a pull request, so a PR gets a real status and publishes nothing, and a push to
-# `dev` cannot move `edge` from code that does not pass. Before this, a PR showed NO statuses at all
-# and a broken `dev` published freely.
-#
-# Harbor is the PRIVATE registry (LAN-only) and `edge` is the *dev* tag: the newest build of `dev`,
-# which the cluster may track. Releases are a separate workflow (`publish.yml`, on `main`) and go to
-# BOTH registries. `edge` is deliberately NOT mirrored to GHCR: a public tag that stops moving is a
-# trap, and it would freeze the moment this branch stopped being the source.
-#
-# amd64 only, on purpose: the cluster is amd64, and an arm64 half would double the build for no user
-# (public users pull releases; see publish.yml for where arm64 stands).
+# `dev` cannot move `edge` from code that does not pass.
 on:
   push:
     branches: [dev]
@@ -26,6 +33,7 @@ env:
   IMAGE: harbor.vn.linuxguru.net/library/ellmephant
   BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
   BUILDER_PROFILE: rust-lean
+  SOURCE_URL: https://git.vn.linuxguru.net/soma/ellmephant
 
 jobs:
   # The gate: format, lints and the suite, one cargo step at a time, in a throwaway image.
@@ -52,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The dev tag counts commits (`v1.2.0-dev.<n>`), so a shallow clone would always say 1.
+          # The dev tag counts commits since the last release tag, so a shallow clone would lie.
           fetch-depth: 0
 
       - name: Log in to Harbor
@@ -87,22 +95,88 @@ jobs:
           fi
           echo "$ref" > .builder-ref
 
-      - name: Build and push edge
+      # What the dev build of THIS commit is called. Two values, from two places:
+      #   version  <- Cargo.toml: the release this is a prerelease OF
+      #   dev      <- version + commits since the last release tag
+      - name: Name this build
+        id: name
         run: |
           set -eu
-          short=$(echo "${{ github.sha }}" | cut -c1-7)
-          # ★ A VERSION ON EVERY DEV BUILD (James, 2026-10-24): `sha-` is a pin and `edge` moves,
-          # but neither says WHICH release line this is. The dev tag reads `v1.2.0-dev.329`.
-          ver=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
-          count=$(git rev-list --count HEAD)
-          dev="v${ver}-dev.${count}"
-          docker build --platform linux/amd64 \
-            --build-arg BUILDER="$(cat .builder-ref)" \
-            --build-arg VERSION="$dev" \
-            --build-arg REVISION="${{ github.sha }}" \
-            -t "$IMAGE:edge" -t "$IMAGE:sha-$short" -t "$IMAGE:$dev" .
-          # Immutable handles FIRST: the pinned names exist before the moving tag points at them.
-          docker push "$IMAGE:sha-$short"
-          docker push "$IMAGE:$dev"
-          docker push "$IMAGE:edge"
-          echo "pushed $IMAGE:{sha-$short, $dev, edge}"
+          ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          [ -n "$ver" ] || { echo "no version in Cargo.toml"; exit 1; }
+          # `--exclude '*-dev.*'` matters: without it the nearest tag is a dev tag and the distance
+          # collapses to zero on the second build onwards.
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-dev.*' 2>/dev/null || true)
+          if [ -n "$base" ]; then
+            n=$(git rev-list --count "$base"..HEAD)
+          else
+            n=$(git rev-list --count HEAD)
+          fi
+          short=$(git rev-parse --short=7 HEAD)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "dev=v${ver}-dev.${n}" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "built from ${base:-the first commit}: $n commit(s) since"
+          echo "dev name: v${ver}-dev.${n}; immutable handle: sha-${short}"
+
+      # Build ONCE per commit. `sha-<commit>` is the artifact's identity; the version-shaped tags are
+      # aliases pointed at it afterwards. Re-running the same commit therefore reuses the same bytes.
+      - name: Build the image (or reuse this commit's build)
+        run: |
+          set -eu
+          B="$IMAGE"
+          DEV="${{ steps.name.outputs.dev }}"
+          VER="${{ steps.name.outputs.version }}"
+          SHORT="${{ steps.name.outputs.short }}"
+          if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
+            echo "sha-$SHORT already exists -- reusing it, not rebuilding"
+          else
+            docker build --platform linux/amd64 \
+              --build-arg BUILDER="$(cat .builder-ref)" \
+              --build-arg VERSION="$VER" \
+              --build-arg REVISION="$(git rev-parse HEAD)" \
+              --label org.opencontainers.image.version="$VER" \
+              --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+              --label org.opencontainers.image.source="$SOURCE_URL" \
+              --label net.linuxguru.build="$DEV" \
+              -t "$B:sha-$SHORT" .
+            # Immutable handle FIRST: it exists before any version-shaped name points at it.
+            docker push "$B:sha-$SHORT"
+          fi
+
+      # Every alias is created FROM THE MANIFEST, not from a local image -- so this is the same code
+      # path whether this run built the image or a previous one did.
+      - name: Point the dev line and edge at the build, then prove they agree
+        run: |
+          set -eu
+          B="$IMAGE"
+          DEV="${{ steps.name.outputs.dev }}"
+          SHORT="${{ steps.name.outputs.short }}"
+          want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:sha-$SHORT")
+
+          if docker buildx imagetools inspect "$B:$DEV" > /dev/null 2>&1; then
+            got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$DEV")
+            if [ "$got" != "$want" ]; then
+              echo "REFUSING: $B:$DEV already exists at $got, but this commit builds $want."
+              echo "A version-shaped tag must never move. Bump the version, or investigate why the"
+              echo "same commit produces different bytes (a moved base image is the usual reason)."
+              exit 1
+            fi
+            echo "$DEV already points at this build"
+          else
+            docker buildx imagetools create -t "$B:$DEV" "$B:sha-$SHORT"
+          fi
+
+          # `edge` is the only moving name a dev build owns.
+          docker buildx imagetools create -t "$B:edge" "$B:sha-$SHORT"
+
+          # MEASURED, not declared: read the tags back and compare digests.
+          for t in "$DEV" edge; do
+            got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$t")
+            [ "$got" = "$want" ] || { echo "MISMATCH: $B:$t is $got, expected $want"; exit 1; }
+            echo "verified $B:$t -> $got"
+          done
+          {
+            echo "published $B:{sha-$SHORT, $DEV, edge}"
+            echo "index digest $want"
+          } >> "$GITHUB_STEP_SUMMARY"

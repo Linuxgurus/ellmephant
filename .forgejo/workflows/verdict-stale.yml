@@ -1,0 +1,53 @@
+name: verdict-stale
+
+# ★ A REVISION NEEDS A NEW REVIEW (James, 2026-10-26). When a PR's head changes, every per-pen
+# verdict label is stale by construction: `<pen>:lgtm` was given for a tree nobody is looking at any
+# more, and `<pen>:needs-work` may have been answered by the very commit that just landed. So a push
+# drops ALL THREE — lgtm, needs-work and no-opinion — and the pen says it again or it stays unsaid.
+#
+# ★ MEASURED ON THIS FORGEJO (16.0.5, scratch probe): the trigger type is `synchronize` but the
+# PAYLOAD action is **`synchronized`**. Do not test for the trigger spelling in the payload.
+# `github.ref` here is `refs/pull/<n>/head`, not a branch name. `${{ github.token }}` CAN delete
+# labels with `permissions: issues: write`.
+#
+# ★ WHY NOT KEEP needs-work: a blocker that survives a typo fix is a blocker the reviewer still owes
+# an answer on, but a label that survives *every* push becomes a sticker — and the reviewer who pushed
+# a real fix deserves a clean board. Re-review is cheap; a stale verdict is not.
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  issues: write
+
+jobs:
+  drop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drop every <pen>:<verdict> label
+        env:
+          TOKEN: ${{ github.token }}
+          API: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          curl -fsS -H "Authorization: token $TOKEN" \
+            "$API/api/v1/repos/$REPO/issues/$NUM/labels" > /tmp/labels.json
+          python3 - > /tmp/drop.txt <<'PY'
+          import json, urllib.parse
+          VERDICTS = ("lgtm", "needs-work", "no-opinion")
+          for label in json.load(open("/tmp/labels.json")):
+              name = label["name"]
+              if ":" in name and name.split(":", 1)[1].lower() in VERDICTS:
+                  print(urllib.parse.quote(name, safe=""))
+          PY
+          if [ ! -s /tmp/drop.txt ]; then
+            echo "no verdict labels to drop"
+            exit 0
+          fi
+          while read -r enc; do
+            curl -fsS -X DELETE -H "Authorization: token $TOKEN" \
+              "$API/api/v1/repos/$REPO/issues/$NUM/labels/$enc"
+            echo "dropped $enc"
+          done < /tmp/drop.txt

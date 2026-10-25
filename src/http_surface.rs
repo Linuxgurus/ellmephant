@@ -297,6 +297,16 @@ pub const ROUTES: &[Route] = &[
         path: "/channels/{channel}/events",
         tool: "channel_events",
     },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/retention",
+        tool: "channel_set_retention",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/prune",
+        tool: "channel_prune",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -4297,6 +4307,101 @@ pub async fn channel_events(
                 json,
                 serde_json::json!({ "channel": channel, "events": rows }).to_string(),
                 format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/retention — how long the text is kept. Keeper-only, recorded.
+pub async fn channel_set_retention(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let Some(keep) = doc.get("keep_secs").and_then(|v| v.as_i64()) else {
+        return error(json, StatusCode::BAD_REQUEST, "`keep_secs` is required");
+    };
+    let (who, chan) = (pen.clone(), channel.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_set_retention", move |s| {
+            s.channel_set_retention(&who, &chan, keep)
+        })
+        .await
+    {
+        Ok(row) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
+            format!(
+                "#{} keeps {}\n",
+                row.key,
+                if row.keep_secs == 0 {
+                    "forever".into()
+                } else {
+                    format!("{}s", row.keep_secs)
+                }
+            ),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/prune — expire the text past retention. Receipts stay.
+pub async fn channel_prune(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => serde_json::json!({}),
+    };
+    let only = doc
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+        .await
+    {
+        Ok(rows) => {
+            let total: usize = rows.iter().map(|r| r.emptied).sum();
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "pruned": rows, "emptied": total }).to_string(),
+                format!("emptied {total} message body(s)\n"),
             )
         }
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),

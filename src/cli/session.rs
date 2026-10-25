@@ -806,8 +806,13 @@ impl Session {
 
     /// Mark that a turn boundary OFFERED this pen its inbox. One call is one miss while unread.
     /// Called by whatever owns the turn (the spine, the harness), never by the model.
-    pub fn channel_present(&self, pen: &str) -> Result<usize> {
-        channel::present(&self.conn, pen)
+    pub fn channel_present(&self, pen: &str, boundary: Option<&str>) -> Result<usize> {
+        channel::present(&self.conn, pen, boundary)
+    }
+
+    /// Put ANOTHER pen in a channel. Keeper-only: an invitation has an inviter.
+    pub fn channel_invite(&self, actor: &str, pen: &str, channel: &str) -> Result<()> {
+        channel::invite(&self.conn, actor, pen, channel)
     }
 
     /// LISTEN: take the unread messages and mark them fetched. This is what clears a gate.

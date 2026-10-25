@@ -2675,7 +2675,10 @@ async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
              INSERT OR IGNORE INTO pen (name, kind) VALUES ('james', 'self');",
         )
         .unwrap();
-        ellmephant::store::channel::join(&conn, "http-as-gated", "ops_team").unwrap();
+        // `ops_team` is invite-only: a pen cannot add itself, so the keeper invites both the pen
+        // under test and the pen that raises the incident.
+        ellmephant::store::channel::invite(&conn, "james", "http-as-gated", "ops_team").unwrap();
+        ellmephant::store::channel::invite(&conn, "james", "james", "ops_team").unwrap();
         let m = ellmephant::store::channel::send(
             &conn,
             "james",
@@ -2686,8 +2689,8 @@ async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
         .expect("send");
         seq = m.seq;
         // Two boundaries offered it and the pen did not fetch: `ops_team` tolerates one, not two.
-        ellmephant::store::channel::present(&conn, "http-as-gated").unwrap();
-        ellmephant::store::channel::present(&conn, "http-as-gated").unwrap();
+        ellmephant::store::channel::present(&conn, "http-as-gated", None).unwrap();
+        ellmephant::store::channel::present(&conn, "http-as-gated", None).unwrap();
         // The grace is 60s from the FIRST OPPORTUNITY; backdate the opportunity, not the message.
         conn.execute(
             "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')

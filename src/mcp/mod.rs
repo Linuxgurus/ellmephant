@@ -81,6 +81,7 @@ pub const TOOLS: &[&str] = &[
     "channel_history",
     "channel_fetch",
     "channel_present",
+    "channel_invite",
     "channel_breach",
     "channel_join",
     "channel_leave",
@@ -1260,6 +1261,32 @@ pub struct ChannelMemberParams {
         description = "The channel key, without the `#`. Joining `ops_team` also joins `emergency`, in the same transaction: a team that runs the cluster must be reachable when it falls over."
     )]
     pub channel: String,
+}
+
+/// Parameters for [`MemoryServer::channel_invite`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelInviteParams {
+    /// Which channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
+    /// Who is invited.
+    #[schemars(
+        description = "The pen to put in the channel. `estate` or `james` only: an invitation has an inviter. Inviting to `ops_team` also puts the pen in `emergency`."
+    )]
+    pub pen: String,
+}
+
+/// Parameters for [`MemoryServer::channel_present`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPresentParams {
+    /// Name this turn boundary.
+    #[serde(default)]
+    #[schemars(
+        description = "A token for THIS turn boundary (e.g. the task key plus a counter). The same token twice is the SAME opportunity and adds no miss, so a retry or a second step in one turn cannot lock the pen. Omit only if every call really is a new boundary."
+    )]
+    pub boundary: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::channel_wait`].
@@ -2816,9 +2843,14 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
-            .with_store("memory_reembed", move |s| s.reembed())
+            .with_store("memory_reembed", move |s| {
+                // ★ ACTING, NOT RECORD: a rebuild touches every vector in the store, and `all` is
+                // the class that says "acting without this news is dangerous" (#159 review).
+                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
+                s.reembed()
+            })
             .await?;
         tracing::info!(
             tool = "memory_reembed",
@@ -2867,9 +2899,12 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
-            .with_store("memory_reparse", move |s| s.reparse())
+            .with_store("memory_reparse", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
+                s.reparse()
+            })
             .await?;
         tracing::info!(
             tool = "memory_reparse",
@@ -3612,8 +3647,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn channel_history(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelHistoryParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review)
         let ChannelHistoryParams {
             channel,
             since,
@@ -3679,11 +3716,15 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     async fn channel_present(
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelPresentParams>,
     ) -> std::result::Result<String, String> {
         let pen = pen_name(&ctx, self.declared.as_deref())?;
         let who = pen.clone();
+        let boundary = p.boundary;
         let touched = self
-            .with_store("channel_present", move |s| s.channel_present(&who))
+            .with_store("channel_present", move |s| {
+                s.channel_present(&who, boundary.as_deref())
+            })
             .await?;
         serde_json::to_string(&serde_json::json!({ "pen": pen, "marked": touched }))
             .map_err(|e| e.to_string())
@@ -3746,6 +3787,35 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": true }).to_string())
     }
 
+    /// Invite a pen to a channel.
+    #[tool(
+        name = "channel_invite",
+        description = "Put ANOTHER pen in a channel. ★ `estate` or `james` only: a `list` channel is invite-only, so an invitation has an inviter and a pen cannot add itself. Inviting to `ops_team` also puts the pen in `emergency` — a team that runs the cluster must be reachable when it falls over.",
+        annotations(
+            title = "Invite a pen to a channel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_invite(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelInviteParams>,
+    ) -> std::result::Result<String, String> {
+        let actor = pen_name(&ctx, self.declared.as_deref())?;
+        let (who, guest, chan) = (actor.clone(), p.pen.clone(), p.channel.clone());
+        self.with_store("channel_invite", move |s| {
+            s.channel_invite(&who, &guest, &chan)
+        })
+        .await?;
+        Ok(serde_json::json!({
+            "channel": p.channel, "pen": p.pen, "member": true, "invited_by": actor
+        })
+        .to_string())
+    }
+
     /// Leave a channel.
     #[tool(
         name = "channel_leave",
@@ -3802,13 +3872,15 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 )
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
+                let truncated = rows.len() >= 200;
                 return serde_json::to_string(&serde_json::json!({
                     "after": after,
                     "messages": rows,
+                    "truncated": truncated,
                 }))
                 .map_err(|e| e.to_string());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
     }
 
@@ -3826,8 +3898,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn channel_members(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMembersParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // the roster is configuration, not a public list
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -3913,8 +3987,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn channel_events(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelEventsParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // who gated what is not a public record
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -3973,10 +4049,13 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPruneParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // a prune writes; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // a prune writes; anonymous is read-only
         let only = p.channel;
         let rows = self
-            .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+            .with_store("channel_prune", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
+                s.channel_prune(only.as_deref())
+            })
             .await?;
         let total: usize = rows.iter().map(|r| r.emptied).sum();
         tracing::info!(
@@ -4158,6 +4237,10 @@ pub fn http_router(
         .route(
             "/channels/{channel}/members",
             axum::routing::get(surface::channel_members),
+        )
+        .route(
+            "/channels/{channel}/invite",
+            axum::routing::post(surface::channel_invite),
         )
         .route(
             "/channels/{channel}/gate",

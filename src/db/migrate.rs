@@ -175,6 +175,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0033_channel_retention.sql"),
         "`channel.keep_secs`: retention as a policy on the row; 0 = forever (#163)",
     ),
+    (
+        34,
+        include_str!("../../migrations/0034_channel_boundary.sql"),
+        "`channel_boundary`: a turn boundary names itself, so a retry is not a second miss (#159 review)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

@@ -307,6 +307,11 @@ pub const ROUTES: &[Route] = &[
         path: "/channels/prune",
         tool: "channel_prune",
     },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/invite",
+        tool: "channel_invite",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -2273,7 +2278,13 @@ pub async fn reparse(
         Err(r) => return r,
     };
     match server
-        .with_store("memory_reparse", move |s| s.reparse())
+        .with_store("memory_reparse", move |s| {
+            // The pen the identity pair proves, if any: maintenance over the whole store is ACTING.
+            if let Some(caller) = crate::identity::resolve(&headers).ok().flatten() {
+                s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
+            }
+            s.reparse()
+        })
         .await
     {
         Ok(report) => {
@@ -2321,7 +2332,13 @@ pub async fn reembed(
         Err(r) => return r,
     };
     match server
-        .with_store("memory_reembed", move |s| s.reembed())
+        .with_store("memory_reembed", move |s| {
+            // The pen the identity pair proves, if any: maintenance over the whole store is ACTING.
+            if let Some(caller) = crate::identity::resolve(&headers).ok().flatten() {
+                s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
+            }
+            s.reembed()
+        })
         .await
     {
         Ok(report) => {
@@ -3776,10 +3793,16 @@ pub async fn channel_list(
 pub async fn channel_history(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
+    // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review): the store filters private memories by audience and
+    // a chat log has the same problem — an incident channel is not a public page.
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
     let since = params
         .maybe("since")
         .and_then(|v| v.parse::<i64>().ok())
@@ -3968,6 +3991,7 @@ pub async fn channel_present(
     State(state): State<HttpState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
+    body: Body,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     if let Err(r) = authorize(&state, &headers, json) {
@@ -3977,13 +4001,23 @@ pub async fn channel_present(
         Ok(p) => p,
         Err(r) => return r,
     };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => serde_json::json!({}),
+    };
+    let boundary = doc
+        .get("boundary")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let who = pen.clone();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("channel_present", move |s| s.channel_present(&who))
+        .with_store("channel_present", move |s| {
+            s.channel_present(&who, boundary.as_deref())
+        })
         .await
     {
         Ok(marked) => render(
@@ -4104,14 +4138,16 @@ pub async fn channel_wait(
                 .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let truncated = rows.len() >= 200;
             return render(
                 StatusCode::OK,
                 json,
-                serde_json::json!({ "after": after, "messages": rows }).to_string(),
+                serde_json::json!({ "after": after, "messages": rows, "truncated": truncated })
+                    .to_string(),
                 format!("{text}\n"),
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
 }
 
@@ -4119,9 +4155,13 @@ pub async fn channel_wait(
 pub async fn channel_members(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
     let key = channel.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -4260,9 +4300,13 @@ pub async fn channel_set_gate(
 pub async fn channel_events(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
     let key = channel.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -4393,6 +4437,50 @@ pub async fn channel_prune(
                 format!("emptied {total} message body(s)\n"),
             )
         }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/invite — put another pen in. Keeper-only: an invitation has an inviter.
+pub async fn channel_invite(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let actor = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let Some(guest) = doc.get("pen").and_then(|v| v.as_str()).map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`pen` is required");
+    };
+    let (who, chan, target) = (actor.clone(), channel.clone(), guest.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_invite", move |s| {
+            s.channel_invite(&who, &target, &chan)
+        })
+        .await
+    {
+        Ok(()) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "channel": channel, "pen": guest, "member": true, "invited_by": actor }).to_string(),
+            format!("invited {guest} to #{channel}\n"),
+        ),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
     }
 }

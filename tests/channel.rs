@@ -375,3 +375,43 @@ fn the_gate_follows_the_pen_the_effect_lands_on() {
     channel::gate(&conn, "stet", Class::Record).expect("the sender is not behind");
     channel::gate(&conn, "cline", Class::Record).expect_err("cline is behind");
 }
+
+// ── THE DOOR'S COUNT ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn unread_counts_what_was_told_and_only_fetching_clears_it() {
+    let (_dir, conn) = store();
+    channel::send(&conn, "james", "general", "one", None).expect("send");
+    channel::send(&conn, "james", "general", "two", None).expect("send");
+
+    let before = channel::unread(&conn, "cline").expect("unread");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].channel, "general");
+    assert_eq!(before[0].count, 2);
+    assert_eq!(
+        before[0].oldest_seq + 1,
+        before[0].latest_seq,
+        "the range names the oldest and newest unread message"
+    );
+
+    channel::history(&conn, "general", 0, 50).expect("history");
+    let after_history = channel::unread(&conn, "cline").expect("unread");
+    assert_eq!(
+        after_history[0].count, 2,
+        "reading the log is not listening: only fetch moves a receipt"
+    );
+
+    channel::fetch(&conn, "cline", None, 50).expect("fetch");
+    assert!(
+        channel::unread(&conn, "cline").expect("unread").is_empty(),
+        "fetching is listening, so the count empties"
+    );
+
+    assert!(
+        !channel::unread(&conn, "james")
+            .expect("unread")
+            .iter()
+            .any(|u| u.channel == "general"),
+        "a pen is not behind on its own words"
+    );
+}

@@ -414,6 +414,41 @@ pub fn fetch(
     Ok(messages)
 }
 
+/// What this pen has been TOLD and has not yet LISTENED to, per channel.
+///
+/// Read-only in the strictest sense: it moves no receipt. `fetch` is the only thing that marks a
+/// message fetched, because fetching is listening and a count is not.
+#[derive(Debug, Clone, Serialize)]
+pub struct Unread {
+    pub channel: String,
+    pub count: i64,
+    pub oldest_seq: i64,
+    pub latest_seq: i64,
+}
+
+pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
+    let id = pen_id(conn, pen)?;
+    let mut stmt = conn.prepare(
+        "SELECT m.channel, COUNT(*), MIN(m.seq), MAX(m.seq)
+           FROM channel_delivery d
+           JOIN channel_message m ON m.seq = d.seq
+          WHERE d.pen_id = ?1 AND d.fetched_at IS NULL
+          GROUP BY m.channel
+          ORDER BY m.channel",
+    )?;
+    let rows = stmt
+        .query_map(params![id], |r| {
+            Ok(Unread {
+                channel: r.get(0)?,
+                count: r.get(1)?,
+                oldest_seq: r.get(2)?,
+                latest_seq: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// The log: what was said, regardless of whether this pen has listened. Does not touch receipts.
 pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Result<Vec<Message>> {
     let limit = limit.clamp(1, 500);

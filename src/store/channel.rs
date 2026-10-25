@@ -44,6 +44,11 @@ pub const GATE_WRITES: &str = "writes";
 /// Everything except recovery is blocked. Reserved for a live incident.
 pub const GATE_ALL: &str = "all";
 
+/// The ops team's room. Membership is `list`, and joining it implies `#emergency`.
+pub const OPS_TEAM: &str = "ops_team";
+/// The channel every member must be reachable in if they run the cluster.
+pub const EMERGENCY: &str = "emergency";
+
 /// Which tools a breach is allowed to stop.
 ///
 /// Two classes, not five: the five in the issue are the **tool** classes, and they collapse to
@@ -72,6 +77,8 @@ impl Class {
 pub struct Channel {
     pub key: String,
     pub title: String,
+    /// `open` (every live self unless opted out) or `list` (explicit members only).
+    pub members: String,
     pub gate: String,
     pub grace_secs: i64,
     pub clock: String,
@@ -126,18 +133,19 @@ fn pen_id(conn: &Connection, name: &str) -> Result<i64> {
 
 fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
     conn.query_row(
-        "SELECT key, title, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+        "SELECT key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs
            FROM channel WHERE lower(key) = lower(?1)",
         params![key],
         |r| {
             Ok(Channel {
                 key: r.get(0)?,
                 title: r.get(1)?,
-                gate: r.get(2)?,
-                grace_secs: r.get(3)?,
-                clock: r.get(4)?,
-                misses_to_gate: r.get(5)?,
-                lock_max_secs: r.get(6)?,
+                members: r.get(2)?,
+                gate: r.get(3)?,
+                grace_secs: r.get(4)?,
+                clock: r.get(5)?,
+                misses_to_gate: r.get(6)?,
+                lock_max_secs: r.get(7)?,
             })
         },
     )
@@ -148,34 +156,99 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
 /// Every channel, in creation order.
 pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
     let mut stmt = conn.prepare(
-        "SELECT key, title, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+        "SELECT key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs
            FROM channel ORDER BY rowid",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(Channel {
             key: r.get(0)?,
             title: r.get(1)?,
-            gate: r.get(2)?,
-            grace_secs: r.get(3)?,
-            clock: r.get(4)?,
-            misses_to_gate: r.get(5)?,
-            lock_max_secs: r.get(6)?,
+            members: r.get(2)?,
+            gate: r.get(3)?,
+            grace_secs: r.get(4)?,
+            clock: r.get(5)?,
+            misses_to_gate: r.get(6)?,
+            lock_max_secs: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Who is in every channel: the live selves, plus James. Not fingers — a finger is a mechanism by
-/// which a self does more work, not a party to a conversation — and not `estate`, which has no
-/// entity behind it and can never authenticate to read anything.
-fn members(conn: &Connection) -> Result<Vec<i64>> {
+/// Who is in one channel: the live selves, filtered by the channel's membership kind.
+///
+/// Not fingers — a finger is a mechanism by which a self does more work, not a party to a
+/// conversation — and not `estate`, which has no entity behind it and can never authenticate to
+/// read anything.
+///
+/// `open` is opt-out: a live self is a member unless a `state = 'out'` row says otherwise.
+/// `list` is opt-in: only a `state = 'in'` row makes a member. One table serves both, and a channel
+/// changes kind without a migration.
+fn members_of(conn: &Connection, channel: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM pen
-          WHERE kind = 'self' AND ceased_at IS NULL AND lower(name) <> 'estate'
-          ORDER BY id",
+        "SELECT p.id
+           FROM pen p JOIN channel c ON lower(c.key) = lower(?1)
+          WHERE p.kind = 'self' AND p.ceased_at IS NULL AND lower(p.name) <> 'estate'
+            AND (
+                 (c.members = 'open' AND NOT EXISTS (
+                      SELECT 1 FROM channel_member m
+                       WHERE m.channel = c.key AND m.pen_id = p.id AND m.state = 'out'))
+              OR (c.members = 'list' AND EXISTS (
+                      SELECT 1 FROM channel_member m
+                       WHERE m.channel = c.key AND m.pen_id = p.id AND m.state = 'in'))
+            )
+          ORDER BY p.id",
     )?;
-    let rows = stmt.query_map([], |r| r.get(0))?;
+    let rows = stmt.query_map(params![channel], |r| r.get(0))?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Join a channel. Joining `#ops_team` joins `#emergency` too — a team that runs the cluster must be
+/// reachable when it falls over, and the coupling belongs to the membership rather than to a check
+/// somewhere later.
+pub fn join(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
+    let id = pen_id(conn, pen)?;
+    let ch = channel_row(conn, channel)?;
+    let mut targets = vec![ch.key.clone()];
+    if ch.key.eq_ignore_ascii_case(OPS_TEAM) {
+        targets.push(EMERGENCY.to_string());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for target in targets {
+        tx.execute(
+            "INSERT INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'in')
+             ON CONFLICT(channel, pen_id) DO UPDATE SET state = 'in', at = datetime('now')",
+            params![target, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Leave a channel. Leaving `#emergency` while on the ops team is refused — the graceful path is to
+/// leave `#ops_team` first, which makes the reason the caller reads match the rule.
+pub fn leave(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
+    let id = pen_id(conn, pen)?;
+    let ch = channel_row(conn, channel)?;
+    if ch.key.eq_ignore_ascii_case(EMERGENCY) {
+        let on_team: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM channel_member m JOIN channel c ON c.key = m.channel
+                                 WHERE lower(c.key) = lower(?1) AND m.pen_id = ?2 AND m.state = 'in')",
+                params![OPS_TEAM, id],
+                |r| r.get(0),
+            )?;
+        if on_team {
+            return Err(Error::Invalid(format!(
+                "refused: {pen} is on #{OPS_TEAM}, and ops membership requires #{EMERGENCY}.                  Leave #{OPS_TEAM} first."
+            )));
+        }
+    }
+    conn.execute(
+        "INSERT INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'out')
+         ON CONFLICT(channel, pen_id) DO UPDATE SET state = 'out', at = datetime('now')",
+        params![ch.key, id],
+    )?;
+    Ok(())
 }
 
 /// Post a message and fan out a receipt to every member except the sender.
@@ -230,7 +303,7 @@ pub fn send(
 
     // Fan out at send time: a receipt exists from the moment the message exists for that pen, which
     // is what makes `available_at` an honest answer to "were you told".
-    for member in members(&tx)? {
+    for member in members_of(&tx, &channel_row.key)? {
         if member == pen_id {
             continue;
         }

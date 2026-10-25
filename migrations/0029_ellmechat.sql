@@ -25,19 +25,33 @@
 CREATE TABLE channel (
     key        TEXT PRIMARY KEY,
     title      TEXT NOT NULL,
+    -- `open` = every live self is in unless it opted out; `list` = only explicit members. This is
+    -- also the invite-only switch: a channel becomes invite-only by flipping this to `list`.
+    members    TEXT NOT NULL DEFAULT 'open' CHECK (members IN ('open', 'list')),
     -- What stops working while a member is behind. `none` is the default because a gate is a
-    -- precious thing: `ops` and `emergency` exist because they are the two things this estate
+    -- precious thing: `ops_team` and `emergency` exist because they are the two things this estate
     -- genuinely does under time pressure, and a third should have to argue for itself.
     gate       TEXT NOT NULL DEFAULT 'none' CHECK (gate IN ('none', 'writes', 'all')),
     grace_secs INTEGER NOT NULL DEFAULT 0 CHECK (grace_secs >= 0),
     clock      TEXT NOT NULL DEFAULT 'delivery' CHECK (clock IN ('send', 'delivery')),
     -- How many turn boundaries may offer a message without a fetch before it locks. 1 = the first
-    -- miss is enough (`emergency`); 2 = a mid-turn arrival is not a crime (`ops`).
+    -- miss is enough (`emergency`); 2 = a mid-turn arrival is not a crime (`ops_team`).
     misses_to_gate  INTEGER NOT NULL DEFAULT 1 CHECK (misses_to_gate >= 1),
     -- A lock that can only be cleared by a fetch or an ancestor is a lock forever if both are
     -- asleep. 0 = no expiry; anything else releases the lock after that many seconds, loudly.
     lock_max_secs   INTEGER NOT NULL DEFAULT 0 CHECK (lock_max_secs >= 0),
     created    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Membership is a set of OVERRIDES, not a roster: `in` forces membership of a `list` channel,
+-- `out` removes it from an `open` one. That is one table for invite-only and one for opting out,
+-- and no migration when a channel changes kind.
+CREATE TABLE channel_member (
+    channel TEXT NOT NULL REFERENCES channel(key),
+    pen_id  INTEGER NOT NULL REFERENCES pen(id),
+    state   TEXT NOT NULL CHECK (state IN ('in', 'out')),
+    at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (channel, pen_id)
 );
 
 CREATE TABLE channel_message (
@@ -66,14 +80,20 @@ CREATE TABLE channel_delivery (
 );
 CREATE INDEX channel_delivery_pending ON channel_delivery(pen_id, fetched_at);
 
--- The two channels that gate, and the one that never does. `general` is deliberately `none`:
--- the vast majority of channels should carry no lock at all.
+-- The channels that exist at MVP. `general` and `changes` carry no lock at all: most channels
+-- should not, and `changes` is information ("we are rolling in 30 minutes"), not an obligation.
 --
--- `ops` is the soft lock: information that may change the work you are doing, two turn boundaries
--- to read it, half an hour before the lock releases itself.
--- `emergency` is the hard lock: the incident is happening now, one boundary, and a quarter of an
--- hour before the release — long enough that a release means something went wrong.
-INSERT INTO channel (key, title, gate, grace_secs, clock, misses_to_gate, lock_max_secs) VALUES
-    ('general',   'General',   'none',   0,  'delivery', 1, 0),
-    ('ops',       'Ops',       'writes', 60, 'delivery', 2, 1800),
-    ('emergency', 'Emergency', 'all',    0,  'delivery', 1, 900);
+-- `ops_team` is the ops team's room — the merged home of operations and security incident response,
+-- which is why it is `list` rather than open. Its members are also in `emergency` by rule (see the
+-- store's `join`), because a team that runs the cluster must be reachable when it falls over.
+--
+-- `emergency` is `open`: being told the cluster is going down should not require a title.
+INSERT INTO channel (key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs) VALUES
+    ('general',   'General',   'open', 'none',   0,  'delivery', 1, 0),
+    ('changes',   'Changes',   'open', 'none',   0,  'delivery', 1, 0),
+    ('emergency', 'Emergency', 'open', 'all',    0,  'delivery', 1, 900),
+    ('ops_team',  'Ops Team',  'list', 'writes', 60, 'delivery', 2, 1800);
+
+-- Membership is NOT seeded here. Who is on the ops team is a decision, not a schema fact, and a
+-- migration that quietly enrolled someone would be the same mistake as a migration that quietly
+-- granted a role. Rows are added by hand (or by an admin call) until there is a reason to automate.

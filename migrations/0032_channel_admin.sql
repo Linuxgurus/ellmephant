@@ -14,7 +14,7 @@ CREATE TABLE channel_event (
     channel TEXT NOT NULL,
     -- who acted; NULL only for a row written by a migration
     pen_id  INTEGER REFERENCES pen(id),
-    action  TEXT NOT NULL CHECK (action IN ('create', 'gate', 'retention', 'expiry')),
+    action  TEXT NOT NULL CHECK (action IN ('create', 'gate', 'members', 'retention')),
     -- the value BEFORE and AFTER, as text: `none` -> `writes`, `open` -> `list`, etc.
     was     TEXT,
     now     TEXT

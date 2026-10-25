@@ -2273,16 +2273,19 @@ pub async fn reparse(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let caller = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
         .with_store("memory_reparse", move |s| {
-            // The pen the identity pair proves, if any: maintenance over the whole store is ACTING.
-            if let Some(caller) = crate::identity::resolve(&headers).ok().flatten() {
-                s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
-            }
+            // ★ A BODY WITHOUT A PEN CANNOT SKIP `all` (#168 review): requiring identity here is what
+            // makes the hardest gate unskippable, rather than "gated if you happen to say who you are".
+            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
             s.reparse()
         })
         .await
@@ -2327,16 +2330,19 @@ pub async fn reembed(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let caller = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
         .with_store("memory_reembed", move |s| {
-            // The pen the identity pair proves, if any: maintenance over the whole store is ACTING.
-            if let Some(caller) = crate::identity::resolve(&headers).ok().flatten() {
-                s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
-            }
+            // ★ A BODY WITHOUT A PEN CANNOT SKIP `all` (#168 review): requiring identity here is what
+            // makes the hardest gate unskippable, rather than "gated if you happen to say who you are".
+            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
             s.reembed()
         })
         .await
@@ -4105,10 +4111,28 @@ pub async fn channel_wait(
             "refused: waiting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
         );
     };
-    let after = params
-        .maybe("after")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
+    let after = match params.maybe("after").and_then(|v| v.parse::<i64>().ok()) {
+        Some(after) => after,
+        None => {
+            // No cursor = "from now", not the whole backlog.
+            let who = pen.clone();
+            let server = match session(&state) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            match server
+                .with_read(
+                    "channel_wait",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.channel_head(&who),
+                )
+                .await
+            {
+                Ok(head) => head,
+                Err(e) => return error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+            }
+        }
+    };
     let timeout = params
         .maybe("timeout")
         .and_then(|v| v.parse::<u64>().ok())

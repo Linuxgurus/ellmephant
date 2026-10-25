@@ -618,11 +618,18 @@ fn one_boundary_named_twice_is_one_miss() {
 
     channel::present(&conn, "cline", Some("task-7")).expect("boundary");
     channel::present(&conn, "cline", Some("task-7")).expect("the same boundary again");
-    let breach = channel::breach(&conn, "cline").expect("breach");
-    assert!(
-        breach.is_none() || breach.as_ref().map(|b| b.misses) == Some(1),
-        "a retry inside one boundary must not count twice: {breach:?}"
-    );
+    // ★ ASSERT THE LEDGER, NOT THE ABSENCE OF A BREACH (#168 review): `breach == None` also passes
+    // when `present` recorded nothing at all, which is the regression this test exists to catch.
+    let misses: i64 = conn
+        .query_row(
+            "SELECT misses FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')
+                AND seq = (SELECT MAX(seq) FROM channel_message WHERE channel='ops_team')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("delivery row");
+    assert_eq!(misses, 1, "one boundary, however many times it is named");
 
     // A genuinely new boundary still counts.
     channel::present(&conn, "cline", Some("task-8")).expect("next boundary");
@@ -642,11 +649,28 @@ fn an_expired_lock_is_recorded_as_a_row() {
     )
     .expect("age");
     channel::gate(&conn, "cline", Class::Record).expect("an expired lock releases");
-    let events = channel::events(&conn, "emergency").expect("events");
+    let (misses, presented): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT misses, presented_at FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("delivery");
+    assert_eq!(misses, 0, "a release clears the opportunity");
     assert!(
-        events.iter().any(|e| e.action == "expiry"),
-        "the release is a row, not a log line: {events:?}"
+        presented.is_none(),
+        "and the clock stops, or it expires again"
     );
+
+    // A second gated call must NOT write a second expiry: the lock is over.
+    channel::gate(&conn, "cline", Class::Record).expect("still open");
+    let expiries = channel::events(&conn, "emergency")
+        .expect("events")
+        .into_iter()
+        .filter(|e| e.action == "expiry")
+        .count();
+    assert_eq!(expiries, 1, "one release, one row");
 }
 
 #[test]
@@ -695,4 +719,128 @@ fn the_roster_excludes_estate_and_the_store_refuses_a_case_variant() {
         "estate has no entity behind it and is never a member: {names:?}"
     );
     let _ = dir;
+}
+
+// ── THIRD PASS: THE FIXES' OWN EDGES ────────────────────────────────────────────────────────────
+
+#[test]
+fn a_boundary_token_stops_working_once_it_is_stale() {
+    let (_dir, conn) = store();
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
+    channel::send(&conn, "james", "ops_team", "news", None).expect("send");
+
+    channel::present(&conn, "cline", Some("turn")).expect("boundary");
+    // Same token, but the window has passed: it names a NEW opportunity, not the old one.
+    conn.execute(
+        "UPDATE channel_boundary SET at = datetime('now','-10 minutes')
+          WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+        [],
+    )
+    .expect("age the boundary");
+    channel::present(&conn, "cline", Some("turn")).expect("a new opportunity");
+    let misses: i64 = conn
+        .query_row(
+            "SELECT MAX(misses) FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("delivery");
+    assert_eq!(misses, 2, "a reused token cannot buy permanent immunity");
+}
+
+#[test]
+fn a_finger_cannot_be_invited_to_a_channel() {
+    let (_dir, conn) = store();
+    conn.execute(
+        "INSERT INTO pen (name, kind, parent_id) VALUES ('stet/f-1', 'finger', (SELECT id FROM pen WHERE name='stet'))",
+        [],
+    )
+    .expect("seed a finger");
+    let err = channel::invite(&conn, "james", "stet/f-1", "ops_team")
+        .expect_err("a finger is a mechanism, not a member");
+    assert!(
+        err.to_string().contains("never be a channel member"),
+        "{err}"
+    );
+    assert!(
+        channel::members(&conn, "ops_team")
+            .expect("members")
+            .is_empty()
+    );
+}
+
+#[test]
+fn only_a_keeper_may_make_an_invite_only_room_and_its_creator_is_in_it() {
+    let (_dir, conn) = store();
+    assert!(
+        channel::create(&conn, "stet", "hidden", "Hidden", "list", "none").is_err(),
+        "invite-only is a policy decision like a gate"
+    );
+    channel::create(&conn, "james", "hidden", "Hidden", "list", "none").expect("keeper may");
+    assert!(
+        channel::members(&conn, "hidden")
+            .expect("members")
+            .iter()
+            .any(|m| m.pen == "james"),
+        "the creator is in the room they made"
+    );
+    channel::send(&conn, "james", "hidden", "hello", None).expect("and may speak in it");
+}
+
+#[test]
+fn leaving_a_channel_ends_its_hold() {
+    let (_dir, conn) = store();
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
+    channel::send(&conn, "james", "ops_team", "unread incident", None).expect("send");
+    channel::send(&conn, "james", "ops_team", "second", None).expect("send");
+    channel::present(&conn, "cline", None).expect("boundary");
+    channel::present(&conn, "cline", None).expect("boundary");
+    // The grace runs from the FIRST OPPORTUNITY, so age the opportunity, not the message.
+    conn.execute(
+        "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+          WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+        [],
+    )
+    .expect("age the opportunity");
+    assert!(channel::breach(&conn, "cline").expect("breach").is_some());
+
+    // Leaving ends the obligation: the delivery is kept, but it no longer gates.
+    channel::leave(&conn, "cline", "ops_team").expect("leave");
+    assert!(
+        channel::breach(&conn, "cline").expect("breach").is_none(),
+        "a pen must not be locked by a room it has left"
+    );
+    let kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert!(
+        kept > 0,
+        "the receipt survives: you were told, even if you left"
+    );
+}
+
+#[test]
+fn a_waiter_with_no_cursor_starts_at_the_head_and_a_typo_is_not_success() {
+    let (_dir, conn) = store();
+    channel::send(&conn, "james", "general", "old news", None).expect("send");
+    let head = channel::head(&conn, "cline").expect("head");
+    assert!(head > 0, "the head is the newest seq this pen was told");
+    assert!(
+        channel::since(&conn, "cline", head, 50)
+            .expect("since")
+            .is_empty(),
+        "from the head, nothing has arrived yet"
+    );
+
+    let err = channel::prune(&conn, Some("no-such-channel"), None)
+        .expect_err("a typo is not 'nothing to prune'");
+    assert!(err.to_string().contains("no channel named"), "{err}");
 }

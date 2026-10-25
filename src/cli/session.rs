@@ -872,6 +872,11 @@ impl Session {
         channel::members(&self.conn, channel)
     }
 
+    /// The highest seq this pen has been told — a waiter's default cursor.
+    pub fn channel_head(&self, pen: &str) -> Result<i64> {
+        channel::head(&self.conn, pen)
+    }
+
     /// What this pen was TOLD after `after_seq`. Moves no receipt: a wait is not a fetch.
     pub fn channel_since(
         &self,

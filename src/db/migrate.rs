@@ -180,6 +180,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0034_channel_boundary.sql"),
         "`channel_boundary`: a turn boundary names itself, so a retry is not a second miss (#159 review)",
     ),
+    (
+        35,
+        include_str!("../../migrations/0035_channel_event_actions.sql"),
+        "`channel_event` accepts every action the code writes, via a rebuild — a migration is immutable once it can merge (#168 review)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

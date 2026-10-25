@@ -3859,7 +3859,20 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Parameters(p): Parameters<ChannelWaitParams>,
     ) -> std::result::Result<String, String> {
         let pen = pen_name(&ctx, self.declared.as_deref())?;
-        let after = p.after.unwrap_or(0);
+        // ★ NO CURSOR MEANS "FROM NOW", NOT "FROM THE BEGINNING OF TIME" (#168 review): a fresh body
+        // that waits should see what arrives next, not the entire backlog.
+        let after = match p.after {
+            Some(after) => after,
+            None => {
+                let who = pen.clone();
+                self.with_read(
+                    "channel_wait",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.channel_head(&who),
+                )
+                .await?
+            }
+        };
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(p.timeout_secs.unwrap_or(0).min(25));
         loop {

@@ -76,6 +76,14 @@ pub const TOOLS: &[&str] = &[
     "mail_read",
     "mail_ack",
     "mail_prune",
+    "channel_list",
+    "channel_send",
+    "channel_history",
+    "channel_fetch",
+    "channel_present",
+    "channel_breach",
+    "channel_join",
+    "channel_leave",
     "mail_surrogate_grant",
     "mail_surrogate_revoke",
     "mail_surrogate_list",
@@ -1146,6 +1154,76 @@ fn pen_name(
 
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
+/// Parameters for [`MemoryServer::channel_send`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelSendParams {
+    /// Which channel.
+    #[schemars(
+        description = "The channel key, without the `#`: `general`, `changes`, `emergency`, `ops_team`."
+    )]
+    pub channel: String,
+    /// What to say.
+    #[schemars(
+        description = "The message. One log line, not a memory — a fact from a channel becomes a memory only when a pen writes one deliberately."
+    )]
+    pub body: String,
+    /// Reply to an earlier message in the same channel.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional `seq` of a message in the SAME channel. A reply to nothing is a new message, and the store says so rather than guessing."
+    )]
+    pub reply_to: Option<i64>,
+}
+
+/// Parameters for [`MemoryServer::channel_history`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelHistoryParams {
+    /// Which channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
+    /// Start after this seq.
+    #[serde(default)]
+    #[schemars(
+        description = "Return messages with `seq` greater than this. Omit for the beginning."
+    )]
+    pub since: Option<i64>,
+    /// How many.
+    #[serde(default)]
+    #[schemars(description = "Maximum messages to return (default 50, capped at 500).")]
+    pub limit: Option<i64>,
+}
+
+/// Parameters for [`MemoryServer::channel_fetch`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelFetchParams {
+    /// One channel, or every channel.
+    #[serde(default)]
+    #[schemars(
+        description = "Fetch only this channel's unread messages. Omit to listen to everything at once."
+    )]
+    pub channel: Option<String>,
+    /// How many.
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum messages to FETCH (default 50, capped at 500). Fetching marks them listened; use `channel_history` to re-read without touching the ledger."
+    )]
+    pub limit: Option<i64>,
+}
+
+/// Parameters for [`MemoryServer::channel_join`] and [`MemoryServer::channel_leave`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelMemberParams {
+    /// Which channel.
+    #[schemars(
+        description = "The channel key, without the `#`. Joining `ops_team` also joins `emergency`, in the same transaction: a team that runs the cluster must be reachable when it falls over."
+    )]
+    pub channel: String,
+}
+
 #[derive(Clone)]
 pub struct MemoryServer {
     session: Arc<Mutex<Session>>,
@@ -3293,6 +3371,258 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         tracing::info!(tool = "mail_prune", keep_days, removed, "letters pruned");
         Ok(serde_json::json!({ "removed": removed, "keep_days": keep_days }).to_string())
     }
+
+    /// Every channel, its policy, and — for a proven pen — what it has not listened to yet.
+    #[tool(
+        name = "channel_list",
+        description = "List the channels this store knows, with each one's policy: `members` (open = every live self unless it opted out; list = invite-only), `gate` (none / writes / all), and the clock the grace runs on. For a PROVEN pen it also returns `unread` per channel and the current `breach`, if any. ★ A count is not a receipt: listing moves nothing. `channel_fetch` is the only thing that counts as listening.",
+        annotations(
+            title = "List channels",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_list(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let pen = identity_of(&ctx).ok().flatten();
+        let caller = pen.clone();
+        let out = self
+            .with_read(
+                "channel_list",
+                crate::store::audience::Reader::everything(),
+                move |s| {
+                    let channels = s.channels()?;
+                    let unread = match caller.as_deref() {
+                        Some(p) => s.channel_unread(p)?,
+                        None => Vec::new(),
+                    };
+                    let breach = match caller.as_deref() {
+                        Some(p) => s.channel_breach(p)?,
+                        None => None,
+                    };
+                    Ok((channels, unread, breach))
+                },
+            )
+            .await?;
+        let (channels, unread, breach) = out;
+        serde_json::to_string(&serde_json::json!({
+            "channels": channels,
+            "unread": unread,
+            "breach": breach,
+            "listener": pen,
+        }))
+        .map_err(|e| e.to_string())
+    }
+
+    /// Say one thing in one channel.
+    #[tool(
+        name = "channel_send",
+        description = "Say ONE message in one channel. This is a channel, not a memory: the message is a log line with a fan-out and a receipt per member, and it becomes a memory only when a pen writes one deliberately. A write needs a PROVEN pen. Returns the `seq` and who was told.",
+        annotations(
+            title = "Send to a channel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_send(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelSendParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let ChannelSendParams {
+            channel,
+            body,
+            reply_to,
+        } = p;
+        let (who, chan) = (pen.clone(), channel.clone());
+        let msg = self
+            .with_store("channel_send", move |s| {
+                s.channel_send(&who, &chan, &body, reply_to)
+            })
+            .await?;
+        tracing::info!(tool = "channel_send", pen = %pen, channel = %channel, seq = msg.seq, "channel message sent");
+        serde_json::to_string(&msg).map_err(|e| e.to_string())
+    }
+
+    /// The channel log, without moving a receipt.
+    #[tool(
+        name = "channel_history",
+        description = "Read a channel's LOG: what was said, regardless of whether this pen has listened. ★ This does NOT touch the delivery ledger — only `channel_fetch` does — so reading history can never be mistaken for being up to date.",
+        annotations(
+            title = "Read channel history",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_history(
+        &self,
+        Parameters(p): Parameters<ChannelHistoryParams>,
+    ) -> std::result::Result<String, String> {
+        let ChannelHistoryParams {
+            channel,
+            since,
+            limit,
+        } = p;
+        let (chan, since, limit) = (channel.clone(), since.unwrap_or(0), limit.unwrap_or(50));
+        let rows = self
+            .with_read(
+                "channel_history",
+                crate::store::audience::Reader::everything(),
+                move |s| s.channel_history(&chan, since, limit),
+            )
+            .await?;
+        serde_json::to_string(&serde_json::json!({ "channel": channel, "messages": rows }))
+            .map_err(|e| e.to_string())
+    }
+
+    /// LISTEN: take the unread messages and mark them fetched — the only call that clears a gate.
+    #[tool(
+        name = "channel_fetch",
+        description = "LISTEN to the channels: return everything this pen was told and has not yet fetched, and mark it fetched. ★ THIS is what clears a gate — `available_at` (told), `presented_at` (offered at a turn boundary) and `fetched_at` (listened) are three different facts, and only the third means the message reached the pen. Fetch before changing the record, not to keep a lock open.",
+        annotations(
+            title = "Fetch channel messages",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_fetch(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelFetchParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let ChannelFetchParams { channel, limit } = p;
+        let (who, chan, limit) = (pen.clone(), channel.clone(), limit.unwrap_or(50));
+        let rows = self
+            .with_store("channel_fetch", move |s| {
+                s.channel_fetch(&who, chan.as_deref(), limit)
+            })
+            .await?;
+        tracing::info!(tool = "channel_fetch", pen = %pen, fetched = rows.len(), "channel messages fetched");
+        serde_json::to_string(&serde_json::json!({
+            "fetched": rows.len(),
+            "messages": rows,
+        }))
+        .map_err(|e| e.to_string())
+    }
+
+    /// Mark that a turn boundary OFFERED this pen its inbox.
+    #[tool(
+        name = "channel_present",
+        description = "Mark that a TURN BOUNDARY offered this pen its inbox. Called by whatever owns the turn (the spine, the harness), never by the model — the normal path is present-then-fetch in the same turn, and a turn should never BEGIN gated. Each call while messages stay unfetched is one MISS; a channel decides how many misses it tolerates before it locks.",
+        annotations(
+            title = "Mark a delivery opportunity",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_present(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let who = pen.clone();
+        let touched = self
+            .with_store("channel_present", move |s| s.channel_present(&who))
+            .await?;
+        serde_json::to_string(&serde_json::json!({ "pen": pen, "marked": touched }))
+            .map_err(|e| e.to_string())
+    }
+
+    /// What, if anything, is stopping this pen from changing the record.
+    #[tool(
+        name = "channel_breach",
+        description = "What, if anything, is gating this pen right now: the channel, the message `seq`, how many turn boundaries offered it, and how long ago. ★ Reading is never gated. `channel_fetch` clears it; `lock_max_secs` releases an old lock and RECORDS the expiry, because a lock that aged out silently is worse than one that held.",
+        annotations(
+            title = "Read the gate",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_breach(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let pen = identity_of(&ctx).ok().flatten();
+        if pen.is_none() {
+            return Ok(serde_json::json!({ "breach": null, "proven": false }).to_string());
+        }
+        let who = pen.clone().unwrap_or_default();
+        let found = self
+            .with_read(
+                "channel_breach",
+                crate::store::audience::Reader::everything(),
+                move |s| s.channel_breach(&who),
+            )
+            .await?;
+        serde_json::to_string(&serde_json::json!({ "breach": found, "proven": true }))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Join a channel.
+    #[tool(
+        name = "channel_join",
+        description = "Join a channel. Open channels are opt-out, so joining is only needed to undo a leave or to take up an invitation to a `list` channel. ★ Joining `ops_team` also joins `emergency` in the same transaction: a team that runs the cluster must be reachable when it falls over.",
+        annotations(
+            title = "Join a channel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_join(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelMemberParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let channel = p.channel;
+        let (who, chan) = (pen.clone(), channel.clone());
+        self.with_store("channel_join", move |s| s.channel_join(&who, &chan))
+            .await?;
+        Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": true }).to_string())
+    }
+
+    /// Leave a channel.
+    #[tool(
+        name = "channel_leave",
+        description = "Leave a channel. ★ Leaving `emergency` while on the ops team is REFUSED, with the way out named: leave `ops_team` first. Anyone may otherwise be in `emergency` — being told the cluster is going down should not require a title.",
+        annotations(
+            title = "Leave a channel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_leave(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelMemberParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let channel = p.channel;
+        let (who, chan) = (pen.clone(), channel.clone());
+        self.with_store("channel_leave", move |s| s.channel_leave(&who, &chan))
+            .await?;
+        Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": false }).to_string())
+    }
 }
 
 #[tool_handler]
@@ -3452,6 +3782,31 @@ pub fn http_router(
             axum::routing::get(surface::mail_inbox).post(surface::mail_send),
         )
         .route("/mail/prune", axum::routing::post(surface::mail_prune))
+        .route("/channels", axum::routing::get(surface::channel_list))
+        .route(
+            "/channels/breach",
+            axum::routing::get(surface::channel_breach),
+        )
+        .route(
+            "/channels/fetch",
+            axum::routing::post(surface::channel_fetch),
+        )
+        .route(
+            "/channels/present",
+            axum::routing::post(surface::channel_present),
+        )
+        .route(
+            "/channels/{channel}/messages",
+            axum::routing::get(surface::channel_history).post(surface::channel_send),
+        )
+        .route(
+            "/channels/{channel}/join",
+            axum::routing::post(surface::channel_join),
+        )
+        .route(
+            "/channels/{channel}/leave",
+            axum::routing::post(surface::channel_leave),
+        )
         .route(
             "/mail/surrogate/grant",
             axum::routing::post(surface::mail_surrogate_grant),

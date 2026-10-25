@@ -18,7 +18,7 @@ use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, claim, encode, links, mail, maintain, project};
+use crate::store::{self, Memory, channel, claim, encode, links, mail, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -768,6 +768,71 @@ impl Session {
             Some(n) => Ok(claim::get(&self.conn, n)?.into_iter().collect()),
             None => claim::list(&self.conn),
         }
+    }
+
+    // ---- ellmechat (#151): the door over the ledger. Thin on purpose: every rule lives in
+    // `store::channel`, so the MCP door, the CLI and a future HTTP surface cannot disagree.
+
+    /// Every channel and its policy (`members`, `gate`, `grace_secs`, `clock`, …).
+    pub fn channels(&self) -> Result<Vec<channel::Channel>> {
+        channel::channels(&self.conn)
+    }
+
+    /// What `pen` has been told and not yet listened to, per channel. Moves no receipt.
+    pub fn channel_unread(&self, pen: &str) -> Result<Vec<channel::Unread>> {
+        channel::unread(&self.conn, pen)
+    }
+
+    /// Join a channel. `#ops_team` also joins `#emergency`, in the same transaction, by rule.
+    pub fn channel_join(&self, pen: &str, channel: &str) -> Result<()> {
+        channel::join(&self.conn, pen, channel)
+    }
+
+    /// Leave a channel. Leaving `#emergency` while on the team is refused, with the way out named.
+    pub fn channel_leave(&self, pen: &str, channel: &str) -> Result<()> {
+        channel::leave(&self.conn, pen, channel)
+    }
+
+    /// Say one thing in one channel. The fan-out writes a delivery row for every member.
+    pub fn channel_send(
+        &self,
+        pen: &str,
+        channel: &str,
+        body: &str,
+        reply_to: Option<i64>,
+    ) -> Result<channel::Message> {
+        channel::send(&self.conn, pen, channel, body, reply_to)
+    }
+
+    /// Mark that a turn boundary OFFERED this pen its inbox. One call is one miss while unread.
+    /// Called by whatever owns the turn (the spine, the harness), never by the model.
+    pub fn channel_present(&self, pen: &str) -> Result<usize> {
+        channel::present(&self.conn, pen)
+    }
+
+    /// LISTEN: take the unread messages and mark them fetched. This is what clears a gate.
+    pub fn channel_fetch(
+        &self,
+        pen: &str,
+        channel: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<channel::Message>> {
+        channel::fetch(&self.conn, pen, channel, limit)
+    }
+
+    /// Read the LOG. Does not touch receipts: reading history is not listening to a message.
+    pub fn channel_history(
+        &self,
+        channel: &str,
+        since: i64,
+        limit: i64,
+    ) -> Result<Vec<channel::Message>> {
+        channel::history(&self.conn, channel, since, limit)
+    }
+
+    /// What, if anything, is stopping this pen from changing the record.
+    pub fn channel_breach(&self, pen: &str) -> Result<Option<channel::Breach>> {
+        channel::breach(&self.conn, pen)
     }
 
     /// Write one letter into `recipient`'s box. Nothing is delivered: this is the whole event.

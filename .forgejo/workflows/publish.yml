@@ -5,10 +5,18 @@ name: publish
 #   :X.Y.Z     a named version — immutable, and SPENT ONCE
 #   :latest    the newest stable release (never a prerelease)
 #
-# and push the chart with the same version. Both the image and the chart go to BOTH registries:
+# and push the chart with the same version. HARBOR ONLY, for now:
 #
 #   Harbor  harbor.vn.linuxguru.net/library/...   PRIVATE -- LAN-only, what the cluster pulls
-#   GHCR    ghcr.io/jdblack/...                   PUBLIC  -- the same bytes, mirrored
+#
+# ★ THE PUBLIC MIRROR IS PARKED, NOT BROKEN (James, 2026-10-25). Releases used to go to GHCR as well
+# (ghcr.io/jdblack/ellmephant + the chart), which made every release public. The GHCR credential died
+# -- the classic PATs answer "Bad credentials" and the fine-grained ones lack the packages scope -- so
+# the mirror ABORTED every release. Two honest options: keep the mirror and block releases, or publish
+# where the estate actually pulls from. This is the second, taken deliberately.
+# ★ THE MIRROR IS REMOVED, NOT SKIPPED. A release that silently stops mirroring is the failure this
+# already refused to allow (the job used to fail rather than skip). Do not re-add a
+# "continue-on-error" -- re-add the mirror with a working write:packages token when there is one.
 #
 # ★ THE TWO LINES, AND WHO OWNS WHICH NAME (James, 2026-10-25):
 #     dev  -> publish-dev.yml   v<X.Y.Z>-dev.<n>  +  sha-<commit>  +  edge
@@ -40,9 +48,6 @@ env:
   IMAGE: harbor.vn.linuxguru.net/library/ellmephant
   CHART_REPO: harbor.vn.linuxguru.net/library/charts
   BUILDER: harbor.vn.linuxguru.net/library/ellmephant-builder
-  GHCR_REGISTRY: ghcr.io
-  GHCR_IMAGE: ghcr.io/jdblack/ellmephant
-  GHCR_CHART_REPO: ghcr.io/jdblack/charts
   CHART: charts/ellmephant
   # Pinned so the job does not depend on what the runner image happens to ship: the act ubuntu image
   # has node + git + docker and no helm.
@@ -141,22 +146,6 @@ jobs:
           # The robot name contains a `$` (robot$library+forgejo); quoted, so the shell leaves it be.
           echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
 
-      # The public mirror needs its own credentials, and they are NOT written by
-      # `module.forgejo_setup` the way the Harbor robot is. Missing them FAILS the job rather than
-      # skipping the mirror: a public release that silently stops is worse than one that complains.
-      - name: Log in to GHCR (public mirror)
-        env:
-          GHCR_USER: ${{ secrets.GHCR_USER }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        run: |
-          set -eu
-          if [ -z "${GHCR_TOKEN:-}" ] || [ -z "${GHCR_USER:-}" ]; then
-            echo "GHCR_USER / GHCR_TOKEN are not set (repo secrets): the public mirror did NOT run."
-            echo "Set them (token needs write:packages) -- see DEVELOPMENT.md (Publishing)."
-            exit 1
-          fi
-          echo "$GHCR_TOKEN" | docker login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
-
       # ★ A VERSION IS SPENT ONCE. Checked BEFORE anything is built, so a spent version costs seconds
       # rather than a full build, and the message names the fix (bump Cargo.toml).
       - name: Refuse to reuse a spent version
@@ -211,7 +200,6 @@ jobs:
           B="$IMAGE"
           VER="${{ steps.ver.outputs.version }}"
           SHORT="${{ steps.ver.outputs.short }}"
-          G="$GHCR_IMAGE"
           SHA=$(git rev-parse HEAD)
 
           # `latest` never moves for a prerelease.
@@ -220,8 +208,6 @@ jobs:
           if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
             echo "promoting $B:sha-$SHORT -- built and tested on dev, not rebuilt"
             docker buildx imagetools create -t "$B:$VER" "$B:sha-$SHORT"
-            # The public mirror is a copy of the same manifest, never a second build.
-            docker buildx imagetools create -t "$G:$VER" "$B:sha-$SHORT"
           else
             echo "no dev build for sha-$SHORT -- building the release here (hotfix path)"
             docker build --platform linux/amd64 \
@@ -231,14 +217,13 @@ jobs:
               --label org.opencontainers.image.version="$VER" \
               --label org.opencontainers.image.revision="$SHA" \
               --label org.opencontainers.image.source="$SOURCE_URL" \
-              -t "$B:sha-$SHORT" -t "$B:$VER" -t "$G:$VER" .
+              -t "$B:sha-$SHORT" -t "$B:$VER" .
             docker push "$B:sha-$SHORT"
             docker push "$B:$VER"
-            docker push "$G:$VER"
           fi
 
           if [ "$stable" = "1" ]; then
-            docker buildx imagetools create -t "$B:latest" -t "$G:latest" "$B:$VER"
+            docker buildx imagetools create -t "$B:latest" "$B:$VER"
           else
             echo "prerelease $VER: not moving latest (by design)"
           fi
@@ -249,7 +234,6 @@ jobs:
         run: |
           set -eu
           B="$IMAGE"
-          G="$GHCR_IMAGE"
           VER="${{ steps.ver.outputs.version }}"
           SHORT="${{ steps.ver.outputs.short }}"
           want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$VER")
@@ -259,9 +243,8 @@ jobs:
                      echo "verified $1 -> $got"; }
           check "$B:$VER"
           check "$B:sha-$SHORT"
-          check "$G:$VER"
           case "$VER" in *-*) echo "prerelease: latest not expected" ;;
-                     *) check "$B:latest" ; check "$G:latest" ;; esac
+                     *) check "$B:latest" ;; esac
           {
             echo "published $VER"
             echo "index digest $want"
@@ -274,8 +257,6 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
           HARBOR_USER: ${{ secrets.HARBOR_USER }}
           HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
-          GHCR_USER: ${{ secrets.GHCR_USER }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -eu
           # The runner image has docker but not helm; pin our own rather than trust the image. (If a
@@ -289,15 +270,9 @@ jobs:
           # helm keeps its OWN credential store (separate from docker's), so both registries need a
           # login here even though docker is already authenticated to both.
           echo "$HARBOR_TOKEN" | helm registry login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
-          echo "$GHCR_TOKEN" | helm registry login "$GHCR_REGISTRY" -u "$GHCR_USER" --password-stdin
 
           helm package "$CHART" --destination .tmp/chart > /dev/null
           pkg=$(ls .tmp/chart/*.tgz)
           echo "pushing $(basename "$pkg")"
-          # Harbor first (private, what the cluster installs from), then the SAME .tgz to GHCR.
-          # `helm push` derives the final path segment from the chart's `name`, so the two repos
-          # differ only by their parent path -- the chart stays `ellmephant`, and its labels,
-          # selectors and resource names are unchanged.
           helm push "$pkg" "oci://$CHART_REPO"
-          helm push "$pkg" "oci://$GHCR_CHART_REPO"
-          echo "published the chart to $CHART_REPO and $GHCR_CHART_REPO"
+          echo "published the chart to $CHART_REPO"

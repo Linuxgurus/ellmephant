@@ -18,6 +18,7 @@ fn a_letter_is_stored_addressed_and_stamped() -> Result<()> {
     let sent = mail::send(
         &conn,
         "stet",
+        "stet",
         "Twine",
         "the claim race",
         "I think the retry is wrong. Object?",
@@ -45,10 +46,18 @@ fn the_cursor_shows_only_what_is_after_it() -> Result<()> {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
 
-    let first = mail::send(&conn, "stet", "twine", "one", "first", "text")?;
-    let second = mail::send(&conn, "stet", "twine", "two", "second", "text")?;
+    let first = mail::send(&conn, "stet", "stet", "twine", "one", "first", "text")?;
+    let second = mail::send(&conn, "stet", "stet", "twine", "two", "second", "text")?;
     // Another box, to prove boxes do not leak into each other.
-    let _other = mail::send(&conn, "stet", "james", "elsewhere", "not twine's", "text")?;
+    let _other = mail::send(
+        &conn,
+        "stet",
+        "stet",
+        "james",
+        "elsewhere",
+        "not twine's",
+        "text",
+    )?;
 
     let all = mail::inbox(&conn, "twine", 0, 50)?;
     assert_eq!(all.len(), 2, "only twine's box");
@@ -78,7 +87,15 @@ fn the_body_is_fetched_on_demand_never_copied_into_an_envelope() -> Result<()> {
     let conn = db::open(&paths)?;
     let body = "a report that is not a memory yet ".repeat(100);
 
-    let sent = mail::send(&conn, "stet/finger-1", "stet", "report", &body, "text")?;
+    let sent = mail::send(
+        &conn,
+        "stet/finger-1",
+        "stet/finger-1",
+        "stet",
+        "report",
+        &body,
+        "text",
+    )?;
     assert_eq!(sent.bytes, body.len() as i64);
 
     let letter = mail::read(&conn, sent.seq)?.expect("the letter");
@@ -102,20 +119,20 @@ fn a_letter_is_refused_when_it_is_not_a_letter() -> Result<()> {
     let conn = db::open(&paths)?;
 
     assert!(
-        mail::send(&conn, "", "twine", "s", "b", "text").is_err(),
+        mail::send(&conn, "", "", "twine", "s", "b", "text").is_err(),
         "no sender"
     );
     assert!(
-        mail::send(&conn, "stet", "  ", "s", "b", "text").is_err(),
+        mail::send(&conn, "stet", "stet", "  ", "s", "b", "text").is_err(),
         "no recipient"
     );
     assert!(
-        mail::send(&conn, "stet", "twine", "s", "   ", "text").is_err(),
+        mail::send(&conn, "stet", "stet", "twine", "s", "   ", "text").is_err(),
         "no body"
     );
 
     let huge = "x".repeat(mail::MAX_BODY_BYTES + 1);
-    let err = mail::send(&conn, "stet", "twine", "big", &huge, "text").unwrap_err();
+    let err = mail::send(&conn, "stet", "stet", "twine", "big", &huge, "text").unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("cap"),
@@ -132,15 +149,15 @@ fn a_prune_cannot_make_old_mail_look_new() -> Result<()> {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
 
-    let first = mail::send(&conn, "stet", "twine", "one", "first", "text")?;
-    let second = mail::send(&conn, "stet", "twine", "two", "second", "text")?;
+    let first = mail::send(&conn, "stet", "stet", "twine", "one", "first", "text")?;
+    let second = mail::send(&conn, "stet", "stet", "twine", "two", "second", "text")?;
 
     // Age both, then prune them.
     conn.execute("UPDATE mail SET at = datetime('now', '-30 days')", [])?;
     assert_eq!(mail::prune(&conn, 7)?, 2, "both aged out");
     assert_eq!(mail::head(&conn, "twine")?, 0, "the box is empty");
 
-    let third = mail::send(&conn, "stet", "twine", "three", "third", "text")?;
+    let third = mail::send(&conn, "stet", "stet", "twine", "three", "third", "text")?;
     assert!(
         third.seq > second.seq,
         "a new letter must be NEWER than the pruned ones ({} !> {})",
@@ -155,7 +172,15 @@ fn a_prune_cannot_make_old_mail_look_new() -> Result<()> {
 fn an_encoded_body_keeps_its_encoding() -> Result<()> {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
-    let sent = mail::send(&conn, "stet", "twine", "a patch", "H4sIAAAA", "gzip+base64")?;
+    let sent = mail::send(
+        &conn,
+        "stet",
+        "stet",
+        "twine",
+        "a patch",
+        "H4sIAAAA",
+        "gzip+base64",
+    )?;
     assert_eq!(sent.encoding, "gzip+base64");
     assert_eq!(
         mail::read(&conn, sent.seq)?
@@ -180,6 +205,7 @@ fn a_short_page_reports_its_own_top_not_the_boxs() -> Result<()> {
     for n in 0..40 {
         mail::send(
             &conn,
+            "james",
             "james",
             "stet",
             &format!("letter {n}"),
@@ -213,8 +239,8 @@ fn a_cursor_belongs_to_one_reader_and_only_moves_forward() -> Result<()> {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
 
-    let one = mail::send(&conn, "james", "stet", "one", "first", "text")?;
-    let two = mail::send(&conn, "james", "stet", "two", "second", "text")?;
+    let one = mail::send(&conn, "james", "james", "stet", "one", "first", "text")?;
+    let two = mail::send(&conn, "james", "james", "stet", "two", "second", "text")?;
 
     // No row is not 0: it is "this reader has never advanced here", and the whole box is unread.
     assert_eq!(mail::cursor(&conn, "stet", "stet")?, None);
@@ -246,5 +272,103 @@ fn a_cursor_belongs_to_one_reader_and_only_moves_forward() -> Result<()> {
     assert_eq!(again.moved, 0);
     assert_eq!(again.seq, one.seq);
     assert_eq!(mail::cursor(&conn, "hands", "stet")?.unwrap().seq, one.seq);
+    Ok(())
+}
+
+// ── SURROGATES (#153) ────────────────────────────────────────────────────────────────────────────
+// The defect these exist for: a letter written on someone's behalf used to be stamped with the
+// typist's name, silently. The rule is now: prove it, or be refused by name.
+
+#[test]
+fn an_unauthorized_sender_is_refused_by_name() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+
+    let err = mail::send(&conn, "cline", "james", "stet", "s", "b", "text").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("may not send as"), "{msg}");
+    assert!(msg.contains("james"), "{msg}");
+    Ok(())
+}
+
+#[test]
+fn a_granted_surrogate_sends_and_the_letter_says_who_typed_it() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    mail::grant(&conn, "james", "cline", "send", None, Some("asleep"))?;
+
+    let env = mail::send(&conn, "cline", "james", "stet", "s", "b", "text")?;
+    assert_eq!(env.sender, "james", "the letter is from the grantor");
+    assert_eq!(
+        env.sent_by.as_deref(),
+        Some("cline"),
+        "and it says who typed it"
+    );
+
+    let letter = mail::read(&conn, env.seq)?.expect("letter");
+    assert_eq!(letter.envelope.sent_by.as_deref(), Some("cline"));
+    Ok(())
+}
+
+#[test]
+fn revoking_a_grant_refuses_the_very_next_letter() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    mail::grant(&conn, "james", "cline", "send", None, None)?;
+    assert!(mail::send(&conn, "cline", "james", "stet", "s", "b", "text").is_ok());
+
+    assert_eq!(mail::revoke(&conn, "james", "cline")?, 1);
+    let err = mail::send(&conn, "cline", "james", "stet", "s", "b", "text").unwrap_err();
+    assert!(err.to_string().contains("may not send as"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn an_expired_grant_is_refused() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    mail::grant(
+        &conn,
+        "james",
+        "cline",
+        "send",
+        Some("2000-01-01 00:00:00"),
+        None,
+    )?;
+
+    let err = mail::send(&conn, "cline", "james", "stet", "s", "b", "text").unwrap_err();
+    assert!(err.to_string().contains("may not send as"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn a_grant_is_scoped() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    mail::grant(&conn, "james", "cline", "read", None, None)?;
+
+    assert!(mail::may_read_box(&conn, "cline", "james")?, "read scope");
+    assert!(
+        !mail::may_send_as(&conn, "cline", "james").is_ok(),
+        "not a send grant"
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_scopes_are_refused() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    let err = mail::grant(&conn, "james", "cline", "write", None, None).unwrap_err();
+    assert!(err.to_string().contains("scopes"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn ordinary_letters_carry_no_sent_by() -> Result<()> {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths)?;
+    let env = mail::send(&conn, "stet", "stet", "twine", "s", "b", "text")?;
+    assert!(env.sent_by.is_none());
     Ok(())
 }

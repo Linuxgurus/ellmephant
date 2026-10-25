@@ -1115,7 +1115,7 @@ async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
             &client,
             "mail_send",
             serde_json::json!({
-                "sender": "james",
+                "sender": "tester",
                 "recipient": "tester",
                 "subject": format!("letter {n}"),
                 "body": "body",

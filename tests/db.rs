@@ -204,7 +204,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
-         DROP TABLE IF EXISTS channel;",
+         DROP TABLE IF EXISTS channel;
+         DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
@@ -288,7 +289,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
-         DROP TABLE IF EXISTS channel;",
+         DROP TABLE IF EXISTS channel;
+         DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
@@ -479,7 +481,8 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
-         DROP TABLE IF EXISTS channel;",
+         DROP TABLE IF EXISTS channel;
+         DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
     conn.execute("PRAGMA user_version = 20", []).unwrap();
@@ -578,7 +581,8 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
         "DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
-         DROP TABLE IF EXISTS channel;",
+         DROP TABLE IF EXISTS channel;
+         DROP TABLE IF EXISTS mail_surrogate;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 24).unwrap();

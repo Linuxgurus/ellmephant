@@ -155,6 +155,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0029_ellmechat.sql"),
         "ellmechat: channels, the message log, and the delivery ledger — told, presented, listened (#151)",
     ),
+    (
+        30,
+        include_str!("../../migrations/0030_mail_surrogate.sql"),
+        "mail surrogates are a GRANT with a scope and a revocation, not an environment variable (#153)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

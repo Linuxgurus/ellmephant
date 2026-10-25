@@ -50,6 +50,10 @@ pub struct Envelope {
     pub encoding: String,
     /// Size of the body in bytes, so the reader decides before paying for it.
     pub bytes: i64,
+    /// The PROVEN pen, when it differs from `sender`: a letter sent on someone else's behalf.
+    /// Absent on an ordinary letter, so every existing reader is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sent_by: Option<String>,
 }
 
 /// One letter WITH its body.
@@ -64,9 +68,14 @@ pub struct Letter {
     pub body: String,
 }
 
-/// Write one letter and return its envelope. Refuses empty sender/recipient/body and an oversize body.
+/// Write one letter and return its envelope.
+///
+/// `proven` is the pen the connection proved, `sender` is the name the letter is from. They differ
+/// only when `proven` holds a live `send` grant from `sender`; **an unauthorized claim is refused,
+/// never silently overridden** (the defect of 2026-10-25, seq 566).
 pub fn send(
     conn: &Connection,
+    proven: &str,
     sender: &str,
     recipient: &str,
     subject: &str,
@@ -87,6 +96,7 @@ pub fn send(
             "`sender` cannot be empty: say who is writing".into(),
         ));
     }
+    may_send_as(conn, proven, sender)?;
     if recipient.is_empty() {
         return Err(Error::Invalid(
             "`recipient` cannot be empty: address a SELF (`stet`, `twine`), never a finger".into(),
@@ -105,14 +115,15 @@ pub fn send(
 
     conn.execute(
         "INSERT INTO mail (sender, recipient, subject, body, encoding, bytes, asserted_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?1)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             sender,
             recipient,
             subject.trim(),
             body,
             encoding,
-            bytes as i64
+            bytes as i64,
+            proven
         ],
     )?;
     let seq = conn.last_insert_rowid();
@@ -127,7 +138,9 @@ pub fn inbox(
     limit: usize,
 ) -> Result<Vec<Envelope>> {
     let mut stmt = conn.prepare(
-        "SELECT seq, at, sender, subject, encoding, bytes
+        "SELECT seq, at, sender, subject, encoding, bytes,
+                CASE WHEN asserted_by IS NOT NULL AND lower(asserted_by) <> lower(sender)
+                     THEN asserted_by END
            FROM mail
           WHERE recipient = ?1 AND seq > ?2
           ORDER BY seq
@@ -143,6 +156,7 @@ pub fn inbox(
                 subject: r.get(3)?,
                 encoding: r.get(4)?,
                 bytes: r.get(5)?,
+                sent_by: r.get(6)?,
             })
         },
     )?;
@@ -153,7 +167,9 @@ pub fn inbox(
 pub fn read(conn: &Connection, seq: i64) -> Result<Option<Letter>> {
     Ok(conn
         .query_row(
-            "SELECT seq, at, sender, recipient, subject, encoding, bytes, body
+            "SELECT seq, at, sender, recipient, subject, encoding, bytes, body,
+                    CASE WHEN asserted_by IS NOT NULL AND lower(asserted_by) <> lower(sender)
+                         THEN asserted_by END
                FROM mail WHERE seq = ?1",
             params![seq],
             |r| {
@@ -165,6 +181,7 @@ pub fn read(conn: &Connection, seq: i64) -> Result<Option<Letter>> {
                         subject: r.get(4)?,
                         encoding: r.get(5)?,
                         bytes: r.get(6)?,
+                        sent_by: r.get(8)?,
                     },
                     recipient: r.get(3)?,
                     body: r.get(7)?,
@@ -308,4 +325,182 @@ fn shape(conn: &Connection, reader: &str, recipient: &str, seq: i64, moved: i64)
 
 fn read_envelope(conn: &Connection, seq: i64) -> Result<Option<Envelope>> {
     Ok(read(conn, seq)?.map(|l| l.envelope))
+}
+
+// ── SURROGATES ───────────────────────────────────────────────────────────────────────────────────
+//
+// A pen may lend its NAME to another pen: `sender` is the name on the letter, `asserted_by` is the
+// pen that proved it spoke. The grant is a row, so it has a grantor, a date, a scope, an optional
+// expiry, and a revocation that takes effect on the next call.
+//
+// ★ A GRANT IS SELF-ONLY. A pen lends its own name; it cannot lend someone else's, and no ancestry
+// rule applies, because this is delegation of self rather than authority over another.
+
+/// The scopes a grant may carry. Comma list in the row; validated on write.
+const SCOPES: [&str; 3] = ["send", "read", "ack"];
+
+/// A recorded grant.
+#[derive(Debug, Clone, Serialize)]
+pub struct Surrogate {
+    pub grantor: String,
+    pub surrogate: String,
+    pub scopes: String,
+    pub granted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+fn scopes_valid(scopes: &str) -> Option<String> {
+    let cleaned: Vec<String> = scopes
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.iter().any(|s| !SCOPES.contains(&s.as_str())) {
+        return None;
+    }
+    Some(cleaned.join(","))
+}
+
+/// Grant `surrogate` the right to act as `grantor` for `scopes` (`send`, `read`, `ack`).
+///
+/// Re-granting replaces the scopes and clears a revocation: a grant is a row, and the ledger keeps
+/// the date of the latest grant rather than a history of every edit.
+pub fn grant(
+    conn: &Connection,
+    grantor: &str,
+    surrogate: &str,
+    scopes: &str,
+    expires_at: Option<&str>,
+    note: Option<&str>,
+) -> Result<Surrogate> {
+    let (grantor, surrogate) = (grantor.trim(), surrogate.trim());
+    if grantor.is_empty() || surrogate.is_empty() {
+        return Err(Error::Invalid(
+            "a grant needs a grantor and a surrogate".into(),
+        ));
+    }
+    if grantor.eq_ignore_ascii_case(surrogate) {
+        return Err(Error::Invalid(
+            "a pen does not need a grant to speak as itself".into(),
+        ));
+    }
+    let scopes = scopes_valid(scopes)
+        .ok_or_else(|| Error::Invalid("scopes must be a comma list of: send, read, ack".into()))?;
+
+    conn.execute(
+        "INSERT INTO mail_surrogate (grantor, surrogate, scopes, expires_at, note)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(grantor, surrogate) DO UPDATE SET
+             scopes = excluded.scopes,
+             expires_at = excluded.expires_at,
+             granted_at = datetime('now'),
+             revoked_at = NULL,
+             note = excluded.note",
+        params![grantor, surrogate, scopes, expires_at, note],
+    )?;
+
+    conn.query_row(
+        "SELECT grantor, surrogate, scopes, granted_at, expires_at, revoked_at, note
+           FROM mail_surrogate WHERE grantor = ?1 AND surrogate = ?2",
+        params![grantor, surrogate],
+        |r| {
+            Ok(Surrogate {
+                grantor: r.get(0)?,
+                surrogate: r.get(1)?,
+                scopes: r.get(2)?,
+                granted_at: r.get(3)?,
+                expires_at: r.get(4)?,
+                revoked_at: r.get(5)?,
+                note: r.get(6)?,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
+/// Revoke a grant. Effective on the next call — nothing is cached.
+pub fn revoke(conn: &Connection, grantor: &str, surrogate: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE mail_surrogate SET revoked_at = datetime('now')
+          WHERE lower(grantor) = lower(?1) AND lower(surrogate) = lower(?2)
+            AND revoked_at IS NULL",
+        params![grantor.trim(), surrogate.trim()],
+    )?)
+}
+
+/// Every grant `surrogate` holds, live or not — the question a reader asks before trusting a letter.
+pub fn surrogates_of(conn: &Connection, surrogate: &str) -> Result<Vec<Surrogate>> {
+    let mut stmt = conn.prepare(
+        "SELECT grantor, surrogate, scopes, granted_at, expires_at, revoked_at, note
+           FROM mail_surrogate WHERE lower(surrogate) = lower(?1)
+          ORDER BY grantor",
+    )?;
+    let rows = stmt.query_map(params![surrogate.trim()], |r| {
+        Ok(Surrogate {
+            grantor: r.get(0)?,
+            surrogate: r.get(1)?,
+            scopes: r.get(2)?,
+            granted_at: r.get(3)?,
+            expires_at: r.get(4)?,
+            revoked_at: r.get(5)?,
+            note: r.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn live_grant(conn: &Connection, grantor: &str, surrogate: &str, scope: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM mail_surrogate
+              WHERE lower(grantor) = lower(?1)
+                AND lower(surrogate) = lower(?2)
+                AND revoked_at IS NULL
+                AND (expires_at IS NULL OR expires_at > datetime('now'))
+                AND instr(',' || replace(scopes, ' ', '') || ',', ',' || ?3 || ',') > 0)",
+        params![grantor.trim(), surrogate.trim(), scope],
+        |r| r.get(0),
+    )?)
+}
+
+/// May `proven` send a letter whose `sender` is `sender`?
+///
+/// This is the check that replaces the silent override: the old path discarded the argument and
+/// stamped the proven pen, so a letter written on someone's behalf went out as the typist's and
+/// nobody was told.
+pub fn may_send_as(conn: &Connection, proven: &str, sender: &str) -> Result<()> {
+    if proven.eq_ignore_ascii_case(sender) {
+        return Ok(());
+    }
+    if live_grant(conn, sender, proven, "send")? {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "refused: `{proven}` may not send as `{sender}`. A letter on another pen's behalf needs a \
+         live `send` grant from them (`mail_surrogate_grant`)."
+    )))
+}
+
+/// May `reader` read `requested`'s box?
+pub fn may_read_box(conn: &Connection, reader: &str, requested: &str) -> Result<bool> {
+    if reader.eq_ignore_ascii_case(requested) {
+        return Ok(true);
+    }
+    live_grant(conn, requested, reader, "read")
+}
+
+/// May `reader` advance `requested`'s cursor?
+pub fn may_ack_box(conn: &Connection, reader: &str, requested: &str) -> Result<bool> {
+    if reader.eq_ignore_ascii_case(requested) {
+        return Ok(true);
+    }
+    live_grant(conn, requested, reader, "ack")
 }

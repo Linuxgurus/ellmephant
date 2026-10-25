@@ -230,6 +230,29 @@ fn a_lock_expires_and_says_so() {
 }
 
 #[test]
+fn an_old_message_still_locks_when_the_opportunity_is_new() {
+    let (_dir, conn) = store();
+    set_policy(&conn, "emergency", "all", 0, "send", 1, 60);
+    let m = channel::send(&conn, "james", "emergency", "incident at 02:00", None).expect("send");
+    // The message is an hour old, the boundary is now. The lock's expiry must count from the
+    // opportunity, not the message: otherwise the pen wakes, is told the incident, and is never
+    // gated because the message "aged out" before it opened its eyes.
+    conn.execute(
+        "UPDATE channel_delivery SET available_at = datetime('now', '-60 minutes') WHERE seq = ?1",
+        params![m.seq],
+    )
+    .expect("backdate");
+    channel::present(&conn, "cline").expect("boundary");
+
+    let b = channel::breach(&conn, "cline")
+        .expect("breach")
+        .expect("breach");
+    assert!(b.age_secs >= 3600, "the message is old");
+    assert!(b.lock_age_secs < 60, "the lock is new: {}", b.lock_age_secs);
+    channel::gate(&conn, "cline", Class::Record).expect_err("a fresh opportunity locks");
+}
+
+#[test]
 fn general_never_gates() {
     let (_dir, conn) = store();
     channel::send(&conn, "james", "general", "chatter", None).expect("send");

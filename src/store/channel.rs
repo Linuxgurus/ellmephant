@@ -106,6 +106,10 @@ pub struct Breach {
     pub misses: i64,
     /// Seconds since `since`, measured by the store's own clock.
     pub age_secs: i64,
+    /// Seconds since the lock could first have bitten: from the first opportunity, never from the
+    /// message. An expiry measured from `since` would release an old message before a sleeping pen
+    /// ever woke, which is the opposite of protecting it.
+    pub lock_age_secs: i64,
     /// 0 = the lock never expires.
     pub lock_max_secs: i64,
 }
@@ -379,6 +383,8 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
                     strftime('%s', 'now')
                       - strftime('%s', CASE WHEN c.clock = 'send' THEN d.available_at
                                             ELSE d.presented_at END) AS age_secs,
+                    strftime('%s', 'now')
+                      - strftime('%s', COALESCE(d.presented_at, d.available_at)) AS lock_age_secs,
                     c.lock_max_secs
                FROM channel_delivery d
                JOIN channel_message m ON m.seq = d.seq
@@ -405,7 +411,8 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
                     since: r.get(3)?,
                     misses: r.get(4)?,
                     age_secs: r.get(5)?,
-                    lock_max_secs: r.get(6)?,
+                    lock_age_secs: r.get(6)?,
+                    lock_max_secs: r.get(7)?,
                 })
             },
         )
@@ -424,12 +431,12 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
 pub fn gate(conn: &Connection, pen: &str, class: Class) -> Result<()> {
     match breach(conn, pen) {
         Ok(Some(b)) if class.gated_by(&b.gate) => {
-            if b.lock_max_secs > 0 && b.age_secs >= b.lock_max_secs {
+            if b.lock_max_secs > 0 && b.lock_age_secs >= b.lock_max_secs {
                 tracing::warn!(
                     pen,
                     channel = %b.channel,
                     seq = b.seq,
-                    age_secs = b.age_secs,
+                    lock_age_secs = b.lock_age_secs,
                     "ellmechat lock expired without a fetch; releasing and recording the expiry"
                 );
                 return Ok(());

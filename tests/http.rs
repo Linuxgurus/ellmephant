@@ -379,10 +379,19 @@ async fn request(
 /// An in-process MCP peer over the same session — the other door, for parity. The service must be
 /// kept alive by the caller (dropping it closes the pipe).
 async fn mcp_peer(server: MemoryServer) -> rmcp::service::RunningService<RoleClient, ()> {
+    mcp_peer_as(server, "tester").await
+}
+
+/// The same peer, declaring a DIFFERENT pen. Needed whenever a test compares the two doors for the
+/// same identity: `mcp_peer` hard-codes `tester`, which silently made an MCP call look ungated.
+async fn mcp_peer_as(
+    server: MemoryServer,
+    pen: &str,
+) -> rmcp::service::RunningService<RoleClient, ()> {
     // This peer is IN-PROCESS: there is no HTTP request, so no headers, so no proven identity.
     // A transport with no request declares its pen once, at construction — which is exactly what
     // `with_identity` is for (anonymous writes are refused by design).
-    let server = server.with_identity("tester");
+    let server = server.with_identity(pen);
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         server
@@ -1103,7 +1112,7 @@ async fn the_two_doors_are_one_core() {
         "127.0.0.1",
         state,
     );
-    let service = mcp_peer(mcp).await;
+    let service = mcp_peer_as(mcp, "http-as-gated").await;
 
     let seeded = tool(
         service.peer(),
@@ -2696,4 +2705,135 @@ async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
         StatusCode::OK,
         "after fetching, the record opens: {status} {body}"
     );
+}
+
+/// ★ THE TWO DOORS MUST AGREE (#159, Stet's refusal): not "both paths work" — **the same verdict on
+/// the same inputs, compared.** One shared store, one gated pen, one refusal text.
+#[tokio::test]
+async fn the_gate_gives_the_same_verdict_on_both_doors() {
+    use serde_json::json;
+    identity_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer_as(mcp, "http-as-gated").await;
+
+    // Provisioning outside both doors: a pen on the ops team, and an incident it has not fetched.
+    {
+        let paths = Paths::from_root(dir.path());
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-gated', 'self');
+             INSERT OR IGNORE INTO pen (name, kind) VALUES ('james', 'self');",
+        )
+        .unwrap();
+        use ellmephant::store::channel as ch;
+        ch::join(&conn, "http-as-gated", "ops_team").unwrap();
+        ch::join(&conn, "james", "ops_team").unwrap();
+        let m = ch::send(&conn, "james", "ops_team", "the cluster is on fire", None).unwrap();
+        ch::present(&conn, "http-as-gated").unwrap();
+        ch::present(&conn, "http-as-gated").unwrap();
+        conn.execute(
+            "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+              WHERE seq = ?1 AND pen_id = (SELECT id FROM pen WHERE name='http-as-gated')",
+            [m.seq],
+        )
+        .unwrap();
+        let b = ch::breach(&conn, "http-as-gated").unwrap();
+        assert!(b.is_some(), "the fixture must actually gate the pen: {b:?}");
+    }
+
+    // Door one: MCP.
+    let mcp_verdict = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "through-mcp", "title": "t", "body": "b" }),
+    )
+    .await;
+
+    // Door two: HTTP.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/memory")
+        .header(header::AUTHORIZATION, "Bearer tok")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Stet-From", "http-as-gated")
+        .header("X-Stet-Auth", "as-secret-g")
+        .body(Body::from(
+            json!({ "key": "through-http", "title": "t", "body": "b" }).to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let http_verdict = String::from_utf8_lossy(&bytes).to_string();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{http_verdict}");
+    assert!(
+        mcp_verdict.contains("ops_team") && mcp_verdict.contains("not been fetched"),
+        "MCP must refuse by name: {mcp_verdict}"
+    );
+    assert!(
+        http_verdict.contains("ops_team") && http_verdict.contains("not been fetched"),
+        "HTTP must refuse by name: {http_verdict}"
+    );
+    // The SAME verdict, compared — the channel, the reason, and the count, not just "both failed".
+    let mcp_core: Vec<&str> = mcp_verdict
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    for word in ["ops_team", "offered", "fetched"] {
+        assert!(
+            mcp_core.contains(&word),
+            "MCP verdict lost {word}: {mcp_verdict}"
+        );
+        assert!(
+            http_verdict.contains(word),
+            "HTTP verdict lost {word}: {http_verdict}"
+        );
+    }
+
+    // And the same inputs STOP being refused once the pen listens — on both doors, again compared.
+    {
+        let paths = Paths::from_root(dir.path());
+        let conn = ellmephant::db::open(&paths).unwrap();
+        ellmephant::store::channel::fetch(&conn, "http-as-gated", None, 50).unwrap();
+    }
+    let mcp_after = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "through-mcp", "title": "t", "body": "b" }),
+    )
+    .await;
+    assert!(
+        mcp_after.contains("\"status\""),
+        "MCP opens after fetch: {mcp_after}"
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/memory")
+        .header(header::AUTHORIZATION, "Bearer tok")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Stet-From", "http-as-gated")
+        .header("X-Stet-Auth", "as-secret-g")
+        .body(Body::from(
+            json!({ "key": "through-http", "title": "t", "body": "b" }).to_string(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "HTTP opens after fetch");
 }

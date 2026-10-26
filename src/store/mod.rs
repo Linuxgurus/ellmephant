@@ -459,7 +459,16 @@ fn add_impl(
         // "`nosuchpen` names no pen" beats "it would be invisible to you", because a typo is a typo.
         audience::validated(&tx, &mem.audience)?;
     }
-    if let (true, Some(author)) = (addressed, mem.asserted_by.as_deref()) {
+    // ★ AN AUTHOR WHO IS NOBODY IS NOT PROTECTED BY THIS RULE (second adversarial pass, 2026-10-26).
+    // #122's backfill left rows with `asserted_by = anonymous`. There is no author to hide his own
+    // words from, so the rule has nothing to enforce — and enforcing it anyway made those rows
+    // unwritable forever, with the remedy "add `pen:anonymous`", which is an address to a pen that
+    // does not exist. A rule that cannot be satisfied by any legal write is a trap of its own.
+    let author = mem.asserted_by.as_deref().filter(|a| {
+        let a = a.trim();
+        !a.is_empty() && !a.eq_ignore_ascii_case(crate::identity::ANONYMOUS)
+    });
+    if let (true, Some(author)) = (addressed, author) {
         if !may_read_audience(&tx, author, &mem.audience)? {
             return Err(Error::Invalid(format!(
                 "`{}` would be invisible to its own author: the audience is `{}` and does not include \

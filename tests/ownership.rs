@@ -2052,6 +2052,50 @@ fn a_public_row_cannot_be_narrowed_into_the_trap_in_two_steps() {
 }
 
 #[test]
+fn a_row_with_no_author_is_not_held_to_an_authors_rule() {
+    // ★ SECOND ADVERSARIAL PASS (#195). The D1 rule protects an AUTHOR from losing its own words. A row
+    // with no author (`anonymous`, which #122's backfill produced) has nobody to protect, and the
+    // refusal it produced was nonsense: "Add `pen:anonymous`" — an address to a pen that is not one.
+    // Worse, it would have made those rows unwritable forever short of publishing them.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    let mem = Memory {
+        key: "nobody-wrote-this".into(),
+        title: "backfilled".into(),
+        body: "author lost".into(),
+        asserted_by: Some("anonymous".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    match common::add_now(&conn, &embedder, &mem) {
+        Ok(_) => {}
+        Err(e) => panic!("a row with no author must not be trapped: {e}"),
+    }
+}
+
+#[test]
+fn a_retired_authors_row_is_still_writable() {
+    // ★ SECOND ADVERSARIAL PASS (#195). The rule asks whether the AUTHOR can read the row. If a pen is
+    // retired, does it still resolve as a reader? If not, every row it ever wrote becomes permanently
+    // unwritable — the trap one layer down, applied to a whole pen.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "james", "ghost", "self").expect("mint a pen that will depart");
+    row_with_audience(&conn, &embedder, "ghosts-note", "ghost", "pen:ghost");
+    store::retire(&conn, "ghost", "james", store::Rows::Inherit, store::History::Memorialize)
+        .expect("retire it");
+
+    let patch = store::Patch {
+        key: Some("ghosts-note".into()),
+        tags: Some(vec!["after-death".into()]),
+        asserted_by: Some("james".into()),
+        acted_by: Some("james".into()),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("the parent may still tidy what the pen left behind");
+}
+
+#[test]
 fn an_update_on_an_owned_row_must_name_the_pen_that_acts() {
     // ★ STET'S FINDING, review of #192 at `1a7cad1`. `acted_by: None` silently fell back to
     // `asserted_by`, and `asserted_by` is the CREDITED pen — so a caller that omitted the actor was

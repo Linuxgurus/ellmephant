@@ -59,7 +59,13 @@ pub enum Class {
     /// Changes the record: `memory_upsert`, `memory_delete`, `memory_merge`, `memory_adopt`,
     /// `project_upsert`. Gated by `writes` and by `all`.
     Record,
-    /// Acts on the world: dispatch, handoff, reindex/rebuild. Gated by `all` only.
+    /// Acts on the world: dispatch, handoff, prune. Gated by `all` only.
+    ///
+    /// ★ NOT maintenance (#168 review). `memory_reparse` and `memory_reembed` are derived-data
+    /// rebuilds — idempotent, and their output depends on the bodies rather than on the news — so
+    /// they are not in this class at all. Putting them here would make "acting" mean "upkeep", and
+    /// the first pen annoyed by a lockout would weaken the gate to quiet the noise, taking the
+    /// prune that *does* belong here with it.
     Acting,
 }
 

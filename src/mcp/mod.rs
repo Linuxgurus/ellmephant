@@ -2846,14 +2846,16 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reembed", move |s| {
-                // ★ ACTING, NOT RECORD: a rebuild touches every vector in the store, and `all` is
-                // the class that says "acting without this news is dangerous" (#159 review).
-                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
+                // ★ NOT GATED, AND THAT IS THE DECISION (#168 review): a rebuild is derived data —
+                // idempotent, and its output depends on the bodies, not on the news. A pen locked out
+                // of an incident may still repair the index; making maintenance mean "acting" would
+                // dilute the class until someone weakens it to stop the noise.
                 s.reembed()
             })
             .await?;
         tracing::info!(
             tool = "memory_reembed",
+            pen = %pen,
             queued = report.queued,
             dim = report.dim,
             rebuilt = report.rebuilt,
@@ -2902,12 +2904,14 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reparse", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
+                // ★ NOT GATED (#168 review): the link graph is derived data. Rebuilding it is
+                // idempotent and changes nothing anyone was told, so a locked pen may do it.
                 s.reparse()
             })
             .await?;
         tracing::info!(
             tool = "memory_reparse",
+            pen = %pen,
             rows = report.rows,
             edges = report.edges,
             "re-parsed the link graph"

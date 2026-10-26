@@ -2283,9 +2283,9 @@ pub async fn reparse(
     };
     match server
         .with_store("memory_reparse", move |s| {
-            // ★ A BODY WITHOUT A PEN CANNOT SKIP `all` (#168 review): requiring identity here is what
-            // makes the hardest gate unskippable, rather than "gated if you happen to say who you are".
-            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
+            // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): identity is what makes the call
+            // attributable, but a rebuild is derived data — it is not "acting", and a locked pen may
+            // still repair the graph. So `caller` is logged, not consulted.
             s.reparse()
         })
         .await
@@ -2293,6 +2293,7 @@ pub async fn reparse(
         Ok(report) => {
             tracing::info!(
                 area = scope.area,
+                pen = %caller,
                 rows = report.rows,
                 edges = report.edges,
                 "re-parsed the link graph over http"
@@ -2340,9 +2341,8 @@ pub async fn reembed(
     };
     match server
         .with_store("memory_reembed", move |s| {
-            // ★ A BODY WITHOUT A PEN CANNOT SKIP `all` (#168 review): requiring identity here is what
-            // makes the hardest gate unskippable, rather than "gated if you happen to say who you are".
-            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
+            // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): same rule as `reparse` above — a
+            // rebuild is derived data, not an act on the world.
             s.reembed()
         })
         .await
@@ -2350,6 +2350,7 @@ pub async fn reembed(
         Ok(report) => {
             tracing::info!(
                 area = scope.area,
+                pen = %caller,
                 queued = report.queued,
                 "queued a re-embed over http"
             );
@@ -4433,9 +4434,13 @@ pub async fn channel_prune(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    if let Err(r) = proven_pen(&headers, json) {
-        return r;
-    }
+    // ★ THE PEN IS REQUIRED, AND THEN CONSULTED (#168 review): the gate lives on this door too.
+    // The MCP tool gated `channel_prune` and this route did not, so a locked pen could destroy the
+    // text it was locked out of knowing — the two doors disagreed exactly where it matters.
+    let caller = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
         _ => serde_json::json!({}),
@@ -4449,7 +4454,10 @@ pub async fn channel_prune(
         Err(r) => return r,
     };
     match server
-        .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+        .with_store("channel_prune", move |s| {
+            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
+            s.channel_prune(only.as_deref())
+        })
         .await
     {
         Ok(rows) => {

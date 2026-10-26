@@ -2779,11 +2779,14 @@ async fn the_gate_gives_the_same_verdict_on_both_doors() {
         )
         .unwrap();
         use ellmephant::store::channel as ch;
-        ch::join(&conn, "http-as-gated", "ops_team").unwrap();
-        ch::join(&conn, "james", "ops_team").unwrap();
+        // `ops_team` is invite-only in this branch (#168): a pen cannot add itself.
+        ch::invite(&conn, "james", "http-as-gated", "ops_team").unwrap();
+        ch::invite(&conn, "james", "james", "ops_team").unwrap();
         let m = ch::send(&conn, "james", "ops_team", "the cluster is on fire", None).unwrap();
-        ch::present(&conn, "http-as-gated").unwrap();
-        ch::present(&conn, "http-as-gated").unwrap();
+        // `present` gained a boundary argument in this branch: no token means "one opportunity,
+        // one miss" the old way (#168).
+        ch::present(&conn, "http-as-gated", None).unwrap();
+        ch::present(&conn, "http-as-gated", None).unwrap();
         conn.execute(
             "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
               WHERE seq = ?1 AND pen_id = (SELECT id FROM pen WHERE name='http-as-gated')",
@@ -2874,4 +2877,112 @@ async fn the_gate_gives_the_same_verdict_on_both_doors() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "HTTP opens after fetch");
+}
+
+/// ★ ACTING IS FOR THE ACT, NOT FOR THE UPKEEP (#168 review).
+///
+/// Stet's objection to the first wiring was that all three new `Class::Acting` sites were
+/// maintenance. `memory_reparse` and `memory_reembed` are derived-data rebuilds — idempotent, and
+/// their output depends on the bodies, not on the news — so a pen locked out of an incident may
+/// still repair the index. `channel_prune` is the one that must wait: it destroys text the incident
+/// may still be about, and it is the reason `Acting` exists at all.
+///
+/// This test holds that boundary at the CALL SITES, which is where the class is chosen — the store's
+/// own gate tests would pass under either wiring.
+#[tokio::test]
+async fn a_locked_pen_may_rebuild_but_may_not_prune() {
+    use serde_json::json;
+    identity_fixture();
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let paths = Paths::from_root(dir.path());
+
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-gated', 'self');
+             INSERT OR IGNORE INTO pen (name, kind) VALUES ('james', 'self');",
+        )
+        .unwrap();
+        ellmephant::store::channel::invite(&conn, "james", "http-as-gated", "ops_team").unwrap();
+        ellmephant::store::channel::invite(&conn, "james", "james", "ops_team").unwrap();
+        ellmephant::store::channel::send(
+            &conn,
+            "james",
+            "ops_team",
+            "the cluster is on fire",
+            None,
+        )
+        .expect("send");
+        // Two boundaries offered, neither fetched: `ops_team` tolerates one.
+        ellmephant::store::channel::present(&conn, "http-as-gated", None).unwrap();
+        ellmephant::store::channel::present(&conn, "http-as-gated", None).unwrap();
+        conn.execute(
+            "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+              WHERE pen_id = (SELECT id FROM pen WHERE name = 'http-as-gated')",
+            [],
+        )
+        .unwrap();
+        // Retention long enough to be real, short enough that nothing has aged past it yet — the
+        // gate must be what refuses, not an empty table.
+        conn.execute(
+            "UPDATE channel SET keep_secs = 3600 WHERE key = 'ops_team'",
+            [],
+        )
+        .unwrap();
+        // `ops_team` ships at gate `writes`; a lockout is `all`, which is what makes `Acting` the
+        // class under test here.
+        conn.execute("UPDATE channel SET gate = 'all' WHERE key = 'ops_team'", [])
+            .unwrap();
+    }
+
+    let post = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Stet-From", "http-as-gated")
+                .header("X-Stet-Auth", "as-secret-g")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+    };
+
+    // The lock is real: the pen still cannot write.
+    let (status, body) = post("/memory").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the pen is locked: {body}");
+    assert!(
+        body.contains("not been fetched"),
+        "and for the reason we think: {body}"
+    );
+
+    // Derived data: rebuilding is not acting, so the lock does not stop it.
+    for path in ["/reparse", "/reembed"] {
+        let (status, body) = post(path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} is maintenance, not an act: {status} {body}"
+        );
+    }
+
+    // The text is another matter: pruning it is exactly what a lockout must prevent.
+    let (status, body) = post("/channels/prune").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "prune is acting, and the pen is locked: {status} {body}"
+    );
+    assert!(
+        body.contains("ops_team") && body.contains("not been fetched"),
+        "the refusal names the channel and the reason: {body}"
+    );
 }

@@ -828,9 +828,18 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                         // An explicit audience is a SHARE (it names others), so it is checked against
                         // the registry; `private` is derived from the proven pen and cannot.
                         (Some(spec), _) => audience::validated(conn, spec)?,
+                        // ★ `private` NAMES THE PEN THAT ACTS, NOT THE PEN IT CREDITS (hostile review of
+                        // #195, round 2). This read `asserted_by` — the credit — so a hand crediting its
+                        // finger made the row private to the FINGER, and a legacy row with an
+                        // `anonymous` author could be made private to a pen that does not exist. The
+                        // proven pen is the one making the row private; the credit is a name.
                         (None, Some(p)) => audience::for_write(
                             p,
-                            patch.asserted_by.as_deref().or(old.asserted_by.as_deref()),
+                            patch
+                                .acted_by
+                                .as_deref()
+                                .or(patch.asserted_by.as_deref())
+                                .or(old.asserted_by.as_deref()),
                         )?,
                         (None, None) => old.audience.clone(),
                     },
@@ -863,7 +872,12 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                         Some(spec) => audience::validated(conn, spec)?,
                         None => audience::for_write(
                             patch.private == Some(true),
-                            patch.asserted_by.as_deref(),
+                            // ★ The same correction on the CREATE path: the pen making the row private
+                            // is the one that acts; the credit is a name and may be a finger.
+                            patch
+                                .acted_by
+                                .as_deref()
+                                .or(patch.asserted_by.as_deref()),
                         )?,
                     },
                     ..Default::default()

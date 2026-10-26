@@ -2248,3 +2248,37 @@ fn nobody_can_claim_the_anonymous_exemption_to_address_a_row_to_others_only() {
         "a NEW row may not buy the exemption by naming itself anonymous: {err}"
     );
 }
+
+#[test]
+fn private_names_the_pen_that_acts_not_the_pen_it_credits() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 2. `private: true` derived its audience from `asserted_by` — the
+    // CREDITED pen — so a hand writing as its finger made the row private to the FINGER. That is the
+    // same asymmetry as the guards: the proven pen decides who the boundary belongs to.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    let patch = store::Patch {
+        key: Some("handed-note".into()),
+        title: Some("handed note".into()),
+        body: Some("the hand's own words".into()),
+        private: Some(true),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the pen that acts
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("write");
+
+    let mem = store::get(&conn, "handed-note").unwrap().unwrap();
+    assert_eq!(
+        mem.audience, "pen:stet/hand",
+        "private belongs to the pen that ACTS: {mem:?}"
+    );
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("stet/hand/finger-1"),
+        "and the credit still names the finger"
+    );
+}

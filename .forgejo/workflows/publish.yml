@@ -125,6 +125,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # ★ a SHALLOW CLONE GRAFTS THE BOUNDARY COMMIT, so a merge commit reports NO PARENTS and the
+          # release cannot see the second one to promote. Measured: v1.4.1 rebuilt because
+          # `git rev-list --parents -n1 HEAD` printed only the commit.
+          fetch-depth: 0
 
       # The release's identity comes from the one source of truth: the TAG if this run is a tag push,
       # otherwise `Cargo.toml`. A tag wins because a tag is the deliberate act; the file is the

@@ -918,8 +918,15 @@ pub(crate) fn apply(tx: &Connection, mem: &Memory, prepared: &Prepared) -> Resul
     Ok(id)
 }
 
-/// The exact row for a name — no parent resolution. Ownership rules need both this and
-/// [`owner_pen_id`]: a finger acts as itself but owns as its parent.
+/// The exact row for a name — **no parent resolution**, which is the only thing "exact" means here.
+///
+/// ★ IT IS CASE-INSENSITIVE, AND THE NAME SUGGESTS OTHERWISE (Stet, review of #193, 2026-10-26).
+/// `lower(name) = lower(?1)` — so `exact_pen_id("James")` and `exact_pen_id("james")` are one row.
+/// The adjective distinguishes it from [`owner_pen_id`], which resolves a FINGER to its parent; it has
+/// never meant "exact case", and a reader who assumed it did would conclude every fold in the tree was
+/// unsafe. Uniqueness of `lower(name)` is enforced by the triggers in migration `0027` (and by
+/// `store::ensure_name_uniqueness` once the table is clean), so a folded lookup cannot pick between two
+/// rows — which is the fact this comment exists to make checkable rather than assumed.
 fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(

@@ -406,9 +406,18 @@ fn add_impl(
     // same defect as a sudo gate that trusts the label. The rule is a conjunction, not a switch.
     let actor = actor.or(mem.asserted_by.as_deref());
     may_write(&tx, &prepared.key, actor)?;
-    if let Some(credited) = credited {
-        if Some(credited) != actor {
-            may_write(&tx, &prepared.key, Some(credited))?;
+    // ★ AND THE CREDIT MUST BE LEGITIMATE — BY LEND, NOT BY TREE SHAPE (Stet, review of #192, and #126).
+    // My first attempt asked `may_write` about the credited pen too, which was the wrong question twice:
+    // it tested AUTHORITY OVER THE ROW when the thing to test is AUTHORITY OVER THE NAME, and it would
+    // have refused every legitimate `as:` (a parent crediting a child for work on the parent's own row,
+    // which is what fingers are FOR). Ancestry is not the gate: every finger has an ancestor, so testing
+    // ancestry here would undo #126 and make the refusal stop nothing.
+    //
+    // So: the actor half is "may you write this row?"; the credit half is "may you act as that name?"
+    // — a descendant, not retired, with a LIVE lend. Two lower bounds, and neither can widen the other.
+    if let (Some(credited), Some(proven)) = (credited, actor) {
+        if !credited.eq_ignore_ascii_case(proven) {
+            may_act_as(&tx, proven, credited)?;
         }
     }
     let id = apply(&tx, mem, &prepared)?;
@@ -683,7 +692,14 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     // writer names itself in `edited_by` — so re-filing a row cannot launder
                     // its provenance, and the move is visible without a version.
                     asserted_by: old.asserted_by.clone(),
-                    edited_by: patch.asserted_by.clone().or_else(|| old.edited_by.clone()),
+                    // ★ THE WRITER, NOT THE CREDIT (Stet, review of #192): a parent writing as its
+                    // child must be recorded as the parent, or the laundering survives in the audit trail
+                    // after being blocked at the gate.
+                    edited_by: patch
+                        .acted_by
+                        .clone()
+                        .or_else(|| patch.asserted_by.clone())
+                        .or_else(|| old.edited_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     audience: match (&patch.audience, patch.private) {
                         // An explicit audience is a SHARE (it names others), so it is checked against
@@ -718,7 +734,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     tags: patch.tags.clone().unwrap_or_default(),
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
                     asserted_by: patch.asserted_by.clone(),
-                    edited_by: patch.asserted_by.clone(),
+                    edited_by: patch.acted_by.clone().or_else(|| patch.asserted_by.clone()),
                     origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
                     audience: match &patch.audience {
                         Some(spec) => audience::validated(conn, spec)?,

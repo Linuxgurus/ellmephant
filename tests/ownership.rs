@@ -1772,3 +1772,46 @@ fn an_ancestor_may_not_overwrite_a_row_it_cannot_read() {
         "no version was created"
     );
 }
+
+#[test]
+fn a_write_credited_to_a_finger_needs_a_live_lend_and_records_the_hand_as_the_writer() {
+    // ★ STET, REVIEW OF #192, both halves in one test:
+    //  1. the credit is gated by a LIVE LEND, not by tree shape — otherwise every finger could be
+    //     credited for anything and #126 is undone;
+    //  2. `edited_by` names the pen that WROTE it, not the pen that got the credit — and vice versa for
+    //     `asserted_by`. Two fields, two questions, no laundering in the audit trail.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+
+    let patch = || store::Patch {
+        key: Some("credited".into()),
+        title: Some("credited".into()),
+        body: Some("the finger's work".into()),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the proven pen
+        ..Default::default()
+    };
+
+    let err = store::merge(&conn, &patch()).unwrap_err();
+    assert!(
+        format!("{err}").contains("LIVE lend"),
+        "a descendant is necessary, a live lend is what permits: {err}"
+    );
+
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+    store::merge(&conn, &patch()).expect("credited write");
+
+    let mem = store::get(&conn, "credited").unwrap().unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("stet/hand/finger-1"),
+        "the credit names the finger"
+    );
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("stet/hand"),
+        "the writer names the hand that actually wrote it"
+    );
+}

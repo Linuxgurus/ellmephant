@@ -1332,7 +1332,9 @@ pub struct Whois {
 }
 
 /// A pen row as `whois` reads it: `(id, kind, parent_id, created, ceased_at)`.
-type PenFacts = (i64, String, Option<i64>, String, Option<String>);
+// id, the row's own spelling of the name, kind, parent, created, ceased (#191: the spelling is
+// part of the answer, so it is part of the row we read).
+type PenFacts = (i64, String, String, Option<i64>, String, Option<String>);
 
 /// Look up one pen as `viewer` sees it.
 ///
@@ -1343,12 +1345,25 @@ type PenFacts = (i64, String, Option<i64>, String, Option<String>);
 pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
     let row: Option<PenFacts> = conn
         .query_row(
-            "SELECT id, kind, parent_id, created, ceased_at FROM pen WHERE lower(name) = lower(?1)",
+            // ★ THE ROW'S SPELLING, NOT THE QUERY'S (soma/ellmephant#191). `name` in the reply used to
+            // be the string the caller typed, so asking for `JAMES` answered `"name": "JAMES"` — a field
+            // called `name` echoing the question instead of stating the row. Case-PRESERVING means the
+            // stored spelling is what gets shown; case-INSENSITIVE means any spelling may be asked for.
+            "SELECT id, name, kind, parent_id, created, ceased_at FROM pen WHERE lower(name) = lower(?1)",
             params![name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((id, kind, parent_id, created, ceased)) = row else {
+    let Some((id, stored_name, kind, parent_id, created, ceased)) = row else {
         return Err(Error::Invalid(format!("no pen named {name}")));
     };
     let parent = match parent_id {
@@ -1375,12 +1390,12 @@ pub fn whois(conn: &Connection, viewer: &str, name: &str) -> Result<Whois> {
         |r| r.get(0),
     )?;
     Ok(Whois {
-        name: name.to_string(),
+        name: stored_name.clone(),
         kind,
         parent,
         created,
         ceased,
-        relation: relation::relation(conn, viewer, name)?.map(|k| k.gloss()),
+        relation: relation::relation(conn, viewer, &stored_name)?.map(|k| k.gloss()),
         owns,
         descendants,
     })

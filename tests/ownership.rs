@@ -2040,3 +2040,41 @@ fn a_lend_grants_the_credit_and_not_the_owners_blind_write() {
         "the actor must be able to read what it writes, however the credit is spelled: {err}"
     );
 }
+
+#[test]
+fn whois_is_invariant_under_the_case_of_the_name() {
+    let (_dir, conn) = subtree();
+    // soma/ellmephant#191: the same pen must answer the same way whichever way it is spelled. Before
+    // the fix, `james` was `PS "uncle"` and `James` was `P "parent"` — one row, two families.
+    let base = store::whois(&conn, "cline", "james").expect("the pen exists");
+    assert_eq!(base.name, "james", "the row's own spelling");
+    for spelling in ["James", "JAMES", "jAmEs", "james"] {
+        let w = store::whois(&conn, "cline", spelling).expect("case-insensitive lookup");
+        assert_eq!(
+            w.name, "james",
+            "{spelling} must report the STORED spelling, not echo the query"
+        );
+        assert_eq!(
+            w.relation, base.relation,
+            "kin must not depend on how the caller typed it ({spelling})"
+        );
+    }
+    // And two different spells of the SAME pen are still `ME`, not a walk.
+    let me = store::whois(&conn, "James", "james").expect("self across cases");
+    assert_eq!(me.relation.as_deref(), Some("ME"));
+}
+
+#[test]
+fn kin_is_invariant_under_the_case_of_the_VIEWER_too() {
+    // ★ ADVERSARIAL REVIEW OF #191: the first test varied the name ASKED ABOUT. The other half of the
+    // same fold is the viewer — a pen that spells itself differently in two calls must get one answer.
+    let (_dir, conn) = subtree();
+    let base = store::whois(&conn, "cline", "james").expect("the pen exists");
+    for viewer in ["cline", "CLINE", "Cline", "cLiNe"] {
+        let w = store::whois(&conn, viewer, "james").expect("viewer resolves case-insensitively");
+        assert_eq!(
+            w.relation, base.relation,
+            "the answer must not depend on how the VIEWER spells itself ({viewer})"
+        );
+    }
+}

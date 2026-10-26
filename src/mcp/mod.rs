@@ -1419,6 +1419,20 @@ pub struct MemoryServer {
     declared: Option<String>,
 }
 
+/// What a miss means when the row belongs to the caller (hostile review of #194, round 1). Three
+/// outcomes, decided once and rendered elsewhere: the first version tested the same two conditions in
+/// two places, which is how a diagnostic comes to disagree with itself.
+enum OwnRowMiss {
+    /// The row exists, the caller owns it, and its audience excludes the caller: recoverable, and the
+    /// caller may be told because it already knows the row exists.
+    ExcludedByItsAudience(String),
+    /// Writer sees it, the reader's own predicate says it may see it, the read returned nothing: a real
+    /// divergence between the two connections.
+    Divergence(String),
+    /// Not the caller's row: absence, never a diagnosis.
+    NotYours,
+}
+
 impl MemoryServer {
     /// Build a server over an open session — the `ellmephant mcp` path.
     pub fn new(session: Session) -> Self {
@@ -3531,19 +3545,14 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     // would be a FALSE cause for the one case that is genuinely a divergence: the
                     // audience DOES include the caller and the reader still cannot see it. Claiming a
                     // cause without testing it is the defect this whole issue is about.
-                    let reader_sees = reader.sees(&audience);
+                    // ★ ONE PLACE DECIDES (hostile review of #194, round 1): the caller's own row was
+                    // tested twice — once inside `own_row_miss`, once here — so a change to one could
+                    // leave the other answering the old question. The decision returns a value; this
+                    // site renders it.
                     match Self::own_row_miss(key, caller, &owner, &audience, reader.sees(&audience)) {
-                        Some(msg) => return msg,
-                        None => {
-                            if owner.eq_ignore_ascii_case(&caller_owned) && reader_sees {
-                                return format!(
-                                    "no such memory: {key} — but this process's writer connection sees it \
-                                     and its audience ({audience}) DOES include you. That is a real \
-                                     divergence between the reading and writing connections: report the \
-                                     store and this sentence rather than re-writing the memory."
-                                );
-                            }
-                        }
+                        OwnRowMiss::ExcludedByItsAudience(msg) => return msg,
+                        OwnRowMiss::Divergence(msg) => return msg,
+                        OwnRowMiss::NotYours => {}
                     }
                 }
             }
@@ -3591,11 +3600,21 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         owner: &str,
         audience: &str,
         reader_can_see: bool,
-    ) -> Option<String> {
-        if !owner.eq_ignore_ascii_case(caller) || reader_can_see {
-            return None;
+    ) -> OwnRowMiss {
+        if !owner.eq_ignore_ascii_case(caller) {
+            return OwnRowMiss::NotYours;
         }
-        Some(format!(
+        if reader_can_see {
+            // The writer sees it, this reader's own predicate says it may see it, and the read still
+            // returned nothing: the ONE case where "the read is lying" is true rather than slander.
+            return OwnRowMiss::Divergence(format!(
+                "no such memory: {key} — but this process's writer connection sees it and its audience \
+                 ({audience}) DOES include you. That is a real divergence between the reading and \
+                 writing connections: report the store and this sentence rather than re-writing the \
+                 memory."
+            ));
+        }
+        OwnRowMiss::ExcludedByItsAudience(format!(
             "no such memory: {key} — but it EXISTS, it is YOURS (owner: {owner}), and its audience \
              ({audience}) does not include you, so a read may not return it. This is not a store fault \
              and not a deletion. Write it with an audience that includes `pen:{caller}` (or `public`) \
@@ -4759,27 +4778,37 @@ mod tests {
 
 #[cfg(test)]
 mod miss_answer_tests {
-    // ★ THE DIAGNOSTIC IS A DECISION ABOUT THREE FACTS, so it is tested as one (adversarial review of
-    // #194). Each case here is a different sentence a caller can receive, and the one that matters is
-    // the second: an author whose own audience DOES include them must not be told that it excludes them.
-    use super::MemoryServer;
+    //! ★ HOSTILE REVIEW OF #194: the diagnostic is a decision about facts, so it is tested as one.
+    //! Every case here is a different sentence a caller can receive, and the two that matter are the
+    //! middle ones: an author whose audience DOES include them must not be told it excludes them, and a
+    //! stranger must not be told anything.
+    use super::{MemoryServer, OwnRowMiss};
 
     #[test]
     fn an_owner_hidden_by_its_own_audience_is_told_so() {
-        let msg = MemoryServer::own_row_miss("trap", "cline", "cline", "pen:james", false).expect("a message");
-        assert!(msg.contains("it is YOURS"), "{msg}");
-        assert!(msg.contains("pen:james"), "and quotes the audience: {msg}");
-        assert!(msg.contains("pen:cline"), "and names what to add, as a token: {msg}");
+        match MemoryServer::own_row_miss("trap", "cline", "cline", "pen:james", false) {
+            OwnRowMiss::ExcludedByItsAudience(msg) => {
+                assert!(msg.contains("it is YOURS"), "{msg}");
+                assert!(msg.contains("pen:james"), "and quotes the audience: {msg}");
+                assert!(msg.contains("pen:cline"), "and names what to add: {msg}");
+            }
+            _ => panic!("expected the audience explanation"),
+        }
     }
 
     #[test]
-    fn an_owner_who_could_see_it_gets_no_audience_excuse() {
-        // This is a divergence, not an exclusion — and saying otherwise would be the wrong cause.
-        assert!(MemoryServer::own_row_miss("k", "cline", "cline", "pen:cline", true).is_none());
+    fn an_owner_who_could_see_it_gets_a_divergence_not_an_audience_excuse() {
+        match MemoryServer::own_row_miss("k", "cline", "cline", "pen:cline", true) {
+            OwnRowMiss::Divergence(msg) => assert!(msg.contains("divergence"), "{msg}"),
+            _ => panic!("the audience includes them; the cause must be the divergence"),
+        }
     }
 
     #[test]
     fn someone_elses_row_is_never_explained_to_a_stranger() {
-        assert!(MemoryServer::own_row_miss("k", "cline", "james", "pen:james", false).is_none());
+        assert!(matches!(
+            MemoryServer::own_row_miss("k", "cline", "james", "pen:james", false),
+            OwnRowMiss::NotYours
+        ));
     }
 }

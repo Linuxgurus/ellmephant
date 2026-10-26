@@ -56,7 +56,11 @@ jobs:
           spec:
             backoffLimit: 0
             activeDeadlineSeconds: 1800
-            ttlSecondsAfterFinished: 3600
+            # ★ A FINISHED JOB IS STILL A JOB TO THE QUOTA. `ci-builds` allows 5 (count/jobs.batch), so
+            # with an hour of retention the SIXTH build in an hour is refused — which is what blocked
+            # main's release on 2026-10-26 with an 8-second failure and no pod. Ten minutes is enough
+            # for a human to look; the log is relayed below in any case.
+            ttlSecondsAfterFinished: 600
             template:
               spec:
                 restartPolicy: Never
@@ -85,10 +89,15 @@ jobs:
           )
 
           echo "build job: $job"
+          # ★ RELAY THE LOG, THEN DROP THE JOB. The workflow's value is the log, not the object: keeping
+          # the Job until its TTL spends a quota slot that the next build needs (five is the whole
+          # budget). `|| true` on the delete: a failure to tidy must not fail a green build.
           if kubectl -n ci-builds wait --for=condition=complete "job/$job" --timeout=1800s; then
             kubectl -n ci-builds logs "job/$job" --tail=-1
+            kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
           else
             echo "build failed or timed out:"
             kubectl -n ci-builds logs "job/$job" --tail=200 || true
+            kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
             exit 1
           fi

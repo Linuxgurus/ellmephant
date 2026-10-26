@@ -92,11 +92,26 @@ jobs:
           # ★ RELAY THE LOG, THEN DROP THE JOB. The workflow's value is the log, not the object: keeping
           # the Job until its TTL spends a quota slot that the next build needs (five is the whole
           # budget). `|| true` on the delete: a failure to tidy must not fail a green build.
-          if kubectl -n ci-builds wait --for=condition=complete "job/$job" --timeout=1800s; then
+          # ★ WAIT FOR COMPLETE **OR FAILED** (2026-10-26). `kubectl wait --for=condition=complete`
+          # never returns when the Job has FAILED — it waits the full 30 minutes, and during that time
+          # the run holds its runner and the repository's publish concurrency slot. Three runs wedged
+          # that way this evening and no dev build could start. The gate's own failure was invisible
+          # while the gate was hung: **a wait that cannot see the failure it is watching for is a
+          # silence, not a wait.**
+          state=""
+          for _ in $(seq 1 360); do
+            succeeded=$(kubectl -n ci-builds get "job/$job" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+            failed=$(kubectl -n ci-builds get "job/$job" -o jsonpath='{.status.failed}' 2>/dev/null || true)
+            if [ "${succeeded:-0}" -ge 1 ] 2>/dev/null; then state=complete; break; fi
+            if [ "${failed:-0}" -ge 1 ] 2>/dev/null; then state=failed; break; fi
+            if ! kubectl -n ci-builds get "job/$job" >/dev/null 2>&1; then state=gone; break; fi
+            sleep 5
+          done
+          if [ "$state" = complete ]; then
             kubectl -n ci-builds logs "job/$job" --tail=-1
             kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
           else
-            echo "build failed or timed out:"
+            echo "build ${state:-timed out}:"
             kubectl -n ci-builds logs "job/$job" --tail=200 || true
             kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
             exit 1

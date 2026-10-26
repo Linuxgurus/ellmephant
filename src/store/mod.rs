@@ -168,7 +168,12 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _, _) = add_impl(conn, mem, None, None, mem.asserted_by.as_deref(), None)?;
+    // ★ THE CREATE PATH HAS NO ACTOR FIELD, SO IT PASSES NONE (soma/ellmephant#192, Stet's review of
+    // HEAD). It used to pass `mem.asserted_by`, which is the CREDIT — so `store::add` against an
+    // EXISTING key was authorised as the name it credited, and on a commons row that name is the only
+    // thing the visibility check has to go on. A create needs no actor (there is no row to write
+    // over); an update through this door now fails closed on an owned row instead of guessing.
+    let (id, key, _, _) = add_impl(conn, mem, None, None, None, None)?;
     Ok((id, key))
 }
 
@@ -746,11 +751,11 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     // ★ THE WRITER, NOT THE CREDIT (Stet, review of #192): a parent writing as its
                     // child must be recorded as the parent, or the laundering survives in the audit trail
                     // after being blocked at the gate.
-                    edited_by: patch
-                        .acted_by
-                        .clone()
-                        .or_else(|| patch.asserted_by.clone())
-                        .or_else(|| old.edited_by.clone()),
+                    // ★ AN UNKNOWN WRITER IS HONEST; A CREDITED WRITER IS A GUESS (Stet's review of
+                    // #192). Falling back to `asserted_by` here would record the pen being CREDITED as
+                    // the pen that wrote — the exact defect the `edited_by`-from-`acted_by` fix exists
+                    // to prevent, surviving in the one branch that kept a fallback.
+                    edited_by: patch.acted_by.clone().or_else(|| old.edited_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     audience: match (&patch.audience, patch.private) {
                         // An explicit audience is a SHARE (it names others), so it is checked against

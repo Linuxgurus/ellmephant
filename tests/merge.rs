@@ -288,7 +288,8 @@ fn key_is_an_address_not_a_field() {
         &conn,
         &embedder,
         &store::Patch {
-            acted_by: None,
+            // A PROVEN writer: the actor is named, and `edited_by` records it (soma/ellmephant#192).
+            acted_by: Some("James".into()),
             key: Some(key.clone()),
             title: Some("a new title".into()),
             body: Some("new facts".into()),

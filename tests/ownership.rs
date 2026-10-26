@@ -476,14 +476,18 @@ fn rewrite(
     key: &str,
     author: &str,
 ) -> String {
-    let mem = Memory {
-        key: key.to_string(),
-        title: format!("rewritten by {author}"),
-        body: "something else".to_string(),
+    // ★ A REWRITE IS AN UPDATE, SO IT NAMES ITS ACTOR (soma/ellmephant#192, Stet's review of HEAD).
+    // This used `store::add`, the CREATE path, which has no actor field — so the pen doing the rewrite
+    // could only be expressed as the credit, and authority was asked about the name it credited.
+    let patch = store::Patch {
+        key: Some(key.to_string()),
+        acted_by: Some(author.to_string()),
+        title: Some(format!("rewritten by {author}")),
+        body: Some("something else".to_string()),
         asserted_by: Some(author.to_string()),
         ..Default::default()
     };
-    match common::add_now(conn, embedder, &mem) {
+    match store::merge(conn, &patch) {
         Ok(_) => String::new(),
         Err(e) => format!("{e}"),
     }
@@ -1173,20 +1177,29 @@ fn an_ancestor_writes_a_descendants_row_and_the_attribution_says_so() {
     // James, 2026-10-24: "an ancestor always has (rarely used) ability to write on descendant-owned
     // data, with proper attribution". No lend is needed for that — the lend is only for CREDITING the
     // write to the descendant. Here the writer is the ancestor, and the record says so.
-    let rewrite = Memory {
-        key: "stets-note".into(),
-        title: "rewritten by james".into(),
-        body: "the ancestor's correction".into(),
+    let rewrite = store::Patch {
+        key: Some("stets-note".into()),
+        acted_by: Some("james".into()),
+        title: Some("rewritten by james".into()),
+        body: Some("the ancestor's correction".into()),
         asserted_by: Some("james".into()),
         ..Default::default()
     };
-    common::add_now(&conn, &embedder, &rewrite).expect("an ancestor may write down its subtree");
+    store::merge(&conn, &rewrite).expect("an ancestor may write down its subtree");
 
     let mem = store::get(&conn, "stets-note").unwrap().unwrap();
+    // ★ ATTRIBUTION SAYS SO — AND AUTHORSHIP IS WRITE-ONCE (#107). `add()` used to restamp the author
+    // here, which was #107 through the create door; the writer is named in `edited_by`, and the author
+    // stays the pen that wrote it first.
     assert_eq!(
         mem.asserted_by.as_deref(),
+        Some("stet"),
+        "the author does not move: authorship is write-once"
+    );
+    assert_eq!(
+        mem.edited_by.as_deref(),
         Some("james"),
-        "the ancestor is credited, not the owner"
+        "and the ancestor is recorded as the writer"
     );
     assert_eq!(
         mem.edited_by.as_deref(),

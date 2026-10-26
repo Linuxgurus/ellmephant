@@ -415,3 +415,21 @@ fn unread_counts_what_was_told_and_only_fetching_clears_it() {
         "a pen is not behind on its own words"
     );
 }
+
+#[test]
+fn since_returns_what_arrived_after_a_cursor_without_moving_a_receipt() {
+    let (_dir, conn) = store();
+    let one = channel::send(&conn, "james", "general", "one", None).expect("send");
+    let two = channel::send(&conn, "james", "general", "two", None).expect("send");
+
+    let after_one = channel::since(&conn, "cline", one.seq, 50).expect("since");
+    assert_eq!(after_one.len(), 1, "only what arrived after the cursor");
+    assert_eq!(after_one[0].seq, two.seq);
+
+    let none = channel::since(&conn, "cline", two.seq, 50).expect("since");
+    assert!(none.is_empty(), "nothing after the head");
+
+    // ★ a WAIT is not a LISTEN: the delivery rows are untouched, so the pen is still behind.
+    let still_unread = channel::unread(&conn, "cline").expect("unread");
+    assert_eq!(still_unread[0].count, 2);
+}

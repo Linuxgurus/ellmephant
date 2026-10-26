@@ -84,6 +84,7 @@ pub const TOOLS: &[&str] = &[
     "channel_breach",
     "channel_join",
     "channel_leave",
+    "channel_wait",
     "mail_surrogate_grant",
     "mail_surrogate_revoke",
     "mail_surrogate_list",
@@ -1253,6 +1254,24 @@ pub struct ChannelMemberParams {
         description = "The channel key, without the `#`. Joining `ops_team` also joins `emergency`, in the same transaction: a team that runs the cluster must be reachable when it falls over."
     )]
     pub channel: String,
+}
+
+/// Parameters for [`MemoryServer::channel_wait`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelWaitParams {
+    /// Wait for messages after this seq.
+    #[serde(default)]
+    #[schemars(
+        description = "Return messages the pen was TOLD with `seq` greater than this. Omit (or 0) for everything it has been told."
+    )]
+    pub after: Option<i64>,
+    /// How long to wait.
+    #[serde(default)]
+    #[schemars(
+        description = "Seconds to wait for something to arrive (default 0 = answer now, max 25). ★ This is a WAIT, not a listen: it moves no receipt, so it can never make a pen look up to date."
+    )]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -3661,6 +3680,47 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             .await?;
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": false }).to_string())
     }
+
+    /// Wait for channel messages to arrive — the push primitive a body blocks on.
+    #[tool(
+        name = "channel_wait",
+        description = "WAIT for channel messages to arrive, up to `timeout_secs` (max 25), returning everything this pen was TOLD after `after`. ★ This is a WAIT, not a LISTEN: it moves no receipt and cannot make a pen look up to date. A body that wants to be woken by chat blocks here; a body that wants to answer it then calls `channel_fetch`.",
+        annotations(
+            title = "Wait for channel messages",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_wait(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelWaitParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let after = p.after.unwrap_or(0);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(p.timeout_secs.unwrap_or(0).min(25));
+        loop {
+            let who = pen.clone();
+            let rows = self
+                .with_read(
+                    "channel_wait",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.channel_since(&who, after, 200),
+                )
+                .await?;
+            if !rows.is_empty() || std::time::Instant::now() >= deadline {
+                return serde_json::to_string(&serde_json::json!({
+                    "after": after,
+                    "messages": rows,
+                }))
+                .map_err(|e| e.to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
 }
 
 #[tool_handler]
@@ -3825,6 +3885,7 @@ pub fn http_router(
             "/channels/breach",
             axum::routing::get(surface::channel_breach),
         )
+        .route("/channels/wait", axum::routing::get(surface::channel_wait))
         .route(
             "/channels/fetch",
             axum::routing::post(surface::channel_fetch),

@@ -820,6 +820,16 @@ impl Session {
         channel::fetch(&self.conn, pen, channel, limit)
     }
 
+    /// What this pen was TOLD after `after_seq`. Moves no receipt: a wait is not a fetch.
+    pub fn channel_since(
+        &self,
+        pen: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<channel::Message>> {
+        channel::since(&self.conn, pen, after_seq, limit)
+    }
+
     /// Read the LOG. Does not touch receipts: reading history is not listening to a message.
     pub fn channel_history(
         &self,

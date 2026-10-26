@@ -449,6 +449,38 @@ pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
     Ok(rows)
 }
 
+/// What this pen was TOLD after `after_seq`, oldest first. Moves no receipt.
+///
+/// This is the delivery primitive a body waits on: a long poll reads from here, so "wait for
+/// something to arrive" never has to become "fetch and mark everything read".
+pub fn since(conn: &Connection, pen: &str, after_seq: i64, limit: i64) -> Result<Vec<Message>> {
+    let id = pen_id(conn, pen)?;
+    let limit = limit.clamp(1, 500);
+    let mut stmt = conn.prepare(
+        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.pruned_at, m.created
+           FROM channel_delivery d
+           JOIN channel_message m ON m.seq = d.seq
+           JOIN pen p ON p.id = m.pen_id
+          WHERE d.pen_id = ?1 AND m.seq > ?2
+          ORDER BY m.seq
+          LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![id, after_seq, limit], |r| {
+            Ok(Message {
+                seq: r.get(0)?,
+                channel: r.get(1)?,
+                pen: r.get(2)?,
+                body: r.get(3)?,
+                reply_to: r.get(4)?,
+                pruned_at: r.get(5)?,
+                created: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// The log: what was said, regardless of whether this pen has listened. Does not touch receipts.
 pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Result<Vec<Message>> {
     let limit = limit.clamp(1, 500);

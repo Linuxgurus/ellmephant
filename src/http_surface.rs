@@ -272,6 +272,11 @@ pub const ROUTES: &[Route] = &[
         path: "/channels/{channel}/leave",
         tool: "channel_leave",
     },
+    Route {
+        method: "GET",
+        path: "/channels/wait",
+        tool: "channel_wait",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -4018,5 +4023,64 @@ async fn channel_membership(
             format!("{} #{channel}\n", if join { "joined" } else { "left" }),
         ),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// GET /channels/wait — block for new messages. A WAIT, not a LISTEN: no receipt moves.
+pub async fn channel_wait(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let Some(pen) = proven(&headers) else {
+        return error(
+            json,
+            StatusCode::UNAUTHORIZED,
+            "refused: waiting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+        );
+    };
+    let after = params
+        .maybe("after")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let timeout = params
+        .maybe("timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(25);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    loop {
+        let who = pen.clone();
+        let server = match session(&state) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        let rows = match server
+            .with_read(
+                "channel_wait",
+                crate::store::audience::Reader::everything(),
+                move |s| s.channel_since(&who, after, 200),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+        if !rows.is_empty() || std::time::Instant::now() >= deadline {
+            let text = rows
+                .iter()
+                .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "after": after, "messages": rows }).to_string(),
+                format!("{text}\n"),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

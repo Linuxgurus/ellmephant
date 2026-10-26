@@ -6,17 +6,30 @@
 # `needs` of that file's `publish` job, so a push to `dev` cannot publish `edge` from code that does
 # not pass. The same job runs on a `pull request`, which is the only way a PR gets a status here.
 #
-# Deliberately STANDALONE: `FROM rust:1-bookworm`, no Harbor dependency and no secrets, so it runs
-# identically on a `dev` push and on a pull request, including one from a branch that cannot read
-# the private registry. That costs a fresh dependency compile every run -- the publish build reuses
-# a prebuilt dependency image and this one cannot -- and the trade is on purpose: a gate that always
-# starts beats one that is fast but occasionally cannot. `rust:1-bookworm` carries rustfmt and
-# clippy, which the gates need.
-FROM rust:1-bookworm
+# Deliberately STANDALONE: it needs no secrets and no private registry, so it runs identically on a
+# `dev` push and on a pull request. The only thing it asks of the world is a base image, and the
+# base is a build-arg:
+#
+#   BUILDER = a prebuilt dependency image (Dockerfile.gate-builder), when one exists for this
+#             lockfile. Measured 2026-10-26: 336 compiles -> 57, 612 s -> 476 s.
+#   BUILDER = rust:1-bookworm (the default) otherwise — a PR that changes Cargo.lock, or the first
+#             run before the image exists. That costs the full dependency compile, never a wrong
+#             answer, which is the property this file has always had.
+#
+# The caller (.forgejo/workflows/test.yml) picks, by checking Harbor for the tag first.
+ARG BUILDER=rust:1-bookworm
+FROM ${BUILDER}
 
 WORKDIR /src
 # `.dockerignore` keeps target/, .git/ and the scratch dir out of the context.
 COPY . .
+
+# ★ TOUCH, because cargo fingerprints by mtime. When BUILDER is a dependency image that was built
+# AFTER this checkout -- which happens whenever the image is rebuilt and used in the same pipeline
+# -- the stub artifacts inside it look NEWER than the source just copied in, and cargo keeps the
+# stub's empty lib. The build then dies with "cannot find `embed` in `ellmephant`", which names
+# the wrong problem. In normal CI the image is older than the commit and this is a no-op.
+RUN find src tests benches -type f -exec touch {} + 2>/dev/null || true
 
 # The official image carries rustup but NOT the `rustfmt`/`clippy` components, and the gates below
 # need both. (Learned the loud way: the first probe died at `cargo fmt` with "'cargo-fmt' is not

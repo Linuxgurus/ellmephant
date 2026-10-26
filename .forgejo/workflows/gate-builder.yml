@@ -1,0 +1,98 @@
+name: gate-builder
+
+# The gate's dependency image (Dockerfile.gate-builder): the crates the gate would otherwise compile
+# on every single run.
+#
+# Built only when something that decides the gate's dependency set changes, and tagged with a
+# fingerprint of exactly those inputs — the same tag `.forgejo/workflows/test.yml` looks for. A miss
+# there is not an error: the gate falls back to `rust:1-bookworm` and pays the compile it always
+# used to. That is why this can be added without a coordinated release.
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile.test
+      - Dockerfile.gate-builder
+      - .forgejo/workflows/gate-builder.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install kubectl
+        run: |
+          set -eu
+          curl -sSLo kubectl "https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: build the dependency image in a build pod
+        env:
+          CI_KUBECONFIG: ${{ secrets.CI_KUBECONFIG }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          echo "$CI_KUBECONFIG" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+
+          # MUST stay identical to the computation in test.yml, or the gate never finds the image.
+          image="harbor.vn.linuxguru.net/library/ellmephant-gate-builder:gate-$(cat Cargo.toml Cargo.lock Dockerfile.test Dockerfile.gate-builder | sha256sum | cut -c1-8)"
+
+          # Idempotent: a push that changes nothing about the dependency set rebuilds nothing.
+          if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
+            echo "$image already exists, nothing to build"
+            exit 0
+          fi
+
+          job=$(kubectl create -f - -o jsonpath='{.metadata.name}' <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            generateName: gate-builder-
+            namespace: ci-builds
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 2400
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: build
+                    image: harbor.vn.linuxguru.net/library/ci-base:0.4.0
+                    command: ["/harness/build.sh"]
+                    securityContext:
+                      privileged: true
+                    env:
+                      - { name: REPO_URL,   value: "https://git.vn.linuxguru.net/${REPO}.git" }
+                      - { name: GIT_REF,    value: "${SHA}" }
+                      - { name: DOCKERFILE, value: "Dockerfile.gate-builder" }
+                      - { name: IMAGE,      value: "${image}" }
+                      - { name: CACHE_REPO, value: "harbor.vn.linuxguru.net/library/ellmephant-gate-builder-cache" }
+                      - { name: PUSH,       value: "1" }
+                      - { name: REG_USER, valueFrom: { secretKeyRef: { name: ci-registry, key: username } } }
+                      - { name: REG_PASS, valueFrom: { secretKeyRef: { name: ci-registry, key: password } } }
+                    resources:
+                      requests: { cpu: "2", memory: 2Gi }
+                      limits:   { cpu: "4", memory: 8Gi }
+          YAML
+          )
+
+          echo "build job: $job"
+          if kubectl -n ci-builds wait --for=condition=complete "job/$job" --timeout=2400s; then
+            kubectl -n ci-builds logs "job/$job" --tail=-1
+            kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
+            echo "published $image"
+          else
+            echo "dependency image build failed or timed out:"
+            kubectl -n ci-builds logs "job/$job" --tail=-1 || true
+            kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
+            exit 1
+          fi

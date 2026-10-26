@@ -42,10 +42,18 @@ jobs:
           echo "$CI_KUBECONFIG" | base64 -d > "$RUNNER_TEMP/kubeconfig"
           export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
 
-          # The dependency image's tag is a fingerprint of the dependency set (same computation as
-          # publish-dev.yml and the Makefile), so this is a cache hit unless Cargo.toml/lock or
-          # Dockerfile.builder changed. A miss costs one slow build, never a wrong one.
-          builder="harbor.vn.linuxguru.net/library/ellmephant-builder:rust-lean-$(cat Cargo.toml Cargo.lock Dockerfile.builder | sha256sum | cut -c1-8)"
+          # The gate's dependency image: a fingerprint of everything that decides WHICH
+          # dependencies the gate compiles (lockfile + both Dockerfiles). Built by gate-builder.yml.
+          # If it is absent — a PR that changes Cargo.lock, or a run before the image exists — fall
+          # back to the plain toolchain: one slow build, never a wrong one.
+          gatebase="harbor.vn.linuxguru.net/library/ellmephant-gate-builder:gate-$(cat Cargo.toml Cargo.lock Dockerfile.test Dockerfile.gate-builder | sha256sum | cut -c1-8)"
+          if docker buildx imagetools inspect "$gatebase" > /dev/null 2>&1; then
+            builder="$gatebase"
+            echo "gate dependencies: $gatebase"
+          else
+            builder="rust:1-bookworm"
+            echo "gate dependencies: none for this lockfile, compiling from scratch"
+          fi
 
           job=$(kubectl create -f - -o jsonpath='{.metadata.name}' <<YAML
           apiVersion: batch/v1

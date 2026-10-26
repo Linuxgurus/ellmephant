@@ -2,8 +2,8 @@ apiVersion: v2
 name: ellmephant
 description: Single-binary, SQLite-backed long-term memory for AI agents (MCP over HTTP)
 type: application
-version: 0.2.4
-appVersion: "1.4.0"
+version: 0.2.5
+appVersion: "1.4.1"
 home: https://github.com/jdblack/ellmephant
 sources:
   - https://github.com/jdblack/ellmephant

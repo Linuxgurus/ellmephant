@@ -2054,27 +2054,7 @@ fn a_public_row_cannot_be_narrowed_into_the_trap_in_two_steps() {
     assert_eq!(mem.audience, "public", "nothing changed");
 }
 
-#[test]
-fn a_row_with_no_author_is_not_held_to_an_authors_rule() {
-    // ★ SECOND ADVERSARIAL PASS (#195). The D1 rule protects an AUTHOR from losing its own words. A row
-    // with no author (`anonymous`, which #122's backfill produced) has nobody to protect, and the
-    // refusal it produced was nonsense: "Add `pen:anonymous`" — an address to a pen that is not one.
-    // Worse, it would have made those rows unwritable forever short of publishing them.
-    let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
-    let mem = Memory {
-        key: "nobody-wrote-this".into(),
-        title: "backfilled".into(),
-        body: "author lost".into(),
-        asserted_by: Some("anonymous".into()),
-        audience: "pen:james".into(),
-        ..Default::default()
-    };
-    match common::add_now(&conn, &embedder, &mem) {
-        Ok(_) => {}
-        Err(e) => panic!("a row with no author must not be trapped: {e}"),
-    }
-}
+
 
 #[test]
 fn a_retired_authors_row_is_still_writable() {
@@ -2206,4 +2186,65 @@ fn kin_is_invariant_under_the_case_of_the_VIEWER_too() {
             "the answer must not depend on how the VIEWER spells itself ({viewer})"
         );
     }
+}
+
+#[test]
+fn a_legacy_row_with_no_author_can_still_be_written_but_a_new_one_cannot_claim_to_be_it() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 1 — this test replaces `a_row_with_no_author_is_not_held_to_an_authors_rule`,
+    // which asserted that a NEW row could be written with `asserted_by: anonymous` and an audience of
+    // someone else. That is not unsticking a legacy row; it is the bypass, written down as a rule.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A row that #122's backfill could have left: unattributed, addressed to james, written long ago.
+    row_with_audience(&conn, &embedder, "legacy-orphan", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'anonymous', audience = 'pen:james' WHERE key = 'legacy-orphan'",
+        [],
+    )
+    .expect("make it look like a backfilled row");
+
+    // The pen that answers for it can still tidy it — the exemption exists for this, and only this.
+    let patch = store::Patch {
+        key: Some("legacy-orphan".into()),
+        acted_by: Some("cline".into()),
+        tags: Some(vec!["tidied".into()]),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("a legacy unattributed row is not trapped");
+
+    // And a NEW row cannot buy the same exemption by naming itself anonymous.
+    let mem = Memory {
+        key: "fresh-anonymous".into(),
+        title: "for james only".into(),
+        body: "claimed to be nobody".into(),
+        asserted_by: Some("anonymous".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
+    assert!(err.contains("unattributed"), "{err}");
+}
+
+#[test]
+fn nobody_can_claim_the_anonymous_exemption_to_address_a_row_to_others_only() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 1. The exemption exists to unstick rows that #122 backfilled
+    // with `asserted_by = anonymous`. But it was applied to ANY write whose author string was
+    // "anonymous" — so a caller could simply name itself anonymous and create a row addressed to
+    // others only. **The exemption was a bypass with a legacy alibi.**
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    let mem = Memory {
+        key: "anonymous-trap".into(),
+        title: "for james only".into(),
+        body: "and nobody can read it".into(),
+        asserted_by: Some("anonymous".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
+    assert!(
+        err.contains("invisible to its own author") || err.contains("unattributed"),
+        "a NEW row may not buy the exemption by naming itself anonymous: {err}"
+    );
 }

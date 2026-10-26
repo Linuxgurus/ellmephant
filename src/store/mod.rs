@@ -464,12 +464,33 @@ fn add_impl(
     // words from, so the rule has nothing to enforce — and enforcing it anyway made those rows
     // unwritable forever, with the remedy "add `pen:anonymous`", which is an address to a pen that
     // does not exist. A rule that cannot be satisfied by any legal write is a trap of its own.
-    let author = mem.asserted_by.as_deref().filter(|a| {
-        let a = a.trim();
-        !a.is_empty() && !a.eq_ignore_ascii_case(crate::identity::ANONYMOUS)
-    });
+    // ★ THE EXEMPTION IS FOR ROWS THAT WERE ALREADY UNATTRIBUTED, NOT FOR CALLERS WHO CLAIM IT
+    // (hostile review, round 1). Applied to any write whose author string was `anonymous`, it was a
+    // bypass with a legacy alibi: name yourself anonymous, address the row to someone else, and the
+    // rule that exists to prevent exactly that never runs. So it is keyed on the STORED row.
+    let stored_author: Option<String> = tx
+        .query_row(
+            "SELECT asserted_by FROM memory WHERE key = ?1",
+            params![prepared.key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let is_anonymous = |a: &str| a.trim().is_empty() || a.eq_ignore_ascii_case(crate::identity::ANONYMOUS);
+    let legacy_unattributed = stored_author.as_deref().is_some_and(is_anonymous);
+    let author = mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty());
+    if addressed && author.is_some_and(is_anonymous) && !legacy_unattributed {
+        return Err(Error::Invalid(format!(
+            "`{}` would be addressed to others only while its author claims to be unattributed \
+             (`{}`). An unattributed row has nobody to read it: name the pen that writes it, or pass \
+             `as: <pen>` with a live lend so the row is theirs.",
+            prepared.key,
+            mem.asserted_by.as_deref().unwrap_or("")
+        )));
+    }
+    let author = author.filter(|a| !is_anonymous(a) || legacy_unattributed);
     if let (true, Some(author)) = (addressed, author) {
-        if !may_read_audience(&tx, author, &mem.audience)? {
+        if !is_anonymous(author) && !may_read_audience(&tx, author, &mem.audience)? {
             return Err(Error::Invalid(format!(
                 "`{}` would be invisible to its own author: the audience is `{}` and does not include \
                  `{author}`. Add `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if it is \

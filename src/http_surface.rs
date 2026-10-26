@@ -1786,8 +1786,12 @@ pub async fn claim_release(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // ★ THE HTTP SURFACE HAS NO PEN, ONLY A STORE-WIDE TOKEN, so it cannot check ancestry. It keeps
+    // the owner check and says so: an ancestor release is an MCP act, where the caller is proven.
     match server
-        .with_store("claim_release", move |s| s.claim_release(&name, &owner))
+        .with_store("claim_release", move |s| {
+            s.claim_release(&name, &owner, None)
+        })
         .await
     {
         Ok(out) => {

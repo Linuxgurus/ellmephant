@@ -756,9 +756,14 @@ impl Session {
         claim::acquire(&self.conn, name, owner, ttl_seconds)
     }
 
-    /// Release a lease, but only your own. A non-owner is refused and told who holds it.
-    pub fn claim_release(&self, name: &str, owner: &str) -> Result<claim::Release> {
-        claim::release(&self.conn, name, owner)
+    /// Release a lease as the proven pen: your own, or a descendant's with a reason.
+    pub fn claim_release(
+        &self,
+        name: &str,
+        actor: &str,
+        reason: Option<&str>,
+    ) -> Result<claim::Release> {
+        claim::release_by(&self.conn, name, actor, reason)
     }
 
     /// The claims a reader can see: one by `name`, or every claim (expired rows included) when `name`

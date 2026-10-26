@@ -1815,3 +1815,82 @@ fn a_write_credited_to_a_finger_needs_a_live_lend_and_records_the_hand_as_the_wr
         "the writer names the hand that actually wrote it"
     );
 }
+
+#[test]
+fn a_cas_compare_must_not_leak_a_version_to_a_pen_that_may_not_write() {
+    // ★ ADVERSARIAL REVIEW OF #192. Authorisation used to run AFTER the version compare, so a pen that
+    // may not write a row could ask "write only if version 0" and be told the CURRENT version — which
+    // is existence and size, from a store whose read path correctly reports absence. A refusal must
+    // not be a read.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "james-secret", "james", "pen:james");
+
+    let patch = store::Patch {
+        key: Some("james-secret".into()),
+        body: Some("probe".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: Some("cline".into()),
+        expected_version: Some(0),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("may not write"),
+        "a refusal, not a version: {err}"
+    );
+    assert!(
+        !err.contains("version"),
+        "and nothing about the row's version: {err}"
+    );
+}
+
+#[test]
+fn a_stranger_is_not_told_that_a_row_is_private() {
+    // ★ ADVERSARIAL REVIEW OF #192. `guard_audience` used to run before authorisation, so a pen that
+    // may not touch a row learned that it exists and is non-public from a DIFFERENT sentence than the
+    // one a stranger gets for an ordinary refusal. Same rule as the CAS: a refusal must not be a read.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-private-2", "stet", "pen:stet");
+
+    let patch = store::Patch {
+        key: Some("stets-private-2".into()),
+        audience: Some("public".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: Some("cline".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(err.contains("may not write"), "a refusal: {err}");
+    assert!(
+        !err.contains("private to another pen"),
+        "and no confirmation that it is private: {err}"
+    );
+}
+
+#[test]
+fn a_hand_may_reclassify_its_own_row_while_crediting_its_finger() {
+    // ★ ADVERSARIAL REVIEW OF #192. `guard_audience` judged the CREDITED pen (`asserted_by`) instead of
+    // the pen that acted, so a hand crediting its finger was refused its own boundary. The proven pen
+    // answers for the row; the credit is a name, not an authority.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    row_with_audience(&conn, &embedder, "hands-note", "stet/hand", "public");
+
+    let patch = store::Patch {
+        key: Some("hands-note".into()),
+        audience: Some("pen:stet".into()),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the pen that acts
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("the hand answers for its own row");
+    let mem = store::get(&conn, "hands-note").unwrap().unwrap();
+    assert_eq!(mem.audience, "pen:stet");
+    assert_eq!(mem.edited_by.as_deref(), Some("stet/hand"), "the writer, not the credit");
+}

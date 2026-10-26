@@ -381,9 +381,18 @@ fn add_impl(
     // Taking the write lock first makes "compare, then write" ONE serialized unit, which is the whole
     // point of a CAS. Writes are short; the wait is a few milliseconds.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    // ★ AND THE COMPARE IS INSIDE THE TRANSACTION, or it is theatre: a check outside would let a
-    // rival commit between the read and the write, which is exactly the lost update this exists to
-    // prevent.
+    // ★ AUTHORISE FIRST, THEN COMPARE (adversarial review of #192, 2026-10-26). The CAS used to run
+    // BEFORE `may_write`, so a pen that may not write a row could call `upsert` with a wrong
+    // `expected_version` and be told the row's CURRENT VERSION — existence and size — while every read
+    // path correctly reported absence. The compare is still inside the transaction, where it belongs;
+    // it is the ORDER that changed. A refusal must not be a read.
+    let actor = actor.or(mem.asserted_by.as_deref());
+    may_write(&tx, &prepared.key, actor)?;
+    if let (Some(credited), Some(proven)) = (credited, actor) {
+        if !credited.eq_ignore_ascii_case(proven) {
+            may_act_as(&tx, proven, credited)?;
+        }
+    }
     if let Some(want) = expected {
         let current = live_version(&tx, &prepared.key)?;
         if current != want {
@@ -404,8 +413,6 @@ fn add_impl(
     // names a descendant takes the credit; if only the actor were checked, a pen could spend its own
     // authority while stamping the row with a child's name — laundering authority THROUGH a child, the
     // same defect as a sudo gate that trusts the label. The rule is a conjunction, not a switch.
-    let actor = actor.or(mem.asserted_by.as_deref());
-    may_write(&tx, &prepared.key, actor)?;
     // ★ AND THE CREDIT MUST BE LEGITIMATE — BY LEND, NOT BY TREE SHAPE (Stet, review of #192, and #126).
     // My first attempt asked `may_write` about the credited pen too, which was the wrong question twice:
     // it tested AUTHORITY OVER THE ROW when the thing to test is AUTHORITY OVER THE NAME, and it would
@@ -589,7 +596,12 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
 /// The audience is not a preference — it is a boundary, and boundaries are not editable by the party
 /// they exclude. A row private to `pen:stet` may only be re-classified by `stet`, or by the owner's
 /// explicit forensic path (which is a different act, recorded).
-fn guard_audience(conn: &Connection, existing: Option<&Memory>, patch: &Patch) -> Result<()> {
+fn guard_audience(
+    conn: &Connection,
+    existing: Option<&Memory>,
+    patch: &Patch,
+    writer: Option<&str>,
+) -> Result<()> {
     let Some(old) = existing else {
         return Ok(());
     };
@@ -608,11 +620,11 @@ fn guard_audience(conn: &Connection, existing: Option<&Memory>, patch: &Patch) -
     // it, could not write it, could not re-classify it, and could only watch an ancestor delete it.
     // The guard exists to stop a pen that cannot read a row from publishing it — an owner or an
     // ancestor already has that power through deletion, so refusing them the gentler act is theatre.
-    if answers_for(conn, &old.key, patch.asserted_by.as_deref())? {
+    if answers_for(conn, &old.key, writer)? {
         return Ok(());
     }
     // The pen a row is ADDRESSED to may re-classify it — that pen owns the boundary.
-    let writer = patch.asserted_by.as_deref().unwrap_or_default();
+    let writer = writer.unwrap_or_default();
     let addressed_exactly = audience::parse(&old.audience)
         .is_some_and(|targets| targets.iter().any(|t| t.token() == audience::pen(writer)));
     if addressed_exactly {
@@ -657,10 +669,22 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         .as_ref()
         .map(|m| m.tags.clone())
         .unwrap_or_default();
+    // ★ WHO IS WRITING, ONCE (adversarial review of #192). `acted_by` is the proven pen; `asserted_by`
+    // is the credited one. Authority, the boundary guard and the write all have to agree about which
+    // pen is acting, or a hand crediting its finger gets judged as the finger for some checks and as
+    // the hand for others.
+    let writer = patch.acted_by.as_deref().or(patch.asserted_by.as_deref());
+    // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
+    // `guard_audience` produce different sentences for different states, so running them first let a
+    // pen that may not write the row learn that it exists and is not public — a read disguised as a
+    // refusal. A refusal must not be a read; the same rule as the CAS ordering.
+    if existing.is_some() {
+        may_write(conn, &key, writer)?;
+    }
     guard_protected(conn, &key, &was_tags, patch)?;
     // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
     // could not read. Without this, `private` would be a lock whose key hangs beside the door.
-    guard_audience(conn, existing.as_ref(), patch)?;
+    guard_audience(conn, existing.as_ref(), patch, writer)?;
 
     let (mem, created) = match existing {
         Some(old) => {

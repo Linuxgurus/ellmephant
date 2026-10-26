@@ -2305,3 +2305,35 @@ fn private_names_the_pen_that_acts_not_the_pen_it_credits() {
     let mem = store::get(&conn, "handed-note").unwrap().unwrap();
     assert_eq!(mem.audience, "pen:stet/hand", "private names the actor: {mem:?}");
 }
+
+#[test]
+fn a_write_to_an_already_trapped_row_says_it_was_already_trapped() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 4. "This would be invisible" is the wrong tense for a row that
+    // already is: it invites the caller to look for what their write introduced, and their write
+    // introduced nothing. A message that names the wrong moment names the wrong cause.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    // A legacy trap with a REAL author: created legally, then addressed elsewhere by hand.
+    row_with_audience(&conn, &embedder, "old-trap", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james' WHERE key = 'old-trap'",
+        [],
+    )
+    .expect("make the legacy trap");
+
+    let patch = store::Patch {
+        key: Some("old-trap".into()),
+        acted_by: Some("cline".into()),
+        tags: Some(vec!["tidied".into()]),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("IS ALREADY"),
+        "the row was already trapped and the message says so: {err}"
+    );
+    assert!(
+        err.contains("did not create that state"),
+        "and it says the write did not cause it: {err}"
+    );
+}

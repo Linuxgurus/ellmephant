@@ -468,6 +468,14 @@ fn add_impl(
     // (hostile review, round 1). Applied to any write whose author string was `anonymous`, it was a
     // bypass with a legacy alibi: name yourself anonymous, address the row to someone else, and the
     // rule that exists to prevent exactly that never runs. So it is keyed on the STORED row.
+    let stored_audience: Option<String> = tx
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![prepared.key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
     let stored_author: Option<String> = tx
         .query_row(
             "SELECT asserted_by FROM memory WHERE key = ?1",
@@ -491,14 +499,32 @@ fn add_impl(
     let author = author.filter(|a| !is_anonymous(a) || legacy_unattributed);
     if let (true, Some(author)) = (addressed, author) {
         if !is_anonymous(author) && !may_read_audience(&tx, author, &mem.audience)? {
+            // ★ SAY "IS", NOT "WOULD BE" (hostile review, round 4). For a row that is ALREADY trapped,
+            // "this would be invisible" invites the caller to look for what their write introduced —
+            // and their write introduced nothing; the row has been unreadable since before the call.
+            // A message that names the wrong moment names the wrong cause, which is the whole class
+            // this PR exists to remove.
+            let was_trapped = stored_audience
+                .as_deref()
+                .map(|a| !a.trim().is_empty() && a != audience::PUBLIC)
+                .unwrap_or(false);
             return Err(Error::Invalid(format!(
-                "`{}` would be invisible to its own author: the audience is `{}` and does not include \
-                 `{author}`. Add `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if it is \
-                 for a branch — or make it `public`. If this is genuinely a note FOR someone else and \
-                 not for you, credit them (`as: <pen>`, which needs a live lend) so the row is theirs \
-                 and the rule has an author who can read it. A row may be addressed to others; it may \
-                 not be addressed to others ONLY, because then nobody who answers for it can read it.",
-                prepared.key, mem.audience
+                "`{}` {} invisible to its own author: the audience is `{}` and does not include \
+                 `{author}`. {}\n\nAdd `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if \
+                 it is for a branch — or make it `public`. If this is genuinely a note FOR someone else \
+                 and not for you, credit them (`as: <pen>`, which needs a live lend) so the row is \
+                 theirs and the rule has an author who can read it. A row may be addressed to others; \
+                 it may not be addressed to others ONLY, because then nobody who answers for it can \
+                 read it.",
+                prepared.key,
+                if was_trapped { "IS ALREADY" } else { "would be" },
+                mem.audience,
+                if was_trapped {
+                    "This write did not create that state — the row was already unreadable to the pen \
+                     that wrote it, and this write does not change the audience."
+                } else {
+                    ""
+                }
             )));
         }
     }

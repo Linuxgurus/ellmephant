@@ -855,11 +855,16 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     // `audience` names others. Asked for both, this used to keep the `audience` and drop `private`
     // without a word — and when that audience did not include the author, the row became invisible to
     // the pen that wrote it. A caller must not have to guess which of its two sentences was obeyed.
-    if patch.private.is_some() && patch.audience.is_some() {
+    // ★ ONLY `private: true` CONTRADICTS AN AUDIENCE (hostile review of #194, round 2). `private: false`
+    // says "not private", and ANY explicit audience satisfies that — refusing the pair rejected a
+    // request that was not contradictory, and every client that always sends `private: false` with an
+    // audience would have broken. The contradiction is a claim of exclusivity alongside a list.
+    if patch.private == Some(true) && patch.audience.is_some() {
         return Err(Error::Invalid(
-            "`private` and `audience` say the same thing twice: `private: true` addresses the row to the \
-             writing pen, `audience` addresses it to others. Pass one. To address several pens INCLUDING \
-             yourself, use `audience: \"pen:<you>,pen:<other>\"` and no `private`."
+            "`private: true` and `audience` contradict each other: private addresses the row to the \
+             writing pen ALONE, audience names other pens. Pass one. To address several pens INCLUDING \
+             yourself, use `audience: \"pen:<you>,pen:<other>\"` and no `private`; `private: false` \
+             needs no audience, and any audience satisfies it."
                 .into(),
         ));
     }

@@ -3473,7 +3473,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         }
         let lookup = key.to_string();
         let facts = match self
-            .with_read("memory_get", reader, move |s| s.miss_facts(&lookup))
+            .with_read("memory_get", reader.clone(), move |s| s.miss_facts(&lookup))
             .await
         {
             Ok(f) => f,
@@ -3512,25 +3512,58 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             }
         };
         tracing::warn!(tool = "memory_get", key = %key, writer_sees, "memory_get miss: writer check");
-        let divergence = if writer_sees == "writer-sees-it" {
-            " ★ THIS PROCESS'S WRITER CONNECTION CAN SEE THIS ROW, so the read is lying about a row the process itself can prove: report the store and this sentence, do not re-write the memory."
-        } else {
-            ""
-        };
+        // ★ A HIDDEN ROW IS NOT A BROKEN READ (soma/ellmephant#189, 2026-10-26). The writer check is
+        // raw SQL on the table, so it says "exists" for every row the reader's AUDIENCE hides — which
+        // is the normal state of affairs in this estate, not a fault. Resolving that disagreement in
+        // favour of "the read is lying" and telling the caller to *report the store* is how I spent an
+        // hour hunting a split store that did not exist. The row's author is the one caller who may be
+        // told the difference: it knows the row exists, so the truth leaks nothing.
+        if writer_sees == "writer-sees-it" {
+            if let Some(caller) = reader.pen_name() {
+                let caller_owned = caller.to_string();
+                let lookup = key.to_string();
+                if let Ok(Some((owner, audience))) = self
+                    .with_read("memory_get", reader.clone(), move |s| s.self_facts(&lookup))
+                    .await
+                {
+                    if owner.eq_ignore_ascii_case(&caller_owned) {
+                        return format!(
+                            "no such memory: {key} — but it EXISTS, it is YOURS (owner: {owner}), and its \
+                             audience ({audience}) does not include you, so a read may not return it. \
+                             This is not a store fault and not a deletion. Write it with an audience \
+                             that includes `{caller_owned}` (or `public`) and it comes back: that write \
+                             narrows what the row exposes and is always yours to make."
+                        );
+                    }
+                }
+            }
+            // Not the caller's row: absence is the honest answer, and inventing a fault is not.
+            return err;
+        }
+        // ★ THE COUNT IS THE READER'S, AND SAYS SO (soma/ellmephant#189 D3). It used to read "holds N
+        // memories", i.e. a statement about the file, while it was computed with the reader's own
+        // predicate — so two pens comparing notes at the same moment saw a store that disagreed with
+        // itself by eight rows, which is precisely the "wrong store" hypothesis the sentence invites.
         if facts.versions > 0 {
             format!(
-                "no such memory: {key} — but {} holds {} memories (schema {}) and {} version(s) for this key, newest {}. So this is a DELETED row with history, or a reader looking at the wrong store; `memory_history` lists the versions and `memory_get` with `version=N` fetches one. Do not treat this as 'never existed'. [{}]{divergence}",
+                "no such memory: {key} — but {} holds {} version(s) for this key (newest {}), which you can \
+                 see, and it is not in the live table. So this is a DELETED row with history, or a reader \
+                 looking at the wrong store; `memory_history` lists the versions and `memory_get` with \
+                 `version=N` fetches one. Do not treat this as 'never existed'. (You can see {} memories, \
+                 schema {}.) [{}]",
                 facts.store,
-                facts.memories,
-                facts.schema,
                 facts.versions,
                 facts.newest.as_deref().unwrap_or("unknown"),
+                facts.memories,
+                facts.schema,
                 writer_sees
             )
         } else {
             format!(
-                "no such memory: {key} — {} holds {} memories (schema {}) and has no history for this key, so it has never existed THERE. If you believe it does, the store that holds it is not this one. [{}]{divergence}",
-                facts.store, facts.memories, facts.schema, writer_sees
+                "no such memory: {key} — you can see {} memories in {} (schema {}), and neither this reader \
+                 nor the writer connection has any history for this key, so it has never existed THERE — \
+                 either the key is new, or you are reading a different store. [{}]",
+                facts.memories, facts.store, facts.schema, writer_sees
             )
         }
     }

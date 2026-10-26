@@ -850,6 +850,19 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         ..Default::default()
     };
     let key = resolve_key(conn, &probe)?;
+    // ★ TWO INSTRUCTIONS THAT CONTRADICT EACH OTHER ARE REFUSED, NOT RESOLVED SILENTLY
+    // (soma/ellmephant#189 D5). `private` derives an audience from the proven pen; an explicit
+    // `audience` names others. Asked for both, this used to keep the `audience` and drop `private`
+    // without a word — and when that audience did not include the author, the row became invisible to
+    // the pen that wrote it. A caller must not have to guess which of its two sentences was obeyed.
+    if patch.private.is_some() && patch.audience.is_some() {
+        return Err(Error::Invalid(
+            "`private` and `audience` say the same thing twice: `private: true` addresses the row to the \
+             writing pen, `audience` addresses it to others. Pass one. To address several pens INCLUDING \
+             yourself, use `audience: \"pen:<you>,pen:<other>\"` and no `private`."
+                .into(),
+        ));
+    }
     let existing = get(conn, &key)?;
     // A `protected` row (or a write that would make one) needs a live lease on its own key.
     let was_tags = existing

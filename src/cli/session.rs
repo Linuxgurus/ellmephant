@@ -471,6 +471,38 @@ impl Session {
     /// refusal gives the reader nothing to test: on 2026-10-21 a live, versioned key was reported
     /// absent for 42 minutes and nobody could tell "wrong store" from "deleted" from "stale reader".
     /// These three numbers are the difference, and they cost one indexed query each.
+    /// WHO answers for `key` and what its audience is — read WITHOUT the audience filter, and used
+    /// only to tell a caller about a row it can already prove exists.
+    ///
+    /// ★ THE MISS HAS THREE ANSWERS, NOT TWO (soma/ellmephant#189, 2026-10-26). A row can be missing
+    /// from a reader for three reasons: it is not there; it is there and this reader may not see it;
+    /// or it is there, this reader may not see it, **and this reader is the pen that wrote it**. The
+    /// third case is not a permission question at all — the author already knows the row exists, so
+    /// telling it the truth leaks nothing — and answering it with "the store that holds it is not
+    /// this one" sends the author hunting a fault that is not there. That is exactly what happened.
+    ///
+    /// Only ever call this from a miss explanation, and only ever report the result to a caller that
+    /// OWNS the row; for anyone else the absence rule stands.
+    pub fn self_facts(&self, key: &str) -> Result<Option<(String, String)>> {
+        let row: Option<(Option<i64>, String)> = self
+            .conn
+            .query_row(
+                "SELECT owner, audience FROM memory WHERE key = ?1",
+                rusqlite::params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((Some(owner_id), audience)) = row else {
+            return Ok(None);
+        };
+        let name: String = self.conn.query_row(
+            "SELECT name FROM pen WHERE id = ?1",
+            rusqlite::params![owner_id],
+            |r| r.get(0),
+        )?;
+        Ok(Some((name, audience)))
+    }
+
     pub fn miss_facts(&self, key: &str) -> Result<MissFacts> {
         // ★ A DIAGNOSTIC IS A READ. "It existed 42 minutes ago" is exactly the sentence the tier
         // exists to prevent, so the history half is gated by the same rule as `memory_history`, and

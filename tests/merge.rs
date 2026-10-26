@@ -388,3 +388,38 @@ fn a_patch_that_changes_nothing_re_embeds_nothing() {
     );
     assert_eq!(vec::get(&conn, id).unwrap(), vector_before);
 }
+
+
+#[test]
+fn private_and_an_explicit_audience_are_refused_together() {
+    // soma/ellmephant#189 D5. Asked for both, the store used to keep the `audience` and drop `private`
+    // without a word — and when that audience did not include the author, the author lost the row:
+    // invisible to every read, and every repair refused.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    let (_id, key) = seed(&conn, &embedder, "ambiguous", "the facts");
+
+    let err = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            private: Some(true),
+            audience: Some("pen:james".into()),
+            asserted_by: Some("cline".into()),
+            ..bare(&key)
+        },
+    )
+    .expect_err("two contradictory instructions are refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("private") && msg.contains("audience"),
+        "the refusal names both instructions: {msg}"
+    );
+    let after = store::get(&conn, &key).unwrap().unwrap();
+    assert_eq!(
+        after.audience, "public",
+        "a refused write changes nothing, in particular not the audience"
+    );
+}

@@ -164,6 +164,12 @@ pub fn relation(conn: &Connection, from: &str, to: &str) -> Result<Option<Kin>> 
     // two chains with exact string equality — so `whois James` answered `P "parent"` and `whois james`
     // answered `PS "uncle"` for the same row, because `to` is seeded with the spelling the CALLER typed
     // while `mine` holds the spelling the DATABASE stored. One fold, once, at the comparison.
+    // ★ ASCII FOLDING, DELIBERATELY (adversarial review of #191). SQLite's `lower()` — which every pen
+    // lookup and every audience comparison already uses — folds ASCII only, so folding more here
+    // (`to_lowercase()`) would make this function disagree with the lookup that produced the names:
+    // `Ä` would match in one and not the other. Matching the database's own rule is the invariant;
+    // a pen named with non-ASCII letters is case-SENSITIVE everywhere today, which is a limitation of
+    // the stores's `lower()`, not of this function, and it should be fixed there or nowhere.
     let fold = |s: &str| s.to_ascii_lowercase();
     // ★ YOURSELF IS `ME` (James, 2026-10-23) — not a walk at all, and not a word in quotes: it is
     // the one answer that needs no gloss.

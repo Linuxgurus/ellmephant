@@ -3526,14 +3526,24 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     .with_read("memory_get", reader.clone(), move |s| s.self_facts(&lookup))
                     .await
                 {
-                    if owner.eq_ignore_ascii_case(&caller_owned) {
-                        return format!(
-                            "no such memory: {key} — but it EXISTS, it is YOURS (owner: {owner}), and its \
-                             audience ({audience}) does not include you, so a read may not return it. \
-                             This is not a store fault and not a deletion. Write it with an audience \
-                             that includes `{caller_owned}` (or `public`) and it comes back: that write \
-                             narrows what the row exposes and is always yours to make."
-                        );
+                    // ★ ASK THE READER, DO NOT ASSUME (adversarial review of #194). The first version
+                    // said "its audience does not include you" whenever the writer saw the row — which
+                    // would be a FALSE cause for the one case that is genuinely a divergence: the
+                    // audience DOES include the caller and the reader still cannot see it. Claiming a
+                    // cause without testing it is the defect this whole issue is about.
+                    let reader_sees = reader.sees(&audience);
+                    match Self::own_row_miss(key, caller, &owner, &audience, reader.sees(&audience)) {
+                        Some(msg) => return msg,
+                        None => {
+                            if owner.eq_ignore_ascii_case(&caller_owned) && reader_sees {
+                                return format!(
+                                    "no such memory: {key} — but this process's writer connection sees it \
+                                     and its audience ({audience}) DOES include you. That is a real \
+                                     divergence between the reading and writing connections: report the \
+                                     store and this sentence rather than re-writing the memory."
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3566,6 +3576,31 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 facts.memories, facts.store, facts.schema, writer_sees
             )
         }
+    }
+
+    /// The message for a miss that is really the AUTHOR's own row, hidden from the author by its
+    /// audience — or `None` when that is not what happened.
+    ///
+    /// ★ PURE ON PURPOSE (adversarial review of #194): the decision is a question about three facts, and
+    /// a diagnostic that can only be tested by standing up a transport is a diagnostic that will not be
+    /// tested. `reader_can_see` is passed in rather than assumed — claiming "the audience excludes you"
+    /// without checking is the same class of wrong cause this issue exists to remove.
+    fn own_row_miss(
+        key: &str,
+        caller: &str,
+        owner: &str,
+        audience: &str,
+        reader_can_see: bool,
+    ) -> Option<String> {
+        if !owner.eq_ignore_ascii_case(caller) || reader_can_see {
+            return None;
+        }
+        Some(format!(
+            "no such memory: {key} — but it EXISTS, it is YOURS (owner: {owner}), and its audience \
+             ({audience}) does not include you, so a read may not return it. This is not a store fault \
+             and not a deletion. Write it with an audience that includes `pen:{caller}` (or `public`) \
+             and it comes back: that write narrows what the row exposes and is always yours to make."
+        ))
     }
 
     /// One letter, body included.
@@ -4719,5 +4754,32 @@ mod tests {
         let cfg = Config::default();
         let spec = crate::model::Spec::from_config(&cfg, &paths);
         Session::open(paths, cfg, spec).expect("open store")
+    }
+}
+
+#[cfg(test)]
+mod miss_answer_tests {
+    // ★ THE DIAGNOSTIC IS A DECISION ABOUT THREE FACTS, so it is tested as one (adversarial review of
+    // #194). Each case here is a different sentence a caller can receive, and the one that matters is
+    // the second: an author whose own audience DOES include them must not be told that it excludes them.
+    use super::MemoryServer;
+
+    #[test]
+    fn an_owner_hidden_by_its_own_audience_is_told_so() {
+        let msg = MemoryServer::own_row_miss("trap", "cline", "cline", "pen:james", false).expect("a message");
+        assert!(msg.contains("it is YOURS"), "{msg}");
+        assert!(msg.contains("pen:james"), "and quotes the audience: {msg}");
+        assert!(msg.contains("pen:cline"), "and names what to add, as a token: {msg}");
+    }
+
+    #[test]
+    fn an_owner_who_could_see_it_gets_no_audience_excuse() {
+        // This is a divergence, not an exclusion — and saying otherwise would be the wrong cause.
+        assert!(MemoryServer::own_row_miss("k", "cline", "cline", "pen:cline", true).is_none());
+    }
+
+    #[test]
+    fn someone_elses_row_is_never_explained_to_a_stranger() {
+        assert!(MemoryServer::own_row_miss("k", "cline", "james", "pen:james", false).is_none());
     }
 }

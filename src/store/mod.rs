@@ -417,10 +417,6 @@ fn add_impl(
     // always yes. Measured consequence: a pen that could not even READ a row could overwrite it by
     // naming its key. The authority question and the provenance answer are two different questions and
     // must never be the same field. `actor` is who is writing; `mem.asserted_by` is who wrote it first.
-    // ★ AND THE CREDITED PEN MUST BE PERMITTED TOO (soma/ellmephant#192, Stet's review). A `as:` that
-    // names a descendant takes the credit; if only the actor were checked, a pen could spend its own
-    // authority while stamping the row with a child's name — laundering authority THROUGH a child, the
-    // same defect as a sudo gate that trusts the label. The rule is a conjunction, not a switch.
     // ★ AND THE CREDIT MUST BE LEGITIMATE — BY LEND, NOT BY TREE SHAPE (Stet, review of #192, and #126).
     // My first attempt asked `may_write` about the credited pen too, which was the wrong question twice:
     // it tested AUTHORITY OVER THE ROW when the thing to test is AUTHORITY OVER THE NAME, and it would
@@ -433,6 +429,38 @@ fn add_impl(
     if let (Some(credited), Some(proven)) = (credited, actor) {
         if !credited.eq_ignore_ascii_case(proven) {
             may_act_as(&tx, proven, credited)?;
+        }
+    }
+    // ★ A ROW ITS OWN AUTHOR CANNOT READ IS A TRAP, AND IS REFUSED (soma/ellmephant#189 D1,
+    // 2026-10-26). You may address a row to others; you may not address it to others ONLY. That
+    // combination creates a row that exists, is stamped as yours, and is invisible to you — and before
+    // #189's repair path it was unrecoverable: no read, no search, no backlink, no history, no write.
+    // The store already refuses an audience naming a pen that does not exist, with the words "a row
+    // nobody can see"; the author is a pen that does exist, and this is the same mistake.
+    //
+    // The check is on `asserted_by` — the AUTHOR, which is write-once — not on `actor`: an ancestor may
+    // write a child's row, but the row still has to be readable by the pen it is attributed to. `public`
+    // and `subtree:` audiences that contain the author pass, which is why no escape hatch is needed.
+    // An EMPTY audience is the legacy spelling of `public` (the column defaults to it on read), so it
+    // is included rather than sent through the address parser.
+    let addressed = !mem.audience.trim().is_empty() && mem.audience != audience::PUBLIC;
+    if addressed {
+        // ★ THE NAMED PENS MUST EXIST BEFORE WE ASK WHETHER THE AUTHOR IS AMONG THEM. `validated` also
+        // runs later, in `apply`; running it here keeps the FIRST refusal the more fundamental one —
+        // "`nosuchpen` names no pen" beats "it would be invisible to you", because a typo is a typo.
+        audience::validated(&tx, &mem.audience)?;
+    }
+    if let (true, Some(author)) = (addressed, mem.asserted_by.as_deref()) {
+        if !may_read_audience(&tx, author, &mem.audience)? {
+            return Err(Error::Invalid(format!(
+                "`{}` would be invisible to its own author: the audience is `{}` and does not include \
+                 `{author}`. Add `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if it is \
+                 for a branch — or make it `public`. If this is genuinely a note FOR someone else and \
+                 not for you, credit them (`as: <pen>`, which needs a live lend) so the row is theirs \
+                 and the rule has an author who can read it. A row may be addressed to others; it may \
+                 not be addressed to others ONLY, because then nobody who answers for it can read it.",
+                prepared.key, mem.audience
+            )));
         }
     }
     let id = apply(&tx, mem, &prepared)?;

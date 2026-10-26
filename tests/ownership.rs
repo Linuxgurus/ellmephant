@@ -1524,16 +1524,30 @@ fn sessions_are_listable_and_expiry_is_visible() {
 // A pen above you no longer reads your private rows by ancestry — that was the old law and he
 // removed it: an ancestor must be named, or use `subtree:`.
 
+/// A row addressed in a way the write path now REFUSES: an audience that omits its own author. Rows
+/// like this exist in the live store (written before soma/ellmephant#189 D1), so both the repair path
+/// and the read tier must be tested against one. Create it legally, then re-address it — the same
+/// shape a legacy row has, without pretending the API can produce it.
+fn planted(
+    conn: &rusqlite::Connection,
+    embedder: &HashEmbedder,
+    key: &str,
+    author: &str,
+    audience: &str,
+) {
+    row_with_audience(conn, embedder, key, author, "public");
+    conn.execute(
+        "UPDATE memory SET audience = ?1 WHERE key = ?2",
+        rusqlite::params![audience, key],
+    )
+    .expect("plant the audience a legacy row could carry");
+}
+
 fn shared(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str, audience: &str) {
-    let mem = Memory {
-        key: key.into(),
-        title: "shared".into(),
-        body: "one fact, two readers".into(),
-        asserted_by: Some("james".into()),
-        audience: audience.into(),
-        ..Default::default()
-    };
-    common::add_now(conn, embedder, &mem).expect("write");
+    // Addressed by james to a branch that does not always include james (`pen:cline`), which the write
+    // path now refuses — so the row is planted rather than written. The READ tier is what this fixture
+    // is for.
+    planted(conn, embedder, key, "james", audience);
 }
 
 fn sees(conn: &rusqlite::Connection, who: &str, key: &str) -> bool {
@@ -1729,7 +1743,7 @@ fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
     // The trap from #189: the author addressed its own row to someone else and not itself.
     // (The author's inability to READ it is a session/Reader property, tested elsewhere; here the
     // question is whether the write gate lets the owner repair what the owner cannot see.)
-    row_with_audience(&conn, &embedder, "trap", "cline", "pen:james");
+    planted(&conn, &embedder, "trap", "cline", "pen:james");
 
     // The repair must be possible from the author's side, or the only exit is destruction.
     let err = merge_as(&conn, "trap", "cline", Some("pen:james,pen:cline"));
@@ -1748,7 +1762,7 @@ fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
 fn an_ancestor_may_repair_a_descendants_trapped_row() {
     let (_dir, conn) = subtree();
     let embedder = HashEmbedder::new(DIM);
-    row_with_audience(&conn, &embedder, "stets-trap", "stet", "pen:james");
+    planted(&conn, &embedder, "stets-trap", "stet", "pen:james");
 
     let err = merge_as(&conn, "stets-trap", "james", Some("pen:james,pen:stet"));
     assert!(err.is_empty(), "answering for the row means being able to fix it: {err}");
@@ -1761,6 +1775,7 @@ fn an_ancestor_may_repair_a_descendants_trapped_row() {
     );
 }
 
+// ── from #192 (base) ──
 
 #[test]
 fn an_ancestor_may_not_overwrite_a_row_it_cannot_read() {
@@ -1907,6 +1922,40 @@ fn a_hand_may_reclassify_its_own_row_while_crediting_its_finger() {
     let mem = store::get(&conn, "hands-note").unwrap().unwrap();
     assert_eq!(mem.audience, "pen:stet");
     assert_eq!(mem.edited_by.as_deref(), Some("stet/hand"), "the writer, not the credit");
+// ── from #195 ──
+#[test]
+fn a_row_addressed_to_others_only_is_refused_at_write() {
+    // soma/ellmephant#189 D1: the trap is refused at the door. Before this, the write succeeded and the
+    // author lost the row — invisible to every read, and every repair refused.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    let trap = Memory {
+        key: "trap-door".into(),
+        title: "for james only".into(),
+        body: "and not for me".into(),
+        asserted_by: Some("cline".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = common::add_now(&conn, &embedder, &trap).expect_err("the trap is refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invisible to its own author") && msg.contains("cline"),
+        "the refusal names the author and the reason: {msg}"
+    );
+    assert!(
+        store::get(&conn, "trap-door").unwrap().is_none(),
+        "a refusal writes nothing"
+    );
+
+    // The same intent, expressed legally: address it to James AND to yourself.
+    let ok = Memory {
+        audience: "pen:james,pen:cline".into(),
+        ..trap
+    };
+    common::add_now(&conn, &embedder, &ok).expect("addressing yourself too is allowed");
+    assert!(store::get(&conn, "trap-door").unwrap().is_some());
 }
 
 #[test]

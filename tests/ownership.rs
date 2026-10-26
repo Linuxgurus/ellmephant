@@ -1697,6 +1697,15 @@ fn a_pen_may_not_overwrite_a_row_it_cannot_read() {
         "the refused write changed nothing — this was the whole finding"
     );
     assert_eq!(mem.asserted_by.as_deref(), Some("james"));
+    // ★ STET, REVIEW OF #192: assert BOTH, because they are different claims. An unauthorised write
+    // that is correctly attributed is not a forged signature, and the test that matters is that the
+    // refusal leaves no trace of a write at all — not merely that the name stayed right.
+    assert_eq!(mem.edited_by.as_deref(), Some("james"), "no writer was recorded");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory_version"),
+        0,
+        "a refused write creates no version"
+    );
 }
 
 #[test]
@@ -1735,5 +1744,31 @@ fn an_ancestor_may_repair_a_descendants_trapped_row() {
     assert!(
         err.contains("may not write"),
         "a sibling is not an owner and not an ancestor: {err}"
+    );
+}
+
+
+#[test]
+fn an_ancestor_may_not_overwrite_a_row_it_cannot_read() {
+    // ★ STET, REVIEW OF #192: "owners may write blind; ancestors may not." My first version let
+    // ancestors through because they can already delete the row — wrong on measurement. A delete is
+    // loud and leaves a version; an overwrite is quiet, and the row reads intact and wrong. So the
+    // ancestor must be able to SEE what it writes. (It may still write rows it can read: see
+    // `an_ancestor_may_repair_a_descendants_trapped_row`.)
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-private", "stet", "pen:stet");
+
+    let err = merge_as(&conn, "stets-private", "james", None);
+    assert!(
+        err.contains("audience does not include you"),
+        "an ancestor that cannot read it may not rewrite it: {err}"
+    );
+    let mem = store::get(&conn, "stets-private").unwrap().unwrap();
+    assert_eq!(mem.body, "the facts", "nothing changed");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory_version"),
+        0,
+        "no version was created"
     );
 }

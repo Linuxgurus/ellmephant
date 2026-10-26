@@ -377,6 +377,7 @@ impl UpsertParams {
     /// Convert the request into a partial write — `None` means "leave this field alone".
     fn into_patch(self) -> store::Patch {
         store::Patch {
+            acted_by: None,
             key: self.key,
             title: self.title,
             body: self.body,
@@ -2242,6 +2243,10 @@ impl MemoryServer {
             _ => None,
         };
         patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
+        // ★ THE PROVEN PEN, KEPT SEPARATE FROM THE CREDITED ONE (soma/ellmephant#192): authority is a
+        // conjunction — the pen that sent this must be permitted AND the pen taking the credit must be
+        // permitted, or `as:` becomes a way to spend one authority under another pen's name.
+        patch.acted_by = Some(caller.clone());
         let outcome = self
             .with_store("memory_upsert", move |s| {
                 s.channel_gate(&caller, crate::store::channel::Class::Record)?;

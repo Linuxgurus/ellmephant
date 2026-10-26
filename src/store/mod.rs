@@ -168,7 +168,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _, _) = add_impl(conn, mem, None, None, mem.asserted_by.as_deref())?;
+    let (id, key, _, _) = add_impl(conn, mem, None, None, mem.asserted_by.as_deref(), None)?;
     Ok((id, key))
 }
 
@@ -270,10 +270,10 @@ fn answers_for(conn: &Connection, key: &str, caller: Option<&str>) -> Result<boo
     let Some(caller_exact) = exact_pen_id(conn, caller)? else {
         return Ok(false);
     };
-    if caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id) {
-        return Ok(true);
-    }
-    is_ancestor(conn, caller_exact, owner_id)
+    // ★ OWNER ONLY, NOT ANCESTOR (Stet, review of #192). An ancestor that cannot read a row must not
+    // re-classify it either: publishing a private row it cannot see is a quieter harm than deleting it,
+    // not a gentler one. The owner answers for the row and may repair it.
+    Ok(caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id))
 }
 
 pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
@@ -313,47 +313,47 @@ pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> R
     let caller_exact = exact_pen_id(conn, caller)?
         .ok_or_else(|| Error::Invalid(format!("no pen named {caller}")))?;
 
-    // ★ AUTHORITY IS OWNERSHIP, NOT VISIBILITY (soma/ellmephant#189, #190 — 2026-10-26). These used to
-    // be one question: an unreadable row was unwritable, *even for the pen that owned it*, which made a
-    // row whose audience omits its own author recoverable only by deleting it. Visibility still decides
-    // READS (absence, never refusal); it no longer decides writes for the pens that ANSWER for the row.
-    let authorised = if caller_exact == owner_id
-        || owner_pen_id(conn, Some(caller))? == Some(owner_id)
-        || is_ancestor(conn, caller_exact, owner_id)?
-    {
-        true
-    } else {
-        // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the
-        // root is reaching rows the tree does not put under you. `asserted_by` still names the hand
-        // that typed it, so a borrowed write is attributable; the session row says whose authority it
-        // spent.
-        let mut via_session = false;
-        for held in held_authority(conn, caller)? {
-            if held == owner_id || is_ancestor(conn, held, owner_id)? {
-                via_session = true;
-                break;
-            }
-        }
-        via_session
-    };
-    if authorised {
+    // ★ THE OWNER MAY WRITE BLIND; AN ANCESTOR MAY NOT (Stet, review of #192, 2026-10-26). My first
+    // version let ancestors through on a consistency argument — "it can already delete the row, so
+    // refusing the gentler act is theatre". That argument is WRONG on measurement, and the measurement
+    // decides it: a delete is LOUD and leaves a version, so the content survives and the act is
+    // recorded; an overwrite is QUIET and plausible, so the row reads intact and wrong and the old
+    // meaning survives only as history. **The gentler-sounding act is the one whose damage is invisible
+    // when it happens**, which makes it the last thing to allow blind.
+    //
+    // The owner is the exception because the row is already attributed to it: telling it the truth
+    // leaks nothing, and a row whose audience omits its own author has no other exit (#189).
+    if caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id) {
         return Ok(());
     }
-
-    // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24): a read must never confirm a row
-    // it may not see, but a WRITE that answers *"no such memory"* for a memory that plainly exists
-    // sends an agent hunting a bug that is not there. The cost is that a prober learns the key exists;
-    // inside one estate, with cooperating pens, clarity is worth more than that.
-    //
-    // ★ AND IT SAYS **WHICH** REASON (soma/ellmephant#189). One sentence for three causes is how a
-    // correct refusal became a wrong diagnosis: this used to tell the row's own author that the row
-    // "is not yours, and you are not an ancestor of its owner", which is false twice.
+    // Everyone else must be able to SEE what they are writing…
     let visible = may_read_audience(conn, caller, &audience)?;
     if !visible {
+        // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24) — and it says WHICH reason
+        // (#189). One sentence for three causes is how a correct refusal became a wrong diagnosis: this
+        // used to tell the row's own author that the row "is not yours, and you are not an ancestor of
+        // its owner", which is false twice.
         return Err(Error::Forbidden(format!(
             "{caller} may not write {key}: it exists, its audience does not include you, and you do not own it"
         )));
     }
+    // …and must answer for it: an ancestor, or a pen holding a session that makes it one.
+    if is_ancestor(conn, caller_exact, owner_id)? {
+        return Ok(());
+    }
+    // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the root
+    // is reaching rows the tree does not put under you. `asserted_by` still names the hand that typed
+    // it, so a borrowed write is attributable; the session row says whose authority it spent.
+    for held in held_authority(conn, caller)? {
+        if held == owner_id || is_ancestor(conn, held, owner_id)? {
+            return Ok(());
+        }
+    }
+    // ★ DELETE AND UPDATE DELIBERATELY CONSULT THIS SAME FUNCTION (Stet, review of #192). They used to
+    // disagree — `delete` passed the requester, `update` passed the row's author — and that divergence
+    // is what exposed the #190 bug. Two functions that must agree should BE one function; otherwise the
+    // signal that found the bug becomes an accident nobody notices going quiet.
+
     let owner_name: String = conn.query_row(
         "SELECT name FROM pen WHERE id = ?1",
         params![owner_id],
@@ -370,6 +370,7 @@ fn add_impl(
     note: Option<&str>,
     expected: Option<i64>,
     actor: Option<&str>,
+    credited: Option<&str>,
 ) -> Result<(i64, String, bool, Option<i64>)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, mem, note)?;
@@ -399,11 +400,17 @@ fn add_impl(
     // always yes. Measured consequence: a pen that could not even READ a row could overwrite it by
     // naming its key. The authority question and the provenance answer are two different questions and
     // must never be the same field. `actor` is who is writing; `mem.asserted_by` is who wrote it first.
-    may_write(
-        &tx,
-        &prepared.key,
-        actor.or(mem.asserted_by.as_deref()),
-    )?;
+    // ★ AND THE CREDITED PEN MUST BE PERMITTED TOO (soma/ellmephant#192, Stet's review). A `as:` that
+    // names a descendant takes the credit; if only the actor were checked, a pen could spend its own
+    // authority while stamping the row with a child's name — laundering authority THROUGH a child, the
+    // same defect as a sudo gate that trusts the label. The rule is a conjunction, not a switch.
+    let actor = actor.or(mem.asserted_by.as_deref());
+    may_write(&tx, &prepared.key, actor)?;
+    if let Some(credited) = credited {
+        if Some(credited) != actor {
+            may_write(&tx, &prepared.key, Some(credited))?;
+        }
+    }
     let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
     Ok((id, prepared.key, queued, None))
@@ -444,7 +451,16 @@ pub struct Patch {
     /// New provenance. `Some("")` clears it — empty is a fact here.
     pub source: Option<String>,
     /// The store stamps this from the connection's proven identity; a caller may not set it.
+    ///
+    /// ★ THIS IS THE **ATTRIBUTED** PEN, NOT NECESSARILY THE ACTOR (soma/ellmephant#192). With `as:`
+    /// it names the descendant that takes the credit; the pen that actually sent the request is
+    /// [`Patch::acted_by`]. Authority requires BOTH to be permitted (Stet, review of #192): crediting a
+    /// child must not launder an authority its parent lacks, and a parent must not be refused a row it
+    /// may write because it chose to give a child the credit.
     pub asserted_by: Option<String>,
+    /// The pen that actually made the request, as the connection proved it. `None` means "same as
+    /// `asserted_by`" — the ordinary case, where nobody is being credited.
+    pub acted_by: Option<String>,
     /// Where the information came from, declared by the caller. `None` leaves the stored value.
     pub origin: Option<String>,
     /// New tags. `Some(vec![])` clears them.
@@ -725,7 +741,9 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         patch.expected_version,
         // ★ WHO IS WRITING, which is not who the row is attributed to: on an update `mem.asserted_by`
         // is the stored author (write-once, #107), so passing it here would authorise every update as
-        // the row's own author (#190). `patch.asserted_by` is the proven pen from the connection.
+        // the row's own author (#190). `acted_by` is the proven pen; `asserted_by` is the credited one,
+        // and authority needs both.
+        patch.acted_by.as_deref().or(patch.asserted_by.as_deref()),
         patch.asserted_by.as_deref(),
     )?;
     Ok(MergeOutcome {

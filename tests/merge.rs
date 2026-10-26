@@ -182,7 +182,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         (
             "title",
             store::Patch {
-            acted_by: None,
+                acted_by: None,
                 title: Some(String::new()),
                 ..bare(&key)
             },
@@ -190,7 +190,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         (
             "body",
             store::Patch {
-            acted_by: None,
+                acted_by: None,
                 body: Some(String::new()),
                 ..bare(&key)
             },

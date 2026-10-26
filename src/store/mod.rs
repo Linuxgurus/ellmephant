@@ -261,7 +261,9 @@ fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<
 /// answers neither: the pen that wrote a row can be locked out of reading it, and it is still the pen
 /// that answers for it.
 fn answers_for(conn: &Connection, key: &str, caller: Option<&str>) -> Result<bool> {
-    let Some(caller) = caller else { return Ok(false) };
+    let Some(caller) = caller else {
+        return Ok(false);
+    };
     let owner: Option<Option<i64>> = conn
         .query_row(
             "SELECT owner FROM memory WHERE key = ?1",
@@ -484,14 +486,22 @@ fn add_impl(
         )
         .optional()?
         .flatten();
-    let is_anonymous = |a: &str| a.trim().is_empty() || a.eq_ignore_ascii_case(crate::identity::ANONYMOUS);
+    let is_anonymous =
+        |a: &str| a.trim().is_empty() || a.eq_ignore_ascii_case(crate::identity::ANONYMOUS);
     let legacy_unattributed = stored_author.as_deref().is_some_and(is_anonymous);
     // ★ A ROW ADDRESSED TO OTHERS MUST NAME ITS AUTHOR (Stet, review of #195, 2026-10-26). Two gates
     // were skipped by one omission: with `asserted_by: None`, `author` is None, the check below does not
     // fire, and D1's `if let (true, Some(author))` does not run either — and then the COLUMN DEFAULT
     // (`asserted_by NOT NULL DEFAULT 'anonymous'`) supplied exactly the legacy state the exemption
     // exists for. **A check on a request field cannot see a value the default supplies.**
-    if addressed && mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty()).is_none() {
+    if addressed
+        && mem
+            .asserted_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .is_none()
+    {
         return Err(Error::Invalid(format!(
             "`{}` is addressed to others but names no author. An unattributed row has nobody to read \
              it, and the store's own default (`anonymous`) would make it the exact state the audience \
@@ -499,7 +509,11 @@ fn add_impl(
             prepared.key
         )));
     }
-    let author = mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty());
+    let author = mem
+        .asserted_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty());
     if addressed && author.is_some_and(is_anonymous) && !legacy_unattributed {
         return Err(Error::Invalid(format!(
             "`{}` would be addressed to others only while its author claims to be unattributed \
@@ -561,7 +575,11 @@ fn add_impl(
                  it may not be addressed to others ONLY, because then nobody who answers for it can \
                  read it.",
                 prepared.key,
-                if was_trapped { "IS ALREADY" } else { "would be" },
+                if was_trapped {
+                    "IS ALREADY"
+                } else {
+                    "would be"
+                },
                 mem.audience,
                 if was_trapped && audience_changed {
                     "The row was already unreadable to the pen that wrote it; this write changes the \
@@ -851,7 +869,8 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     // no longer read words it was credited for, so the D1 rule refused the write with a message about
     // invisibility — a true sentence that names the wrong cause. Refuse the combination instead.
     if patch.private == Some(true) {
-        if let (Some(credited), Some(actor)) = (patch.asserted_by.as_deref(), patch.acted_by.as_deref())
+        if let (Some(credited), Some(actor)) =
+            (patch.asserted_by.as_deref(), patch.acted_by.as_deref())
         {
             if !credited.eq_ignore_ascii_case(actor) {
                 return Err(Error::Invalid(
@@ -965,10 +984,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                             patch.private == Some(true),
                             // ★ The same correction on the CREATE path: the pen making the row private
                             // is the one that acts; the credit is a name and may be a finger.
-                            patch
-                                .acted_by
-                                .as_deref()
-                                .or(patch.asserted_by.as_deref()),
+                            patch.acted_by.as_deref().or(patch.asserted_by.as_deref()),
                         )?,
                     },
                     ..Default::default()

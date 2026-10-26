@@ -215,7 +215,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
         .unwrap();
     // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
-        "DROP TABLE IF EXISTS channel_event;
+        "DROP TABLE IF EXISTS channel_boundary;
+         DROP TABLE IF EXISTS channel_event;
          DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
@@ -302,7 +303,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         .unwrap();
     // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
-        "DROP TABLE IF EXISTS channel_event;
+        "DROP TABLE IF EXISTS channel_boundary;
+         DROP TABLE IF EXISTS channel_event;
          DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
@@ -496,7 +498,8 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         .unwrap();
     // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
-        "DROP TABLE IF EXISTS channel_event;
+        "DROP TABLE IF EXISTS channel_boundary;
+         DROP TABLE IF EXISTS channel_event;
          DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
@@ -598,7 +601,8 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
         .unwrap();
     // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
-        "DROP TABLE IF EXISTS channel_event;
+        "DROP TABLE IF EXISTS channel_boundary;
+         DROP TABLE IF EXISTS channel_event;
          DROP TABLE IF EXISTS channel_delivery;
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;

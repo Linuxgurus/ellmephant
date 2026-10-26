@@ -1,18 +1,25 @@
 name: verdict-stale
 
-# ★ A REVISION NEEDS A NEW REVIEW (James, 2026-10-26). When a PR's head changes, every per-pen
-# verdict label is stale by construction: `<pen>:lgtm` was given for a tree nobody is looking at any
-# more, and `<pen>:needs-work` may have been answered by the very commit that just landed. So a push
-# drops ALL THREE — lgtm, needs-work and no-opinion — and the pen says it again or it stays unsaid.
+# ★ A REVISION NEEDS A NEW REVIEW — BUT A BASE MERGE IS NOT A REVISION (James, 2026-10-26).
 #
-# ★ MEASURED ON THIS FORGEJO (16.0.5, scratch probe): the trigger type is `synchronize` but the
-# PAYLOAD action is **`synchronized`**. Do not test for the trigger spelling in the payload.
-# `github.ref` here is `refs/pull/<n>/head`, not a branch name. `${{ github.token }}` CAN delete
-# labels with `permissions: issues: write`.
+# When a PR's head changes because the BRANCH moved, every per-pen verdict is stale by construction:
+# `<pen>:lgtm` was given for a tree nobody is looking at any more. So the labels go, and the pen says
+# it again or it stays unsaid.
 #
-# ★ WHY NOT KEEP needs-work: a blocker that survives a typo fix is a blocker the reviewer still owes
-# an answer on, but a label that survives *every* push becomes a sticker — and the reviewer who pushed
-# a real fix deserves a clean board. Re-review is cheap; a stale verdict is not.
+# ★ BUT: merging the base branch in to unblock ("update branch") also pushes a commit, and dropping a
+# verdict for that is an unwanted side effect — the PR's own change did not move. So the push is
+# CLASSIFIED before anything is dropped:
+#
+#   content change  -> drop
+#   base sync       -> keep
+#
+# A push counts as a BASE SYNC only if all three hold:
+#   1. the new head is a MERGE commit (2+ parents);
+#   2. a non-first parent is an ancestor of the base branch (i.e. the base was merged in);
+#   3. the merge was CLEAN — the commit's tree equals the automatic merge of its parents, so nobody
+#      resolved a conflict (a conflict resolution is new content and must be re-reviewed).
+# Anything else — a normal commit, an amended commit, a rebase, or a merge-tree we cannot verify —
+# is treated as a content change. When in doubt, ask for review again.
 on:
   pull_request:
     types: [synchronize]
@@ -24,14 +31,46 @@ jobs:
   drop:
     runs-on: ubuntu-latest
     steps:
-      - name: Drop every <pen>:<verdict> label
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Classify the push and drop verdicts only for a content change
         env:
           TOKEN: ${{ github.token }}
           API: ${{ github.server_url }}
           REPO: ${{ github.repository }}
           NUM: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.base_ref }}
         run: |
           set -eu
+          git fetch -q origin "$BASE"
+          head=$(git rev-parse HEAD)
+          parents=$(git rev-list --parents -n1 "$head" | cut -d' ' -f2-)
+          n=$(echo $parents | wc -w | tr -d ' ')
+
+          sync=0
+          if [ "$n" -ge 2 ]; then
+            base_hit=0
+            first=1
+            for p in $parents; do
+              if [ "$first" = 1 ]; then first=0; continue; fi
+              if git merge-base --is-ancestor "$p" "origin/$BASE"; then base_hit=1; fi
+            done
+            if [ "$base_hit" = 1 ]; then
+              tree=$(git rev-parse "$head^{tree}")
+              auto=$(git merge-tree --write-tree $parents 2>/dev/null | head -1 || true)
+              if [ -n "${auto:-}" ] && [ "$auto" = "$tree" ]; then sync=1; fi
+            fi
+          fi
+
+          if [ "$sync" = 1 ]; then
+            echo "BASE SYNC ($head): the base moved, the PR did not — labels kept"
+            exit 0
+          fi
+          echo "CONTENT CHANGE ($head): dropping verdict labels, this tree needs review"
+
           curl -fsS -H "Authorization: token $TOKEN" \
             "$API/api/v1/repos/$REPO/issues/$NUM/labels" > /tmp/labels.json
           python3 - > /tmp/drop.txt <<'PY'

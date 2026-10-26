@@ -486,6 +486,19 @@ fn add_impl(
         .flatten();
     let is_anonymous = |a: &str| a.trim().is_empty() || a.eq_ignore_ascii_case(crate::identity::ANONYMOUS);
     let legacy_unattributed = stored_author.as_deref().is_some_and(is_anonymous);
+    // ★ A ROW ADDRESSED TO OTHERS MUST NAME ITS AUTHOR (Stet, review of #195, 2026-10-26). Two gates
+    // were skipped by one omission: with `asserted_by: None`, `author` is None, the check below does not
+    // fire, and D1's `if let (true, Some(author))` does not run either — and then the COLUMN DEFAULT
+    // (`asserted_by NOT NULL DEFAULT 'anonymous'`) supplied exactly the legacy state the exemption
+    // exists for. **A check on a request field cannot see a value the default supplies.**
+    if addressed && mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty()).is_none() {
+        return Err(Error::Invalid(format!(
+            "`{}` is addressed to others but names no author. An unattributed row has nobody to read \
+             it, and the store's own default (`anonymous`) would make it the exact state the audience \
+             rule exists to prevent. Name the pen that writes it, or pass `as: <pen>` with a live lend.",
+            prepared.key
+        )));
+    }
     let author = mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty());
     if addressed && author.is_some_and(is_anonymous) && !legacy_unattributed {
         return Err(Error::Invalid(format!(
@@ -496,9 +509,14 @@ fn add_impl(
             mem.asserted_by.as_deref().unwrap_or("")
         )));
     }
-    let author = author.filter(|a| !is_anonymous(a) || legacy_unattributed);
+    // ★ THE LEGACY EXEMPTION IS THE `is_anonymous` GUARD BELOW, NOT THIS FILTER (Stet, review of
+    // #195, 2026-10-26). The filter used to retain `anonymous` as the author "when legacy", which read
+    // as if it did the work — and then the guard skipped the check anyway, so the filter was DEAD CODE
+    // in a security path: worse than absent, because the next reader trusts it. Dropped, and the guard
+    // now says what it is doing and why.
     if let (true, Some(author)) = (addressed, author) {
-        if !is_anonymous(author) && !may_read_audience(&tx, author, &mem.audience)? {
+        let legacy_author = is_anonymous(author) && legacy_unattributed;
+        if !legacy_author && !may_read_audience(&tx, author, &mem.audience)? {
             // ★ SAY "IS", NOT "WOULD BE" (hostile review, round 4). For a row that is ALREADY trapped,
             // "this would be invisible" invites the caller to look for what their write introduced —
             // and their write introduced nothing; the row has been unreadable since before the call.
@@ -512,7 +530,28 @@ fn add_impl(
             // not change the audience" — false when the write changes it to another set that also
             // excludes the author. A second false claim in the message that exists to stop false
             // claims, so: compare before saying.
-            let audience_changed = stored_audience.as_deref() != Some(mem.audience.as_str());
+            // ★ COMPARE THE SETS, NOT THE STRINGS (Stet, review of #195, 2026-10-26). An exact
+            // comparison reads `pen:james,pen:cline` versus `pen:cline,pen:james` as a CHANGE, so the
+            // message claimed "this write changes the audience" about a reorder that changed nothing —
+            // round 5's class, in the comparator rather than the sentence. A reorder is not a change.
+            let same_audience = if stored_audience.as_deref() == Some(mem.audience.as_str()) {
+                true
+            } else {
+                match (
+                    audience::parse(stored_audience.as_deref().unwrap_or_default()),
+                    audience::parse(&mem.audience),
+                ) {
+                    (Some(old), Some(new)) => {
+                        let mut a: Vec<String> = new.iter().map(|t| t.token()).collect();
+                        let mut b: Vec<String> = old.iter().map(|t| t.token()).collect();
+                        a.sort();
+                        b.sort();
+                        a == b
+                    }
+                    _ => false,
+                }
+            };
+            let audience_changed = !same_audience;
             return Err(Error::Invalid(format!(
                 "`{}` {} invisible to its own author: the audience is `{}` and does not include \
                  `{author}`. {}\n\nAdd `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if \

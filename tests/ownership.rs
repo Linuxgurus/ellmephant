@@ -2398,3 +2398,58 @@ fn a_legacy_anonymous_row_can_be_made_private_by_the_pen_that_answers_for_it() {
         "private names the pen that acts, even when the author is nobody: {mem:?}"
     );
 }
+
+#[test]
+fn a_row_addressed_to_others_must_name_its_author() {
+    // ★ STET, review of #195: two gates were skipped by one omission. With `asserted_by: None` the new
+    // check does not fire, D1's `if let (true, Some(author))` does not run either — and then the column
+    // DEFAULT (`asserted_by NOT NULL DEFAULT 'anonymous'`) supplies the legacy state the exemption
+    // exists for. A check on a request field cannot see a value the default supplies.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    let mem = Memory {
+        key: "nameless".into(),
+        title: "addressed to someone".into(),
+        body: "with no author".into(),
+        asserted_by: None,
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
+    assert!(
+        err.contains("names no author"),
+        "refused for the right reason: {err}"
+    );
+    assert!(
+        store::get(&conn, "nameless").unwrap().is_none(),
+        "and nothing was written"
+    );
+}
+
+#[test]
+fn a_reordered_audience_is_not_a_changed_audience() {
+    // ★ STET, review of #195: `audience_changed` was an exact string comparison, so a reorder read as a
+    // change and the refusal said "this write changes the audience" about a write that changed nothing.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "reorder-trap", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james,pen:stet' WHERE key = 'reorder-trap'",
+        [],
+    )
+    .expect("legacy trap, two addressees");
+
+    // The same two pens, the other way round.
+    let patch = store::Patch {
+        key: Some("reorder-trap".into()),
+        acted_by: Some("cline".into()),
+        audience: Some("pen:stet,pen:james".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(err.contains("IS ALREADY"), "{err}");
+    assert!(
+        !err.contains("changes the audience"),
+        "a reorder changed nothing, and the sentence must not say it did: {err}"
+    );
+}

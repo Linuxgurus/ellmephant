@@ -62,7 +62,7 @@ jobs:
                 restartPolicy: Never
                 containers:
                   - name: build
-                    image: harbor.vn.linuxguru.net/library/ci-base:0.3.0
+                    image: harbor.vn.linuxguru.net/library/ci-base:0.4.0
                     command: ["/harness/build.sh"]
                     securityContext:
                       privileged: true
@@ -76,6 +76,8 @@ jobs:
                       - { name: PUSH,       value: "0" }
                       - { name: GIT_USER, valueFrom: { secretKeyRef: { name: ci-git, key: username } } }
                       - { name: GIT_PASS, valueFrom: { secretKeyRef: { name: ci-git, key: password } } }
+                      - { name: REG_USER, valueFrom: { secretKeyRef: { name: ci-registry, key: username } } }
+                      - { name: REG_PASS, valueFrom: { secretKeyRef: { name: ci-registry, key: password } } }
                     resources:
                       requests: { cpu: "2", memory: 2Gi }
                       limits:   { cpu: "4", memory: 8Gi }

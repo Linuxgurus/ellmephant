@@ -417,10 +417,6 @@ fn add_impl(
     // always yes. Measured consequence: a pen that could not even READ a row could overwrite it by
     // naming its key. The authority question and the provenance answer are two different questions and
     // must never be the same field. `actor` is who is writing; `mem.asserted_by` is who wrote it first.
-    // ★ AND THE CREDITED PEN MUST BE PERMITTED TOO (soma/ellmephant#192, Stet's review). A `as:` that
-    // names a descendant takes the credit; if only the actor were checked, a pen could spend its own
-    // authority while stamping the row with a child's name — laundering authority THROUGH a child, the
-    // same defect as a sudo gate that trusts the label. The rule is a conjunction, not a switch.
     // ★ AND THE CREDIT MUST BE LEGITIMATE — BY LEND, NOT BY TREE SHAPE (Stet, review of #192, and #126).
     // My first attempt asked `may_write` about the credited pen too, which was the wrong question twice:
     // it tested AUTHORITY OVER THE ROW when the thing to test is AUTHORITY OVER THE NAME, and it would
@@ -433,6 +429,150 @@ fn add_impl(
     if let (Some(credited), Some(proven)) = (credited, actor) {
         if !credited.eq_ignore_ascii_case(proven) {
             may_act_as(&tx, proven, credited)?;
+        }
+    }
+    // ★ A ROW ITS OWN AUTHOR CANNOT READ IS A TRAP, AND IS REFUSED (soma/ellmephant#189 D1,
+    // 2026-10-26). You may address a row to others; you may not address it to others ONLY. That
+    // combination creates a row that exists, is stamped as yours, and is invisible to you — and before
+    // #189's repair path it was unrecoverable: no read, no search, no backlink, no history, no write.
+    // The store already refuses an audience naming a pen that does not exist, with the words "a row
+    // nobody can see"; the author is a pen that does exist, and this is the same mistake.
+    //
+    // The check is on `asserted_by` — the AUTHOR, which is write-once — not on `actor`: an ancestor may
+    // write a child's row, but the row still has to be readable by the pen it is attributed to. `public`
+    // and `subtree:` audiences that contain the author pass, which is why no escape hatch is needed.
+    // An EMPTY audience is the legacy spelling of `public` (the column defaults to it on read), so it
+    // is included rather than sent through the address parser.
+    //
+    // ★ NO CARVE-OUT FOR NARROWING TO AN ANCESTOR — DECIDED, 2026-10-26. It is tempting: a hand making
+    // a note private to its parent can still RECOVER it, because the owner may write blind (#192), so
+    // the row is not permanently lost. But recoverability does not undo the harm: the author still
+    // cannot read words it wrote, which is exactly what #189 measured as a lost day. The remedies are
+    // one token (`pen:<you>`) or one honest credit (`as: <parent>`, with a live lend), and both are
+    // named in the refusal. Every exception here would also need a subset relation between audiences
+    // (is `subtree:x` narrower than `pen:y`?), and the strength of this rule is that it has no such
+    // relation to get wrong — the two-step bypass test exists because that is where the weight sits.
+    let addressed = !mem.audience.trim().is_empty() && mem.audience != audience::PUBLIC;
+    if addressed {
+        // ★ THE NAMED PENS MUST EXIST BEFORE WE ASK WHETHER THE AUTHOR IS AMONG THEM. `validated` also
+        // runs later, in `apply`; running it here keeps the FIRST refusal the more fundamental one —
+        // "`nosuchpen` names no pen" beats "it would be invisible to you", because a typo is a typo.
+        audience::validated(&tx, &mem.audience)?;
+    }
+    // ★ AN AUTHOR WHO IS NOBODY IS NOT PROTECTED BY THIS RULE (second adversarial pass, 2026-10-26).
+    // #122's backfill left rows with `asserted_by = anonymous`. There is no author to hide his own
+    // words from, so the rule has nothing to enforce — and enforcing it anyway made those rows
+    // unwritable forever, with the remedy "add `pen:anonymous`", which is an address to a pen that
+    // does not exist. A rule that cannot be satisfied by any legal write is a trap of its own.
+    // ★ THE EXEMPTION IS FOR ROWS THAT WERE ALREADY UNATTRIBUTED, NOT FOR CALLERS WHO CLAIM IT
+    // (hostile review, round 1). Applied to any write whose author string was `anonymous`, it was a
+    // bypass with a legacy alibi: name yourself anonymous, address the row to someone else, and the
+    // rule that exists to prevent exactly that never runs. So it is keyed on the STORED row.
+    let stored_audience: Option<String> = tx
+        .query_row(
+            "SELECT audience FROM memory WHERE key = ?1",
+            params![prepared.key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let stored_author: Option<String> = tx
+        .query_row(
+            "SELECT asserted_by FROM memory WHERE key = ?1",
+            params![prepared.key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let is_anonymous = |a: &str| a.trim().is_empty() || a.eq_ignore_ascii_case(crate::identity::ANONYMOUS);
+    let legacy_unattributed = stored_author.as_deref().is_some_and(is_anonymous);
+    // ★ A ROW ADDRESSED TO OTHERS MUST NAME ITS AUTHOR (Stet, review of #195, 2026-10-26). Two gates
+    // were skipped by one omission: with `asserted_by: None`, `author` is None, the check below does not
+    // fire, and D1's `if let (true, Some(author))` does not run either — and then the COLUMN DEFAULT
+    // (`asserted_by NOT NULL DEFAULT 'anonymous'`) supplied exactly the legacy state the exemption
+    // exists for. **A check on a request field cannot see a value the default supplies.**
+    if addressed && mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty()).is_none() {
+        return Err(Error::Invalid(format!(
+            "`{}` is addressed to others but names no author. An unattributed row has nobody to read \
+             it, and the store's own default (`anonymous`) would make it the exact state the audience \
+             rule exists to prevent. Name the pen that writes it, or pass `as: <pen>` with a live lend.",
+            prepared.key
+        )));
+    }
+    let author = mem.asserted_by.as_deref().map(str::trim).filter(|a| !a.is_empty());
+    if addressed && author.is_some_and(is_anonymous) && !legacy_unattributed {
+        return Err(Error::Invalid(format!(
+            "`{}` would be addressed to others only while its author claims to be unattributed \
+             (`{}`). An unattributed row has nobody to read it: name the pen that writes it, or pass \
+             `as: <pen>` with a live lend so the row is theirs.",
+            prepared.key,
+            mem.asserted_by.as_deref().unwrap_or("")
+        )));
+    }
+    // ★ THE LEGACY EXEMPTION IS THE `is_anonymous` GUARD BELOW, NOT THIS FILTER (Stet, review of
+    // #195, 2026-10-26). The filter used to retain `anonymous` as the author "when legacy", which read
+    // as if it did the work — and then the guard skipped the check anyway, so the filter was DEAD CODE
+    // in a security path: worse than absent, because the next reader trusts it. Dropped, and the guard
+    // now says what it is doing and why.
+    if let (true, Some(author)) = (addressed, author) {
+        let legacy_author = is_anonymous(author) && legacy_unattributed;
+        if !legacy_author && !may_read_audience(&tx, author, &mem.audience)? {
+            // ★ SAY "IS", NOT "WOULD BE" (hostile review, round 4). For a row that is ALREADY trapped,
+            // "this would be invisible" invites the caller to look for what their write introduced —
+            // and their write introduced nothing; the row has been unreadable since before the call.
+            // A message that names the wrong moment names the wrong cause, which is the whole class
+            // this PR exists to remove.
+            let was_trapped = stored_audience
+                .as_deref()
+                .map(|a| !a.trim().is_empty() && a != audience::PUBLIC)
+                .unwrap_or(false);
+            // ★ AND WHETHER *THIS* WRITE CHANGED IT (round 5). Round 4's sentence said "this write does
+            // not change the audience" — false when the write changes it to another set that also
+            // excludes the author. A second false claim in the message that exists to stop false
+            // claims, so: compare before saying.
+            // ★ COMPARE THE SETS, NOT THE STRINGS (Stet, review of #195, 2026-10-26). An exact
+            // comparison reads `pen:james,pen:cline` versus `pen:cline,pen:james` as a CHANGE, so the
+            // message claimed "this write changes the audience" about a reorder that changed nothing —
+            // round 5's class, in the comparator rather than the sentence. A reorder is not a change.
+            let same_audience = if stored_audience.as_deref() == Some(mem.audience.as_str()) {
+                true
+            } else {
+                match (
+                    audience::parse(stored_audience.as_deref().unwrap_or_default()),
+                    audience::parse(&mem.audience),
+                ) {
+                    (Some(old), Some(new)) => {
+                        let mut a: Vec<String> = new.iter().map(|t| t.token()).collect();
+                        let mut b: Vec<String> = old.iter().map(|t| t.token()).collect();
+                        a.sort();
+                        b.sort();
+                        a == b
+                    }
+                    _ => false,
+                }
+            };
+            let audience_changed = !same_audience;
+            return Err(Error::Invalid(format!(
+                "`{}` {} invisible to its own author: the audience is `{}` and does not include \
+                 `{author}`. {}\n\nAdd `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if \
+                 it is for a branch — or make it `public`. If this is genuinely a note FOR someone else \
+                 and not for you, credit them (`as: <pen>`, which needs a live lend) so the row is \
+                 theirs and the rule has an author who can read it. A row may be addressed to others; \
+                 it may not be addressed to others ONLY, because then nobody who answers for it can \
+                 read it.",
+                prepared.key,
+                if was_trapped { "IS ALREADY" } else { "would be" },
+                mem.audience,
+                if was_trapped && audience_changed {
+                    "The row was already unreadable to the pen that wrote it; this write changes the \
+                     audience, but the new one excludes the author too."
+                } else if was_trapped {
+                    "This write did not create that state — the row was already unreadable to the pen \
+                     that wrote it, and this write does not change the audience."
+                } else {
+                    ""
+                }
+            )));
         }
     }
     let id = apply(&tx, mem, &prepared)?;
@@ -705,6 +845,24 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     // the hand for others.
     // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): the guards below must judge the pen that
     // acts. Falling back to `asserted_by` is how a write gets authorised as the name it credits.
+    // ★ `private` AND `as:` CONTRADICT EACH OTHER (hostile review of #195, round 3). `private: true`
+    // addresses the row to the pen that ACTS; `as:` credits a different pen. Both cannot be true, and
+    // the failure was ugly rather than refused: with the audience on the actor, the CREDITED pen could
+    // no longer read words it was credited for, so the D1 rule refused the write with a message about
+    // invisibility — a true sentence that names the wrong cause. Refuse the combination instead.
+    if patch.private == Some(true) {
+        if let (Some(credited), Some(actor)) = (patch.asserted_by.as_deref(), patch.acted_by.as_deref())
+        {
+            if !credited.eq_ignore_ascii_case(actor) {
+                return Err(Error::Invalid(
+                    "`private: true` addresses the row to the pen that ACTS, and `as:` credits a \
+                     different pen — they contradict each other. Pass an explicit `audience` (e.g. \
+                     `pen:<you>,pen:<them>`) if the row is for both, or drop one of them."
+                        .into(),
+                ));
+            }
+        }
+    }
     let writer = patch.acted_by.as_deref();
     // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
     // `guard_audience` produce different sentences for different states, so running them first let a
@@ -761,9 +919,18 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                         // An explicit audience is a SHARE (it names others), so it is checked against
                         // the registry; `private` is derived from the proven pen and cannot.
                         (Some(spec), _) => audience::validated(conn, spec)?,
+                        // ★ `private` NAMES THE PEN THAT ACTS, NOT THE PEN IT CREDITS (hostile review of
+                        // #195, round 2). This read `asserted_by` — the credit — so a hand crediting its
+                        // finger made the row private to the FINGER, and a legacy row with an
+                        // `anonymous` author could be made private to a pen that does not exist. The
+                        // proven pen is the one making the row private; the credit is a name.
                         (None, Some(p)) => audience::for_write(
                             p,
-                            patch.asserted_by.as_deref().or(old.asserted_by.as_deref()),
+                            patch
+                                .acted_by
+                                .as_deref()
+                                .or(patch.asserted_by.as_deref())
+                                .or(old.asserted_by.as_deref()),
                         )?,
                         (None, None) => old.audience.clone(),
                     },
@@ -796,7 +963,12 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                         Some(spec) => audience::validated(conn, spec)?,
                         None => audience::for_write(
                             patch.private == Some(true),
-                            patch.asserted_by.as_deref(),
+                            // ★ The same correction on the CREATE path: the pen making the row private
+                            // is the one that acts; the credit is a name and may be a finger.
+                            patch
+                                .acted_by
+                                .as_deref()
+                                .or(patch.asserted_by.as_deref()),
                         )?,
                     },
                     ..Default::default()

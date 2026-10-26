@@ -1524,16 +1524,30 @@ fn sessions_are_listable_and_expiry_is_visible() {
 // A pen above you no longer reads your private rows by ancestry — that was the old law and he
 // removed it: an ancestor must be named, or use `subtree:`.
 
+/// A row addressed in a way the write path now REFUSES: an audience that omits its own author. Rows
+/// like this exist in the live store (written before soma/ellmephant#189 D1), so both the repair path
+/// and the read tier must be tested against one. Create it legally, then re-address it — the same
+/// shape a legacy row has, without pretending the API can produce it.
+fn planted(
+    conn: &rusqlite::Connection,
+    embedder: &HashEmbedder,
+    key: &str,
+    author: &str,
+    audience: &str,
+) {
+    row_with_audience(conn, embedder, key, author, "public");
+    conn.execute(
+        "UPDATE memory SET audience = ?1 WHERE key = ?2",
+        rusqlite::params![audience, key],
+    )
+    .expect("plant the audience a legacy row could carry");
+}
+
 fn shared(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str, audience: &str) {
-    let mem = Memory {
-        key: key.into(),
-        title: "shared".into(),
-        body: "one fact, two readers".into(),
-        asserted_by: Some("james".into()),
-        audience: audience.into(),
-        ..Default::default()
-    };
-    common::add_now(conn, embedder, &mem).expect("write");
+    // Addressed by james to a branch that does not always include james (`pen:cline`), which the write
+    // path now refuses — so the row is planted rather than written. The READ tier is what this fixture
+    // is for.
+    planted(conn, embedder, key, "james", audience);
 }
 
 fn sees(conn: &rusqlite::Connection, who: &str, key: &str) -> bool {
@@ -1679,8 +1693,8 @@ fn merge_as(
 ) -> String {
     let patch = store::Patch {
         key: Some(key.to_string()),
-        // ★ NAMED, NOT INFERRED (Stet's review of #192): setting only `asserted_by` made these tests
-        // exercise the fallback, so they would have passed with the conjunction deleted.
+        // ★ NAMED, NOT INFERRED (Stet's review of #192): a fixture that sets only `asserted_by` tests
+        // the fallback, not the rule.
         acted_by: Some(actor.to_string()),
         body: Some(format!("changed by {actor}")),
         asserted_by: Some(actor.to_string()),
@@ -1729,7 +1743,7 @@ fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
     // The trap from #189: the author addressed its own row to someone else and not itself.
     // (The author's inability to READ it is a session/Reader property, tested elsewhere; here the
     // question is whether the write gate lets the owner repair what the owner cannot see.)
-    row_with_audience(&conn, &embedder, "trap", "cline", "pen:james");
+    planted(&conn, &embedder, "trap", "cline", "pen:james");
 
     // The repair must be possible from the author's side, or the only exit is destruction.
     let err = merge_as(&conn, "trap", "cline", Some("pen:james,pen:cline"));
@@ -1748,7 +1762,7 @@ fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
 fn an_ancestor_may_repair_a_descendants_trapped_row() {
     let (_dir, conn) = subtree();
     let embedder = HashEmbedder::new(DIM);
-    row_with_audience(&conn, &embedder, "stets-trap", "stet", "pen:james");
+    planted(&conn, &embedder, "stets-trap", "stet", "pen:james");
 
     let err = merge_as(&conn, "stets-trap", "james", Some("pen:james,pen:stet"));
     assert!(err.is_empty(), "answering for the row means being able to fix it: {err}");
@@ -1896,17 +1910,71 @@ fn a_hand_may_reclassify_its_own_row_while_crediting_its_finger() {
 
     row_with_audience(&conn, &embedder, "hands-note", "stet/hand", "public");
 
+    // ★ AND THE AUDIENCE MUST STILL INCLUDE THE AUTHOR (#189 D1): narrowing a row to its parent alone
+    // would make it unreadable by the pen that wrote it. So the lawful reclassification names both.
     let patch = store::Patch {
         key: Some("hands-note".into()),
-        audience: Some("pen:stet".into()),
+        audience: Some("pen:stet,pen:stet/hand".into()),
         asserted_by: Some("stet/hand/finger-1".into()), // the credit
         acted_by: Some("stet/hand".into()),             // the pen that acts
         ..Default::default()
     };
     store::merge(&conn, &patch).expect("the hand answers for its own row");
     let mem = store::get(&conn, "hands-note").unwrap().unwrap();
-    assert_eq!(mem.audience, "pen:stet");
-    assert_eq!(mem.edited_by.as_deref(), Some("stet/hand"), "the writer, not the credit");
+    assert_eq!(mem.audience, "pen:stet,pen:stet/hand");
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("stet/hand"),
+        "the writer, not the credit"
+    );
+}
+
+#[test]
+fn a_row_addressed_to_others_only_is_refused_at_write() {
+    // soma/ellmephant#189 D1: the trap is refused at the door. Before this, the write succeeded and the
+    // author lost the row — invisible to every read, and every repair refused.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    let trap = Memory {
+        key: "trap-door".into(),
+        title: "for james only".into(),
+        body: "and not for me".into(),
+        asserted_by: Some("cline".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = common::add_now(&conn, &embedder, &trap).expect_err("the trap is refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invisible to its own author") && msg.contains("cline"),
+        "the refusal names the author and the reason: {msg}"
+    );
+    assert!(
+        store::get(&conn, "trap-door").unwrap().is_none(),
+        "a refusal writes nothing"
+    );
+    // ★ AND IT LEAVES NOTHING QUEUED OR VERSIONED (round 2): `apply` is where the snapshot, the row,
+    // the links and the encode-queue entry all happen, so a refusal before it must leave all four
+    // untouched — otherwise a refused write still costs a queue entry and an embedding.
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory_version"),
+        0,
+        "no version from a refused write"
+    );
+    assert_eq!(
+        ellmephant::store::encode::pending(&conn).unwrap(),
+        0,
+        "nothing queued for embedding by a refused write"
+    );
+
+    // The same intent, expressed legally: address it to James AND to yourself.
+    let ok = Memory {
+        audience: "pen:james,pen:cline".into(),
+        ..trap
+    };
+    common::add_now(&conn, &embedder, &ok).expect("addressing yourself too is allowed");
+    assert!(store::get(&conn, "trap-door").unwrap().is_some());
 }
 
 #[test]
@@ -1967,6 +2035,60 @@ fn a_live_lease_held_by_someone_else_is_not_permission_to_delete() {
     // The holder can.
     store::delete(&conn, "stets-protected", Some("stet")).expect("the holder may delete");
     assert!(store::get(&conn, "stets-protected").unwrap().is_none());
+}
+
+#[test]
+fn a_public_row_cannot_be_narrowed_into_the_trap_in_two_steps() {
+    // ★ ADVERSARIAL REVIEW OF #195. The obvious bypass of a write-time check is to write legally and
+    // then change the audience: create public, then address it to someone else only. If that passed,
+    // the guard would be decoration. It does not: the audience change is itself a write, and the same
+    // rule applies to it.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "two-step", "cline", "public");
+
+    let patch = store::Patch {
+        key: Some("two-step".into()),
+        audience: Some("pen:james".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: Some("cline".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("invisible to its own author"),
+        "narrowing into the trap is refused: {err}"
+    );
+    assert!(
+        err.contains("as:"),
+        "and the refusal names the legitimate route for a note to someone else: {err}"
+    );
+    let mem = store::get(&conn, "two-step").unwrap().unwrap();
+    assert_eq!(mem.audience, "public", "nothing changed");
+}
+
+
+
+#[test]
+fn a_retired_authors_row_is_still_writable() {
+    // ★ SECOND ADVERSARIAL PASS (#195). The rule asks whether the AUTHOR can read the row. If a pen is
+    // retired, does it still resolve as a reader? If not, every row it ever wrote becomes permanently
+    // unwritable — the trap one layer down, applied to a whole pen.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "james", "ghost", "self").expect("mint a pen that will depart");
+    row_with_audience(&conn, &embedder, "ghosts-note", "ghost", "pen:ghost");
+    store::retire(&conn, "ghost", "james", store::Rows::Inherit, store::History::Memorialize)
+        .expect("retire it");
+
+    let patch = store::Patch {
+        key: Some("ghosts-note".into()),
+        tags: Some(vec!["after-death".into()]),
+        asserted_by: Some("james".into()),
+        acted_by: Some("james".into()),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("the parent may still tidy what the pen left behind");
 }
 
 #[test]
@@ -2077,4 +2199,257 @@ fn kin_is_invariant_under_the_case_of_the_VIEWER_too() {
             "the answer must not depend on how the VIEWER spells itself ({viewer})"
         );
     }
+}
+
+#[test]
+fn a_legacy_row_with_no_author_can_still_be_written_but_a_new_one_cannot_claim_to_be_it() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 1 — this test replaces `a_row_with_no_author_is_not_held_to_an_authors_rule`,
+    // which asserted that a NEW row could be written with `asserted_by: anonymous` and an audience of
+    // someone else. That is not unsticking a legacy row; it is the bypass, written down as a rule.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+
+    // A row that #122's backfill could have left: unattributed, addressed to james, written long ago.
+    row_with_audience(&conn, &embedder, "legacy-orphan", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'anonymous', audience = 'pen:james' WHERE key = 'legacy-orphan'",
+        [],
+    )
+    .expect("make it look like a backfilled row");
+
+    // The pen that answers for it can still tidy it — the exemption exists for this, and only this.
+    let patch = store::Patch {
+        key: Some("legacy-orphan".into()),
+        acted_by: Some("cline".into()),
+        tags: Some(vec!["tidied".into()]),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("a legacy unattributed row is not trapped");
+
+    // And a NEW row cannot buy the same exemption by naming itself anonymous.
+    let mem = Memory {
+        key: "fresh-anonymous".into(),
+        title: "for james only".into(),
+        body: "claimed to be nobody".into(),
+        asserted_by: Some("anonymous".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
+    assert!(err.contains("unattributed"), "{err}");
+}
+
+#[test]
+fn nobody_can_claim_the_anonymous_exemption_to_address_a_row_to_others_only() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 1. The exemption exists to unstick rows that #122 backfilled
+    // with `asserted_by = anonymous`. But it was applied to ANY write whose author string was
+    // "anonymous" — so a caller could simply name itself anonymous and create a row addressed to
+    // others only. **The exemption was a bypass with a legacy alibi.**
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    let mem = Memory {
+        key: "anonymous-trap".into(),
+        title: "for james only".into(),
+        body: "and nobody can read it".into(),
+        asserted_by: Some("anonymous".into()),
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
+    assert!(
+        err.contains("unattributed"),
+        "a NEW row may not buy the exemption by naming itself anonymous: {err}"
+    );
+}
+
+#[test]
+fn private_names_the_pen_that_acts_not_the_pen_it_credits() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 2. `private: true` derived its audience from `asserted_by` — the
+    // CREDITED pen — so a hand writing as its finger made the row private to the FINGER. That is the
+    // same asymmetry as the guards: the proven pen decides who the boundary belongs to.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    let patch = store::Patch {
+        key: Some("handed-note".into()),
+        title: Some("handed note".into()),
+        body: Some("the hand's own words".into()),
+        private: Some(true),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the pen that acts
+        ..Default::default()
+    };
+    // ★ ROUND 3: private + as: is REFUSED, because they contradict. Round 2 fixed the boundary to
+    // follow the actor; the result was a row the CREDITED pen could not read — a true D1 refusal with a
+    // message about invisibility, which names the wrong cause. Say the real one.
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("contradict") || err.contains("addresses the row to the pen that ACTS"),
+        "private and a credit are refused, not silently resolved: {err}"
+    );
+
+    // Private alone works, and it belongs to the acting pen.
+    let alone = store::Patch {
+        key: Some("handed-note".into()),
+        title: Some("handed note".into()),
+        body: Some("the hand's own words".into()),
+        private: Some(true),
+        asserted_by: Some("stet/hand".into()),
+        acted_by: Some("stet/hand".into()),
+        ..Default::default()
+    };
+    store::merge(&conn, &alone).expect("private alone");
+    let mem = store::get(&conn, "handed-note").unwrap().unwrap();
+    assert_eq!(mem.audience, "pen:stet/hand", "private names the actor: {mem:?}");
+}
+
+#[test]
+fn a_write_to_an_already_trapped_row_says_it_was_already_trapped() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 4. "This would be invisible" is the wrong tense for a row that
+    // already is: it invites the caller to look for what their write introduced, and their write
+    // introduced nothing. A message that names the wrong moment names the wrong cause.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    // A legacy trap with a REAL author: created legally, then addressed elsewhere by hand.
+    row_with_audience(&conn, &embedder, "old-trap", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james' WHERE key = 'old-trap'",
+        [],
+    )
+    .expect("make the legacy trap");
+
+    let patch = store::Patch {
+        key: Some("old-trap".into()),
+        acted_by: Some("cline".into()),
+        tags: Some(vec!["tidied".into()]),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("IS ALREADY"),
+        "the row was already trapped and the message says so: {err}"
+    );
+    assert!(
+        err.contains("did not create that state"),
+        "and it says the write did not cause it: {err}"
+    );
+}
+
+#[test]
+fn a_write_that_changes_a_trapped_rows_audience_says_the_new_one_still_excludes_the_author() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 5. Round 4's message claimed "this write does not change the
+    // audience" — false when the write changes it to a different set that also excludes the author.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "moving-trap", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james' WHERE key = 'moving-trap'",
+        [],
+    )
+    .expect("legacy trap");
+
+    // The owner re-addresses it — from one excluding set to another.
+    let patch = store::Patch {
+        key: Some("moving-trap".into()),
+        acted_by: Some("cline".into()),
+        audience: Some("pen:stet".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(err.contains("IS ALREADY"), "{err}");
+    assert!(
+        err.contains("changes the audience"),
+        "and it says the audience moved, rather than claiming it did not: {err}"
+    );
+    assert!(
+        !err.contains("does not change the audience"),
+        "a false claim about the write, in the message that exists to stop false claims: {err}"
+    );
+}
+
+
+#[test]
+fn a_legacy_anonymous_row_can_be_made_private_by_the_pen_that_answers_for_it() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 6. The exemption and the `private` rule have to compose: a row
+    // #122 backfilled with no author must still be repairable. Exempting it and then refusing the
+    // repair would be a lock with the key on the wrong side.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "orphan", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'anonymous' WHERE key = 'orphan'",
+        [],
+    )
+    .expect("make it like a backfilled row");
+
+    let patch = store::Patch {
+        key: Some("orphan".into()),
+        acted_by: Some("cline".into()),
+        private: Some(true),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("an unattributed row can still be made private");
+    let mem = store::get(&conn, "orphan").unwrap().unwrap();
+    assert_eq!(
+        mem.audience, "pen:cline",
+        "private names the pen that acts, even when the author is nobody: {mem:?}"
+    );
+}
+
+#[test]
+fn a_row_addressed_to_others_must_name_its_author() {
+    // ★ STET, review of #195: two gates were skipped by one omission. With `asserted_by: None` the new
+    // check does not fire, D1's `if let (true, Some(author))` does not run either — and then the column
+    // DEFAULT (`asserted_by NOT NULL DEFAULT 'anonymous'`) supplies the legacy state the exemption
+    // exists for. A check on a request field cannot see a value the default supplies.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    let mem = Memory {
+        key: "nameless".into(),
+        title: "addressed to someone".into(),
+        body: "with no author".into(),
+        asserted_by: None,
+        audience: "pen:james".into(),
+        ..Default::default()
+    };
+    let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
+    assert!(
+        err.contains("names no author"),
+        "refused for the right reason: {err}"
+    );
+    assert!(
+        store::get(&conn, "nameless").unwrap().is_none(),
+        "and nothing was written"
+    );
+}
+
+#[test]
+fn a_reordered_audience_is_not_a_changed_audience() {
+    // ★ STET, review of #195: `audience_changed` was an exact string comparison, so a reorder read as a
+    // change and the refusal said "this write changes the audience" about a write that changed nothing.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "reorder-trap", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james,pen:stet' WHERE key = 'reorder-trap'",
+        [],
+    )
+    .expect("legacy trap, two addressees");
+
+    // The same two pens, the other way round.
+    let patch = store::Patch {
+        key: Some("reorder-trap".into()),
+        acted_by: Some("cline".into()),
+        audience: Some("pen:stet,pen:james".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(err.contains("IS ALREADY"), "{err}");
+    assert!(
+        !err.contains("changes the audience"),
+        "a reorder changed nothing, and the sentence must not say it did: {err}"
+    );
 }

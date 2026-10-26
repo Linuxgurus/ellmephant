@@ -443,6 +443,15 @@ fn add_impl(
     // and `subtree:` audiences that contain the author pass, which is why no escape hatch is needed.
     // An EMPTY audience is the legacy spelling of `public` (the column defaults to it on read), so it
     // is included rather than sent through the address parser.
+    //
+    // ★ NO CARVE-OUT FOR NARROWING TO AN ANCESTOR — DECIDED, 2026-10-26. It is tempting: a hand making
+    // a note private to its parent can still RECOVER it, because the owner may write blind (#192), so
+    // the row is not permanently lost. But recoverability does not undo the harm: the author still
+    // cannot read words it wrote, which is exactly what #189 measured as a lost day. The remedies are
+    // one token (`pen:<you>`) or one honest credit (`as: <parent>`, with a live lend), and both are
+    // named in the refusal. Every exception here would also need a subset relation between audiences
+    // (is `subtree:x` narrower than `pen:y`?), and the strength of this rule is that it has no such
+    // relation to get wrong — the two-step bypass test exists because that is where the weight sits.
     let addressed = !mem.audience.trim().is_empty() && mem.audience != audience::PUBLIC;
     if addressed {
         // ★ THE NAMED PENS MUST EXIST BEFORE WE ASK WHETHER THE AUTHOR IS AMONG THEM. `validated` also

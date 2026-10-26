@@ -508,6 +508,11 @@ fn add_impl(
                 .as_deref()
                 .map(|a| !a.trim().is_empty() && a != audience::PUBLIC)
                 .unwrap_or(false);
+            // ★ AND WHETHER *THIS* WRITE CHANGED IT (round 5). Round 4's sentence said "this write does
+            // not change the audience" — false when the write changes it to another set that also
+            // excludes the author. A second false claim in the message that exists to stop false
+            // claims, so: compare before saying.
+            let audience_changed = stored_audience.as_deref() != Some(mem.audience.as_str());
             return Err(Error::Invalid(format!(
                 "`{}` {} invisible to its own author: the audience is `{}` and does not include \
                  `{author}`. {}\n\nAdd `pen:{author}` — or `subtree:<one of {author}'s ancestors>` if \
@@ -519,7 +524,10 @@ fn add_impl(
                 prepared.key,
                 if was_trapped { "IS ALREADY" } else { "would be" },
                 mem.audience,
-                if was_trapped {
+                if was_trapped && audience_changed {
+                    "The row was already unreadable to the pen that wrote it; this write changes the \
+                     audience, but the new one excludes the author too."
+                } else if was_trapped {
                     "This write did not create that state — the row was already unreadable to the pen \
                      that wrote it, and this write does not change the audience."
                 } else {

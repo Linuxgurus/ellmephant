@@ -2337,3 +2337,35 @@ fn a_write_to_an_already_trapped_row_says_it_was_already_trapped() {
         "and it says the write did not cause it: {err}"
     );
 }
+
+#[test]
+fn a_write_that_changes_a_trapped_rows_audience_says_the_new_one_still_excludes_the_author() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 5. Round 4's message claimed "this write does not change the
+    // audience" — false when the write changes it to a different set that also excludes the author.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "moving-trap", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:james' WHERE key = 'moving-trap'",
+        [],
+    )
+    .expect("legacy trap");
+
+    // The owner re-addresses it — from one excluding set to another.
+    let patch = store::Patch {
+        key: Some("moving-trap".into()),
+        acted_by: Some("cline".into()),
+        audience: Some("pen:stet".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(err.contains("IS ALREADY"), "{err}");
+    assert!(
+        err.contains("changes the audience"),
+        "and it says the audience moved, rather than claiming it did not: {err}"
+    );
+    assert!(
+        !err.contains("does not change the audience"),
+        "a false claim about the write, in the message that exists to stop false claims: {err}"
+    );
+}

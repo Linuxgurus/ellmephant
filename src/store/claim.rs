@@ -406,7 +406,8 @@ mod tests {
     }
 
     #[test]
-    fn an_ancestor_may_end_a_descendants_lease_WITH_a_reason() {
+    // WITH a reason — the emphasis the old name carried in capitals.
+    fn an_ancestor_may_end_a_descendants_lease_with_a_reason() {
         let (_dir, conn) = store();
         pens(&conn);
         acquire(&conn, "finger", "hands", Some(300)).expect("acquire");

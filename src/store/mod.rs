@@ -540,7 +540,13 @@ fn is_protected(tags: &[String]) -> bool {
 /// The lease must be taken deliberately (`claim_acquire`), which is what makes an edit visible
 /// afterwards: the claim table is the write audit for the memories that matter. Pair this with
 /// `ELLMEPHANT_LEASERS`, or a persuaded model simply leases the key itself and the gate is theatre.
-fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) -> Result<()> {
+fn guard_protected(
+    conn: &Connection,
+    key: &str,
+    was: &[String],
+    patch: &Patch,
+    writer: Option<&str>,
+) -> Result<()> {
     let becomes = patch.tags.as_ref().is_some_and(|t| is_protected(t));
     if !is_protected(was) && !becomes {
         return Ok(());
@@ -559,11 +565,12 @@ fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) 
     }
     // A PROVEN writer must BE the holder. An unproven one cannot be told from any other client, and
     // the lease it holds is already the strongest statement available: someone took it on purpose.
-    if let Some(writer) = patch
-        .asserted_by
-        .as_deref()
-        .filter(|w| !claim.owner.eq_ignore_ascii_case(w))
-    {
+    // ★ THE HOLDER IS THE PEN THAT ACTS, NOT THE NAME IT CREDITS (third adversarial pass, 2026-10-26).
+    // This read `patch.asserted_by` — the credited pen — so a hand holding the lease and crediting its
+    // finger for the work was refused its own protection. The lease is taken by the pen that acts; the
+    // credit is a name. Same asymmetry as `guard_audience`, found by looking for it rather than waiting
+    // for it to bite.
+    if let Some(writer) = writer.filter(|w| !claim.owner.eq_ignore_ascii_case(w)) {
         return Err(Error::Invalid(format!(
             "`{key}` is PROTECTED and leased by `{}` until {}; `{writer}` does not hold it.",
             claim.owner, claim.expires_at
@@ -681,7 +688,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     if existing.is_some() {
         may_write(conn, &key, writer)?;
     }
-    guard_protected(conn, &key, &was_tags, patch)?;
+    guard_protected(conn, &key, &was_tags, patch, writer)?;
     // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
     // could not read. Without this, `private` would be a lock whose key hangs beside the door.
     guard_audience(conn, existing.as_ref(), patch, writer)?;

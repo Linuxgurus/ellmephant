@@ -1894,3 +1894,27 @@ fn a_hand_may_reclassify_its_own_row_while_crediting_its_finger() {
     assert_eq!(mem.audience, "pen:stet");
     assert_eq!(mem.edited_by.as_deref(), Some("stet/hand"), "the writer, not the credit");
 }
+
+#[test]
+fn a_protected_row_asks_the_pen_that_acts_for_the_lease() {
+    // ★ THIRD ADVERSARIAL PASS (#192). `guard_protected` compared the lease holder against the CREDITED
+    // pen, so a hand holding a lease and crediting its finger was refused its own protection — the same
+    // asymmetry as `guard_audience`, in a second guard nobody had looked at.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    row_with_audience(&conn, &embedder, "protected-note", "stet/hand", "public");
+    store::claim::acquire(&conn, "protected-note", "stet/hand", Some(60)).expect("lease");
+
+    let patch = store::Patch {
+        key: Some("protected-note".into()),
+        tags: Some(vec!["protected".into()]),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the holder
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("the holder may write under its own lease");
+}

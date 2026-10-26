@@ -152,8 +152,9 @@ fn an_open_channel_can_be_left_and_that_is_the_only_way_out() {
 #[test]
 fn a_list_channel_reaches_only_its_members() {
     let (_dir, conn) = store();
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
     // `#ops_team` is `list` and seeded with nobody on a fresh store: the test seeds membership.
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     let m = channel::send(&conn, "james", "ops_team", "internal", None).expect("send");
 
     assert!(was_told(&conn, m.seq, "cline"));
@@ -163,7 +164,7 @@ fn a_list_channel_reaches_only_its_members() {
 #[test]
 fn joining_the_ops_team_joins_emergency() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
 
     let m = channel::send(&conn, "james", "emergency", "cluster down", None).expect("send");
     assert!(
@@ -175,7 +176,7 @@ fn joining_the_ops_team_joins_emergency() {
 #[test]
 fn leaving_emergency_while_on_the_team_is_refused() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
 
     let err = channel::leave(&conn, "cline", "emergency").expect_err("refused");
     assert!(err.to_string().contains("ops_team"), "{err}");
@@ -189,9 +190,11 @@ fn leaving_emergency_while_on_the_team_is_refused() {
 #[test]
 fn being_asleep_is_not_ignoring() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     // `ops_team` gates on delivery: the clock starts at a turn boundary, not at the message.
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 1, 0);
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
     channel::send(&conn, "james", "ops_team", "we are rolling", None).expect("send");
 
     channel::gate(&conn, "cline", Class::Record).expect("no turn has begun; not a breach");
@@ -201,11 +204,13 @@ fn being_asleep_is_not_ignoring() {
 #[test]
 fn one_missed_boundary_is_not_a_pattern() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 2, 0);
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
     channel::send(&conn, "james", "ops_team", "we are rolling", None).expect("send");
 
-    channel::present(&conn, "cline").expect("first boundary");
+    channel::present(&conn, "cline", None).expect("first boundary");
     channel::gate(&conn, "cline", Class::Record)
         .expect("a message that arrived mid-turn is not a crime");
 }
@@ -213,12 +218,14 @@ fn one_missed_boundary_is_not_a_pattern() {
 #[test]
 fn two_missed_boundaries_lock_the_record_and_not_the_conversation() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 2, 0);
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
     channel::send(&conn, "james", "ops_team", "we are rolling", None).expect("send");
 
-    channel::present(&conn, "cline").expect("first");
-    channel::present(&conn, "cline").expect("second");
+    channel::present(&conn, "cline", None).expect("first");
+    channel::present(&conn, "cline", None).expect("second");
 
     let b = channel::breach(&conn, "cline")
         .expect("breach")
@@ -237,7 +244,7 @@ fn an_emergency_locks_after_a_single_boundary() {
     set_policy(&conn, "emergency", "all", 0, "delivery", 1, 0);
     channel::send(&conn, "james", "emergency", "cluster down in five", None).expect("send");
 
-    channel::present(&conn, "cline").expect("boundary");
+    channel::present(&conn, "cline", None).expect("boundary");
     channel::gate(&conn, "cline", Class::Record).expect_err("record gated");
     channel::gate(&conn, "cline", Class::Acting).expect_err("acting gated too");
 }
@@ -245,10 +252,12 @@ fn an_emergency_locks_after_a_single_boundary() {
 #[test]
 fn listening_clears_the_gate() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 1, 0);
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
     channel::send(&conn, "james", "ops_team", "heads up", None).expect("send");
-    channel::present(&conn, "cline").expect("present");
+    channel::present(&conn, "cline", None).expect("present");
     channel::gate(&conn, "cline", Class::Record).expect_err("gated before the fetch");
 
     let got = channel::fetch(&conn, "cline", Some("ops_team"), 50).expect("fetch");
@@ -259,7 +268,8 @@ fn listening_clears_the_gate() {
 #[test]
 fn a_send_clock_judges_from_the_message_not_the_boundary() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "send", 1, 0);
     let m = channel::send(&conn, "james", "ops_team", "immediate", None).expect("send");
     conn.execute(
@@ -267,7 +277,7 @@ fn a_send_clock_judges_from_the_message_not_the_boundary() {
         params![m.seq],
     )
     .expect("backdate");
-    channel::present(&conn, "cline").expect("boundary");
+    channel::present(&conn, "cline", None).expect("boundary");
 
     let b = channel::breach(&conn, "cline")
         .expect("breach")
@@ -293,7 +303,7 @@ fn an_old_message_still_locks_when_the_opportunity_is_new() {
         params![m.seq],
     )
     .expect("backdate");
-    channel::present(&conn, "cline").expect("boundary");
+    channel::present(&conn, "cline", None).expect("boundary");
 
     let b = channel::breach(&conn, "cline")
         .expect("breach")
@@ -306,10 +316,11 @@ fn an_old_message_still_locks_when_the_opportunity_is_new() {
 #[test]
 fn a_lock_expires_and_says_so() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 1, 60);
     let m = channel::send(&conn, "james", "ops_team", "an hour ago", None).expect("send");
-    channel::present(&conn, "cline").expect("boundary");
+    channel::present(&conn, "cline", None).expect("boundary");
     channel::gate(&conn, "cline", Class::Record).expect_err("locked");
 
     backdate_presentation(&conn, m.seq, "cline", 2);
@@ -320,8 +331,8 @@ fn a_lock_expires_and_says_so() {
 fn changes_never_gates() {
     let (_dir, conn) = store();
     channel::send(&conn, "james", "changes", "rolling in 30", None).expect("send");
-    channel::present(&conn, "cline").expect("present");
-    channel::present(&conn, "cline").expect("present again");
+    channel::present(&conn, "cline", None).expect("present");
+    channel::present(&conn, "cline", None).expect("present again");
 
     assert!(channel::breach(&conn, "cline").expect("breach").is_none());
     channel::gate(&conn, "cline", Class::Record).expect("changes is information");
@@ -331,8 +342,8 @@ fn changes_never_gates() {
 fn general_never_gates() {
     let (_dir, conn) = store();
     channel::send(&conn, "james", "general", "chatter", None).expect("send");
-    channel::present(&conn, "cline").expect("present");
-    channel::present(&conn, "cline").expect("present again");
+    channel::present(&conn, "cline", None).expect("present");
+    channel::present(&conn, "cline", None).expect("present again");
 
     assert!(channel::breach(&conn, "cline").expect("breach").is_none());
     channel::gate(&conn, "cline", Class::Record).expect("general is a conversation");
@@ -341,10 +352,12 @@ fn general_never_gates() {
 #[test]
 fn writes_does_not_stop_acting_but_all_does() {
     let (_dir, conn) = store();
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 1, 0);
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
     channel::send(&conn, "james", "ops_team", "notice", None).expect("send");
-    channel::present(&conn, "cline").expect("present");
+    channel::present(&conn, "cline", None).expect("present");
 
     channel::gate(&conn, "cline", Class::Acting).expect("writes leaves acting alone");
     channel::gate(&conn, "cline", Class::Record).expect_err("writes gates the record");
@@ -365,11 +378,13 @@ fn an_unreadable_ledger_fails_open() {
 #[test]
 fn the_gate_follows_the_pen_the_effect_lands_on() {
     let (_dir, conn) = store();
+    channel::invite(&conn, "james", "stet", "ops_team").expect("sender is a member");
     channel::join(&conn, "james", "ops_team").expect("join");
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     set_policy(&conn, "ops_team", "writes", 0, "delivery", 1, 0);
+    channel::invite(&conn, "james", "stet", "ops_team").expect("sender is a member");
     channel::send(&conn, "stet", "ops_team", "roll", None).expect("send");
-    channel::present(&conn, "cline").expect("present");
+    channel::present(&conn, "cline", None).expect("present");
 
     // `stet` was the sender and has no receipt, so `stet` is not behind even though `cline` is.
     channel::gate(&conn, "stet", Class::Record).expect("the sender is not behind");
@@ -457,7 +472,7 @@ fn the_roster_is_effective_membership_not_override_rows() {
     // `ops_team` is a list: only invitations, and joining it brings `emergency` with it.
     let empty = channel::members(&conn, "ops_team").expect("members");
     assert!(empty.is_empty(), "nobody is on the team until invited");
-    channel::join(&conn, "cline", "ops_team").expect("join");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
     let team = channel::members(&conn, "ops_team").expect("members");
     assert_eq!(team.len(), 1);
     assert!(team[0].explicit, "a list member is always explicit");
@@ -562,4 +577,270 @@ fn pruning_expires_the_text_and_keeps_the_receipt() {
     let kept = channel::create(&conn, "james", "keepme", "Keep", "open", "none").expect("create");
     assert_eq!(kept.keep_secs, 0);
     assert!(channel::set_retention(&conn, "stet", "keepme", 60).is_err());
+}
+
+// ── REVIEW FIXES ────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_non_member_cannot_speak_in_an_invite_only_channel() {
+    let (_dir, conn) = store();
+    let err = channel::send(&conn, "stet", "ops_team", "let me in", None)
+        .expect_err("an outsider may not post into an incident channel");
+    assert!(err.to_string().contains("not a member"), "{err}");
+
+    // Invited, it is allowed — membership is the admission rule, not a fan-out detail.
+    channel::invite(&conn, "james", "stet", "ops_team").expect("invite");
+    channel::send(&conn, "stet", "ops_team", "now I am here", None).expect("member may speak");
+}
+
+#[test]
+fn a_pen_cannot_add_itself_to_a_list_channel() {
+    let (_dir, conn) = store();
+    let err = channel::join(&conn, "cline", "ops_team").expect_err("invite-only means invited");
+    assert!(err.to_string().contains("invite-only"), "{err}");
+
+    // The keeper can, and that is the invitation.
+    channel::invite(&conn, "james", "cline", "ops_team").expect("keeper invites");
+    assert!(
+        channel::members(&conn, "ops_team")
+            .expect("members")
+            .iter()
+            .any(|m| m.pen == "cline")
+    );
+}
+
+#[test]
+fn one_boundary_named_twice_is_one_miss() {
+    let (_dir, conn) = store();
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
+    channel::send(&conn, "james", "ops_team", "news", None).expect("send");
+
+    channel::present(&conn, "cline", Some("task-7")).expect("boundary");
+    channel::present(&conn, "cline", Some("task-7")).expect("the same boundary again");
+    // ★ ASSERT THE LEDGER, NOT THE ABSENCE OF A BREACH (#168 review): `breach == None` also passes
+    // when `present` recorded nothing at all, which is the regression this test exists to catch.
+    let misses: i64 = conn
+        .query_row(
+            "SELECT misses FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')
+                AND seq = (SELECT MAX(seq) FROM channel_message WHERE channel='ops_team')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("delivery row");
+    assert_eq!(misses, 1, "one boundary, however many times it is named");
+
+    // A genuinely new boundary still counts.
+    channel::present(&conn, "cline", Some("task-8")).expect("next boundary");
+}
+
+#[test]
+fn an_expired_lock_is_recorded_as_a_row() {
+    let (_dir, conn) = store();
+    channel::invite(&conn, "james", "cline", "emergency").expect("invite");
+    channel::send(&conn, "james", "emergency", "down", None).expect("send");
+    channel::present(&conn, "cline", None).expect("boundary");
+    // emergency: grace 0, one boundary, lock_max 900s — age it past the ceiling.
+    conn.execute(
+        "UPDATE channel_delivery SET presented_at = datetime('now','-2 hours')
+          WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+        [],
+    )
+    .expect("age");
+    channel::gate(&conn, "cline", Class::Record).expect("an expired lock releases");
+    let (misses, presented): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT misses, presented_at FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("delivery");
+    assert_eq!(misses, 0, "a release clears the opportunity");
+    assert!(
+        presented.is_none(),
+        "and the clock stops, or it expires again"
+    );
+
+    // A second gated call must NOT write a second expiry: the lock is over.
+    channel::gate(&conn, "cline", Class::Record).expect("still open");
+    let expiries = channel::events(&conn, "emergency")
+        .expect("events")
+        .into_iter()
+        .filter(|e| e.action == "expiry")
+        .count();
+    assert_eq!(expiries, 1, "one release, one row");
+}
+
+#[test]
+fn pruning_matches_the_channel_case_insensitively_and_keeps_a_floor() {
+    let (_dir, conn) = store();
+    let m = channel::send(&conn, "james", "general", "text", None).expect("send");
+    conn.execute(
+        "UPDATE channel_message SET created = datetime('now','-2 hours') WHERE seq = ?1",
+        [m.seq],
+    )
+    .expect("age");
+    channel::set_retention(&conn, "james", "general", 3600).expect("retention");
+    let pruned = channel::prune(&conn, Some("GENERAL"), None).expect("prune");
+    assert_eq!(
+        pruned.iter().map(|p| p.emptied).sum::<usize>(),
+        1,
+        "case must not matter"
+    );
+
+    // A unit mistake is refused: `60` is a minute, not an hour.
+    assert!(channel::set_retention(&conn, "james", "general", 60).is_err());
+    assert!(channel::set_retention(&conn, "james", "general", 0).is_ok());
+}
+
+#[test]
+fn the_roster_excludes_estate_and_the_store_refuses_a_case_variant() {
+    // ★ The `lower()` in the roster query is defence, not the only lock: pen names are unique
+    // regardless of case and `estate` is seeded at store creation, so a second spelling cannot exist.
+    // The test pins BOTH facts, because the day the uniqueness rule changes the roster must still hold.
+    let (dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let err = conn
+        .execute("INSERT INTO pen (name, kind) VALUES ('Estate', 'self')", [])
+        .expect_err("a case variant of estate must be refused");
+    assert!(
+        err.to_string().contains("unique regardless of case"),
+        "{err}"
+    );
+    let names: Vec<String> = channel::members(&conn, "general")
+        .expect("members")
+        .into_iter()
+        .map(|m| m.pen)
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.eq_ignore_ascii_case("estate")),
+        "estate has no entity behind it and is never a member: {names:?}"
+    );
+    let _ = dir;
+}
+
+// ── THIRD PASS: THE FIXES' OWN EDGES ────────────────────────────────────────────────────────────
+
+#[test]
+fn a_boundary_token_stops_working_once_it_is_stale() {
+    let (_dir, conn) = store();
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
+    channel::send(&conn, "james", "ops_team", "news", None).expect("send");
+
+    channel::present(&conn, "cline", Some("turn")).expect("boundary");
+    // Same token, but the window has passed: it names a NEW opportunity, not the old one.
+    conn.execute(
+        "UPDATE channel_boundary SET at = datetime('now','-10 minutes')
+          WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+        [],
+    )
+    .expect("age the boundary");
+    channel::present(&conn, "cline", Some("turn")).expect("a new opportunity");
+    let misses: i64 = conn
+        .query_row(
+            "SELECT MAX(misses) FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("delivery");
+    assert_eq!(misses, 2, "a reused token cannot buy permanent immunity");
+}
+
+#[test]
+fn a_finger_cannot_be_invited_to_a_channel() {
+    let (_dir, conn) = store();
+    conn.execute(
+        "INSERT INTO pen (name, kind, parent_id) VALUES ('stet/f-1', 'finger', (SELECT id FROM pen WHERE name='stet'))",
+        [],
+    )
+    .expect("seed a finger");
+    let err = channel::invite(&conn, "james", "stet/f-1", "ops_team")
+        .expect_err("a finger is a mechanism, not a member");
+    assert!(
+        err.to_string().contains("never be a channel member"),
+        "{err}"
+    );
+    assert!(
+        channel::members(&conn, "ops_team")
+            .expect("members")
+            .is_empty()
+    );
+}
+
+#[test]
+fn only_a_keeper_may_make_an_invite_only_room_and_its_creator_is_in_it() {
+    let (_dir, conn) = store();
+    assert!(
+        channel::create(&conn, "stet", "hidden", "Hidden", "list", "none").is_err(),
+        "invite-only is a policy decision like a gate"
+    );
+    channel::create(&conn, "james", "hidden", "Hidden", "list", "none").expect("keeper may");
+    assert!(
+        channel::members(&conn, "hidden")
+            .expect("members")
+            .iter()
+            .any(|m| m.pen == "james"),
+        "the creator is in the room they made"
+    );
+    channel::send(&conn, "james", "hidden", "hello", None).expect("and may speak in it");
+}
+
+#[test]
+fn leaving_a_channel_ends_its_hold() {
+    let (_dir, conn) = store();
+    channel::invite(&conn, "james", "james", "ops_team").expect("sender is a member");
+    channel::invite(&conn, "james", "cline", "ops_team").expect("invite");
+    channel::send(&conn, "james", "ops_team", "unread incident", None).expect("send");
+    channel::send(&conn, "james", "ops_team", "second", None).expect("send");
+    channel::present(&conn, "cline", None).expect("boundary");
+    channel::present(&conn, "cline", None).expect("boundary");
+    // The grace runs from the FIRST OPPORTUNITY, so age the opportunity, not the message.
+    conn.execute(
+        "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+          WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+        [],
+    )
+    .expect("age the opportunity");
+    assert!(channel::breach(&conn, "cline").expect("breach").is_some());
+
+    // Leaving ends the obligation: the delivery is kept, but it no longer gates.
+    channel::leave(&conn, "cline", "ops_team").expect("leave");
+    assert!(
+        channel::breach(&conn, "cline").expect("breach").is_none(),
+        "a pen must not be locked by a room it has left"
+    );
+    let kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM channel_delivery
+              WHERE pen_id = (SELECT id FROM pen WHERE name='cline')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert!(
+        kept > 0,
+        "the receipt survives: you were told, even if you left"
+    );
+}
+
+#[test]
+fn a_waiter_with_no_cursor_starts_at_the_head_and_a_typo_is_not_success() {
+    let (_dir, conn) = store();
+    channel::send(&conn, "james", "general", "old news", None).expect("send");
+    let head = channel::head(&conn, "cline").expect("head");
+    assert!(head > 0, "the head is the newest seq this pen was told");
+    assert!(
+        channel::since(&conn, "cline", head, 50)
+            .expect("since")
+            .is_empty(),
+        "from the head, nothing has arrived yet"
+    );
+
+    let err = channel::prune(&conn, Some("no-such-channel"), None)
+        .expect_err("a typo is not 'nothing to prune'");
+    assert!(err.to_string().contains("no channel named"), "{err}");
 }

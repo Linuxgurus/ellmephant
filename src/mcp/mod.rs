@@ -81,6 +81,7 @@ pub const TOOLS: &[&str] = &[
     "channel_history",
     "channel_fetch",
     "channel_present",
+    "channel_invite",
     "channel_breach",
     "channel_join",
     "channel_leave",
@@ -866,6 +867,11 @@ pub struct ClaimListParams {
         description = "Optional: one name to inspect. Omit for every claim, EXPIRED rows included — the audit view, so an unexplained stale claim is visible rather than hidden."
     )]
     pub name: Option<String>,
+    /// Include the recorded ANCESTOR releases — who ended a lease they did not hold, and why.
+    #[schemars(
+        description = "Also return `revocations`: every recorded release by an ANCESTOR of the holder, newest first, with the reason it gave. A holder's own release writes nothing — this is the log of acts on other pens' leases."
+    )]
+    pub include_revocations: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::mail_send`].
@@ -1265,6 +1271,32 @@ pub struct ChannelMemberParams {
         description = "The channel key, without the `#`. Joining `ops_team` also joins `emergency`, in the same transaction: a team that runs the cluster must be reachable when it falls over."
     )]
     pub channel: String,
+}
+
+/// Parameters for [`MemoryServer::channel_invite`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelInviteParams {
+    /// Which channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
+    /// Who is invited.
+    #[schemars(
+        description = "The pen to put in the channel. `estate` or `james` only: an invitation has an inviter. Inviting to `ops_team` also puts the pen in `emergency`."
+    )]
+    pub pen: String,
+}
+
+/// Parameters for [`MemoryServer::channel_present`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPresentParams {
+    /// Name this turn boundary.
+    #[serde(default)]
+    #[schemars(
+        description = "A token for THIS turn boundary (e.g. the task key plus a counter). The same token twice is the SAME opportunity and adds no miss, so a retry or a second step in one turn cannot lock the pen. Omit only if every call really is a new boundary."
+    )]
+    pub boundary: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::channel_wait`].
@@ -2821,12 +2853,19 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
-            .with_store("memory_reembed", move |s| s.reembed())
+            .with_store("memory_reembed", move |s| {
+                // ★ NOT GATED, AND THAT IS THE DECISION (#168 review): a rebuild is derived data —
+                // idempotent, and its output depends on the bodies, not on the news. A pen locked out
+                // of an incident may still repair the index; making maintenance mean "acting" would
+                // dilute the class until someone weakens it to stop the noise.
+                s.reembed()
+            })
             .await?;
         tracing::info!(
             tool = "memory_reembed",
+            pen = %pen,
             queued = report.queued,
             dim = report.dim,
             rebuilt = report.rebuilt,
@@ -2872,12 +2911,17 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let report = self
-            .with_store("memory_reparse", move |s| s.reparse())
+            .with_store("memory_reparse", move |s| {
+                // ★ NOT GATED (#168 review): the link graph is derived data. Rebuilding it is
+                // idempotent and changes nothing anyone was told, so a locked pen may do it.
+                s.reparse()
+            })
             .await?;
         tracing::info!(
             tool = "memory_reparse",
+            pen = %pen,
             rows = report.rows,
             edges = report.edges,
             "re-parsed the link graph"
@@ -3113,7 +3157,19 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             )
             .await?;
         tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
-        serde_json::to_string(&serde_json::json!({ "claims": rows })).map_err(|e| e.to_string())
+        let mut out = serde_json::json!({ "claims": rows });
+        if p.include_revocations.unwrap_or(false) {
+            let lookup = name.clone();
+            let rev = self
+                .with_read(
+                    "claim_list",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.claim_revocations(lookup.as_deref(), 50),
+                )
+                .await?;
+            out["revocations"] = serde_json::json!(rev);
+        }
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Write one letter into a self's box.
@@ -3629,8 +3685,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn channel_history(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelHistoryParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review)
         let ChannelHistoryParams {
             channel,
             since,
@@ -3696,11 +3754,15 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     async fn channel_present(
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelPresentParams>,
     ) -> std::result::Result<String, String> {
         let pen = pen_name(&ctx, self.declared.as_deref())?;
         let who = pen.clone();
+        let boundary = p.boundary;
         let touched = self
-            .with_store("channel_present", move |s| s.channel_present(&who))
+            .with_store("channel_present", move |s| {
+                s.channel_present(&who, boundary.as_deref())
+            })
             .await?;
         serde_json::to_string(&serde_json::json!({ "pen": pen, "marked": touched }))
             .map_err(|e| e.to_string())
@@ -3763,6 +3825,35 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": true }).to_string())
     }
 
+    /// Invite a pen to a channel.
+    #[tool(
+        name = "channel_invite",
+        description = "Put ANOTHER pen in a channel. ★ `estate` or `james` only: a `list` channel is invite-only, so an invitation has an inviter and a pen cannot add itself. Inviting to `ops_team` also puts the pen in `emergency` — a team that runs the cluster must be reachable when it falls over.",
+        annotations(
+            title = "Invite a pen to a channel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_invite(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelInviteParams>,
+    ) -> std::result::Result<String, String> {
+        let actor = pen_name(&ctx, self.declared.as_deref())?;
+        let (who, guest, chan) = (actor.clone(), p.pen.clone(), p.channel.clone());
+        self.with_store("channel_invite", move |s| {
+            s.channel_invite(&who, &guest, &chan)
+        })
+        .await?;
+        Ok(serde_json::json!({
+            "channel": p.channel, "pen": p.pen, "member": true, "invited_by": actor
+        })
+        .to_string())
+    }
+
     /// Leave a channel.
     #[tool(
         name = "channel_leave",
@@ -3806,7 +3897,20 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Parameters(p): Parameters<ChannelWaitParams>,
     ) -> std::result::Result<String, String> {
         let pen = pen_name(&ctx, self.declared.as_deref())?;
-        let after = p.after.unwrap_or(0);
+        // ★ NO CURSOR MEANS "FROM NOW", NOT "FROM THE BEGINNING OF TIME" (#168 review): a fresh body
+        // that waits should see what arrives next, not the entire backlog.
+        let after = match p.after {
+            Some(after) => after,
+            None => {
+                let who = pen.clone();
+                self.with_read(
+                    "channel_wait",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.channel_head(&who),
+                )
+                .await?
+            }
+        };
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(p.timeout_secs.unwrap_or(0).min(25));
         loop {
@@ -3819,13 +3923,15 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 )
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
+                let truncated = rows.len() >= 200;
                 return serde_json::to_string(&serde_json::json!({
                     "after": after,
                     "messages": rows,
+                    "truncated": truncated,
                 }))
                 .map_err(|e| e.to_string());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
     }
 
@@ -3843,8 +3949,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn channel_members(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMembersParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // the roster is configuration, not a public list
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -3930,8 +4038,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     )]
     async fn channel_events(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelEventsParams>,
     ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // who gated what is not a public record
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -3990,10 +4100,13 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPruneParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // a prune writes; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // a prune writes; anonymous is read-only
         let only = p.channel;
         let rows = self
-            .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+            .with_store("channel_prune", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
+                s.channel_prune(only.as_deref())
+            })
             .await?;
         let total: usize = rows.iter().map(|r| r.emptied).sum();
         tracing::info!(
@@ -4175,6 +4288,10 @@ pub fn http_router(
         .route(
             "/channels/{channel}/members",
             axum::routing::get(surface::channel_members),
+        )
+        .route(
+            "/channels/{channel}/invite",
+            axum::routing::post(surface::channel_invite),
         )
         .route(
             "/channels/{channel}/gate",

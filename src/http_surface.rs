@@ -307,6 +307,11 @@ pub const ROUTES: &[Route] = &[
         path: "/channels/prune",
         tool: "channel_prune",
     },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/invite",
+        tool: "channel_invite",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -2272,17 +2277,27 @@ pub async fn reparse(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let caller = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("memory_reparse", move |s| s.reparse())
+        .with_store("memory_reparse", move |s| {
+            // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): identity is what makes the call
+            // attributable, but a rebuild is derived data — it is not "acting", and a locked pen may
+            // still repair the graph. So `caller` is logged, not consulted.
+            s.reparse()
+        })
         .await
     {
         Ok(report) => {
             tracing::info!(
                 area = scope.area,
+                pen = %caller,
                 rows = report.rows,
                 edges = report.edges,
                 "re-parsed the link graph over http"
@@ -2320,17 +2335,26 @@ pub async fn reembed(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let caller = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("memory_reembed", move |s| s.reembed())
+        .with_store("memory_reembed", move |s| {
+            // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): same rule as `reparse` above — a
+            // rebuild is derived data, not an act on the world.
+            s.reembed()
+        })
         .await
     {
         Ok(report) => {
             tracing::info!(
                 area = scope.area,
+                pen = %caller,
                 queued = report.queued,
                 "queued a re-embed over http"
             );
@@ -3780,10 +3804,16 @@ pub async fn channel_list(
 pub async fn channel_history(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
+    // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review): the store filters private memories by audience and
+    // a chat log has the same problem — an incident channel is not a public page.
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
     let since = params
         .maybe("since")
         .and_then(|v| v.parse::<i64>().ok())
@@ -3972,6 +4002,7 @@ pub async fn channel_present(
     State(state): State<HttpState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
+    body: Body,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     if let Err(r) = authorize(&state, &headers, json) {
@@ -3981,13 +4012,23 @@ pub async fn channel_present(
         Ok(p) => p,
         Err(r) => return r,
     };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => serde_json::json!({}),
+    };
+    let boundary = doc
+        .get("boundary")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let who = pen.clone();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("channel_present", move |s| s.channel_present(&who))
+        .with_store("channel_present", move |s| {
+            s.channel_present(&who, boundary.as_deref())
+        })
         .await
     {
         Ok(marked) => render(
@@ -4075,10 +4116,28 @@ pub async fn channel_wait(
             "refused: waiting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
         );
     };
-    let after = params
-        .maybe("after")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
+    let after = match params.maybe("after").and_then(|v| v.parse::<i64>().ok()) {
+        Some(after) => after,
+        None => {
+            // No cursor = "from now", not the whole backlog.
+            let who = pen.clone();
+            let server = match session(&state) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            match server
+                .with_read(
+                    "channel_wait",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.channel_head(&who),
+                )
+                .await
+            {
+                Ok(head) => head,
+                Err(e) => return error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+            }
+        }
+    };
     let timeout = params
         .maybe("timeout")
         .and_then(|v| v.parse::<u64>().ok())
@@ -4108,14 +4167,16 @@ pub async fn channel_wait(
                 .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let truncated = rows.len() >= 200;
             return render(
                 StatusCode::OK,
                 json,
-                serde_json::json!({ "after": after, "messages": rows }).to_string(),
+                serde_json::json!({ "after": after, "messages": rows, "truncated": truncated })
+                    .to_string(),
                 format!("{text}\n"),
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
 }
 
@@ -4123,9 +4184,13 @@ pub async fn channel_wait(
 pub async fn channel_members(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
     let key = channel.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -4264,9 +4329,13 @@ pub async fn channel_set_gate(
 pub async fn channel_events(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
     let key = channel.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -4369,9 +4438,13 @@ pub async fn channel_prune(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    if let Err(r) = proven_pen(&headers, json) {
-        return r;
-    }
+    // ★ THE PEN IS REQUIRED, AND THEN CONSULTED (#168 review): the gate lives on this door too.
+    // The MCP tool gated `channel_prune` and this route did not, so a locked pen could destroy the
+    // text it was locked out of knowing — the two doors disagreed exactly where it matters.
+    let caller = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
         _ => serde_json::json!({}),
@@ -4385,7 +4458,10 @@ pub async fn channel_prune(
         Err(r) => return r,
     };
     match server
-        .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+        .with_store("channel_prune", move |s| {
+            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
+            s.channel_prune(only.as_deref())
+        })
         .await
     {
         Ok(rows) => {
@@ -4397,6 +4473,50 @@ pub async fn channel_prune(
                 format!("emptied {total} message body(s)\n"),
             )
         }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/invite — put another pen in. Keeper-only: an invitation has an inviter.
+pub async fn channel_invite(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let actor = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let Some(guest) = doc.get("pen").and_then(|v| v.as_str()).map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`pen` is required");
+    };
+    let (who, chan, target) = (actor.clone(), channel.clone(), guest.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_invite", move |s| {
+            s.channel_invite(&who, &target, &chan)
+        })
+        .await
+    {
+        Ok(()) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "channel": channel, "pen": guest, "member": true, "invited_by": actor }).to_string(),
+            format!("invited {guest} to #{channel}\n"),
+        ),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
     }
 }

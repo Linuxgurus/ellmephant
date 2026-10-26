@@ -59,7 +59,13 @@ pub enum Class {
     /// Changes the record: `memory_upsert`, `memory_delete`, `memory_merge`, `memory_adopt`,
     /// `project_upsert`. Gated by `writes` and by `all`.
     Record,
-    /// Acts on the world: dispatch, handoff, reindex/rebuild. Gated by `all` only.
+    /// Acts on the world: dispatch, handoff, prune. Gated by `all` only.
+    ///
+    /// ★ NOT maintenance (#168 review). `memory_reparse` and `memory_reembed` are derived-data
+    /// rebuilds — idempotent, and their output depends on the bodies rather than on the news — so
+    /// they are not in this class at all. Putting them here would make "acting" mean "upkeep", and
+    /// the first pen annoyed by a lockout would weaken the gate to quiet the noise, taking the
+    /// prune that *does* belong here with it.
     Acting,
 }
 
@@ -212,6 +218,15 @@ fn members_of(conn: &Connection, channel: &str) -> Result<Vec<i64>> {
 pub fn join(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
     let id = pen_id(conn, pen)?;
     let ch = channel_row(conn, channel)?;
+    // ★ INVITE-ONLY MEANS INVITED (#165 review). A `list` channel is a room, not a door: a pen
+    // cannot add itself. A keeper may, because a keeper is who the invitation would come from.
+    if ch.members == "list" && !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: #{chan} is invite-only (`list`); a pen cannot add itself. Ask `estate` or \
+             `james` to invite you.",
+            chan = ch.key
+        )));
+    }
     let mut targets = vec![ch.key.clone()];
     if ch.key.eq_ignore_ascii_case(OPS_TEAM) {
         targets.push(EMERGENCY.to_string());
@@ -222,6 +237,59 @@ pub fn join(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
             "INSERT INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'in')
              ON CONFLICT(channel, pen_id) DO UPDATE SET state = 'in', at = datetime('now')",
             params![target, id],
+        )?;
+        tx.execute(
+            "INSERT INTO channel_event (channel, pen_id, action, was, now)
+             VALUES (?1, ?2, 'members', NULL, 'joined')",
+            params![target, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Put ANOTHER pen in a channel. Keeper-only: an invitation has an inviter, and that is the whole
+/// difference between `list` and a door with no lock (#165 review).
+pub fn invite(conn: &Connection, actor: &str, pen: &str, channel: &str) -> Result<()> {
+    if !keeper(actor) {
+        return Err(Error::Invalid(format!(
+            "refused: inviting needs `estate` or `james`; the proven caller is `{actor}`"
+        )));
+    }
+    let id = pen_id(conn, pen)?;
+    // ★ AN INVITATION TO A PEN THAT CAN NEVER LISTEN IS A LIE (#168 review). Fingers are mechanisms
+    // and `estate` has no entity behind it; both are excluded from fan-out, so a row for them would
+    // show on the roster and deliver nothing.
+    let (kind, name): (String, String) = conn.query_row(
+        "SELECT kind, name FROM pen WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if kind != "self" || name.eq_ignore_ascii_case("estate") {
+        return Err(Error::Invalid(format!(
+            "refused: `{pen}` can never be a channel member — a finger is a mechanism and `estate` \
+             has no entity behind it"
+        )));
+    }
+    let ch = channel_row(conn, channel)?;
+    let mut targets = vec![ch.key.clone()];
+    if ch.key.eq_ignore_ascii_case(OPS_TEAM) {
+        targets.push(EMERGENCY.to_string());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let actor_id = pen_id(conn, actor)?;
+    for target in targets {
+        tx.execute(
+            "INSERT INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'in')
+             ON CONFLICT(channel, pen_id) DO UPDATE SET state = 'in', at = datetime('now')",
+            params![target, id],
+        )?;
+        // ★ WHO PUT THEM ON THE TEAM IS A ROW (#168 review): membership was the one change with no
+        // audit trail, while gates and retention had one.
+        tx.execute(
+            "INSERT INTO channel_event (channel, pen_id, action, was, now)
+             VALUES (?1, ?2, 'members', NULL, ?3)",
+            params![target, actor_id, format!("invited {pen}")],
         )?;
     }
     tx.commit()?;
@@ -247,11 +315,26 @@ pub fn leave(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
             )));
         }
     }
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'out')
          ON CONFLICT(channel, pen_id) DO UPDATE SET state = 'out', at = datetime('now')",
         params![ch.key, id],
     )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'members', 'in', 'left')",
+        params![ch.key, id],
+    )?;
+    // ★ LEAVING ENDS THE HOLD (#168 review): an outstanding delivery in a room the pen has left must
+    // not keep it gated, or the only way out is to fetch a channel it is no longer in. The delivery
+    // ROW is kept — "you were told" stays answerable — but it no longer counts as an obligation.
+    tx.execute(
+        "UPDATE channel_delivery SET fetched_at = COALESCE(fetched_at, datetime('now'))
+          WHERE pen_id = ?1
+            AND seq IN (SELECT seq FROM channel_message WHERE channel = ?2)",
+        params![id, ch.key],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -273,6 +356,22 @@ pub fn send(
     let channel_row = channel_row(conn, channel)?;
     let channel_name = channel_row.key.clone();
     let pen_id = pen_id(conn, pen)?;
+
+    // ★ MEMBERSHIP IS AN ADMISSION RULE, NOT A FAN-OUT FILTER (#158 review). Without this, any pen
+    // could post into an invite-only incident channel and every member would be TOLD — an injection
+    // path into the one place where being behind is expensive.
+    if !members_of(conn, &channel_name)?.contains(&pen_id) {
+        return Err(Error::Invalid(format!(
+            "refused: `{pen}` is not a member of #{channel_name}, so this would be a message to a \
+             room it is not in. Join it (open channels) or be invited (list channels) first."
+        )));
+    }
+    if body.len() > MAX_BODY_CHARS {
+        return Err(Error::Invalid(format!(
+            "a channel message is at most {MAX_BODY_CHARS} BYTES; put an artifact in object \
+             storage and post a link"
+        )));
+    }
 
     if let Some(parent) = reply_to {
         let parent_channel: Option<String> = conn
@@ -351,8 +450,36 @@ fn message_by_seq(conn: &Connection, seq: i64) -> Result<Message> {
 ///
 /// A pen that is never presented is never judged — absence is not a crime — which is why this is
 /// separate from [`fetch`].
-pub fn present(conn: &Connection, pen: &str) -> Result<usize> {
+pub fn present(conn: &Connection, pen: &str, boundary: Option<&str>) -> Result<usize> {
     let id = pen_id(conn, pen)?;
+    // ★ ONE OPPORTUNITY, ONE MISS (#159 review). When the caller names the boundary, a repeat is the
+    // same opportunity — a retry, or the second step of a turn, must not count twice. Without a name
+    // the older behaviour stands, and the tool says so, because a caller that does not identify its
+    // turn cannot be given idempotency it did not ask for.
+    if let Some(name) = boundary.map(str::trim).filter(|b| !b.is_empty()) {
+        // ★ A TOKEN IS NOT AN IMMORTALITY SPELL (#168 review). Dedupe only inside a short window: a
+        // body that reuses one token forever would otherwise never accrue a second miss, which would
+        // quietly switch the gate off for exactly the caller who names its boundaries.
+        let seen: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT boundary, strftime('%s','now') - strftime('%s', at)
+                   FROM channel_boundary WHERE pen_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((seen_name, age)) = seen
+            && seen_name == name
+            && (0..=BOUNDARY_WINDOW_SECS).contains(&age)
+        {
+            return Ok(0);
+        }
+        conn.execute(
+            "INSERT INTO channel_boundary (pen_id, boundary, at) VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(pen_id) DO UPDATE SET boundary = ?2, at = datetime('now')",
+            params![id, name],
+        )?;
+    }
     let n = conn.execute(
         "UPDATE channel_delivery
             SET presented_at = COALESCE(presented_at, datetime('now')),
@@ -469,13 +596,18 @@ pub struct Pruned {
 ///
 /// `keep_secs = 0` means forever, and a channel left at 0 is never touched.
 pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result<Vec<Pruned>> {
+    // ★ A TYPO IS NOT "NOTHING TO PRUNE" (#168 review): every other channel function refuses an
+    // unknown key, and a silent success here reads as "the retention ran".
+    if let Some(key) = only {
+        channel_row(conn, key)?;
+    }
     let now = now.map(str::to_string).unwrap_or_else(|| {
         conn.query_row("SELECT datetime('now')", [], |r| r.get::<_, String>(0))
             .unwrap_or_default()
     });
     let mut stmt = conn.prepare(
         "SELECT key, keep_secs FROM channel
-          WHERE keep_secs > 0 AND (?1 IS NULL OR key = ?1)
+          WHERE keep_secs > 0 AND (?1 IS NULL OR lower(key) = lower(?1))
           ORDER BY key",
     )?;
     let channels = stmt
@@ -484,9 +616,10 @@ pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    let tx = conn.unchecked_transaction()?;
     let mut out = Vec::new();
     for (key, keep) in channels {
-        let emptied = conn.execute(
+        let emptied = tx.execute(
             "UPDATE channel_message
                 SET body = '', pruned_at = ?2
               WHERE channel = ?1
@@ -499,6 +632,7 @@ pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result
             emptied,
         });
     }
+    tx.commit()?;
     Ok(out)
 }
 
@@ -511,6 +645,17 @@ pub fn set_retention(
 ) -> Result<Channel> {
     if keep_secs < 0 {
         return Err(Error::Invalid("keep_secs cannot be negative".into()));
+    }
+    // ★ A FLOOR, BECAUSE THE UNIT IS EASY TO GET WRONG (#166 review): `60` read as "an hour" would
+    // destroy incident text after a minute and leave a row saying it was intended.
+    if keep_secs > 0 && keep_secs < MIN_KEEP_SECS {
+        return Err(Error::Invalid(format!(
+            "keep_secs must be 0 (forever) or at least {MIN_KEEP_SECS} seconds; {keep_secs} is \
+             shorter than the floor and would expire text before anyone could read it"
+        )));
+    }
+    if keep_secs > 100 * 365 * 24 * 3600 {
+        return Err(Error::Invalid("keep_secs is implausibly large".into()));
     }
     if !keeper(pen) {
         return Err(Error::Invalid(format!(
@@ -552,6 +697,15 @@ pub struct Event {
 /// behind it and only ever acts as somebody's borrow — so in practice this is James, or a pen James
 /// has lent. The check is on the PROVEN caller, never on a name passed in.
 const GATE_KEEPERS: [&str; 2] = ["estate", "james"];
+
+/// A message body's ceiling. The mail door documents 1 MiB; chat is for a line, not a document.
+const MAX_BODY_CHARS: usize = 16 * 1024;
+
+/// The shortest retention above zero. Long enough that a unit mistake is survivable.
+const MIN_KEEP_SECS: i64 = 3600;
+/// How long a boundary token names the same opportunity. Long enough to cover a retry or a
+/// multi-step turn; short enough that a reused token cannot switch the gate off for ever.
+const BOUNDARY_WINDOW_SECS: i64 = 120;
 
 fn keeper(pen: &str) -> bool {
     GATE_KEEPERS
@@ -609,14 +763,24 @@ pub fn create(
             "gate must be `none`, `writes` or `all`, not {gate:?}"
         )));
     }
-    if gate != "none" && !keeper(pen) {
+    // ★ AN INVITE-ONLY ROOM ITS CREATOR CANNOT ENTER IS A DEAD ROOM (#168 review). `list` is a
+    // policy decision like a gate, and it takes the same two hands.
+    if (members == "list" || gate != "none") && !keeper(pen) {
         return Err(Error::Invalid(format!(
-            "refused: creating a LOCKED channel (gate `{gate}`) needs `estate` or `james`; \
+            "refused: creating a channel with gate `{gate}` or members `{members}` needs `estate` or `james`; \
              the proven caller is `{pen}`. A channel that can stop a pen writing to the record \
              is not something any pen may make on its own."
         )));
     }
-    if channel_row(conn, &key).is_ok() {
+    // ★ NOT `channel_row(..).is_ok()` (#165 review): that reads "the query failed" as "the name is
+    // free", so a locked database would surface as a constraint error from the INSERT instead of
+    // the real cause. Ask the question directly.
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM channel WHERE lower(key) = lower(?1))",
+        params![key],
+        |r| r.get(0),
+    )?;
+    if exists {
         return Err(Error::Invalid(format!(
             "#{key} already exists; a channel is created once"
         )));
@@ -627,6 +791,13 @@ pub fn create(
         "INSERT INTO channel (key, title, members, gate) VALUES (?1, ?2, ?3, ?4)",
         params![key, title, members, gate],
     )?;
+    if members == "list" {
+        // The creator is in the room they made; otherwise their first message would be refused.
+        tx.execute(
+            "INSERT OR IGNORE INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'in')",
+            params![key, pen_id],
+        )?;
+    }
     tx.execute(
         "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'create', NULL, ?3)",
         params![key, pen_id, format!("{members}/{gate}")],
@@ -709,10 +880,13 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
     let row = channel_row(conn, channel)?;
     let mut out = Vec::new();
     if row.members == "list" {
+        // ★ THE SAME ADMISSION RULE AS `members_of` (#168 review): a finger is a mechanism and
+        // `estate` has no entity behind it, so neither is a member — even if a row says so.
         let mut stmt = conn.prepare(
             "SELECT p.name, m.at
                FROM channel_member m JOIN pen p ON p.id = m.pen_id
               WHERE m.channel = ?1 AND m.state = 'in' AND p.ceased_at IS NULL
+                AND p.kind = 'self' AND lower(p.name) <> 'estate'
               ORDER BY p.name",
         )?;
         let rows = stmt
@@ -736,7 +910,7 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
                 EXISTS (SELECT 1 FROM channel_member m2
                          WHERE m2.channel = ?1 AND m2.pen_id = p.id AND m2.state = 'in')
            FROM pen p
-          WHERE p.kind = 'self' AND p.ceased_at IS NULL AND p.name <> 'estate'
+          WHERE p.kind = 'self' AND p.ceased_at IS NULL AND lower(p.name) <> 'estate'
           ORDER BY p.name",
     )?;
     let rows = stmt.query_map(params![row.key], |r| {
@@ -753,10 +927,22 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
             pen,
             state: "in".to_string(),
             explicit: out_at.is_some() || invited,
-            since: None,
+            since: out_at,
         });
     }
     Ok(out)
+}
+
+/// The highest `seq` this pen has been told. A waiter with no cursor starts HERE, not at zero —
+/// otherwise a fresh body is flooded with the whole backlog (#168 review).
+pub fn head(conn: &Connection, pen: &str) -> Result<i64> {
+    let id = pen_id(conn, pen)?;
+    let head: Option<i64> = conn.query_row(
+        "SELECT MAX(seq) FROM channel_delivery WHERE pen_id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(head.unwrap_or(0))
 }
 
 /// What this pen was TOLD after `after_seq`, oldest first. Moves no receipt.
@@ -842,6 +1028,14 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
               WHERE d.pen_id = ?1
                 AND d.fetched_at IS NULL
                 AND c.gate <> 'none'
+                AND (
+                      (c.members = 'open' AND NOT EXISTS (
+                         SELECT 1 FROM channel_member mm
+                          WHERE mm.channel = c.key AND mm.pen_id = d.pen_id AND mm.state = 'out'))
+                   OR (c.members = 'list' AND EXISTS (
+                         SELECT 1 FROM channel_member mm
+                          WHERE mm.channel = c.key AND mm.pen_id = d.pen_id AND mm.state = 'in'))
+                )
                 AND d.misses >= c.misses_to_gate
                 AND (
                       (c.clock = 'send'
@@ -882,12 +1076,36 @@ pub fn gate(conn: &Connection, pen: &str, class: Class) -> Result<()> {
     match breach(conn, pen) {
         Ok(Some(b)) if class.gated_by(&b.gate) => {
             if b.lock_max_secs > 0 && b.lock_age_secs >= b.lock_max_secs {
+                // ★ AN EXPIRY IS A RECORD, NOT A LOG LINE (#159 review). The design says a lock
+                // releases itself and the release is *recorded*; a `warn!` that nobody reads is not a
+                // record. The event row is best-effort: failing to write it must not hold the lock.
+                if let Ok(id) = pen_id(conn, pen) {
+                    // ★ A RELEASE THAT LEAVES THE LOCK IN PLACE IS NOT A RELEASE (#168 review): the
+                    // next call would expire it again, and again, one event per write. Clear the
+                    // opportunity as well as recording it, so the lock ends and the row is written
+                    // once.
+                    let tx = conn.unchecked_transaction();
+                    if let Ok(tx) = tx {
+                        let _ = tx.execute(
+                            "UPDATE channel_delivery
+                                SET misses = 0, presented_at = NULL
+                              WHERE seq = ?1 AND pen_id = ?2",
+                            params![b.seq, id],
+                        );
+                        let _ = tx.execute(
+                            "INSERT INTO channel_event (channel, pen_id, action, was, now)
+                             VALUES (?1, ?2, 'expiry', ?3, 'released')",
+                            params![b.channel, id, format!("lock_age_secs={}", b.lock_age_secs)],
+                        );
+                        let _ = tx.commit();
+                    }
+                }
                 tracing::warn!(
                     pen,
                     channel = %b.channel,
                     seq = b.seq,
                     lock_age_secs = b.lock_age_secs,
-                    "ellmechat lock expired without a fetch; releasing and recording the expiry"
+                    "ellmechat lock expired without a fetch; released and recorded"
                 );
                 return Ok(());
             }

@@ -830,6 +830,15 @@ impl Session {
         channel::history(&self.conn, channel, since, limit)
     }
 
+    /// REFUSE a gated class of action for this pen, or allow it (#151).
+    ///
+    /// Fail open by design: a ledger the store cannot read does not gate, because a pen cannot tell
+    /// "you are late" from "the store is broken", and punishing the second as the first is how a
+    /// chat bug freezes the record.
+    pub fn channel_gate(&self, pen: &str, class: channel::Class) -> Result<()> {
+        channel::gate(&self.conn, pen, class)
+    }
+
     /// What, if anything, is stopping this pen from changing the record.
     pub fn channel_breach(&self, pen: &str) -> Result<Option<channel::Breach>> {
         channel::breach(&self.conn, pen)

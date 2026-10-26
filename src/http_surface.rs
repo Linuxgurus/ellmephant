@@ -1882,6 +1882,9 @@ pub async fn upsert(
     };
     match server
         .with_store("memory_upsert", move |s| {
+            if let Some(caller) = &proven {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
             // ★ A credit needs a LIVE LEND, exactly as on the MCP door: `as` is not a rename of the
             // writer, it is a claim that this pen may act for that one, and parentage alone is not
             // enough to make it true.
@@ -1974,6 +1977,10 @@ pub async fn memory_delete(
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
+            if let Some(caller) = &pen {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+
             if !s.rm(&lookup, pen.as_deref())? {
                 return Ok(None);
             }
@@ -2120,6 +2127,10 @@ pub async fn merge(
     let pen = crate::identity::resolve(&headers).ok().flatten();
     match server
         .with_store("memory_merge", move |s| {
+            if let Some(caller) = &pen {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+
             s.merge_into(&from, &target, pen.as_deref())
         })
         .await
@@ -2183,8 +2194,12 @@ pub async fn adopt(
     };
     let adopting = key.clone();
     let owner = pen.clone();
+    let actor = pen.clone();
     match server
-        .with_store("memory_adopt", move |s| s.adopt(&adopting, &owner, force))
+        .with_store("memory_adopt", move |s| {
+            s.channel_gate(&actor, crate::store::channel::Class::Record)?;
+            s.adopt(&adopting, &owner, force)
+        })
         .await
     {
         Ok(()) => {
@@ -2325,12 +2340,20 @@ pub async fn project_upsert(
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
+    // The pen the identity pair proves, if any: a project write may still be anonymous (the row
+    // records it), but a gate can only bite a pen that has one.
+    let proven = crate::identity::resolve(&headers).ok().flatten();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("project_upsert", move |s| s.project_merge(&patch))
+        .with_store("project_upsert", move |s| {
+            if let Some(caller) = &proven {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+            s.project_merge(&patch)
+        })
         .await
     {
         Ok(out) => {

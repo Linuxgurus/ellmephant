@@ -2098,6 +2098,7 @@ impl MemoryServer {
         patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
         let outcome = self
             .with_store("memory_upsert", move |s| {
+                s.channel_gate(&caller, crate::store::channel::Class::Record)?;
                 if let Some(as_pen) = &credited {
                     s.may_act_as(&caller, as_pen)?;
                 }
@@ -2153,6 +2154,7 @@ impl MemoryServer {
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
             .with_store("memory_delete", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
                 if !s.rm(&rm_key, Some(&pen))? {
                     return Ok(None);
                 }
@@ -2199,6 +2201,7 @@ impl MemoryServer {
         let log_into = into.clone();
         let out = self
             .with_store("memory_merge", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
                 s.merge_into(&from, &into, Some(&pen))
             })
             .await?;
@@ -2238,6 +2241,7 @@ impl MemoryServer {
         let actor = pen.clone();
         let target = owner.clone();
         self.with_store("memory_adopt", move |s| {
+            s.channel_gate(&actor, crate::store::channel::Class::Record)?;
             s.assign(&adopting, &actor, &target, force)
         })
         .await?;
@@ -2788,10 +2792,13 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
-            .with_store("project_upsert", move |s| s.project_merge(&patch))
+            .with_store("project_upsert", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+                s.project_merge(&patch)
+            })
             .await?;
         tracing::info!(
             tool = "project_upsert",

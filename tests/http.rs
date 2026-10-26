@@ -379,10 +379,19 @@ async fn request(
 /// An in-process MCP peer over the same session — the other door, for parity. The service must be
 /// kept alive by the caller (dropping it closes the pipe).
 async fn mcp_peer(server: MemoryServer) -> rmcp::service::RunningService<RoleClient, ()> {
+    mcp_peer_as(server, "tester").await
+}
+
+/// The same peer, declaring a DIFFERENT pen. Needed whenever a test compares the two doors for the
+/// same identity: `mcp_peer` hard-codes `tester`, which silently made an MCP call look ungated.
+async fn mcp_peer_as(
+    server: MemoryServer,
+    pen: &str,
+) -> rmcp::service::RunningService<RoleClient, ()> {
     // This peer is IN-PROCESS: there is no HTTP request, so no headers, so no proven identity.
     // A transport with no request declares its pen once, at construction — which is exactly what
     // `with_identity` is for (anonymous writes are refused by design).
-    let server = server.with_identity("tester");
+    let server = server.with_identity(pen);
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         server
@@ -612,9 +621,27 @@ async fn writes_are_open_when_no_token_is_configured() {
     let (_, boot_open, _) = get(&app, "/bootstrap").await;
     let (_, boot_gated, _) = get(&gated, "/bootstrap").await;
     assert_eq!(
-        boot_open, boot_gated,
+        without_queue_age(&boot_open),
+        without_queue_age(&boot_gated),
         "a boot must not depend on the auth config"
     );
+}
+
+/// The boot's encode-queue readout carries a CLOCK — `1 pending (oldest 12s)`. Two renders a moment
+/// apart can report `0s` and `1s` while agreeing about every decision this test asks about, so the
+/// age is stripped before the documents are compared. Found the loud way: green locally, red in CI,
+/// where the render is slow enough to cross a tick.
+fn without_queue_age(boot: &str) -> String {
+    const MARK: &str = "(oldest ";
+    let mut out = String::with_capacity(boot.len());
+    let mut rest = boot;
+    while let Some(at) = rest.find(MARK) {
+        let (head, tail) = rest.split_at(at + MARK.len());
+        out.push_str(head);
+        rest = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The same code with a token configured is a gate — so auth stays a config flip, not a rewrite.
@@ -1103,7 +1130,7 @@ async fn the_two_doors_are_one_core() {
         "127.0.0.1",
         state,
     );
-    let service = mcp_peer(mcp).await;
+    let service = mcp_peer_as(mcp, "http-as-gated").await;
 
     let seeded = tool(
         service.peer(),
@@ -2272,6 +2299,22 @@ async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
     assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
 }
 
+/// The identity fixture for HTTP writes.
+///
+/// ★ ONE TABLE, SET ONCE, AS A SUPERSET: cargo runs the tests in this binary in parallel threads, and
+/// `ELLMEPHANT_IDENTITIES` is process-global. A per-test table that each test removes would make
+/// whichever test finished last decide the identity of the one still running. Every HTTP test that
+/// needs a proven pen calls this and none of them removes it.
+fn identity_fixture() {
+    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
+    unsafe {
+        std::env::set_var(
+            TABLE,
+            "http-as-tester:as-secret-1,http-as-gated:as-secret-g",
+        )
+    };
+}
+
 /// `as:` on the BODY of `POST /memory` — the same claim as the MCP argument, and the same gate: a
 /// live lend, not tree shape. (The identity fixture is local to this test: it is the only one that
 /// needs a proven pen over HTTP, and it removes the table when it is done.)
@@ -2293,8 +2336,7 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
         .unwrap();
     }
 
-    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
-    unsafe { std::env::set_var(TABLE, "http-as-tester:as-secret-1") };
+    identity_fixture();
 
     let post = |body: serde_json::Value| {
         let app = app.clone();
@@ -2355,8 +2397,6 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
         Some("http-as-tester"),
         "who answers for it"
     );
-
-    unsafe { std::env::remove_var(TABLE) };
 }
 
 /// The three sudo verbs on the door: a borrow needs POLICY, a pass goes DOWN, a release CASCADES.
@@ -2610,4 +2650,225 @@ async fn reading_a_past_state_of_a_descendants_private_row_is_recorded() {
             .any(|r| r.2.as_deref() == Some("f-note") && r.4.as_deref() == Some("version/history")),
         "no audit row for the version read: {rows:?}"
     );
+}
+
+/// ★ THE GATE, THROUGH THE DOOR (#151): a pen that was TOLD something in a gated channel and did not
+/// listen cannot change the record — and fetching is what reopens it.
+///
+/// This is the half that makes ellmechat worth building: the schema and the ledger were already
+/// tested; what was untested is that a *write* is actually refused.
+#[tokio::test]
+async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
+    use serde_json::json;
+    identity_fixture();
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let paths = Paths::from_root(dir.path());
+
+    // Provisioning, outside every door: the pen, its membership, and an unread incident.
+    let seq;
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-gated', 'self');
+             INSERT OR IGNORE INTO pen (name, kind) VALUES ('james', 'self');",
+        )
+        .unwrap();
+        ellmephant::store::channel::join(&conn, "http-as-gated", "ops_team").unwrap();
+        let m = ellmephant::store::channel::send(
+            &conn,
+            "james",
+            "ops_team",
+            "the cluster is on fire",
+            None,
+        )
+        .expect("send");
+        seq = m.seq;
+        // Two boundaries offered it and the pen did not fetch: `ops_team` tolerates one, not two.
+        ellmephant::store::channel::present(&conn, "http-as-gated").unwrap();
+        ellmephant::store::channel::present(&conn, "http-as-gated").unwrap();
+        // The grace is 60s from the FIRST OPPORTUNITY; backdate the opportunity, not the message.
+        conn.execute(
+            "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+              WHERE seq = ?1 AND pen_id = (SELECT id FROM pen WHERE name = 'http-as-gated')",
+            [seq],
+        )
+        .unwrap();
+    }
+
+    let post = |app: axum::Router| async move {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/memory")
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Stet-From", "http-as-gated")
+            .header("X-Stet-Auth", "as-secret-g")
+            .body(Body::from(
+                json!({ "key": "after-incident", "title": "t", "body": "b" }).to_string(),
+            ))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    };
+
+    let (status, body) = post(app.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a behind pen must not write: {status} {body}"
+    );
+    assert!(
+        body.contains("ops_team") && body.contains("not been fetched"),
+        "and the refusal names the channel and the reason: {body}"
+    );
+
+    // LISTEN. Fetching is the only thing that clears it, and it clears it for the whole ledger.
+    {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        let heard = ellmephant::store::channel::fetch(&conn, "http-as-gated", None, 50).unwrap();
+        assert_eq!(heard.len(), 1, "one message was waiting");
+        assert!(heard[0].body.contains("on fire"));
+    }
+
+    let (status, body) = post(app).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "after fetching, the record opens: {status} {body}"
+    );
+}
+
+/// ★ THE TWO DOORS MUST AGREE (#159, Stet's refusal): not "both paths work" — **the same verdict on
+/// the same inputs, compared.** One shared store, one gated pen, one refusal text.
+#[tokio::test]
+async fn the_gate_gives_the_same_verdict_on_both_doors() {
+    use serde_json::json;
+    identity_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Arc::new(LockWatch::new());
+    let shared = Arc::new(Mutex::new(session(dir.path())));
+    let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
+    let state = HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        Arc::clone(&watch),
+        Instant::now(),
+    )
+    .with_write_token(Some("tok".into()));
+    let app = http_router(
+        MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch)),
+        "127.0.0.1",
+        state,
+    );
+    let service = mcp_peer_as(mcp, "http-as-gated").await;
+
+    // Provisioning outside both doors: a pen on the ops team, and an incident it has not fetched.
+    {
+        let paths = Paths::from_root(dir.path());
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES ('http-as-gated', 'self');
+             INSERT OR IGNORE INTO pen (name, kind) VALUES ('james', 'self');",
+        )
+        .unwrap();
+        use ellmephant::store::channel as ch;
+        ch::join(&conn, "http-as-gated", "ops_team").unwrap();
+        ch::join(&conn, "james", "ops_team").unwrap();
+        let m = ch::send(&conn, "james", "ops_team", "the cluster is on fire", None).unwrap();
+        ch::present(&conn, "http-as-gated").unwrap();
+        ch::present(&conn, "http-as-gated").unwrap();
+        conn.execute(
+            "UPDATE channel_delivery SET presented_at = datetime('now','-5 minutes')
+              WHERE seq = ?1 AND pen_id = (SELECT id FROM pen WHERE name='http-as-gated')",
+            [m.seq],
+        )
+        .unwrap();
+        let b = ch::breach(&conn, "http-as-gated").unwrap();
+        assert!(b.is_some(), "the fixture must actually gate the pen: {b:?}");
+    }
+
+    // Door one: MCP.
+    let mcp_verdict = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "through-mcp", "title": "t", "body": "b" }),
+    )
+    .await;
+
+    // Door two: HTTP.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/memory")
+        .header(header::AUTHORIZATION, "Bearer tok")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Stet-From", "http-as-gated")
+        .header("X-Stet-Auth", "as-secret-g")
+        .body(Body::from(
+            json!({ "key": "through-http", "title": "t", "body": "b" }).to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let http_verdict = String::from_utf8_lossy(&bytes).to_string();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{http_verdict}");
+    assert!(
+        mcp_verdict.contains("ops_team") && mcp_verdict.contains("not been fetched"),
+        "MCP must refuse by name: {mcp_verdict}"
+    );
+    assert!(
+        http_verdict.contains("ops_team") && http_verdict.contains("not been fetched"),
+        "HTTP must refuse by name: {http_verdict}"
+    );
+    // The SAME verdict, compared — the channel, the reason, and the count, not just "both failed".
+    let mcp_core: Vec<&str> = mcp_verdict
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    for word in ["ops_team", "offered", "fetched"] {
+        assert!(
+            mcp_core.contains(&word),
+            "MCP verdict lost {word}: {mcp_verdict}"
+        );
+        assert!(
+            http_verdict.contains(word),
+            "HTTP verdict lost {word}: {http_verdict}"
+        );
+    }
+
+    // And the same inputs STOP being refused once the pen listens — on both doors, again compared.
+    {
+        let paths = Paths::from_root(dir.path());
+        let conn = ellmephant::db::open(&paths).unwrap();
+        ellmephant::store::channel::fetch(&conn, "http-as-gated", None, 50).unwrap();
+    }
+    let mcp_after = tool(
+        service.peer(),
+        "memory_upsert",
+        json!({ "key": "through-mcp", "title": "t", "body": "b" }),
+    )
+    .await;
+    assert!(
+        mcp_after.contains("\"status\""),
+        "MCP opens after fetch: {mcp_after}"
+    );
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/memory")
+        .header(header::AUTHORIZATION, "Bearer tok")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Stet-From", "http-as-gated")
+        .header("X-Stet-Auth", "as-secret-g")
+        .body(Body::from(
+            json!({ "key": "through-http", "title": "t", "body": "b" }).to_string(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "HTTP opens after fetch");
 }

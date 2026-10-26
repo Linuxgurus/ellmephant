@@ -60,11 +60,19 @@ pub struct Acquire {
 /// The result of a [`release`]: whether it dropped, and what is left (the next holder, or nothing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Release {
-    /// True when the lease was yours and is now gone.
+    /// True when the lease was dropped.
     pub released: bool,
     /// The lease still standing, when one is (`None` after a clean release).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
+    /// ★ WHO DROPPED IT, when it was not the holder. An ancestor may end a descendant's lease with a
+    /// stated reason (soma/ellmephant, soma/spine#43); a release that says who did it is an act, one
+    /// that does not is an accident.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_by: Option<String>,
+    /// The reason the ancestor gave. Present only with `released_by`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The chosen columns, with `live` derived in SQL so a reader never compares timestamps itself.
@@ -197,22 +205,80 @@ fn try_acquire(conn: &Connection, name: &str, owner: &str, offset: &str) -> Resu
 /// Release a lease — only your own. A release by a non-owner is refused, and the reply (when one
 /// remains) names the holder, so the caller learns who it is, not just that it failed.
 pub fn release(conn: &Connection, name: &str, owner: &str) -> Result<Release> {
+    release_by(conn, name, owner, None)
+}
+
+/// ★ RELEASE AS A PEN, NOT AS A STRING (soma/spine#43 fix 4). The holder may always release its own
+/// lease. An ANCESTOR of the holder may also release it — but only with a stated reason, because a
+/// guard that can only be cleared by the process it guards is a room that locks from the inside, and
+/// a release nobody signed is indistinguishable from a leak. Authority is checked against the ROW's
+/// owner, never against the `owner` a caller asserts.
+pub fn release_by(
+    conn: &Connection,
+    name: &str,
+    actor: &str,
+    reason: Option<&str>,
+) -> Result<Release> {
     let name = normalize_name(name)?;
-    let owner = normalize_owner(owner)?;
-    let dropped = conn.execute(
-        "DELETE FROM claim WHERE name = ?1 AND owner = ?2",
-        params![name, owner],
-    )?;
-    if dropped > 0 {
+    let actor = normalize_owner(actor)?;
+    let Some(claim) = get(conn, &name)? else {
         return Ok(Release {
-            released: true,
+            released: false,
             claim: None,
+            released_by: None,
+            reason: None,
+        });
+    };
+    let mine = claim.owner == actor;
+    let ancestor = if mine {
+        false
+    } else {
+        match (pen_id(conn, &actor)?, pen_id(conn, &claim.owner)?) {
+            (Some(a), Some(o)) => crate::store::is_ancestor(conn, a, o)?,
+            _ => false,
+        }
+    };
+    if !mine && !ancestor {
+        return Ok(Release {
+            released: false,
+            claim: Some(claim),
+            released_by: None,
+            reason: None,
         });
     }
+    let stated = reason.map(str::trim).filter(|r| !r.is_empty());
+    if ancestor && stated.is_none() {
+        return Err(Error::Forbidden(
+            "an ancestor may end a descendant's lease only with a `reason` (a quiet release is \
+             indistinguishable from a leak)"
+                .to_string(),
+        ));
+    }
+    let dropped = conn.execute(
+        "DELETE FROM claim WHERE name = ?1 AND owner = ?2",
+        params![name, claim.owner],
+    )?;
     Ok(Release {
-        released: false,
-        claim: get(conn, &name)?,
+        released: dropped > 0,
+        claim: None,
+        released_by: if ancestor { Some(actor.clone()) } else { None },
+        reason: if ancestor {
+            stated.map(str::to_string)
+        } else {
+            None
+        },
     })
+}
+
+/// The pen id for a name, case-folded like every other identity lookup.
+fn pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM pen WHERE lower(name) = lower(?1)",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// One claim by name, or `None` when no row exists (a never-claimed name). The lookup folds case the
@@ -308,6 +374,95 @@ mod tests {
         let out = acquire(&conn, "bank", "hand-b", Some(300)).expect("second");
         assert!(out.won, "an expired lease must not block");
         assert_eq!(out.claim.owner, "hand-b");
+    }
+
+    /// One pen under another — the shape `stet`/`hands` has. `estate` is seeded by migration 0021.
+    fn pen(conn: &Connection, name: &str, parent: &str) {
+        conn.execute(
+            "INSERT INTO pen (name, kind, parent_id)
+             VALUES (?1, 'self', (SELECT id FROM pen WHERE lower(name) = lower(?2)))",
+            params![name, parent],
+        )
+        .expect("pen");
+    }
+
+    fn pens(conn: &Connection) {
+        pen(conn, "stet", "estate");
+        pen(conn, "hands", "stet");
+        pen(conn, "twine", "estate");
+    }
+
+    #[test]
+    fn the_holder_still_releases_its_own_lease() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        let out = release_by(&conn, "finger", "hands", None).expect("own release");
+        assert!(out.released);
+        assert!(
+            out.released_by.is_none(),
+            "no attribution: the holder did it"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_may_end_a_descendants_lease_WITH_a_reason() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        let out = release_by(&conn, "finger", "stet", Some("  the launcher was killed  "))
+            .expect("ancestor release");
+        assert!(
+            out.released,
+            "an ancestor may clear a dead descendant's lease"
+        );
+        assert_eq!(out.released_by.as_deref(), Some("stet"));
+        assert_eq!(
+            out.reason.as_deref(),
+            Some("the launcher was killed"),
+            "trimmed, and on the record"
+        );
+        assert!(get(&conn, "finger").expect("get").is_none(), "gone");
+    }
+
+    #[test]
+    fn an_ancestor_without_a_reason_is_refused() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        let refused = release_by(&conn, "finger", "stet", Some("   "));
+        assert!(
+            refused.is_err(),
+            "a quiet ancestor release is indistinguishable from a leak"
+        );
+        assert!(
+            get(&conn, "finger").expect("get").is_some(),
+            "and nothing was dropped"
+        );
+    }
+
+    #[test]
+    fn a_pen_that_is_not_an_ancestor_is_refused_and_told_who_holds_it() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        let out =
+            release_by(&conn, "finger", "twine", Some("cousin's privilege")).expect("refused");
+        assert!(!out.released, "a cousin is not an ancestor");
+        assert_eq!(out.claim.expect("still held").owner, "hands");
+    }
+
+    #[test]
+    fn the_owner_argument_cannot_grant_reach() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        // Twine names the holder — the old shape of the hole. The row's owner decides, not the claim.
+        let out = release_by(&conn, "finger", "twine", Some("I say I am hands")).expect("refused");
+        assert!(
+            !out.released,
+            "authority is the proven pen, never the asserted owner"
+        );
     }
 
     #[test]

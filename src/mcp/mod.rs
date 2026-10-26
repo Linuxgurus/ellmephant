@@ -844,11 +844,16 @@ pub struct ClaimReleaseParams {
     /// The name to release.
     #[schemars(description = "The name the lease is over.")]
     pub name: String,
-    /// The owner that must match.
+    /// Advisory only: authority is the proven pen, checked against the ROW's owner.
     #[schemars(
-        description = "Who is releasing — must be the current holder. A non-owner is refused and told who holds it; release is not a way to steal a lease."
+        description = "Advisory. Authority is the PROVEN pen, compared with the row's owner: the holder may always release, and an ANCESTOR of the holder may release with a `reason`. The value here is history and cannot grant reach you do not have."
     )]
-    pub owner: String,
+    pub owner: Option<String>,
+    /// Required when the caller is not the holder.
+    #[schemars(
+        description = "Why an ancestor is ending a descendant's lease. Required when the caller is not the holder; a quiet release is indistinguishable from a leak."
+    )]
+    pub reason: Option<String>,
 }
 
 /// Parameters for [`MemoryServer::claim_list`].
@@ -3039,7 +3044,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     /// Release a lease — only your own.
     #[tool(
         name = "claim_release",
-        description = "Release a lease you hold, so a waiting writer can take it now instead of waiting out the TTL. Only the CURRENT HOLDER may release: a release by anyone else is refused and the reply names the holder, because a lease is not a lock you can steal. A lease that lapses is harmless — this is the tidy path, not a duty. Returns `released` and, when the lease survives, the holder still on it.",
+        description = "Release a lease as the PROVEN pen: your own, or a descendant's with a `reason`. The holder may always release so a waiting writer can take it now instead of waiting out the TTL. An ANCESTOR of the holder may end a lease it did not take — the case that matters when a process died holding its own gate and only its own name could clear it — but only with a non-empty `reason`, because a quiet release is indistinguishable from a leak; the reply then carries `released_by` and `reason`. Anyone else is refused and told who holds it: a lease is not a lock you can steal, and the `owner` argument grants nothing (authority is checked against the ROW's owner). A lease that lapses is harmless — this is the tidy path, not a duty.",
         annotations(
             title = "Release claim",
             read_only_hint = false,
@@ -3053,19 +3058,31 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimReleaseParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
-        let ClaimReleaseParams { name, owner } = p;
+        // ★ WHO MAY END A LEASE (soma/spine#43 fix 4): the PROVEN pen, against the ROW's owner. The
+        // holder releases its own; an ancestor releases a descendant's WITH a reason. The `owner`
+        // argument no longer grants anything — it never should have.
+        let actor = pen_name(&ctx, self.declared.as_deref())?;
+        let ClaimReleaseParams {
+            name,
+            owner,
+            reason,
+        } = p;
         let log_name = name.clone();
-        let log_owner = owner.clone();
+        let log_actor = actor.clone();
         let out = self
-            .with_store("claim_release", move |s| s.claim_release(&name, &owner))
+            .with_store("claim_release", move |s| {
+                s.claim_release(&name, &actor, reason.as_deref())
+            })
             .await?;
         tracing::info!(
             tool = "claim_release",
             name = %log_name,
-            owner = %log_owner,
+            by = %log_actor,
+            owner = ?owner,
             released = out.released,
-            "claim released"
+            released_by = ?out.released_by,
+            reason = ?out.reason,
+            "claim release attempted"
         );
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }

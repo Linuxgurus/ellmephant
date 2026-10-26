@@ -3618,7 +3618,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             "no such memory: {key} — but it EXISTS, it is YOURS (owner: {owner}), and its audience \
              ({audience}) does not include you, so a read may not return it. This is not a store fault \
              and not a deletion. Write it with an audience that includes `pen:{caller}` (or `public`) \
-             and it comes back: that write narrows what the row exposes and is always yours to make."
+             and it comes back: that write narrows what the row exposes and is always yours to make. \
+             If the row is PROTECTED, take its lease first (`claim_acquire`) — the audience is not the \
+             only gate on that write."
         ))
     }
 
@@ -4791,6 +4793,10 @@ mod miss_answer_tests {
                 assert!(msg.contains("it is YOURS"), "{msg}");
                 assert!(msg.contains("pen:james"), "and quotes the audience: {msg}");
                 assert!(msg.contains("pen:cline"), "and names what to add: {msg}");
+                assert!(
+                    msg.contains("PROTECTED"),
+                    "and names the OTHER gate on that write, so the advice is not a loop: {msg}"
+                );
             }
             _ => panic!("expected the audience explanation"),
         }

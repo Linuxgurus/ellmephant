@@ -147,6 +147,15 @@ jobs:
               --label org.opencontainers.image.source="$SOURCE_URL" \
               --label net.linuxguru.build="$DEV" \
               -t "$B:sha-$SHORT" .
+            # ★ RE-CHECK BEFORE THE PUSH (2026-10-26). Two publishes of one commit — a push and a manual
+            # dispatch — can both find `sha-` absent, both build, and the second SILENTLY re-points the
+            # immutable handle. Measured in soma/spine and soma/hands tonight: three builds of one
+            # commit, `edge` and `sha-` on different digests, and nothing failing loudly. A handle a race
+            # can move is not immutable; discard this build instead.
+            if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
+              echo "REFUSING: another publish created sha-$SHORT while this one was building; not overwriting"
+              exit 1
+            fi
             # Immutable handle FIRST: it exists before any version-shaped name points at it.
             docker push "$B:sha-$SHORT"
           fi

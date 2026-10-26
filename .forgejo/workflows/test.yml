@@ -2,16 +2,17 @@ name: test
 
 # THE GATE `main` never had (issue #43): run the repository's own `make test` on every change.
 #
-# `make test` exists and is documented as "unit + integration tests (offline, no model)" -- no
-# workflow called it. `publish.yml` reads the version and publishes; `publish-dev.yml` is the dev
-# branch's publish path; `smoke.yml` tests the RUNNER, not the code. This file needs no registry
-# login, no secret and no cluster, so it can only fail when the CODE is wrong.
+# Since 2026-10-26 the gate builds in a **build pod**, not through the runner's docker daemon
+# (Linuxguru/kube-estates#21). Why: the runner's DinD sidecar is a privileged pod, so anything it
+# starts lands in /sys/fs/cgroup/docker/* — outside kubepods, outside the pod's limits, invisible
+# to cAdvisor. A build pod is an ordinary pod: its limits bind and its CPU is attributed.
 #
-# `ubuntu-latest` is the docker-executor label this repo's three workflows already use
-# (catthehacker/ubuntu:act-22.04). That image carries node, git, bash and the docker CLI and NO
-# cargo (measured for soma/spine on this runner, 2026-10-19), so the toolchain comes from a
-# container -- the same shape as this repo's dev-branch gate (b507d7d). `Dockerfile.test` is
-# standalone (no Harbor, no secrets), so it behaves identically on a push and on a pull request.
+# The job itself now only dispatches: it writes a kubeconfig, creates a Job in `ci-builds`, waits,
+# and relays the build log. The build runs in `library/ci-base` with `/harness/build.sh`
+# (forgejo/ci-builder), which clones THIS commit and runs `buildah build`.
+#
+# PUSH=0: a gate proves the image builds; it does not need to be in Harbor. The registry cache
+# means the expensive dependency layers are pulled rather than compiled on a hit.
 on:
   push:
     branches: [main]
@@ -23,5 +24,71 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: build the gate image (fmt, clippy, tests)
-        run: docker build --platform linux/amd64 -f Dockerfile.test -t ellmephant-test .
+      - name: install kubectl
+        run: |
+          set -eu
+          curl -sSLo kubectl "https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: build the gate image in a build pod
+        env:
+          CI_KUBECONFIG: ${{ secrets.CI_KUBECONFIG }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          echo "$CI_KUBECONFIG" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+
+          # The dependency image's tag is a fingerprint of the dependency set (same computation as
+          # publish-dev.yml and the Makefile), so this is a cache hit unless Cargo.toml/lock or
+          # Dockerfile.builder changed. A miss costs one slow build, never a wrong one.
+          builder="harbor.vn.linuxguru.net/library/ellmephant-builder:rust-lean-$(cat Cargo.toml Cargo.lock Dockerfile.builder | sha256sum | cut -c1-8)"
+
+          job=$(kubectl create -f - -o jsonpath='{.metadata.name}' <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            generateName: gate-
+            namespace: ci-builds
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 1800
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: build
+                    image: harbor.vn.linuxguru.net/library/ci-base:0.4.0
+                    command: ["/harness/build.sh"]
+                    securityContext:
+                      privileged: true
+                    env:
+                      - { name: REPO_URL,   value: "https://git.vn.linuxguru.net/${REPO}.git" }
+                      - { name: GIT_REF,    value: "${SHA}" }
+                      - { name: DOCKERFILE, value: "Dockerfile.test" }
+                      - { name: IMAGE,      value: "localhost/gate:${SHA}" }
+                      - { name: BUILDER,    value: "${builder}" }
+                      - { name: CACHE_REPO, value: "harbor.vn.linuxguru.net/library/ellmephant-gate-cache" }
+                      - { name: PUSH,       value: "0" }
+                      - { name: GIT_USER, valueFrom: { secretKeyRef: { name: ci-git, key: username } } }
+                      - { name: GIT_PASS, valueFrom: { secretKeyRef: { name: ci-git, key: password } } }
+                      - { name: REG_USER, valueFrom: { secretKeyRef: { name: ci-registry, key: username } } }
+                      - { name: REG_PASS, valueFrom: { secretKeyRef: { name: ci-registry, key: password } } }
+                    resources:
+                      requests: { cpu: "2", memory: 2Gi }
+                      limits:   { cpu: "4", memory: 8Gi }
+          YAML
+          )
+
+          echo "build job: $job"
+          if kubectl -n ci-builds wait --for=condition=complete "job/$job" --timeout=1800s; then
+            kubectl -n ci-builds logs "job/$job" --tail=-1
+          else
+            echo "build failed or timed out:"
+            kubectl -n ci-builds logs "job/$job" --tail=200 || true
+            exit 1
+          fi

@@ -1685,12 +1685,7 @@ fn row_with_audience(
 
 /// A patch written as `actor`, changing only the body (and optionally the audience).
 /// Returns the refusal as a string, or `""` when it was allowed.
-fn merge_as(
-    conn: &rusqlite::Connection,
-    key: &str,
-    actor: &str,
-    audience: Option<&str>,
-) -> String {
+fn merge_as(conn: &rusqlite::Connection, key: &str, actor: &str, audience: Option<&str>) -> String {
     let patch = store::Patch {
         key: Some(key.to_string()),
         // ★ NAMED, NOT INFERRED (Stet's review of #192): a fixture that sets only `asserted_by` tests
@@ -1728,7 +1723,11 @@ fn a_pen_may_not_overwrite_a_row_it_cannot_read() {
     // ★ STET, REVIEW OF #192: assert BOTH, because they are different claims. An unauthorised write
     // that is correctly attributed is not a forged signature, and the test that matters is that the
     // refusal leaves no trace of a write at all — not merely that the name stayed right.
-    assert_eq!(mem.edited_by.as_deref(), Some("james"), "no writer was recorded");
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("james"),
+        "no writer was recorded"
+    );
     assert_eq!(
         count(&conn, "SELECT count(*) FROM memory_version"),
         0,
@@ -1747,7 +1746,10 @@ fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
 
     // The repair must be possible from the author's side, or the only exit is destruction.
     let err = merge_as(&conn, "trap", "cline", Some("pen:james,pen:cline"));
-    assert!(err.is_empty(), "the owner may narrow its own exposure: {err}");
+    assert!(
+        err.is_empty(),
+        "the owner may narrow its own exposure: {err}"
+    );
 
     let mem = store::get(&conn, "trap").unwrap().expect("readable again");
     assert_eq!(
@@ -1765,7 +1767,10 @@ fn an_ancestor_may_repair_a_descendants_trapped_row() {
     planted(&conn, &embedder, "stets-trap", "stet", "pen:james");
 
     let err = merge_as(&conn, "stets-trap", "james", Some("pen:james,pen:stet"));
-    assert!(err.is_empty(), "answering for the row means being able to fix it: {err}");
+    assert!(
+        err.is_empty(),
+        "answering for the row means being able to fix it: {err}"
+    );
 
     // And a sibling still may not.
     let err = merge_as(&conn, "stets-trap", "cline", None);
@@ -1774,7 +1779,6 @@ fn an_ancestor_may_repair_a_descendants_trapped_row() {
         "a sibling is not an owner and not an ancestor: {err}"
     );
 }
-
 
 #[test]
 fn an_ancestor_may_not_overwrite_a_row_it_cannot_read() {
@@ -2067,8 +2071,6 @@ fn a_public_row_cannot_be_narrowed_into_the_trap_in_two_steps() {
     assert_eq!(mem.audience, "public", "nothing changed");
 }
 
-
-
 #[test]
 fn a_retired_authors_row_is_still_writable() {
     // ★ SECOND ADVERSARIAL PASS (#195). The rule asks whether the AUTHOR can read the row. If a pen is
@@ -2078,8 +2080,14 @@ fn a_retired_authors_row_is_still_writable() {
     let embedder = HashEmbedder::new(DIM);
     store::mint(&conn, "james", "ghost", "self").expect("mint a pen that will depart");
     row_with_audience(&conn, &embedder, "ghosts-note", "ghost", "pen:ghost");
-    store::retire(&conn, "ghost", "james", store::Rows::Inherit, store::History::Memorialize)
-        .expect("retire it");
+    store::retire(
+        &conn,
+        "ghost",
+        "james",
+        store::Rows::Inherit,
+        store::History::Memorialize,
+    )
+    .expect("retire it");
 
     let patch = store::Patch {
         key: Some("ghosts-note".into()),
@@ -2137,7 +2145,13 @@ fn a_lend_grants_the_credit_and_not_the_owners_blind_write() {
     // the way a legacy row would have it.
     // Planted, because the D1 guard (on #195) refuses to create it; this branch does not have that
     // guard, and building it by hand is what a legacy row looks like either way.
-    row_with_audience(&conn, &embedder, "fingers-private", "stet/hand/finger-1", "public");
+    row_with_audience(
+        &conn,
+        &embedder,
+        "fingers-private",
+        "stet/hand/finger-1",
+        "public",
+    );
     conn.execute(
         "UPDATE memory SET audience = 'pen:stet' WHERE key = 'fingers-private'",
         [],
@@ -2303,7 +2317,10 @@ fn private_names_the_pen_that_acts_not_the_pen_it_credits() {
     };
     store::merge(&conn, &alone).expect("private alone");
     let mem = store::get(&conn, "handed-note").unwrap().unwrap();
-    assert_eq!(mem.audience, "pen:stet/hand", "private names the actor: {mem:?}");
+    assert_eq!(
+        mem.audience, "pen:stet/hand",
+        "private names the actor: {mem:?}"
+    );
 }
 
 #[test]
@@ -2369,7 +2386,6 @@ fn a_write_that_changes_a_trapped_rows_audience_says_the_new_one_still_excludes_
         "a false claim about the write, in the message that exists to stop false claims: {err}"
     );
 }
-
 
 #[test]
 fn a_legacy_anonymous_row_can_be_made_private_by_the_pen_that_answers_for_it() {

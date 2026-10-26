@@ -36,6 +36,9 @@ fn seeded(key: &str) -> (tempfile::TempDir, Connection, HashEmbedder) {
 fn patch(key: &str, body: &str, asserted_by: Option<&str>) -> store::Patch {
     store::Patch {
         key: Some(key.to_string()),
+        // The actor mirrors the author HERE ON PURPOSE: these tests distinguish PROVEN from UNPROVEN
+        // writers, so an unproven patch must carry neither (soma/ellmephant#192).
+        acted_by: asserted_by.map(str::to_string),
         body: Some(body.to_string()),
         asserted_by: asserted_by.map(str::to_string),
         ..Default::default()

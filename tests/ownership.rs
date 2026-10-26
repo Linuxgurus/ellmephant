@@ -476,14 +476,18 @@ fn rewrite(
     key: &str,
     author: &str,
 ) -> String {
-    let mem = Memory {
-        key: key.to_string(),
-        title: format!("rewritten by {author}"),
-        body: "something else".to_string(),
+    // ★ A REWRITE IS AN UPDATE, SO IT NAMES ITS ACTOR (soma/ellmephant#192, Stet's review of HEAD).
+    // This used `store::add`, the CREATE path, which has no actor field — so the pen doing the rewrite
+    // could only be expressed as the credit, and authority was asked about the name it credited.
+    let patch = store::Patch {
+        key: Some(key.to_string()),
+        acted_by: Some(author.to_string()),
+        title: Some(format!("rewritten by {author}")),
+        body: Some("something else".to_string()),
         asserted_by: Some(author.to_string()),
         ..Default::default()
     };
-    match common::add_now(conn, embedder, &mem) {
+    match store::merge(conn, &patch) {
         Ok(_) => String::new(),
         Err(e) => format!("{e}"),
     }
@@ -1173,25 +1177,32 @@ fn an_ancestor_writes_a_descendants_row_and_the_attribution_says_so() {
     // James, 2026-10-24: "an ancestor always has (rarely used) ability to write on descendant-owned
     // data, with proper attribution". No lend is needed for that — the lend is only for CREDITING the
     // write to the descendant. Here the writer is the ancestor, and the record says so.
-    let rewrite = Memory {
-        key: "stets-note".into(),
-        title: "rewritten by james".into(),
-        body: "the ancestor's correction".into(),
+    let rewrite = store::Patch {
+        key: Some("stets-note".into()),
+        acted_by: Some("james".into()),
+        title: Some("rewritten by james".into()),
+        body: Some("the ancestor's correction".into()),
         asserted_by: Some("james".into()),
         ..Default::default()
     };
-    common::add_now(&conn, &embedder, &rewrite).expect("an ancestor may write down its subtree");
+    store::merge(&conn, &rewrite).expect("an ancestor may write down its subtree");
 
     let mem = store::get(&conn, "stets-note").unwrap().unwrap();
+    // ★ ATTRIBUTION SAYS SO — AND AUTHORSHIP IS WRITE-ONCE (#107). `add()` used to restamp the author
+    // here, which was #107 through the create door; the writer is named in `edited_by`, and the author
+    // stays the pen that wrote it first.
     assert_eq!(
         mem.asserted_by.as_deref(),
-        Some("james"),
-        "the ancestor is credited, not the owner"
+        Some("stet"),
+        "the author does not move: authorship is write-once"
     );
+    // ★ ONE ASSERTION, NOT TWO (Stet, review of #192): the same field was asserted twice with different
+    // messages — a copy-paste from the test's earlier shape, and exactly the kind of duplication that
+    // makes a suite look thorough while checking one thing.
     assert_eq!(
         mem.edited_by.as_deref(),
         Some("james"),
-        "and the edit is named"
+        "the ancestor is recorded as the writer, and the author does not move"
     );
     assert_eq!(
         mem.owner.as_deref(),
@@ -1624,4 +1635,408 @@ fn assignment_follows_the_tree_and_needs_force_to_take_it_back() {
         .expect("disclaim again");
     let err = store::assign(&conn, "given", "a", "peer", false).unwrap_err();
     assert!(err.to_string().contains("own subtree"), "{err}");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// ★ AUTHORITY IS OWNERSHIP, NOT VISIBILITY (soma/ellmephant#189, #190 — 2026-10-26).
+//
+// `asserted_by` is WRITE-ONCE by design (#107): a patch carries the stored author through and names
+// itself in `edited_by`. That is correct provenance. It was also, until this test existed, the value
+// the write gate asked about — so every update was authorised as the row's own author, which is always
+// yes. A pen could overwrite a row it could not read, by naming its key.
+//
+// These tests assert the two halves that have to be true at once:
+//   * the ACTOR decides the write (not the author, not a stranger, not a sibling);
+//   * the pens that ANSWER for a row (owner, ancestor) may repair it even when its audience excludes
+//     them — otherwise a row whose audience omits its author is recoverable only by deletion.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+fn row_with_audience(
+    conn: &rusqlite::Connection,
+    embedder: &HashEmbedder,
+    key: &str,
+    author: &str,
+    audience: &str,
+) {
+    let mem = Memory {
+        key: key.to_string(),
+        title: format!("written by {author}"),
+        body: "the facts".to_string(),
+        asserted_by: Some(author.to_string()),
+        audience: audience.to_string(),
+        ..Default::default()
+    };
+    common::add_now(conn, embedder, &mem).expect("write the row");
+}
+
+/// A patch written as `actor`, changing only the body (and optionally the audience).
+/// Returns the refusal as a string, or `""` when it was allowed.
+fn merge_as(
+    conn: &rusqlite::Connection,
+    key: &str,
+    actor: &str,
+    audience: Option<&str>,
+) -> String {
+    let patch = store::Patch {
+        key: Some(key.to_string()),
+        // ★ NAMED, NOT INFERRED (Stet's review of #192): setting only `asserted_by` made these tests
+        // exercise the fallback, so they would have passed with the conjunction deleted.
+        acted_by: Some(actor.to_string()),
+        body: Some(format!("changed by {actor}")),
+        asserted_by: Some(actor.to_string()),
+        audience: audience.map(|a| a.to_string()),
+        ..Default::default()
+    };
+    match store::merge(conn, &patch) {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+#[test]
+fn a_pen_may_not_overwrite_a_row_it_cannot_read() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    // The exact reproduction from #190: James's row, readable only by James.
+    row_with_audience(&conn, &embedder, "james-only", "james", "pen:james");
+
+    let err = merge_as(&conn, "james-only", "cline", None);
+    assert!(
+        err.contains("may not write"),
+        "a row you cannot read is not a row you may write: {err}"
+    );
+    let mem = store::get(&conn, "james-only").unwrap().unwrap();
+    assert_eq!(
+        mem.body, "the facts",
+        "the refused write changed nothing — this was the whole finding"
+    );
+    assert_eq!(mem.asserted_by.as_deref(), Some("james"));
+    // ★ STET, REVIEW OF #192: assert BOTH, because they are different claims. An unauthorised write
+    // that is correctly attributed is not a forged signature, and the test that matters is that the
+    // refusal leaves no trace of a write at all — not merely that the name stayed right.
+    assert_eq!(mem.edited_by.as_deref(), Some("james"), "no writer was recorded");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory_version"),
+        0,
+        "a refused write creates no version"
+    );
+}
+
+#[test]
+fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    // The trap from #189: the author addressed its own row to someone else and not itself.
+    // (The author's inability to READ it is a session/Reader property, tested elsewhere; here the
+    // question is whether the write gate lets the owner repair what the owner cannot see.)
+    row_with_audience(&conn, &embedder, "trap", "cline", "pen:james");
+
+    // The repair must be possible from the author's side, or the only exit is destruction.
+    let err = merge_as(&conn, "trap", "cline", Some("pen:james,pen:cline"));
+    assert!(err.is_empty(), "the owner may narrow its own exposure: {err}");
+
+    let mem = store::get(&conn, "trap").unwrap().expect("readable again");
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("cline"),
+        "authorship is write-once and the repair is still cline's"
+    );
+    assert_eq!(mem.body, "changed by cline");
+}
+
+#[test]
+fn an_ancestor_may_repair_a_descendants_trapped_row() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-trap", "stet", "pen:james");
+
+    let err = merge_as(&conn, "stets-trap", "james", Some("pen:james,pen:stet"));
+    assert!(err.is_empty(), "answering for the row means being able to fix it: {err}");
+
+    // And a sibling still may not.
+    let err = merge_as(&conn, "stets-trap", "cline", None);
+    assert!(
+        err.contains("may not write"),
+        "a sibling is not an owner and not an ancestor: {err}"
+    );
+}
+
+
+#[test]
+fn an_ancestor_may_not_overwrite_a_row_it_cannot_read() {
+    // ★ STET, REVIEW OF #192: "owners may write blind; ancestors may not." My first version let
+    // ancestors through because they can already delete the row — wrong on measurement. A delete is
+    // loud and leaves a version; an overwrite is quiet, and the row reads intact and wrong. So the
+    // ancestor must be able to SEE what it writes. (It may still write rows it can read: see
+    // `an_ancestor_may_repair_a_descendants_trapped_row`.)
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-private", "stet", "pen:stet");
+
+    let err = merge_as(&conn, "stets-private", "james", None);
+    assert!(
+        err.contains("audience does not include you"),
+        "an ancestor that cannot read it may not rewrite it: {err}"
+    );
+    let mem = store::get(&conn, "stets-private").unwrap().unwrap();
+    assert_eq!(mem.body, "the facts", "nothing changed");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory_version"),
+        0,
+        "no version was created"
+    );
+}
+
+#[test]
+fn a_write_credited_to_a_finger_needs_a_live_lend_and_records_the_hand_as_the_writer() {
+    // ★ STET, REVIEW OF #192, both halves in one test:
+    //  1. the credit is gated by a LIVE LEND, not by tree shape — otherwise every finger could be
+    //     credited for anything and #126 is undone;
+    //  2. `edited_by` names the pen that WROTE it, not the pen that got the credit — and vice versa for
+    //     `asserted_by`. Two fields, two questions, no laundering in the audit trail.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+
+    let patch = || store::Patch {
+        key: Some("credited".into()),
+        title: Some("credited".into()),
+        body: Some("the finger's work".into()),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the proven pen
+        ..Default::default()
+    };
+
+    let err = store::merge(&conn, &patch()).unwrap_err();
+    assert!(
+        format!("{err}").contains("LIVE lend"),
+        "a descendant is necessary, a live lend is what permits: {err}"
+    );
+
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+    store::merge(&conn, &patch()).expect("credited write");
+
+    let mem = store::get(&conn, "credited").unwrap().unwrap();
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("stet/hand/finger-1"),
+        "the credit names the finger"
+    );
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("stet/hand"),
+        "the writer names the hand that actually wrote it"
+    );
+}
+
+#[test]
+fn a_cas_compare_must_not_leak_a_version_to_a_pen_that_may_not_write() {
+    // ★ ADVERSARIAL REVIEW OF #192. Authorisation used to run AFTER the version compare, so a pen that
+    // may not write a row could ask "write only if version 0" and be told the CURRENT version — which
+    // is existence and size, from a store whose read path correctly reports absence. A refusal must
+    // not be a read.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "james-secret", "james", "pen:james");
+
+    let patch = store::Patch {
+        key: Some("james-secret".into()),
+        body: Some("probe".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: Some("cline".into()),
+        expected_version: Some(0),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("may not write"),
+        "a refusal, not a version: {err}"
+    );
+    assert!(
+        !err.contains("version"),
+        "and nothing about the row's version: {err}"
+    );
+}
+
+#[test]
+fn a_stranger_is_not_told_that_a_row_is_private() {
+    // ★ ADVERSARIAL REVIEW OF #192. `guard_audience` used to run before authorisation, so a pen that
+    // may not touch a row learned that it exists and is non-public from a DIFFERENT sentence than the
+    // one a stranger gets for an ordinary refusal. Same rule as the CAS: a refusal must not be a read.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-private-2", "stet", "pen:stet");
+
+    let patch = store::Patch {
+        key: Some("stets-private-2".into()),
+        audience: Some("public".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: Some("cline".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(err.contains("may not write"), "a refusal: {err}");
+    assert!(
+        !err.contains("private to another pen"),
+        "and no confirmation that it is private: {err}"
+    );
+}
+
+#[test]
+fn a_hand_may_reclassify_its_own_row_while_crediting_its_finger() {
+    // ★ ADVERSARIAL REVIEW OF #192. `guard_audience` judged the CREDITED pen (`asserted_by`) instead of
+    // the pen that acted, so a hand crediting its finger was refused its own boundary. The proven pen
+    // answers for the row; the credit is a name, not an authority.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    row_with_audience(&conn, &embedder, "hands-note", "stet/hand", "public");
+
+    let patch = store::Patch {
+        key: Some("hands-note".into()),
+        audience: Some("pen:stet".into()),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the pen that acts
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("the hand answers for its own row");
+    let mem = store::get(&conn, "hands-note").unwrap().unwrap();
+    assert_eq!(mem.audience, "pen:stet");
+    assert_eq!(mem.edited_by.as_deref(), Some("stet/hand"), "the writer, not the credit");
+}
+
+#[test]
+fn a_protected_row_asks_the_pen_that_acts_for_the_lease() {
+    // ★ THIRD ADVERSARIAL PASS (#192). `guard_protected` compared the lease holder against the CREDITED
+    // pen, so a hand holding a lease and crediting its finger was refused its own protection — the same
+    // asymmetry as `guard_audience`, in a second guard nobody had looked at.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    row_with_audience(&conn, &embedder, "protected-note", "stet/hand", "public");
+    store::claim::acquire(&conn, "protected-note", "stet/hand", Some(60)).expect("lease");
+
+    let patch = store::Patch {
+        key: Some("protected-note".into()),
+        tags: Some(vec!["protected".into()]),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the holder
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("the holder may write under its own lease");
+}
+
+#[test]
+fn a_live_lease_held_by_someone_else_is_not_permission_to_delete() {
+    // ★ THIRD ADVERSARIAL PASS (#192). The delete path accepted ANY live lease, so a pen with authority
+    // over a protected row could remove it while another pen held the lease — "someone is editing this"
+    // read as "you may delete it". Protection that stops an edit and not a deletion is a lock on the
+    // window.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-protected", "stet", "public");
+    // Mark it protected and lease it as STET.
+    let patch = store::Patch {
+        key: Some("stets-protected".into()),
+        tags: Some(vec!["protected".into()]),
+        asserted_by: Some("stet".into()),
+        acted_by: Some("stet".into()),
+        ..Default::default()
+    };
+    store::claim::acquire(&conn, "stets-protected", "stet", Some(60)).expect("lease");
+    store::merge(&conn, &patch).expect("stet protects and leases its own row");
+
+    // The ancestor may ordinarily delete a child's row — but not while the child holds the lease.
+    let err = format!(
+        "{}",
+        store::delete(&conn, "stets-protected", Some("james")).unwrap_err()
+    );
+    assert!(err.contains("does not hold it"), "{err}");
+    assert!(
+        store::get(&conn, "stets-protected").unwrap().is_some(),
+        "and the row is still there"
+    );
+
+    // The holder can.
+    store::delete(&conn, "stets-protected", Some("stet")).expect("the holder may delete");
+    assert!(store::get(&conn, "stets-protected").unwrap().is_none());
+}
+
+#[test]
+fn an_update_on_an_owned_row_must_name_the_pen_that_acts() {
+    // ★ STET'S FINDING, review of #192 at `1a7cad1`. `acted_by: None` silently fell back to
+    // `asserted_by`, and `asserted_by` is the CREDITED pen — so a caller that omitted the actor was
+    // authorised as the name it typed. That is #190 through a different door. A CREATE may have no
+    // separate actor; an UPDATE on an owned row never does.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "owned-note", "james", "public");
+
+    let patch = store::Patch {
+        key: Some("owned-note".into()),
+        body: Some("no actor named".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: None, // the hole
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        // The refusal comes from `may_write` itself ("a write must name the pen doing it"), which is
+        // the point: with no actor, an owned row FAILS CLOSED rather than being authorised as the
+        // credited name.
+        err.contains("must name the pen"),
+        "the absence is an error, not a fallback: {err}"
+    );
+    let mem = store::get(&conn, "owned-note").unwrap().unwrap();
+    assert_eq!(mem.body, "the facts", "and nothing was written");
+}
+
+#[test]
+fn a_lend_grants_the_credit_and_not_the_owners_blind_write() {
+    // ★ STET'S SECOND FINDING. A hand holding a live lend to its finger writes AS that finger. That buys
+    // the ATTRIBUTION (the finger is credited, and `edited_by` names the hand). It must NOT buy the
+    // finger's ownership rights: the acting pen is the hand, and an ancestor may not write a row it
+    // cannot read.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    // A row OWNED by the finger, addressed to someone the hand cannot read for. Planted, because the
+    // D1 guard (correctly) refuses to CREATE it — which is itself the point: the state has to be built
+    // the way a legacy row would have it.
+    // Planted, because the D1 guard (on #195) refuses to create it; this branch does not have that
+    // guard, and building it by hand is what a legacy row looks like either way.
+    row_with_audience(&conn, &embedder, "fingers-private", "stet/hand/finger-1", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet' WHERE key = 'fingers-private'",
+        [],
+    )
+    .expect("re-address it");
+    conn.execute(
+        "UPDATE memory SET owner = (SELECT id FROM pen WHERE name = 'stet/hand/finger-1') WHERE key = 'fingers-private'",
+        [],
+    )
+    .expect("own it as the finger");
+
+    let patch = store::Patch {
+        key: Some("fingers-private".into()),
+        body: Some("the hand writing as its finger".into()),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the pen that acts
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("audience does not include you"),
+        "the actor must be able to read what it writes, however the credit is spelled: {err}"
+    );
 }

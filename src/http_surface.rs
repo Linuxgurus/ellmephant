@@ -615,6 +615,7 @@ fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), Strin
     };
     Ok((
         store::Patch {
+            acted_by: None,
             key: Some(key),
             title: fm.title,
             body: Some(fm.body),
@@ -662,6 +663,7 @@ fn memory_patch_json(bytes: &[u8]) -> Result<(store::Patch, Option<String>), Str
     let as_pen = m.as_pen;
     Ok((
         store::Patch {
+            acted_by: None,
             key: m.key,
             title: m.title,
             body: m.body,
@@ -1920,6 +1922,9 @@ pub async fn upsert(
         _ => None,
     };
     patch.asserted_by = credited.clone().or_else(|| proven.clone());
+    // ★ THE ACTOR IS THE PROVEN PEN ON EVERY DOOR (soma/ellmephant#192): without this an update over
+    // HTTP would have to take its authority from the credited name.
+    patch.acted_by = proven.clone();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,

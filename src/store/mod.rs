@@ -168,7 +168,12 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _, _) = add_impl(conn, mem, None, None)?;
+    // ★ THE CREATE PATH HAS NO ACTOR FIELD, SO IT PASSES NONE (soma/ellmephant#192, Stet's review of
+    // HEAD). It used to pass `mem.asserted_by`, which is the CREDIT — so `store::add` against an
+    // EXISTING key was authorised as the name it credited, and on a commons row that name is the only
+    // thing the visibility check has to go on. A create needs no actor (there is no row to write
+    // over); an update through this door now fails closed on an owned row instead of guessing.
+    let (id, key, _, _) = add_impl(conn, mem, None, None, None, None)?;
     Ok((id, key))
 }
 
@@ -248,6 +253,34 @@ fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<
 /// is ATTRIBUTABLE even when it was authorised, which is the property to preserve if this ever
 /// changes. A row with no owner
 /// is the commons, and the commons belongs to nobody — so every pen may write it (#109).
+/// Does `caller` ANSWER for the row at `key` — is it the owner, the pen that owns on the owner's
+/// behalf (a finger's parent), or an ancestor of the owner?
+///
+/// ★ THE ONE QUESTION BOTH GATES NEED (soma/ellmephant#189). `may_write` asks "may this pen write
+/// it?"; `guard_audience` asks "may this pen re-classify it?". Visibility is a third question and
+/// answers neither: the pen that wrote a row can be locked out of reading it, and it is still the pen
+/// that answers for it.
+fn answers_for(conn: &Connection, key: &str, caller: Option<&str>) -> Result<bool> {
+    let Some(caller) = caller else { return Ok(false) };
+    let owner: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(Some(owner_id)) = owner else {
+        return Ok(false); // no row, or the commons: nobody answers for it
+    };
+    let Some(caller_exact) = exact_pen_id(conn, caller)? else {
+        return Ok(false);
+    };
+    // ★ OWNER ONLY, NOT ANCESTOR (Stet, review of #192). An ancestor that cannot read a row must not
+    // re-classify it either: publishing a private row it cannot see is a quieter harm than deleting it,
+    // not a gentler one. The owner answers for the row and may repair it.
+    Ok(caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id))
+}
+
 pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
     let row: Option<(Option<i64>, String)> = conn
         .query_row(
@@ -259,43 +292,73 @@ pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> R
     let Some((owner, audience)) = row else {
         return Ok(()); // nothing there: a create, and creates are not gated here
     };
-    // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24). Reads keep the absence rule —
-    // a read must never confirm a row it may not see — but a WRITE that answers *"no such memory"* for
-    // a memory that plainly exists sends an agent hunting a bug that is not there. The cost is that a
-    // prober learns the key exists; inside one estate, with cooperating pens, clarity is worth more
-    // than that.
-    let visible = match caller {
-        Some(caller) => may_read_audience(conn, caller, &audience)?,
-        None => true,
-    };
-    if !visible {
-        return Err(Error::Forbidden(format!(
-            "{caller} may not write {key}: it exists and is not yours, and you are not an ancestor of its owner",
-            caller = caller.unwrap_or("nobody")
-        )));
-    }
-    let Some(owner_id) = owner else { return Ok(()) };
     let Some(caller) = caller else {
-        return Err(Error::Invalid(format!(
-            "{key} has an owner; a write must name the pen doing it"
-        )));
+        // The commons (owner NULL) belongs to nobody and is writable by anyone, as it always was; a
+        // row that HAS an owner needs a name before the question can even be asked.
+        return if owner.is_none() {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!(
+                "{key} has an owner; a write must name the pen doing it"
+            )))
+        };
+    };
+    // ★ THE COMMONS IS DECIDED BY VISIBILITY ALONE, AND NEVER NEEDS A PEN ROW. An unattributed row
+    // (`anonymous` author, owner NULL) is the one place where a name that resolves to nothing must not
+    // turn a normal write into an error — the content is nobody's, so there is no authority to check.
+    let Some(owner_id) = owner else {
+        return if may_read_audience(conn, caller, &audience)? {
+            Ok(())
+        } else {
+            Err(Error::Forbidden(format!(
+                "{caller} may not write {key}: its audience does not include you"
+            )))
+        };
     };
     let caller_exact = exact_pen_id(conn, caller)?
         .ok_or_else(|| Error::Invalid(format!("no pen named {caller}")))?;
+
+    // ★ THE OWNER MAY WRITE BLIND; AN ANCESTOR MAY NOT (Stet, review of #192, 2026-10-26). My first
+    // version let ancestors through on a consistency argument — "it can already delete the row, so
+    // refusing the gentler act is theatre". That argument is WRONG on measurement, and the measurement
+    // decides it: a delete is LOUD and leaves a version, so the content survives and the act is
+    // recorded; an overwrite is QUIET and plausible, so the row reads intact and wrong and the old
+    // meaning survives only as history. **The gentler-sounding act is the one whose damage is invisible
+    // when it happens**, which makes it the last thing to allow blind.
+    //
+    // The owner is the exception because the row is already attributed to it: telling it the truth
+    // leaks nothing, and a row whose audience omits its own author has no other exit (#189).
     if caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id) {
         return Ok(());
     }
+    // Everyone else must be able to SEE what they are writing…
+    let visible = may_read_audience(conn, caller, &audience)?;
+    if !visible {
+        // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24) — and it says WHICH reason
+        // (#189). One sentence for three causes is how a correct refusal became a wrong diagnosis: this
+        // used to tell the row's own author that the row "is not yours, and you are not an ancestor of
+        // its owner", which is false twice.
+        return Err(Error::Forbidden(format!(
+            "{caller} may not write {key}: it exists, its audience does not include you, and you do not own it"
+        )));
+    }
+    // …and must answer for it: an ancestor, or a pen holding a session that makes it one.
     if is_ancestor(conn, caller_exact, owner_id)? {
         return Ok(());
     }
-    // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the root is
-    // reaching rows the tree does not put under you. `asserted_by` still names the hand that typed it,
-    // so a borrowed write is attributable; the session row says whose authority it spent.
+    // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the root
+    // is reaching rows the tree does not put under you. `asserted_by` still names the hand that typed
+    // it, so a borrowed write is attributable; the session row says whose authority it spent.
     for held in held_authority(conn, caller)? {
         if held == owner_id || is_ancestor(conn, held, owner_id)? {
             return Ok(());
         }
     }
+    // ★ DELETE AND UPDATE DELIBERATELY CONSULT THIS SAME FUNCTION (Stet, review of #192). They used to
+    // disagree — `delete` passed the requester, `update` passed the row's author — and that divergence
+    // is what exposed the #190 bug. Two functions that must agree should BE one function; otherwise the
+    // signal that found the bug becomes an accident nobody notices going quiet.
+
     let owner_name: String = conn.query_row(
         "SELECT name FROM pen WHERE id = ?1",
         params![owner_id],
@@ -311,6 +374,8 @@ fn add_impl(
     mem: &Memory,
     note: Option<&str>,
     expected: Option<i64>,
+    actor: Option<&str>,
+    credited: Option<&str>,
 ) -> Result<(i64, String, bool, Option<i64>)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, mem, note)?;
@@ -321,9 +386,21 @@ fn add_impl(
     // Taking the write lock first makes "compare, then write" ONE serialized unit, which is the whole
     // point of a CAS. Writes are short; the wait is a few milliseconds.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    // ★ AND THE COMPARE IS INSIDE THE TRANSACTION, or it is theatre: a check outside would let a
-    // rival commit between the read and the write, which is exactly the lost update this exists to
-    // prevent.
+    // ★ AUTHORISE FIRST, THEN COMPARE (adversarial review of #192, 2026-10-26). The CAS used to run
+    // BEFORE `may_write`, so a pen that may not write a row could call `upsert` with a wrong
+    // `expected_version` and be told the row's CURRENT VERSION — existence and size — while every read
+    // path correctly reported absence. The compare is still inside the transaction, where it belongs;
+    // it is the ORDER that changed. A refusal must not be a read.
+    // ★ NO FALLBACK TO THE CREDIT (soma/ellmephant#192, Stet's finding). `asserted_by` is the pen being
+    // CREDITED; using it as the actor is #190 through another door. With no actor named, `may_write`
+    // sees `None` — which FAILS CLOSED on an owned row and passes on an unowned one, where visibility
+    // alone decides and there is no authority to steal.
+    may_write(&tx, &prepared.key, actor)?;
+    if let (Some(credited), Some(proven)) = (credited, actor) {
+        if !credited.eq_ignore_ascii_case(proven) {
+            may_act_as(&tx, proven, credited)?;
+        }
+    }
     if let Some(want) = expected {
         let current = live_version(&tx, &prepared.key)?;
         if current != want {
@@ -332,7 +409,32 @@ fn add_impl(
     }
     // ★ THE WRITE PATH CONSULTS OWNERSHIP (soma/ellmephant#109). Until now `owner` existed and
     // nothing asked it anything, so "descendants may write" was a sentence rather than a rule.
-    may_write(&tx, &prepared.key, mem.asserted_by.as_deref())?;
+    //
+    // ★ AND IT ASKS ABOUT THE **ACTOR**, NOT THE AUTHOR (soma/ellmephant#190, 2026-10-26). Authorship
+    // is WRITE-ONCE (#107) on purpose — a patch carries the stored author through untouched so
+    // re-filing a row cannot launder its provenance — but that made `mem.asserted_by` the *previous*
+    // author on every update, so `may_write` was asking "may the row's own author write it?", which is
+    // always yes. Measured consequence: a pen that could not even READ a row could overwrite it by
+    // naming its key. The authority question and the provenance answer are two different questions and
+    // must never be the same field. `actor` is who is writing; `mem.asserted_by` is who wrote it first.
+    // ★ AND THE CREDITED PEN MUST BE PERMITTED TOO (soma/ellmephant#192, Stet's review). A `as:` that
+    // names a descendant takes the credit; if only the actor were checked, a pen could spend its own
+    // authority while stamping the row with a child's name — laundering authority THROUGH a child, the
+    // same defect as a sudo gate that trusts the label. The rule is a conjunction, not a switch.
+    // ★ AND THE CREDIT MUST BE LEGITIMATE — BY LEND, NOT BY TREE SHAPE (Stet, review of #192, and #126).
+    // My first attempt asked `may_write` about the credited pen too, which was the wrong question twice:
+    // it tested AUTHORITY OVER THE ROW when the thing to test is AUTHORITY OVER THE NAME, and it would
+    // have refused every legitimate `as:` (a parent crediting a child for work on the parent's own row,
+    // which is what fingers are FOR). Ancestry is not the gate: every finger has an ancestor, so testing
+    // ancestry here would undo #126 and make the refusal stop nothing.
+    //
+    // So: the actor half is "may you write this row?"; the credit half is "may you act as that name?"
+    // — a descendant, not retired, with a LIVE lend. Two lower bounds, and neither can widen the other.
+    if let (Some(credited), Some(proven)) = (credited, actor) {
+        if !credited.eq_ignore_ascii_case(proven) {
+            may_act_as(&tx, proven, credited)?;
+        }
+    }
     let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
     Ok((id, prepared.key, queued, None))
@@ -373,7 +475,16 @@ pub struct Patch {
     /// New provenance. `Some("")` clears it — empty is a fact here.
     pub source: Option<String>,
     /// The store stamps this from the connection's proven identity; a caller may not set it.
+    ///
+    /// ★ THIS IS THE **ATTRIBUTED** PEN, NOT NECESSARILY THE ACTOR (soma/ellmephant#192). With `as:`
+    /// it names the descendant that takes the credit; the pen that actually sent the request is
+    /// [`Patch::acted_by`]. Authority requires BOTH to be permitted (Stet, review of #192): crediting a
+    /// child must not launder an authority its parent lacks, and a parent must not be refused a row it
+    /// may write because it chose to give a child the credit.
     pub asserted_by: Option<String>,
+    /// The pen that actually made the request, as the connection proved it. `None` means "same as
+    /// `asserted_by`" — the ordinary case, where nobody is being credited.
+    pub acted_by: Option<String>,
     /// Where the information came from, declared by the caller. `None` leaves the stored value.
     pub origin: Option<String>,
     /// New tags. `Some(vec![])` clears them.
@@ -437,7 +548,13 @@ fn is_protected(tags: &[String]) -> bool {
 /// The lease must be taken deliberately (`claim_acquire`), which is what makes an edit visible
 /// afterwards: the claim table is the write audit for the memories that matter. Pair this with
 /// `ELLMEPHANT_LEASERS`, or a persuaded model simply leases the key itself and the gate is theatre.
-fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) -> Result<()> {
+fn guard_protected(
+    conn: &Connection,
+    key: &str,
+    was: &[String],
+    patch: &Patch,
+    writer: Option<&str>,
+) -> Result<()> {
     let becomes = patch.tags.as_ref().is_some_and(|t| is_protected(t));
     if !is_protected(was) && !becomes {
         return Ok(());
@@ -456,11 +573,12 @@ fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) 
     }
     // A PROVEN writer must BE the holder. An unproven one cannot be told from any other client, and
     // the lease it holds is already the strongest statement available: someone took it on purpose.
-    if let Some(writer) = patch
-        .asserted_by
-        .as_deref()
-        .filter(|w| !claim.owner.eq_ignore_ascii_case(w))
-    {
+    // ★ THE HOLDER IS THE PEN THAT ACTS, NOT THE NAME IT CREDITS (third adversarial pass, 2026-10-26).
+    // This read `patch.asserted_by` — the credited pen — so a hand holding the lease and crediting its
+    // finger for the work was refused its own protection. The lease is taken by the pen that acts; the
+    // credit is a name. Same asymmetry as `guard_audience`, found by looking for it rather than waiting
+    // for it to bite.
+    if let Some(writer) = writer.filter(|w| !claim.owner.eq_ignore_ascii_case(w)) {
         return Err(Error::Invalid(format!(
             "`{key}` is PROTECTED and leased by `{}` until {}; `{writer}` does not hold it.",
             claim.owner, claim.expires_at
@@ -470,7 +588,7 @@ fn guard_protected(conn: &Connection, key: &str, was: &[String], patch: &Patch) 
 }
 
 /// A delete has no patch to inspect, so it only asks: is a live lease held on this key?
-fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
+fn guard_protected_delete(conn: &Connection, key: &str, writer: Option<&str>) -> Result<()> {
     let Some(mem) = get(conn, key)? else {
         return Ok(());
     };
@@ -478,7 +596,22 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
         return Ok(());
     }
     match crate::store::claim::get(conn, key)? {
-        Some(claim) if claim.live => Ok(()),
+        // ★ THE LEASE MUST BE THE DELETER'S (third adversarial pass, 2026-10-26). This accepted ANY live
+        // lease, so a pen with authority over the row could delete a protected memory while ANOTHER pen
+        // held the lease — "someone is editing this" was read as "you may remove it". The write path
+        // (`guard_protected`) has always asked whose lease it is; the delete path did not. Protection
+        // that stops an edit and not a deletion is a lock on the window.
+        Some(claim) if claim.live => match writer {
+            Some(w) if claim.owner.eq_ignore_ascii_case(w) => Ok(()),
+            Some(w) => Err(Error::Invalid(format!(
+                "`{key}` is PROTECTED and leased by `{}` until {}; `{w}` does not hold it. A live lease \
+                 held by someone else is not permission to delete.",
+                claim.owner, claim.expires_at
+            ))),
+            // An unproven deleter cannot be told apart from any other client; the lease is the
+            // strongest statement available and it was taken on purpose (as on the write path).
+            None => Ok(()),
+        },
         Some(claim) => Err(Error::Invalid(format!(
             "`{key}` is PROTECTED and its lease lapsed at {} (held by `{}`). Take it again.",
             claim.expires_at, claim.owner
@@ -493,7 +626,12 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
 /// The audience is not a preference — it is a boundary, and boundaries are not editable by the party
 /// they exclude. A row private to `pen:stet` may only be re-classified by `stet`, or by the owner's
 /// explicit forensic path (which is a different act, recorded).
-fn guard_audience(existing: Option<&Memory>, patch: &Patch) -> Result<()> {
+fn guard_audience(
+    conn: &Connection,
+    existing: Option<&Memory>,
+    patch: &Patch,
+    writer: Option<&str>,
+) -> Result<()> {
     let Some(old) = existing else {
         return Ok(());
     };
@@ -507,8 +645,16 @@ fn guard_audience(existing: Option<&Memory>, patch: &Patch) -> Result<()> {
     if patch.private.is_none() && patch.audience.is_none() {
         return Ok(());
     }
+    // ★ BUT THE PENS THAT ANSWER FOR THE ROW ARE NOT STRANGERS (soma/ellmephant#189, 2026-10-26).
+    // Without this, a row whose audience omits its own author had NO exit: the author could not read
+    // it, could not write it, could not re-classify it, and could only watch an ancestor delete it.
+    // The guard exists to stop a pen that cannot read a row from publishing it — an owner or an
+    // ancestor already has that power through deletion, so refusing them the gentler act is theatre.
+    if answers_for(conn, &old.key, writer)? {
+        return Ok(());
+    }
     // The pen a row is ADDRESSED to may re-classify it — that pen owns the boundary.
-    let writer = patch.asserted_by.as_deref().unwrap_or_default();
+    let writer = writer.unwrap_or_default();
     let addressed_exactly = audience::parse(&old.audience)
         .is_some_and(|targets| targets.iter().any(|t| t.token() == audience::pen(writer)));
     if addressed_exactly {
@@ -553,10 +699,24 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         .as_ref()
         .map(|m| m.tags.clone())
         .unwrap_or_default();
-    guard_protected(conn, &key, &was_tags, patch)?;
+    // ★ WHO IS WRITING, ONCE (adversarial review of #192). `acted_by` is the proven pen; `asserted_by`
+    // is the credited one. Authority, the boundary guard and the write all have to agree about which
+    // pen is acting, or a hand crediting its finger gets judged as the finger for some checks and as
+    // the hand for others.
+    // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): the guards below must judge the pen that
+    // acts. Falling back to `asserted_by` is how a write gets authorised as the name it credits.
+    let writer = patch.acted_by.as_deref();
+    // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
+    // `guard_audience` produce different sentences for different states, so running them first let a
+    // pen that may not write the row learn that it exists and is not public — a read disguised as a
+    // refusal. A refusal must not be a read; the same rule as the CAS ordering.
+    if existing.is_some() {
+        may_write(conn, &key, writer)?;
+    }
+    guard_protected(conn, &key, &was_tags, patch, writer)?;
     // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
     // could not read. Without this, `private` would be a lock whose key hangs beside the door.
-    guard_audience(existing.as_ref(), patch)?;
+    guard_audience(conn, existing.as_ref(), patch, writer)?;
 
     let (mem, created) = match existing {
         Some(old) => {
@@ -588,7 +748,14 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     // writer names itself in `edited_by` — so re-filing a row cannot launder
                     // its provenance, and the move is visible without a version.
                     asserted_by: old.asserted_by.clone(),
-                    edited_by: patch.asserted_by.clone().or_else(|| old.edited_by.clone()),
+                    // ★ THE WRITER, NOT THE CREDIT (Stet, review of #192): a parent writing as its
+                    // child must be recorded as the parent, or the laundering survives in the audit trail
+                    // after being blocked at the gate.
+                    // ★ AN UNKNOWN WRITER IS HONEST; A CREDITED WRITER IS A GUESS (Stet's review of
+                    // #192). Falling back to `asserted_by` here would record the pen being CREDITED as
+                    // the pen that wrote — the exact defect the `edited_by`-from-`acted_by` fix exists
+                    // to prevent, surviving in the one branch that kept a fallback.
+                    edited_by: patch.acted_by.clone().or_else(|| old.edited_by.clone()),
                     origin: patch.origin.clone().or_else(|| old.origin.clone()),
                     audience: match (&patch.audience, patch.private) {
                         // An explicit audience is a SHARE (it names others), so it is checked against
@@ -623,7 +790,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
                     tags: patch.tags.clone().unwrap_or_default(),
                     source: patch.source.clone().filter(|s| !s.trim().is_empty()),
                     asserted_by: patch.asserted_by.clone(),
-                    edited_by: patch.asserted_by.clone(),
+                    edited_by: patch.acted_by.clone().or_else(|| patch.asserted_by.clone()),
                     origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
                     audience: match &patch.audience {
                         Some(spec) => audience::validated(conn, spec)?,
@@ -644,6 +811,14 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         &mem,
         patch.version_note.as_deref(),
         patch.expected_version,
+        // ★ WHO IS WRITING, which is not who the row is attributed to: on an update `mem.asserted_by`
+        // is the stored author (write-once, #107), so passing it here would authorise every update as
+        // the row's own author (#190). `acted_by` is the proven pen; `asserted_by` is the credited one,
+        // and authority needs both.
+        // ★ THE ACTOR, AND NOT THE CREDIT (soma/ellmephant#192): an absent actor must fail closed, not
+        // be filled in from the name being credited.
+        patch.acted_by.as_deref(),
+        patch.asserted_by.as_deref(),
     )?;
     Ok(MergeOutcome {
         key,
@@ -1841,7 +2016,7 @@ pub fn unowned(conn: &Connection, reader: &audience::Reader, limit: i64) -> Resu
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bool> {
-    guard_protected_delete(conn, key)?;
+    guard_protected_delete(conn, key, acted_by)?;
     // ★ A DELETE IS A WRITE OF ABSENCE (soma/ellmephant#109). It takes the same reach as an edit —
     // the owner, the pen acting for the owner, or an ancestor — and it leaves the same kind of
     // record. Removal that nobody is named for is indistinguishable from a mistake.

@@ -26,6 +26,24 @@ fn seeded(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str) -> i6
     common::add_now(conn, embedder, &mem).expect("add memory").0
 }
 
+/// Register a pen, so a write has an identity that resolves. `cline` is the PARENT of `james` here on
+/// purpose: these tests are about authorship versus the writer, and the writer must be a pen that may
+/// write the row at all (soma/ellmephant#190 — before that fix the gate asked about the row's author,
+/// so this fixture passed without a registry and proved the bug by accident).
+fn pen(conn: &rusqlite::Connection, name: &str, parent: Option<&str>) {
+    conn.execute(
+        "INSERT OR IGNORE INTO pen (name, kind, parent_id)
+         VALUES (?1, 'self', (SELECT id FROM pen WHERE name = ?2))",
+        rusqlite::params![name, parent],
+    )
+    .expect("seed pen");
+}
+
+fn registry(conn: &rusqlite::Connection) {
+    pen(conn, "cline", None);
+    pen(conn, "james", Some("cline"));
+}
+
 fn provenance(conn: &rusqlite::Connection, id: i64) -> (String, Option<String>) {
     conn.query_row(
         "SELECT asserted_by, edited_by FROM memory WHERE id = ?1",
@@ -40,6 +58,7 @@ fn a_tag_only_write_moves_the_writer_and_not_the_author() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    registry(&conn);
     let id = seeded(&conn, &embedder, "handed-to-cline");
 
     // ★ THE REPRODUCTION: a tag pass by another pen. No title, no body, no version_note.
@@ -49,6 +68,7 @@ fn a_tag_only_write_moves_the_writer_and_not_the_author() {
         &store::Patch {
             key: Some("handed-to-cline".into()),
             tags: Some(vec!["pen:cline".into()]),
+            acted_by: Some("cline".into()),
             asserted_by: Some("cline".into()),
             ..Default::default()
         },
@@ -81,6 +101,7 @@ fn a_body_write_by_another_pen_keeps_the_author_and_versions_itself() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
+    registry(&conn);
     let id = seeded(&conn, &embedder, "edited-later");
 
     common::merge_now(
@@ -89,6 +110,7 @@ fn a_body_write_by_another_pen_keeps_the_author_and_versions_itself() {
         &store::Patch {
             key: Some("edited-later".into()),
             body: Some("the facts, corrected by cline".into()),
+            acted_by: Some("cline".into()),
             asserted_by: Some("cline".into()),
             version_note: Some("correction".into()),
             ..Default::default()
@@ -122,6 +144,7 @@ fn the_same_pen_writing_again_is_not_a_change_of_either_fact() {
         &store::Patch {
             key: Some("james-again".into()),
             tags: Some(vec!["pen:james".into()]),
+            acted_by: Some("james".into()),
             asserted_by: Some("james".into()),
             ..Default::default()
         },

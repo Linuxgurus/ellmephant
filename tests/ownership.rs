@@ -1196,15 +1196,13 @@ fn an_ancestor_writes_a_descendants_row_and_the_attribution_says_so() {
         Some("stet"),
         "the author does not move: authorship is write-once"
     );
+    // ★ ONE ASSERTION, NOT TWO (Stet, review of #192): the same field was asserted twice with different
+    // messages — a copy-paste from the test's earlier shape, and exactly the kind of duplication that
+    // makes a suite look thorough while checking one thing.
     assert_eq!(
         mem.edited_by.as_deref(),
         Some("james"),
-        "and the ancestor is recorded as the writer"
-    );
-    assert_eq!(
-        mem.edited_by.as_deref(),
-        Some("james"),
-        "and the edit is named"
+        "the ancestor is recorded as the writer, and the author does not move"
     );
     assert_eq!(
         mem.owner.as_deref(),

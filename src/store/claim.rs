@@ -266,11 +266,19 @@ pub fn release_by(
             params![name, claim.owner, actor, stated.unwrap_or_default()],
         )?;
     }
+    // ★ ATTRIBUTION ONLY WHEN SOMETHING WAS DROPPED (Stet, retro review). A lost race deleted
+    // nothing, and reporting who "released" a lease that is still held records the attempt as the
+    // effect. The row is re-read so the reply names the holder that is actually still there.
+    let dropped_now = dropped > 0;
     Ok(Release {
-        released: dropped > 0,
-        claim: None,
-        released_by: if ancestor { Some(actor.clone()) } else { None },
-        reason: if ancestor {
+        released: dropped_now,
+        claim: if dropped_now { None } else { get(conn, &name)? },
+        released_by: if ancestor && dropped_now {
+            Some(actor.clone())
+        } else {
+            None
+        },
+        reason: if ancestor && dropped_now {
             stated.map(str::to_string)
         } else {
             None
@@ -478,6 +486,25 @@ mod tests {
         assert_eq!(owner, "hands", "who held it");
         assert_eq!(by, "stet", "who ended it");
         assert_eq!(reason, "the launcher was killed");
+    }
+
+    #[test]
+    fn a_release_that_dropped_nothing_claims_nothing() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        // No lease at all — the row is gone before the release lands (a lost race).
+        let out = release_by(&conn, "finger", "stet", Some("raced")).expect("no lease");
+        assert!(!out.released);
+        assert!(
+            out.released_by.is_none(),
+            "it must not report releasing what is still there"
+        );
+        assert!(out.reason.is_none());
+        assert!(
+            revocations(&conn, Some("finger"), 10)
+                .expect("revocations")
+                .is_empty()
+        );
     }
 
     #[test]

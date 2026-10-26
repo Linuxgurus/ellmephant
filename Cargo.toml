@@ -1,6 +1,6 @@
 [package]
 name = "ellmephant"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Single-binary, SQLite-backed long-term memory for AI agents"

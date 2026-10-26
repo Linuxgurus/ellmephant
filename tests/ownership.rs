@@ -1918,3 +1918,39 @@ fn a_protected_row_asks_the_pen_that_acts_for_the_lease() {
     };
     store::merge(&conn, &patch).expect("the holder may write under its own lease");
 }
+
+#[test]
+fn a_live_lease_held_by_someone_else_is_not_permission_to_delete() {
+    // ★ THIRD ADVERSARIAL PASS (#192). The delete path accepted ANY live lease, so a pen with authority
+    // over a protected row could remove it while another pen held the lease — "someone is editing this"
+    // read as "you may delete it". Protection that stops an edit and not a deletion is a lock on the
+    // window.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-protected", "stet", "public");
+    // Mark it protected and lease it as STET.
+    let patch = store::Patch {
+        key: Some("stets-protected".into()),
+        tags: Some(vec!["protected".into()]),
+        asserted_by: Some("stet".into()),
+        acted_by: Some("stet".into()),
+        ..Default::default()
+    };
+    store::claim::acquire(&conn, "stets-protected", "stet", Some(60)).expect("lease");
+    store::merge(&conn, &patch).expect("stet protects and leases its own row");
+
+    // The ancestor may ordinarily delete a child's row — but not while the child holds the lease.
+    let err = format!(
+        "{}",
+        store::delete(&conn, "stets-protected", Some("james")).unwrap_err()
+    );
+    assert!(err.contains("does not hold it"), "{err}");
+    assert!(
+        store::get(&conn, "stets-protected").unwrap().is_some(),
+        "and the row is still there"
+    );
+
+    // The holder can.
+    store::delete(&conn, "stets-protected", Some("stet")).expect("the holder may delete");
+    assert!(store::get(&conn, "stets-protected").unwrap().is_none());
+}

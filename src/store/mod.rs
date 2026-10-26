@@ -580,7 +580,7 @@ fn guard_protected(
 }
 
 /// A delete has no patch to inspect, so it only asks: is a live lease held on this key?
-fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
+fn guard_protected_delete(conn: &Connection, key: &str, writer: Option<&str>) -> Result<()> {
     let Some(mem) = get(conn, key)? else {
         return Ok(());
     };
@@ -588,7 +588,22 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
         return Ok(());
     }
     match crate::store::claim::get(conn, key)? {
-        Some(claim) if claim.live => Ok(()),
+        // ★ THE LEASE MUST BE THE DELETER'S (third adversarial pass, 2026-10-26). This accepted ANY live
+        // lease, so a pen with authority over the row could delete a protected memory while ANOTHER pen
+        // held the lease — "someone is editing this" was read as "you may remove it". The write path
+        // (`guard_protected`) has always asked whose lease it is; the delete path did not. Protection
+        // that stops an edit and not a deletion is a lock on the window.
+        Some(claim) if claim.live => match writer {
+            Some(w) if claim.owner.eq_ignore_ascii_case(w) => Ok(()),
+            Some(w) => Err(Error::Invalid(format!(
+                "`{key}` is PROTECTED and leased by `{}` until {}; `{w}` does not hold it. A live lease \
+                 held by someone else is not permission to delete.",
+                claim.owner, claim.expires_at
+            ))),
+            // An unproven deleter cannot be told apart from any other client; the lease is the
+            // strongest statement available and it was taken on purpose (as on the write path).
+            None => Ok(()),
+        },
         Some(claim) => Err(Error::Invalid(format!(
             "`{key}` is PROTECTED and its lease lapsed at {} (held by `{}`). Take it again.",
             claim.expires_at, claim.owner
@@ -1989,7 +2004,7 @@ pub fn unowned(conn: &Connection, reader: &audience::Reader, limit: i64) -> Resu
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bool> {
-    guard_protected_delete(conn, key)?;
+    guard_protected_delete(conn, key, acted_by)?;
     // ★ A DELETE IS A WRITE OF ABSENCE (soma/ellmephant#109). It takes the same reach as an edit —
     // the owner, the pen acting for the owner, or an ancestor — and it leaves the same kind of
     // record. Removal that nobody is named for is indistinguishable from a mistake.

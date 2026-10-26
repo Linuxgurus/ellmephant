@@ -1693,9 +1693,6 @@ fn merge_as(
 ) -> String {
     let patch = store::Patch {
         key: Some(key.to_string()),
-        // ★ NAMED, NOT INFERRED (Stet's review of #192): setting only `asserted_by` made these tests
-        // exercise the fallback, so they would have passed with the conjunction deleted.
-        acted_by: Some(actor.to_string()),
         body: Some(format!("changed by {actor}")),
         asserted_by: Some(actor.to_string()),
         audience: audience.map(|a| a.to_string()),
@@ -1775,7 +1772,6 @@ fn an_ancestor_may_repair_a_descendants_trapped_row() {
     );
 }
 
-// ── from #192 (base) ──
 
 #[test]
 fn an_ancestor_may_not_overwrite_a_row_it_cannot_read() {
@@ -1911,18 +1907,25 @@ fn a_hand_may_reclassify_its_own_row_while_crediting_its_finger() {
 
     row_with_audience(&conn, &embedder, "hands-note", "stet/hand", "public");
 
+    // ★ AND THE AUDIENCE MUST STILL INCLUDE THE AUTHOR (#189 D1): narrowing a row to its parent alone
+    // would make it unreadable by the pen that wrote it. So the lawful reclassification names both.
     let patch = store::Patch {
         key: Some("hands-note".into()),
-        audience: Some("pen:stet".into()),
+        audience: Some("pen:stet,pen:stet/hand".into()),
         asserted_by: Some("stet/hand/finger-1".into()), // the credit
         acted_by: Some("stet/hand".into()),             // the pen that acts
         ..Default::default()
     };
     store::merge(&conn, &patch).expect("the hand answers for its own row");
     let mem = store::get(&conn, "hands-note").unwrap().unwrap();
-    assert_eq!(mem.audience, "pen:stet");
-    assert_eq!(mem.edited_by.as_deref(), Some("stet/hand"), "the writer, not the credit");
-// ── from #195 ──
+    assert_eq!(mem.audience, "pen:stet,pen:stet/hand");
+    assert_eq!(
+        mem.edited_by.as_deref(),
+        Some("stet/hand"),
+        "the writer, not the credit"
+    );
+}
+
 #[test]
 fn a_row_addressed_to_others_only_is_refused_at_write() {
     // soma/ellmephant#189 D1: the trap is refused at the door. Before this, the write succeeded and the
@@ -2016,6 +2019,36 @@ fn a_live_lease_held_by_someone_else_is_not_permission_to_delete() {
     // The holder can.
     store::delete(&conn, "stets-protected", Some("stet")).expect("the holder may delete");
     assert!(store::get(&conn, "stets-protected").unwrap().is_none());
+}
+
+#[test]
+fn a_public_row_cannot_be_narrowed_into_the_trap_in_two_steps() {
+    // ★ ADVERSARIAL REVIEW OF #195. The obvious bypass of a write-time check is to write legally and
+    // then change the audience: create public, then address it to someone else only. If that passed,
+    // the guard would be decoration. It does not: the audience change is itself a write, and the same
+    // rule applies to it.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "two-step", "cline", "public");
+
+    let patch = store::Patch {
+        key: Some("two-step".into()),
+        audience: Some("pen:james".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: Some("cline".into()),
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("invisible to its own author"),
+        "narrowing into the trap is refused: {err}"
+    );
+    assert!(
+        err.contains("as:"),
+        "and the refusal names the legitimate route for a note to someone else: {err}"
+    );
+    let mem = store::get(&conn, "two-step").unwrap().unwrap();
+    assert_eq!(mem.audience, "public", "nothing changed");
 }
 
 #[test]

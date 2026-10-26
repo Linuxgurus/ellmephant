@@ -766,6 +766,15 @@ impl Session {
         claim::release_by(&self.conn, name, actor, reason)
     }
 
+    /// Ancestor releases on record, newest first — the durable half of `release_by`'s answer.
+    pub fn claim_revocations(
+        &self,
+        name: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<claim::Revocation>> {
+        claim::revocations(&self.conn, name, limit)
+    }
+
     /// The claims a reader can see: one by `name`, or every claim (expired rows included) when `name`
     /// is `None`. The audit view — an unexplained stale claim must be visible, not hidden.
     pub fn claims(&self, name: Option<&str>) -> Result<Vec<claim::Claim>> {

@@ -221,7 +221,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;
-         DROP TABLE IF EXISTS mail_surrogate;",
+         DROP TABLE IF EXISTS mail_surrogate;
+         DROP TABLE IF EXISTS claim_release_log;",
     )
     .unwrap();
     drop_sent_under(&conn);
@@ -309,7 +310,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;
-         DROP TABLE IF EXISTS mail_surrogate;",
+         DROP TABLE IF EXISTS mail_surrogate;
+         DROP TABLE IF EXISTS claim_release_log;",
     )
     .unwrap();
     drop_sent_under(&conn);
@@ -504,7 +506,8 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;
-         DROP TABLE IF EXISTS mail_surrogate;",
+         DROP TABLE IF EXISTS mail_surrogate;
+         DROP TABLE IF EXISTS claim_release_log;",
     )
     .unwrap();
     drop_sent_under(&conn);
@@ -607,7 +610,8 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
          DROP TABLE IF EXISTS channel_message;
          DROP TABLE IF EXISTS channel_member;
          DROP TABLE IF EXISTS channel;
-         DROP TABLE IF EXISTS mail_surrogate;",
+         DROP TABLE IF EXISTS mail_surrogate;
+         DROP TABLE IF EXISTS claim_release_log;",
     )
     .unwrap();
     drop_sent_under(&conn);

@@ -258,6 +258,14 @@ pub fn release_by(
         "DELETE FROM claim WHERE name = ?1 AND owner = ?2",
         params![name, claim.owner],
     )?;
+    // ★ THE LEDGER OUTLIVES THE ROW. A release by the holder leaves no trace (it is the tidy path);
+    // a release BY AN ANCESTOR is an act on somebody else's lease and is recorded with its reason.
+    if ancestor && dropped > 0 {
+        conn.execute(
+            "INSERT INTO claim_release_log (name, owner, released_by, reason) VALUES (?1, ?2, ?3, ?4)",
+            params![name, claim.owner, actor, stated.unwrap_or_default()],
+        )?;
+    }
     Ok(Release {
         released: dropped > 0,
         claim: None,
@@ -292,6 +300,36 @@ pub fn get(conn: &Connection, name: &str) -> Result<Option<Claim>> {
             row_to_claim,
         )
         .optional()?)
+}
+
+/// One recorded ancestor release: `(at, name, owner, released_by, reason)`.
+pub type Revocation = (String, String, String, String, String);
+
+/// The revocations on record, newest first — optionally for one name.
+pub fn revocations(conn: &Connection, name: Option<&str>, limit: i64) -> Result<Vec<Revocation>> {
+    let mut stmt = match name {
+        Some(n) => {
+            let mut st = conn.prepare(
+                "SELECT at, name, owner, released_by, reason FROM claim_release_log
+                 WHERE lower(name) = lower(?1) ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = st.query_map(params![n.trim(), limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            return rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into);
+        }
+        None => conn.prepare(
+            "SELECT at, name, owner, released_by, reason FROM claim_release_log
+             ORDER BY id DESC LIMIT ?1",
+        )?,
+    };
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// Every claim, name order — the audit view. Expired rows stay on purpose: an unexplained stale claim
@@ -424,6 +462,36 @@ mod tests {
             "trimmed, and on the record"
         );
         assert!(get(&conn, "finger").expect("get").is_none(), "gone");
+    }
+
+    #[test]
+    fn an_ancestor_release_is_on_the_record() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        release_by(&conn, "finger", "stet", Some("the launcher was killed"))
+            .expect("ancestor release");
+        let rows = revocations(&conn, Some("finger"), 10).expect("revocations");
+        assert_eq!(rows.len(), 1, "one act, one row");
+        let (_, name, owner, by, reason) = &rows[0];
+        assert_eq!(name, "finger");
+        assert_eq!(owner, "hands", "who held it");
+        assert_eq!(by, "stet", "who ended it");
+        assert_eq!(reason, "the launcher was killed");
+    }
+
+    #[test]
+    fn a_holders_own_release_writes_nothing() {
+        let (_dir, conn) = store();
+        pens(&conn);
+        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
+        release_by(&conn, "finger", "hands", None).expect("own release");
+        assert!(
+            revocations(&conn, Some("finger"), 10)
+                .expect("revocations")
+                .is_empty(),
+            "the tidy path is not an act on someone else's lease"
+        );
     }
 
     #[test]

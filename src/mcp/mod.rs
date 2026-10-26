@@ -867,6 +867,11 @@ pub struct ClaimListParams {
         description = "Optional: one name to inspect. Omit for every claim, EXPIRED rows included — the audit view, so an unexplained stale claim is visible rather than hidden."
     )]
     pub name: Option<String>,
+    /// Include the recorded ANCESTOR releases — who ended a lease they did not hold, and why.
+    #[schemars(
+        description = "Also return `revocations`: every recorded release by an ANCESTOR of the holder, newest first, with the reason it gave. A holder's own release writes nothing — this is the log of acts on other pens' leases."
+    )]
+    pub include_revocations: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::mail_send`].
@@ -3152,7 +3157,19 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             )
             .await?;
         tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
-        serde_json::to_string(&serde_json::json!({ "claims": rows })).map_err(|e| e.to_string())
+        let mut out = serde_json::json!({ "claims": rows });
+        if p.include_revocations.unwrap_or(false) {
+            let lookup = name.clone();
+            let rev = self
+                .with_read(
+                    "claim_list",
+                    crate::store::audience::Reader::everything(),
+                    move |s| s.claim_revocations(lookup.as_deref(), 50),
+                )
+                .await?;
+            out["revocations"] = serde_json::json!(rev);
+        }
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Write one letter into a self's box.

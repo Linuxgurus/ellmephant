@@ -398,11 +398,6 @@ fn add_impl(
     // sees `None` — which FAILS CLOSED on an owned row and passes on an unowned one, where visibility
     // alone decides and there is no authority to steal.
     may_write(&tx, &prepared.key, actor)?;
-    if let (Some(credited), Some(proven)) = (credited, actor) {
-        if !credited.eq_ignore_ascii_case(proven) {
-            may_act_as(&tx, proven, credited)?;
-        }
-    }
     if let Some(want) = expected {
         let current = live_version(&tx, &prepared.key)?;
         if current != want {
@@ -428,10 +423,14 @@ fn add_impl(
     //
     // So: the actor half is "may you write this row?"; the credit half is "may you act as that name?"
     // — a descendant, not retired, with a LIVE lend. Two lower bounds, and neither can widen the other.
-    if let (Some(credited), Some(proven)) = (credited, actor) {
-        if !credited.eq_ignore_ascii_case(proven) {
+    // ★ ONCE, AND NOT NESTED (clippy `-D warnings`, and the duplication was real): this block existed
+    // twice after an earlier reorder, so a credited write would have asked `may_act_as` twice. A match
+    // with a guard says the same thing in one place and one arm.
+    match (credited, actor) {
+        (Some(credited), Some(proven)) if !credited.eq_ignore_ascii_case(proven) => {
             may_act_as(&tx, proven, credited)?;
         }
+        _ => {}
     }
     // ★ A ROW ITS OWN AUTHOR CANNOT READ IS A TRAP, AND IS REFUSED (soma/ellmephant#189 D1,
     // 2026-10-26). You may address a row to others; you may not address it to others ONLY. That
@@ -868,19 +867,20 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     // the failure was ugly rather than refused: with the audience on the actor, the CREDITED pen could
     // no longer read words it was credited for, so the D1 rule refused the write with a message about
     // invisibility — a true sentence that names the wrong cause. Refuse the combination instead.
-    if patch.private == Some(true) {
-        if let (Some(credited), Some(actor)) =
-            (patch.asserted_by.as_deref(), patch.acted_by.as_deref())
-        {
-            if !credited.eq_ignore_ascii_case(actor) {
-                return Err(Error::Invalid(
-                    "`private: true` addresses the row to the pen that ACTS, and `as:` credits a \
-                     different pen — they contradict each other. Pass an explicit `audience` (e.g. \
-                     `pen:<you>,pen:<them>`) if the row is for both, or drop one of them."
-                        .into(),
-                ));
-            }
+    match (
+        patch.private,
+        patch.asserted_by.as_deref(),
+        patch.acted_by.as_deref(),
+    ) {
+        (Some(true), Some(credited), Some(actor)) if !credited.eq_ignore_ascii_case(actor) => {
+            return Err(Error::Invalid(
+                "`private: true` addresses the row to the pen that ACTS, and `as:` credits a \
+                 different pen — they contradict each other. Pass an explicit `audience` (e.g. \
+                 `pen:<you>,pen:<them>`) if the row is for both, or drop one of them."
+                    .into(),
+            ));
         }
+        _ => {}
     }
     let writer = patch.acted_by.as_deref();
     // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and

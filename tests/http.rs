@@ -621,9 +621,27 @@ async fn writes_are_open_when_no_token_is_configured() {
     let (_, boot_open, _) = get(&app, "/bootstrap").await;
     let (_, boot_gated, _) = get(&gated, "/bootstrap").await;
     assert_eq!(
-        boot_open, boot_gated,
+        without_queue_age(&boot_open),
+        without_queue_age(&boot_gated),
         "a boot must not depend on the auth config"
     );
+}
+
+/// The boot's encode-queue readout carries a CLOCK — `1 pending (oldest 12s)`. Two renders a moment
+/// apart can report `0s` and `1s` while agreeing about every decision this test asks about, so the
+/// age is stripped before the documents are compared. Found the loud way: green locally, red in CI,
+/// where the render is slow enough to cross a tick.
+fn without_queue_age(boot: &str) -> String {
+    const MARK: &str = "(oldest ";
+    let mut out = String::with_capacity(boot.len());
+    let mut rest = boot;
+    while let Some(at) = rest.find(MARK) {
+        let (head, tail) = rest.split_at(at + MARK.len());
+        out.push_str(head);
+        rest = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The same code with a token configured is a gate — so auth stays a config flip, not a rewrite.

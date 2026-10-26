@@ -772,6 +772,24 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     // the hand for others.
     // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): the guards below must judge the pen that
     // acts. Falling back to `asserted_by` is how a write gets authorised as the name it credits.
+    // ★ `private` AND `as:` CONTRADICT EACH OTHER (hostile review of #195, round 3). `private: true`
+    // addresses the row to the pen that ACTS; `as:` credits a different pen. Both cannot be true, and
+    // the failure was ugly rather than refused: with the audience on the actor, the CREDITED pen could
+    // no longer read words it was credited for, so the D1 rule refused the write with a message about
+    // invisibility — a true sentence that names the wrong cause. Refuse the combination instead.
+    if patch.private == Some(true) {
+        if let (Some(credited), Some(actor)) = (patch.asserted_by.as_deref(), patch.acted_by.as_deref())
+        {
+            if !credited.eq_ignore_ascii_case(actor) {
+                return Err(Error::Invalid(
+                    "`private: true` addresses the row to the pen that ACTS, and `as:` credits a \
+                     different pen — they contradict each other. Pass an explicit `audience` (e.g. \
+                     `pen:<you>,pen:<them>`) if the row is for both, or drop one of them."
+                        .into(),
+                ));
+            }
+        }
+    }
     let writer = patch.acted_by.as_deref();
     // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
     // `guard_audience` produce different sentences for different states, so running them first let a

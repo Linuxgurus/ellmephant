@@ -1954,6 +1954,19 @@ fn a_row_addressed_to_others_only_is_refused_at_write() {
         store::get(&conn, "trap-door").unwrap().is_none(),
         "a refusal writes nothing"
     );
+    // ★ AND IT LEAVES NOTHING QUEUED OR VERSIONED (round 2): `apply` is where the snapshot, the row,
+    // the links and the encode-queue entry all happen, so a refusal before it must leave all four
+    // untouched — otherwise a refused write still costs a queue entry and an embedding.
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM memory_version"),
+        0,
+        "no version from a refused write"
+    );
+    assert_eq!(
+        ellmephant::store::encode::pending(&conn).unwrap(),
+        0,
+        "nothing queued for embedding by a refused write"
+    );
 
     // The same intent, expressed legally: address it to James AND to yourself.
     let ok = Memory {
@@ -2269,16 +2282,26 @@ fn private_names_the_pen_that_acts_not_the_pen_it_credits() {
         acted_by: Some("stet/hand".into()),             // the pen that acts
         ..Default::default()
     };
-    store::merge(&conn, &patch).expect("write");
+    // ★ ROUND 3: private + as: is REFUSED, because they contradict. Round 2 fixed the boundary to
+    // follow the actor; the result was a row the CREDITED pen could not read — a true D1 refusal with a
+    // message about invisibility, which names the wrong cause. Say the real one.
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("contradict") || err.contains("addresses the row to the pen that ACTS"),
+        "private and a credit are refused, not silently resolved: {err}"
+    );
 
+    // Private alone works, and it belongs to the acting pen.
+    let alone = store::Patch {
+        key: Some("handed-note".into()),
+        title: Some("handed note".into()),
+        body: Some("the hand's own words".into()),
+        private: Some(true),
+        asserted_by: Some("stet/hand".into()),
+        acted_by: Some("stet/hand".into()),
+        ..Default::default()
+    };
+    store::merge(&conn, &alone).expect("private alone");
     let mem = store::get(&conn, "handed-note").unwrap().unwrap();
-    assert_eq!(
-        mem.audience, "pen:stet/hand",
-        "private belongs to the pen that ACTS: {mem:?}"
-    );
-    assert_eq!(
-        mem.asserted_by.as_deref(),
-        Some("stet/hand/finger-1"),
-        "and the credit still names the finger"
-    );
+    assert_eq!(mem.audience, "pen:stet/hand", "private names the actor: {mem:?}");
 }

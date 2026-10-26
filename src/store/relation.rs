@@ -158,6 +158,19 @@ fn ancestry(conn: &Connection, name: &str) -> Result<Vec<String>> {
 /// no path that doubles back, so `CP` cannot be produced, and `PC` is collapsed to `S` before it
 /// could be printed.
 pub fn relation(conn: &Connection, from: &str, to: &str) -> Result<Option<Kin>> {
+    // ★ CASE IS NOT PART OF A NAME (soma/ellmephant#191, 2026-10-26). The spec is case-INSENSITIVE and
+    // case-PRESERVING: `James` and `james` are one pen, and the stored spelling is the only thing that
+    // may be displayed. This function used to resolve the tree case-insensitively and then compare the
+    // two chains with exact string equality — so `whois James` answered `P "parent"` and `whois james`
+    // answered `PS "uncle"` for the same row, because `to` is seeded with the spelling the CALLER typed
+    // while `mine` holds the spelling the DATABASE stored. One fold, once, at the comparison.
+    // ★ ASCII FOLDING, DELIBERATELY (adversarial review of #191). SQLite's `lower()` — which every pen
+    // lookup and every audience comparison already uses — folds ASCII only, so folding more here
+    // (`to_lowercase()`) would make this function disagree with the lookup that produced the names:
+    // `Ä` would match in one and not the other. Matching the database's own rule is the invariant;
+    // a pen named with non-ASCII letters is case-SENSITIVE everywhere today, which is a limitation of
+    // the stores's `lower()`, not of this function, and it should be fixed there or nowhere.
+    let fold = |s: &str| s.to_ascii_lowercase();
     // ★ YOURSELF IS `ME` (James, 2026-10-23) — not a walk at all, and not a word in quotes: it is
     // the one answer that needs no gloss.
     if from.eq_ignore_ascii_case(to) {
@@ -166,15 +179,16 @@ pub fn relation(conn: &Connection, from: &str, to: &str) -> Result<Option<Kin>> 
             word: None,
         }));
     }
-    let mine = ancestry(conn, from)?;
+    let mine: Vec<String> = ancestry(conn, from)?.iter().map(|s| fold(s)).collect();
     // `to` ITSELF may be the common ancestor (a parent, a grandparent), so it belongs in the chain —
     // leaving it out makes every direct ancestor look like kin through someone else's branch.
     let mut theirs = vec![to.to_string()];
     theirs.extend(ancestry(conn, to)?);
+    let theirs: Vec<String> = theirs.iter().map(|s| fold(s)).collect();
 
     // Where do the two chains meet? `to` itself is the ancestor of interest when it is above us.
-    let (lca, up_to_lca) = if theirs.contains(&from.to_string()) {
-        (from.to_string(), 0)
+    let (lca, up_to_lca) = if theirs.contains(&fold(from)) {
+        (fold(from), 0)
     } else {
         let mut found = None;
         for (i, ancestor) in mine.iter().enumerate() {
@@ -191,7 +205,7 @@ pub fn relation(conn: &Connection, from: &str, to: &str) -> Result<Option<Kin>> 
 
     // Distance from the LCA down to `to`: 0 when `to` IS the LCA.
     let mut down = 0usize;
-    let mut cur = to.to_string();
+    let mut cur = fold(to);
     while cur != lca {
         let parent: Option<String> = conn
             .query_row(
@@ -203,7 +217,7 @@ pub fn relation(conn: &Connection, from: &str, to: &str) -> Result<Option<Kin>> 
         match parent {
             Some(p) => {
                 down += 1;
-                cur = p;
+                cur = fold(&p);
             }
             None => return Ok(None),
         }

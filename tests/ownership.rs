@@ -1693,6 +1693,9 @@ fn merge_as(
 ) -> String {
     let patch = store::Patch {
         key: Some(key.to_string()),
+        // ★ NAMED, NOT INFERRED (Stet's review of #192): a fixture that sets only `asserted_by` tests
+        // the fallback, not the rule.
+        acted_by: Some(actor.to_string()),
         body: Some(format!("changed by {actor}")),
         asserted_by: Some(actor.to_string()),
         audience: audience.map(|a| a.to_string()),

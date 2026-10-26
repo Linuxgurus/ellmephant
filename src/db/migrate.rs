@@ -185,6 +185,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0035_channel_event_actions.sql"),
         "`channel_event` accepts every action the code writes, via a rebuild — a migration is immutable once it can merge (#168 review)",
     ),
+    (
+        36,
+        include_str!("../../migrations/0036_claim_release_log.sql"),
+        "claim release log: who ended a lease they did not hold, and why",
+    ),
 ];
 
 /// Current schema version recorded in the file.

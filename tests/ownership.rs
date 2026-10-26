@@ -472,7 +472,7 @@ fn subtree() -> (tempfile::TempDir, rusqlite::Connection) {
 
 fn rewrite(
     conn: &rusqlite::Connection,
-    embedder: &HashEmbedder,
+    _embedder: &HashEmbedder,
     key: &str,
     author: &str,
 ) -> String {
@@ -1813,7 +1813,7 @@ fn a_write_credited_to_a_finger_needs_a_live_lend_and_records_the_hand_as_the_wr
     //  2. `edited_by` names the pen that WROTE it, not the pen that got the credit — and vice versa for
     //     `asserted_by`. Two fields, two questions, no laundering in the audit trail.
     let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
+    let _embedder = HashEmbedder::new(DIM);
     store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
     store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
 
@@ -2201,8 +2201,9 @@ fn whois_is_invariant_under_the_case_of_the_name() {
 }
 
 #[test]
-fn kin_is_invariant_under_the_case_of_the_VIEWER_too() {
+fn kin_is_invariant_under_the_case_of_the_viewer_too() {
     // ★ ADVERSARIAL REVIEW OF #191: the first test varied the name ASKED ABOUT. The other half of the
+    // ("viewer" is lower case because a test name is an identifier; the capitalised word is the point)
     // same fold is the viewer — a pen that spells itself differently in two calls must get one answer.
     let (_dir, conn) = subtree();
     let base = store::whois(&conn, "cline", "james").expect("the pen exists");
@@ -2282,7 +2283,7 @@ fn private_names_the_pen_that_acts_not_the_pen_it_credits() {
     // CREDITED pen — so a hand writing as its finger made the row private to the FINGER. That is the
     // same asymmetry as the guards: the proven pen decides who the boundary belongs to.
     let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
+    let _embedder = HashEmbedder::new(DIM);
     store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
     store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
     store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");

@@ -168,7 +168,7 @@ pub(crate) fn write_links(conn: &Connection, id: i64, key: &str, body: &str) -> 
 /// No project opinion lives here at all: membership is a TAG on the memory (`prj:<key>`), so it is
 /// just another entry in `mem.tags` and this function never has to know about projects.
 pub fn add(conn: &Connection, mem: &Memory) -> Result<(i64, String)> {
-    let (id, key, _, _) = add_impl(conn, mem, None, None)?;
+    let (id, key, _, _) = add_impl(conn, mem, None, None, mem.asserted_by.as_deref())?;
     Ok((id, key))
 }
 
@@ -248,6 +248,34 @@ fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<
 /// is ATTRIBUTABLE even when it was authorised, which is the property to preserve if this ever
 /// changes. A row with no owner
 /// is the commons, and the commons belongs to nobody — so every pen may write it (#109).
+/// Does `caller` ANSWER for the row at `key` — is it the owner, the pen that owns on the owner's
+/// behalf (a finger's parent), or an ancestor of the owner?
+///
+/// ★ THE ONE QUESTION BOTH GATES NEED (soma/ellmephant#189). `may_write` asks "may this pen write
+/// it?"; `guard_audience` asks "may this pen re-classify it?". Visibility is a third question and
+/// answers neither: the pen that wrote a row can be locked out of reading it, and it is still the pen
+/// that answers for it.
+fn answers_for(conn: &Connection, key: &str, caller: Option<&str>) -> Result<bool> {
+    let Some(caller) = caller else { return Ok(false) };
+    let owner: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT owner FROM memory WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(Some(owner_id)) = owner else {
+        return Ok(false); // no row, or the commons: nobody answers for it
+    };
+    let Some(caller_exact) = exact_pen_id(conn, caller)? else {
+        return Ok(false);
+    };
+    if caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id) {
+        return Ok(true);
+    }
+    is_ancestor(conn, caller_exact, owner_id)
+}
+
 pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> Result<()> {
     let row: Option<(Option<i64>, String)> = conn
         .query_row(
@@ -259,42 +287,72 @@ pub(crate) fn may_write(conn: &Connection, key: &str, caller: Option<&str>) -> R
     let Some((owner, audience)) = row else {
         return Ok(()); // nothing there: a create, and creates are not gated here
     };
-    // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24). Reads keep the absence rule —
-    // a read must never confirm a row it may not see — but a WRITE that answers *"no such memory"* for
-    // a memory that plainly exists sends an agent hunting a bug that is not there. The cost is that a
-    // prober learns the key exists; inside one estate, with cooperating pens, clarity is worth more
-    // than that.
-    let visible = match caller {
-        Some(caller) => may_read_audience(conn, caller, &audience)?,
-        None => true,
-    };
-    if !visible {
-        return Err(Error::Forbidden(format!(
-            "{caller} may not write {key}: it exists and is not yours, and you are not an ancestor of its owner",
-            caller = caller.unwrap_or("nobody")
-        )));
-    }
-    let Some(owner_id) = owner else { return Ok(()) };
     let Some(caller) = caller else {
-        return Err(Error::Invalid(format!(
-            "{key} has an owner; a write must name the pen doing it"
-        )));
+        // The commons (owner NULL) belongs to nobody and is writable by anyone, as it always was; a
+        // row that HAS an owner needs a name before the question can even be asked.
+        return if owner.is_none() {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!(
+                "{key} has an owner; a write must name the pen doing it"
+            )))
+        };
+    };
+    // ★ THE COMMONS IS DECIDED BY VISIBILITY ALONE, AND NEVER NEEDS A PEN ROW. An unattributed row
+    // (`anonymous` author, owner NULL) is the one place where a name that resolves to nothing must not
+    // turn a normal write into an error — the content is nobody's, so there is no authority to check.
+    let Some(owner_id) = owner else {
+        return if may_read_audience(conn, caller, &audience)? {
+            Ok(())
+        } else {
+            Err(Error::Forbidden(format!(
+                "{caller} may not write {key}: its audience does not include you"
+            )))
+        };
     };
     let caller_exact = exact_pen_id(conn, caller)?
         .ok_or_else(|| Error::Invalid(format!("no pen named {caller}")))?;
-    if caller_exact == owner_id || owner_pen_id(conn, Some(caller))? == Some(owner_id) {
-        return Ok(());
-    }
-    if is_ancestor(conn, caller_exact, owner_id)? {
-        return Ok(());
-    }
-    // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the root is
-    // reaching rows the tree does not put under you. `asserted_by` still names the hand that typed it,
-    // so a borrowed write is attributable; the session row says whose authority it spent.
-    for held in held_authority(conn, caller)? {
-        if held == owner_id || is_ancestor(conn, held, owner_id)? {
-            return Ok(());
+
+    // ★ AUTHORITY IS OWNERSHIP, NOT VISIBILITY (soma/ellmephant#189, #190 — 2026-10-26). These used to
+    // be one question: an unreadable row was unwritable, *even for the pen that owned it*, which made a
+    // row whose audience omits its own author recoverable only by deleting it. Visibility still decides
+    // READS (absence, never refusal); it no longer decides writes for the pens that ANSWER for the row.
+    let authorised = if caller_exact == owner_id
+        || owner_pen_id(conn, Some(caller))? == Some(owner_id)
+        || is_ancestor(conn, caller_exact, owner_id)?
+    {
+        true
+    } else {
+        // ★ A HELD SESSION WRITES AS ITS POWERFUL PEN (2026-10-24): the whole point of borrowing the
+        // root is reaching rows the tree does not put under you. `asserted_by` still names the hand
+        // that typed it, so a borrowed write is attributable; the session row says whose authority it
+        // spent.
+        let mut via_session = false;
+        for held in held_authority(conn, caller)? {
+            if held == owner_id || is_ancestor(conn, held, owner_id)? {
+                via_session = true;
+                break;
+            }
         }
+        via_session
+    };
+    if authorised {
+        return Ok(());
+    }
+
+    // ★ A WRITE REFUSAL SAYS FORBIDDEN, NOT ABSENT (James, 2026-10-24): a read must never confirm a row
+    // it may not see, but a WRITE that answers *"no such memory"* for a memory that plainly exists
+    // sends an agent hunting a bug that is not there. The cost is that a prober learns the key exists;
+    // inside one estate, with cooperating pens, clarity is worth more than that.
+    //
+    // ★ AND IT SAYS **WHICH** REASON (soma/ellmephant#189). One sentence for three causes is how a
+    // correct refusal became a wrong diagnosis: this used to tell the row's own author that the row
+    // "is not yours, and you are not an ancestor of its owner", which is false twice.
+    let visible = may_read_audience(conn, caller, &audience)?;
+    if !visible {
+        return Err(Error::Forbidden(format!(
+            "{caller} may not write {key}: it exists, its audience does not include you, and you do not own it"
+        )));
     }
     let owner_name: String = conn.query_row(
         "SELECT name FROM pen WHERE id = ?1",
@@ -311,6 +369,7 @@ fn add_impl(
     mem: &Memory,
     note: Option<&str>,
     expected: Option<i64>,
+    actor: Option<&str>,
 ) -> Result<(i64, String, bool, Option<i64>)> {
     check_body(&mem.body)?;
     let prepared = prepare(conn, mem, note)?;
@@ -332,7 +391,19 @@ fn add_impl(
     }
     // ★ THE WRITE PATH CONSULTS OWNERSHIP (soma/ellmephant#109). Until now `owner` existed and
     // nothing asked it anything, so "descendants may write" was a sentence rather than a rule.
-    may_write(&tx, &prepared.key, mem.asserted_by.as_deref())?;
+    //
+    // ★ AND IT ASKS ABOUT THE **ACTOR**, NOT THE AUTHOR (soma/ellmephant#190, 2026-10-26). Authorship
+    // is WRITE-ONCE (#107) on purpose — a patch carries the stored author through untouched so
+    // re-filing a row cannot launder its provenance — but that made `mem.asserted_by` the *previous*
+    // author on every update, so `may_write` was asking "may the row's own author write it?", which is
+    // always yes. Measured consequence: a pen that could not even READ a row could overwrite it by
+    // naming its key. The authority question and the provenance answer are two different questions and
+    // must never be the same field. `actor` is who is writing; `mem.asserted_by` is who wrote it first.
+    may_write(
+        &tx,
+        &prepared.key,
+        actor.or(mem.asserted_by.as_deref()),
+    )?;
     let id = apply(&tx, mem, &prepared)?;
     tx.commit()?;
     Ok((id, prepared.key, queued, None))
@@ -493,7 +564,7 @@ fn guard_protected_delete(conn: &Connection, key: &str) -> Result<()> {
 /// The audience is not a preference — it is a boundary, and boundaries are not editable by the party
 /// they exclude. A row private to `pen:stet` may only be re-classified by `stet`, or by the owner's
 /// explicit forensic path (which is a different act, recorded).
-fn guard_audience(existing: Option<&Memory>, patch: &Patch) -> Result<()> {
+fn guard_audience(conn: &Connection, existing: Option<&Memory>, patch: &Patch) -> Result<()> {
     let Some(old) = existing else {
         return Ok(());
     };
@@ -505,6 +576,14 @@ fn guard_audience(existing: Option<&Memory>, patch: &Patch) -> Result<()> {
     // it, letting any pen re-classify a row it cannot read. The boundary is the boundary whichever
     // door the change arrives at.
     if patch.private.is_none() && patch.audience.is_none() {
+        return Ok(());
+    }
+    // ★ BUT THE PENS THAT ANSWER FOR THE ROW ARE NOT STRANGERS (soma/ellmephant#189, 2026-10-26).
+    // Without this, a row whose audience omits its own author had NO exit: the author could not read
+    // it, could not write it, could not re-classify it, and could only watch an ancestor delete it.
+    // The guard exists to stop a pen that cannot read a row from publishing it — an owner or an
+    // ancestor already has that power through deletion, so refusing them the gentler act is theatre.
+    if answers_for(conn, &old.key, patch.asserted_by.as_deref())? {
         return Ok(());
     }
     // The pen a row is ADDRESSED to may re-classify it — that pen owns the boundary.
@@ -556,7 +635,7 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     guard_protected(conn, &key, &was_tags, patch)?;
     // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
     // could not read. Without this, `private` would be a lock whose key hangs beside the door.
-    guard_audience(existing.as_ref(), patch)?;
+    guard_audience(conn, existing.as_ref(), patch)?;
 
     let (mem, created) = match existing {
         Some(old) => {
@@ -644,6 +723,10 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         &mem,
         patch.version_note.as_deref(),
         patch.expected_version,
+        // ★ WHO IS WRITING, which is not who the row is attributed to: on an update `mem.asserted_by`
+        // is the stored author (write-once, #107), so passing it here would authorise every update as
+        // the row's own author (#190). `patch.asserted_by` is the proven pen from the connection.
+        patch.asserted_by.as_deref(),
     )?;
     Ok(MergeOutcome {
         key,

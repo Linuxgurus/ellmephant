@@ -1625,3 +1625,115 @@ fn assignment_follows_the_tree_and_needs_force_to_take_it_back() {
     let err = store::assign(&conn, "given", "a", "peer", false).unwrap_err();
     assert!(err.to_string().contains("own subtree"), "{err}");
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// ★ AUTHORITY IS OWNERSHIP, NOT VISIBILITY (soma/ellmephant#189, #190 — 2026-10-26).
+//
+// `asserted_by` is WRITE-ONCE by design (#107): a patch carries the stored author through and names
+// itself in `edited_by`. That is correct provenance. It was also, until this test existed, the value
+// the write gate asked about — so every update was authorised as the row's own author, which is always
+// yes. A pen could overwrite a row it could not read, by naming its key.
+//
+// These tests assert the two halves that have to be true at once:
+//   * the ACTOR decides the write (not the author, not a stranger, not a sibling);
+//   * the pens that ANSWER for a row (owner, ancestor) may repair it even when its audience excludes
+//     them — otherwise a row whose audience omits its author is recoverable only by deletion.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+fn row_with_audience(
+    conn: &rusqlite::Connection,
+    embedder: &HashEmbedder,
+    key: &str,
+    author: &str,
+    audience: &str,
+) {
+    let mem = Memory {
+        key: key.to_string(),
+        title: format!("written by {author}"),
+        body: "the facts".to_string(),
+        asserted_by: Some(author.to_string()),
+        audience: audience.to_string(),
+        ..Default::default()
+    };
+    common::add_now(conn, embedder, &mem).expect("write the row");
+}
+
+/// A patch written as `actor`, changing only the body (and optionally the audience).
+/// Returns the refusal as a string, or `""` when it was allowed.
+fn merge_as(
+    conn: &rusqlite::Connection,
+    key: &str,
+    actor: &str,
+    audience: Option<&str>,
+) -> String {
+    let patch = store::Patch {
+        key: Some(key.to_string()),
+        body: Some(format!("changed by {actor}")),
+        asserted_by: Some(actor.to_string()),
+        audience: audience.map(|a| a.to_string()),
+        ..Default::default()
+    };
+    match store::merge(conn, &patch) {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+#[test]
+fn a_pen_may_not_overwrite_a_row_it_cannot_read() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    // The exact reproduction from #190: James's row, readable only by James.
+    row_with_audience(&conn, &embedder, "james-only", "james", "pen:james");
+
+    let err = merge_as(&conn, "james-only", "cline", None);
+    assert!(
+        err.contains("may not write"),
+        "a row you cannot read is not a row you may write: {err}"
+    );
+    let mem = store::get(&conn, "james-only").unwrap().unwrap();
+    assert_eq!(
+        mem.body, "the facts",
+        "the refused write changed nothing — this was the whole finding"
+    );
+    assert_eq!(mem.asserted_by.as_deref(), Some("james"));
+}
+
+#[test]
+fn an_owner_may_repair_its_own_row_whose_audience_excludes_it() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    // The trap from #189: the author addressed its own row to someone else and not itself.
+    // (The author's inability to READ it is a session/Reader property, tested elsewhere; here the
+    // question is whether the write gate lets the owner repair what the owner cannot see.)
+    row_with_audience(&conn, &embedder, "trap", "cline", "pen:james");
+
+    // The repair must be possible from the author's side, or the only exit is destruction.
+    let err = merge_as(&conn, "trap", "cline", Some("pen:james,pen:cline"));
+    assert!(err.is_empty(), "the owner may narrow its own exposure: {err}");
+
+    let mem = store::get(&conn, "trap").unwrap().expect("readable again");
+    assert_eq!(
+        mem.asserted_by.as_deref(),
+        Some("cline"),
+        "authorship is write-once and the repair is still cline's"
+    );
+    assert_eq!(mem.body, "changed by cline");
+}
+
+#[test]
+fn an_ancestor_may_repair_a_descendants_trapped_row() {
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "stets-trap", "stet", "pen:james");
+
+    let err = merge_as(&conn, "stets-trap", "james", Some("pen:james,pen:stet"));
+    assert!(err.is_empty(), "answering for the row means being able to fix it: {err}");
+
+    // And a sibling still may not.
+    let err = merge_as(&conn, "stets-trap", "cline", None);
+    assert!(
+        err.contains("may not write"),
+        "a sibling is not an owner and not an ancestor: {err}"
+    );
+}

@@ -18,7 +18,7 @@ use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, claim, encode, links, mail, maintain, project};
+use crate::store::{self, Memory, channel, claim, encode, links, mail, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -756,9 +756,14 @@ impl Session {
         claim::acquire(&self.conn, name, owner, ttl_seconds)
     }
 
-    /// Release a lease, but only your own. A non-owner is refused and told who holds it.
-    pub fn claim_release(&self, name: &str, owner: &str) -> Result<claim::Release> {
-        claim::release(&self.conn, name, owner)
+    /// Release a lease as the proven pen: your own, or a descendant's with a reason.
+    pub fn claim_release(
+        &self,
+        name: &str,
+        actor: &str,
+        reason: Option<&str>,
+    ) -> Result<claim::Release> {
+        claim::release_by(&self.conn, name, actor, reason)
     }
 
     /// The claims a reader can see: one by `name`, or every claim (expired rows included) when `name`
@@ -768,6 +773,137 @@ impl Session {
             Some(n) => Ok(claim::get(&self.conn, n)?.into_iter().collect()),
             None => claim::list(&self.conn),
         }
+    }
+
+    // ---- ellmechat (#151): the door over the ledger. Thin on purpose: every rule lives in
+    // `store::channel`, so the MCP door, the CLI and a future HTTP surface cannot disagree.
+
+    /// Every channel and its policy (`members`, `gate`, `grace_secs`, `clock`, …).
+    pub fn channels(&self) -> Result<Vec<channel::Channel>> {
+        channel::channels(&self.conn)
+    }
+
+    /// What `pen` has been told and not yet listened to, per channel. Moves no receipt.
+    pub fn channel_unread(&self, pen: &str) -> Result<Vec<channel::Unread>> {
+        channel::unread(&self.conn, pen)
+    }
+
+    /// Join a channel. `#ops_team` also joins `#emergency`, in the same transaction, by rule.
+    pub fn channel_join(&self, pen: &str, channel: &str) -> Result<()> {
+        channel::join(&self.conn, pen, channel)
+    }
+
+    /// Leave a channel. Leaving `#emergency` while on the team is refused, with the way out named.
+    pub fn channel_leave(&self, pen: &str, channel: &str) -> Result<()> {
+        channel::leave(&self.conn, pen, channel)
+    }
+
+    /// Say one thing in one channel. The fan-out writes a delivery row for every member.
+    pub fn channel_send(
+        &self,
+        pen: &str,
+        channel: &str,
+        body: &str,
+        reply_to: Option<i64>,
+    ) -> Result<channel::Message> {
+        channel::send(&self.conn, pen, channel, body, reply_to)
+    }
+
+    /// Mark that a turn boundary OFFERED this pen its inbox. One call is one miss while unread.
+    /// Called by whatever owns the turn (the spine, the harness), never by the model.
+    pub fn channel_present(&self, pen: &str) -> Result<usize> {
+        channel::present(&self.conn, pen)
+    }
+
+    /// LISTEN: take the unread messages and mark them fetched. This is what clears a gate.
+    pub fn channel_fetch(
+        &self,
+        pen: &str,
+        channel: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<channel::Message>> {
+        channel::fetch(&self.conn, pen, channel, limit)
+    }
+
+    /// Create a channel. A LOCKED channel needs `estate` or `james` — the store enforces it.
+    pub fn channel_create(
+        &self,
+        pen: &str,
+        key: &str,
+        title: &str,
+        members: &str,
+        gate: &str,
+    ) -> Result<channel::Channel> {
+        channel::create(&self.conn, pen, key, title, members, gate)
+    }
+
+    /// Change a channel's gate. Writes the `channel_event` row in the same transaction.
+    pub fn channel_set_gate(
+        &self,
+        pen: &str,
+        channel: &str,
+        gate: &str,
+    ) -> Result<channel::Channel> {
+        channel::set_gate(&self.conn, pen, channel, gate)
+    }
+
+    /// Set a channel's retention. Keeper-only; recorded as a `channel_event`.
+    pub fn channel_set_retention(
+        &self,
+        pen: &str,
+        channel: &str,
+        keep_secs: i64,
+    ) -> Result<channel::Channel> {
+        channel::set_retention(&self.conn, pen, channel, keep_secs)
+    }
+
+    /// Expire the TEXT of messages past their channel's retention. Receipts stay.
+    pub fn channel_prune(&self, only: Option<&str>) -> Result<Vec<channel::Pruned>> {
+        channel::prune(&self.conn, only, None)
+    }
+
+    /// The recorded changes to a channel: who made this dangerous, and when.
+    pub fn channel_events(&self, channel: &str) -> Result<Vec<channel::Event>> {
+        channel::events(&self.conn, channel)
+    }
+
+    /// WHO is in a channel: effective membership, not the override rows.
+    pub fn channel_members(&self, channel: &str) -> Result<Vec<channel::Member>> {
+        channel::members(&self.conn, channel)
+    }
+
+    /// What this pen was TOLD after `after_seq`. Moves no receipt: a wait is not a fetch.
+    pub fn channel_since(
+        &self,
+        pen: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<channel::Message>> {
+        channel::since(&self.conn, pen, after_seq, limit)
+    }
+
+    /// Read the LOG. Does not touch receipts: reading history is not listening to a message.
+    pub fn channel_history(
+        &self,
+        channel: &str,
+        since: i64,
+        limit: i64,
+    ) -> Result<Vec<channel::Message>> {
+        channel::history(&self.conn, channel, since, limit)
+    }
+
+    /// REFUSE a gated class of action for this pen, or allow it (#151).
+    ///
+    /// Fail open by design: a ledger the store cannot read does not gate, because a pen cannot tell
+    /// "you are late" from "the store is broken", and punishing the second as the first is how a
+    /// chat bug freezes the record.
+    pub fn channel_gate(&self, pen: &str, class: channel::Class) -> Result<()> {
+        channel::gate(&self.conn, pen, class)
+    }
+
+    /// What, if anything, is stopping this pen from changing the record.
+    pub fn channel_breach(&self, pen: &str) -> Result<Option<channel::Breach>> {
+        channel::breach(&self.conn, pen)
     }
 
     /// Write one letter into `recipient`'s box. Nothing is delivered: this is the whole event.

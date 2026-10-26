@@ -80,6 +80,8 @@ pub struct Channel {
     /// `open` (every live self unless opted out) or `list` (explicit members only).
     pub members: String,
     pub gate: String,
+    /// Seconds of text this channel keeps; `0` = forever. See [`prune`].
+    pub keep_secs: i64,
     pub grace_secs: i64,
     pub clock: String,
     pub misses_to_gate: i64,
@@ -133,7 +135,7 @@ fn pen_id(conn: &Connection, name: &str) -> Result<i64> {
 
 fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
     conn.query_row(
-        "SELECT key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+        "SELECT key, title, members, gate, keep_secs, grace_secs, clock, misses_to_gate, lock_max_secs
            FROM channel WHERE lower(key) = lower(?1)",
         params![key],
         |r| {
@@ -142,10 +144,11 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
                 title: r.get(1)?,
                 members: r.get(2)?,
                 gate: r.get(3)?,
-                grace_secs: r.get(4)?,
-                clock: r.get(5)?,
-                misses_to_gate: r.get(6)?,
-                lock_max_secs: r.get(7)?,
+                keep_secs: r.get(4)?,
+                grace_secs: r.get(5)?,
+                clock: r.get(6)?,
+                misses_to_gate: r.get(7)?,
+                lock_max_secs: r.get(8)?,
             })
         },
     )
@@ -156,7 +159,7 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
 /// Every channel, in creation order.
 pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
     let mut stmt = conn.prepare(
-        "SELECT key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+        "SELECT key, title, members, gate, keep_secs, grace_secs, clock, misses_to_gate, lock_max_secs
            FROM channel ORDER BY rowid",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -165,10 +168,11 @@ pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
             title: r.get(1)?,
             members: r.get(2)?,
             gate: r.get(3)?,
-            grace_secs: r.get(4)?,
-            clock: r.get(5)?,
-            misses_to_gate: r.get(6)?,
-            lock_max_secs: r.get(7)?,
+            keep_secs: r.get(4)?,
+            grace_secs: r.get(5)?,
+            clock: r.get(6)?,
+            misses_to_gate: r.get(7)?,
+            lock_max_secs: r.get(8)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -412,6 +416,379 @@ pub fn fetch(
         tx.commit()?;
     }
     Ok(messages)
+}
+
+/// What this pen has been TOLD and has not yet LISTENED to, per channel.
+///
+/// Read-only in the strictest sense: it moves no receipt. `fetch` is the only thing that marks a
+/// message fetched, because fetching is listening and a count is not.
+#[derive(Debug, Clone, Serialize)]
+pub struct Unread {
+    pub channel: String,
+    pub count: i64,
+    pub oldest_seq: i64,
+    pub latest_seq: i64,
+}
+
+pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
+    let id = pen_id(conn, pen)?;
+    let mut stmt = conn.prepare(
+        "SELECT m.channel, COUNT(*), MIN(m.seq), MAX(m.seq)
+           FROM channel_delivery d
+           JOIN channel_message m ON m.seq = d.seq
+          WHERE d.pen_id = ?1 AND d.fetched_at IS NULL
+          GROUP BY m.channel
+          ORDER BY m.channel",
+    )?;
+    let rows = stmt
+        .query_map(params![id], |r| {
+            Ok(Unread {
+                channel: r.get(0)?,
+                count: r.get(1)?,
+                oldest_seq: r.get(2)?,
+                latest_seq: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// What a prune did: bodies emptied, receipts untouched.
+#[derive(Debug, Clone, Serialize)]
+pub struct Pruned {
+    pub channel: String,
+    pub emptied: usize,
+}
+
+/// Expire the TEXT of messages past their channel's `keep_secs`, and touch nothing else.
+///
+/// ★ A PRUNE IS NOT AN ERASURE OF WHAT HAPPENED. `body` is emptied and `pruned_at` is set; the
+/// message row, its `seq`, and every delivery row survive, so "you were told seq N" is still true
+/// afterwards. Deleting the rows would erase the receipt along with the conversation, which is the
+/// one thing the ledger exists to keep.
+///
+/// `keep_secs = 0` means forever, and a channel left at 0 is never touched.
+pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result<Vec<Pruned>> {
+    let now = now.map(str::to_string).unwrap_or_else(|| {
+        conn.query_row("SELECT datetime('now')", [], |r| r.get::<_, String>(0))
+            .unwrap_or_default()
+    });
+    let mut stmt = conn.prepare(
+        "SELECT key, keep_secs FROM channel
+          WHERE keep_secs > 0 AND (?1 IS NULL OR key = ?1)
+          ORDER BY key",
+    )?;
+    let channels = stmt
+        .query_map(params![only], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out = Vec::new();
+    for (key, keep) in channels {
+        let emptied = conn.execute(
+            "UPDATE channel_message
+                SET body = '', pruned_at = ?2
+              WHERE channel = ?1
+                AND pruned_at IS NULL
+                AND created <= datetime(?2, ?3)",
+            params![key, now, format!("-{keep} seconds")],
+        )?;
+        out.push(Pruned {
+            channel: key,
+            emptied,
+        });
+    }
+    Ok(out)
+}
+
+/// Set a channel's retention. Keeper-only, and recorded — retention is a policy, not a preference.
+pub fn set_retention(
+    conn: &Connection,
+    pen: &str,
+    channel: &str,
+    keep_secs: i64,
+) -> Result<Channel> {
+    if keep_secs < 0 {
+        return Err(Error::Invalid("keep_secs cannot be negative".into()));
+    }
+    if !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: setting RETENTION needs `estate` or `james`; the proven caller is `{pen}`. \
+             How long a channel keeps its text is a decision, not a preference."
+        )));
+    }
+    let row = channel_row(conn, channel)?;
+    if row.keep_secs == keep_secs {
+        return Ok(row);
+    }
+    let pen_id = pen_id(conn, pen)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE channel SET keep_secs = ?2 WHERE key = ?1",
+        params![row.key, keep_secs],
+    )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'retention', ?3, ?4)",
+        params![row.key, pen_id, row.keep_secs.to_string(), keep_secs.to_string()],
+    )?;
+    tx.commit()?;
+    channel_row(conn, &row.key)
+}
+
+/// One recorded change to a channel: who, when, what it was, what it is now.
+#[derive(Debug, Clone, Serialize)]
+pub struct Event {
+    pub at: String,
+    pub pen: Option<String>,
+    pub action: String,
+    pub was: Option<String>,
+    pub now: Option<String>,
+}
+
+/// The pens allowed to create or re-gate a LOCKED channel.
+///
+/// `estate` is in the list because the spec names it, but it cannot authenticate — it has no entity
+/// behind it and only ever acts as somebody's borrow — so in practice this is James, or a pen James
+/// has lent. The check is on the PROVEN caller, never on a name passed in.
+const GATE_KEEPERS: [&str; 2] = ["estate", "james"];
+
+fn keeper(pen: &str) -> bool {
+    GATE_KEEPERS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(pen.trim()))
+}
+
+fn valid_key(key: &str) -> Result<String> {
+    let key = key.trim().to_ascii_lowercase();
+    let ok = !key.is_empty()
+        && key.len() <= 48
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !ok {
+        return Err(Error::Invalid(format!(
+            "{key:?} is not a channel key: lowercase letters, digits, `_` and `-`, starting with a letter or digit"
+        )));
+    }
+    Ok(key)
+}
+
+/// Create a channel.
+///
+/// ★ A LOCKED CHANNEL NEEDS A GATE KEEPER: `gate` other than `none` is refused unless the caller is
+/// `estate` or `james`. A gate is the one thing here that can stop a pen writing to the record, so
+/// creating one is a decision that gets a name attached. A channel with `gate = none` may be made by
+/// any proven pen — conversation costs nobody anything.
+pub fn create(
+    conn: &Connection,
+    pen: &str,
+    key: &str,
+    title: &str,
+    members: &str,
+    gate: &str,
+) -> Result<Channel> {
+    let key = valid_key(key)?;
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(Error::Invalid("a channel needs a title".into()));
+    }
+    let members = members.trim().to_ascii_lowercase();
+    if members != "open" && members != "list" {
+        return Err(Error::Invalid(format!(
+            "members must be `open` or `list`, not {members:?}"
+        )));
+    }
+    let gate = gate.trim().to_ascii_lowercase();
+    if !matches!(gate.as_str(), "none" | "writes" | "all") {
+        return Err(Error::Invalid(format!(
+            "gate must be `none`, `writes` or `all`, not {gate:?}"
+        )));
+    }
+    if gate != "none" && !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: creating a LOCKED channel (gate `{gate}`) needs `estate` or `james`; \
+             the proven caller is `{pen}`. A channel that can stop a pen writing to the record \
+             is not something any pen may make on its own."
+        )));
+    }
+    if channel_row(conn, &key).is_ok() {
+        return Err(Error::Invalid(format!(
+            "#{key} already exists; a channel is created once"
+        )));
+    }
+    let pen_id = pen_id(conn, pen)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO channel (key, title, members, gate) VALUES (?1, ?2, ?3, ?4)",
+        params![key, title, members, gate],
+    )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'create', NULL, ?3)",
+        params![key, pen_id, format!("{members}/{gate}")],
+    )?;
+    tx.commit()?;
+    channel_row(conn, &key)
+}
+
+/// Change a channel's gate, and RECORD it — who, from what, to what (#161).
+pub fn set_gate(conn: &Connection, pen: &str, channel: &str, gate: &str) -> Result<Channel> {
+    let gate = gate.trim().to_ascii_lowercase();
+    if !matches!(gate.as_str(), "none" | "writes" | "all") {
+        return Err(Error::Invalid(format!(
+            "gate must be `none`, `writes` or `all`, not {gate:?}"
+        )));
+    }
+    if !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: changing a gate needs `estate` or `james`; the proven caller is `{pen}`"
+        )));
+    }
+    let row = channel_row(conn, channel)?;
+    if row.gate == gate {
+        return Ok(row);
+    }
+    let pen_id = pen_id(conn, pen)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE channel SET gate = ?2 WHERE key = ?1",
+        params![row.key, gate],
+    )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'gate', ?3, ?4)",
+        params![row.key, pen_id, row.gate, gate],
+    )?;
+    tx.commit()?;
+    channel_row(conn, &row.key)
+}
+
+/// The recorded changes to one channel, newest last. The answer to "who made this dangerous?".
+pub fn events(conn: &Connection, channel: &str) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.at, p.name, e.action, e.was, e.now
+           FROM channel_event e LEFT JOIN pen p ON p.id = e.pen_id
+          WHERE e.channel = ?1
+          ORDER BY e.id",
+    )?;
+    let rows = stmt
+        .query_map(params![channel], |r| {
+            Ok(Event {
+                at: r.get(0)?,
+                pen: r.get(1)?,
+                action: r.get(2)?,
+                was: r.get(3)?,
+                now: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// WHO is in a channel, as EFFECTIVE membership rather than as a list of override rows.
+///
+/// `open` channels are opt-out: every live self is a member unless it has an `out` row. `list`
+/// channels are opt-in: only `in` rows are members. Fingers are never members — a finger is a
+/// mechanism, not a party — and `estate` is not either: it has no entity behind it and can never
+/// authenticate to read.
+#[derive(Debug, Clone, Serialize)]
+pub struct Member {
+    pub pen: String,
+    /// `in` for every effective member. A member by `open` and a member by invitation look the same
+    /// in the answer, because the question is "who is here", not "why".
+    pub state: String,
+    /// Set when this pen has an EXPLICIT row (an invitation or an opt-out): the audit trail.
+    pub explicit: bool,
+    pub since: Option<String>,
+}
+
+pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
+    let row = channel_row(conn, channel)?;
+    let mut out = Vec::new();
+    if row.members == "list" {
+        let mut stmt = conn.prepare(
+            "SELECT p.name, m.at
+               FROM channel_member m JOIN pen p ON p.id = m.pen_id
+              WHERE m.channel = ?1 AND m.state = 'in' AND p.ceased_at IS NULL
+              ORDER BY p.name",
+        )?;
+        let rows = stmt
+            .query_map(params![row.key], |r| {
+                Ok(Member {
+                    pen: r.get(0)?,
+                    state: "in".to_string(),
+                    explicit: true,
+                    since: Some(r.get(1)?),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(rows);
+    }
+
+    // open: every live self, minus those who left on purpose.
+    let mut stmt = conn.prepare(
+        "SELECT p.name,
+                (SELECT m.at FROM channel_member m
+                  WHERE m.channel = ?1 AND m.pen_id = p.id AND m.state = 'out'),
+                EXISTS (SELECT 1 FROM channel_member m2
+                         WHERE m2.channel = ?1 AND m2.pen_id = p.id AND m2.state = 'in')
+           FROM pen p
+          WHERE p.kind = 'self' AND p.ceased_at IS NULL AND p.name <> 'estate'
+          ORDER BY p.name",
+    )?;
+    let rows = stmt.query_map(params![row.key], |r| {
+        let out_at: Option<String> = r.get(1)?;
+        let invited: bool = r.get(2)?;
+        Ok((r.get::<_, String>(0)?, out_at, invited))
+    })?;
+    for row in rows {
+        let (pen, out_at, invited) = row?;
+        if out_at.is_some() && !invited {
+            continue; // left on purpose
+        }
+        out.push(Member {
+            pen,
+            state: "in".to_string(),
+            explicit: out_at.is_some() || invited,
+            since: None,
+        });
+    }
+    Ok(out)
+}
+
+/// What this pen was TOLD after `after_seq`, oldest first. Moves no receipt.
+///
+/// This is the delivery primitive a body waits on: a long poll reads from here, so "wait for
+/// something to arrive" never has to become "fetch and mark everything read".
+pub fn since(conn: &Connection, pen: &str, after_seq: i64, limit: i64) -> Result<Vec<Message>> {
+    let id = pen_id(conn, pen)?;
+    let limit = limit.clamp(1, 500);
+    let mut stmt = conn.prepare(
+        "SELECT m.seq, m.channel, p.name, m.body, m.reply_to, m.pruned_at, m.created
+           FROM channel_delivery d
+           JOIN channel_message m ON m.seq = d.seq
+           JOIN pen p ON p.id = m.pen_id
+          WHERE d.pen_id = ?1 AND m.seq > ?2
+          ORDER BY m.seq
+          LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![id, after_seq, limit], |r| {
+            Ok(Message {
+                seq: r.get(0)?,
+                channel: r.get(1)?,
+                pen: r.get(2)?,
+                body: r.get(3)?,
+                reply_to: r.get(4)?,
+                pruned_at: r.get(5)?,
+                created: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// The log: what was said, regardless of whether this pen has listened. Does not touch receipts.

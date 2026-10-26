@@ -757,7 +757,7 @@ fn exact_pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
 
 /// Is `ancestor` anywhere above `of` in the tree? Walks the parent chain, bounded: a cycle is a bug,
 /// not a shape, and it must not hang a request.
-fn is_ancestor(conn: &Connection, ancestor: i64, of: i64) -> Result<bool> {
+pub(crate) fn is_ancestor(conn: &Connection, ancestor: i64, of: i64) -> Result<bool> {
     let mut cur = of;
     for _ in 0..64 {
         let parent: Option<i64> = conn

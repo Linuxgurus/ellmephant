@@ -375,3 +375,191 @@ fn the_gate_follows_the_pen_the_effect_lands_on() {
     channel::gate(&conn, "stet", Class::Record).expect("the sender is not behind");
     channel::gate(&conn, "cline", Class::Record).expect_err("cline is behind");
 }
+
+// ── THE DOOR'S COUNT ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn unread_counts_what_was_told_and_only_fetching_clears_it() {
+    let (_dir, conn) = store();
+    channel::send(&conn, "james", "general", "one", None).expect("send");
+    channel::send(&conn, "james", "general", "two", None).expect("send");
+
+    let before = channel::unread(&conn, "cline").expect("unread");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].channel, "general");
+    assert_eq!(before[0].count, 2);
+    assert_eq!(
+        before[0].oldest_seq + 1,
+        before[0].latest_seq,
+        "the range names the oldest and newest unread message"
+    );
+
+    channel::history(&conn, "general", 0, 50).expect("history");
+    let after_history = channel::unread(&conn, "cline").expect("unread");
+    assert_eq!(
+        after_history[0].count, 2,
+        "reading the log is not listening: only fetch moves a receipt"
+    );
+
+    channel::fetch(&conn, "cline", None, 50).expect("fetch");
+    assert!(
+        channel::unread(&conn, "cline").expect("unread").is_empty(),
+        "fetching is listening, so the count empties"
+    );
+
+    assert!(
+        !channel::unread(&conn, "james")
+            .expect("unread")
+            .iter()
+            .any(|u| u.channel == "general"),
+        "a pen is not behind on its own words"
+    );
+}
+
+#[test]
+fn since_returns_what_arrived_after_a_cursor_without_moving_a_receipt() {
+    let (_dir, conn) = store();
+    let one = channel::send(&conn, "james", "general", "one", None).expect("send");
+    let two = channel::send(&conn, "james", "general", "two", None).expect("send");
+
+    let after_one = channel::since(&conn, "cline", one.seq, 50).expect("since");
+    assert_eq!(after_one.len(), 1, "only what arrived after the cursor");
+    assert_eq!(after_one[0].seq, two.seq);
+
+    let none = channel::since(&conn, "cline", two.seq, 50).expect("since");
+    assert!(none.is_empty(), "nothing after the head");
+
+    // ★ a WAIT is not a LISTEN: the delivery rows are untouched, so the pen is still behind.
+    let still_unread = channel::unread(&conn, "cline").expect("unread");
+    assert_eq!(still_unread[0].count, 2);
+}
+
+#[test]
+fn the_roster_is_effective_membership_not_override_rows() {
+    let (_dir, conn) = store();
+    // `general` is open: every live self, minus whoever left on purpose.
+    let open = channel::members(&conn, "general").expect("members");
+    let names: Vec<&str> = open.iter().map(|m| m.pen.as_str()).collect();
+    assert!(
+        names.contains(&"stet") && names.contains(&"cline"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"estate"), "estate is never a member");
+    assert!(open.iter().all(|m| m.state == "in"));
+
+    channel::leave(&conn, "stet", "general").expect("leave");
+    let after = channel::members(&conn, "general").expect("members");
+    assert!(
+        !after.iter().any(|m| m.pen == "stet"),
+        "leaving an open channel removes the pen from its roster"
+    );
+
+    // `ops_team` is a list: only invitations, and joining it brings `emergency` with it.
+    let empty = channel::members(&conn, "ops_team").expect("members");
+    assert!(empty.is_empty(), "nobody is on the team until invited");
+    channel::join(&conn, "cline", "ops_team").expect("join");
+    let team = channel::members(&conn, "ops_team").expect("members");
+    assert_eq!(team.len(), 1);
+    assert!(team[0].explicit, "a list member is always explicit");
+    assert!(
+        channel::members(&conn, "emergency")
+            .expect("members")
+            .iter()
+            .any(|m| m.pen == "cline"),
+        "joining the team joins emergency: a team that runs the cluster must be reachable"
+    );
+}
+
+// ── ADMINISTRATION (#161) ────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_locked_channel_needs_a_keeper_and_the_change_is_a_row() {
+    let (_dir, conn) = store();
+
+    // An ordinary pen may make a room; it may not make a LOCK.
+    let made = channel::create(&conn, "stet", "builds", "Build notices", "open", "none")
+        .expect("an open channel costs nobody anything");
+    assert_eq!(made.gate, "none");
+
+    let refused = channel::create(&conn, "stet", "quiet", "Quiet", "list", "writes")
+        .expect_err("a lock needs a name on it");
+    let msg = refused.to_string();
+    assert!(msg.contains("estate") && msg.contains("james"), "{msg}");
+
+    // James may, and creating writes the first event.
+    channel::create(&conn, "james", "quiet", "Quiet", "list", "writes").expect("james may lock");
+    let events = channel::events(&conn, "quiet").expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, "create");
+    assert_eq!(events[0].pen.as_deref(), Some("james"));
+
+    // Changing the gate is a row too: who, from what, to what.
+    channel::set_gate(&conn, "james", "quiet", "all").expect("re-gate");
+    let events = channel::events(&conn, "quiet").expect("events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].action, "gate");
+    assert_eq!(events[1].was.as_deref(), Some("writes"));
+    assert_eq!(events[1].now.as_deref(), Some("all"));
+
+    // And a pen that is not a keeper cannot re-gate, with a refusal that says why.
+    let err = channel::set_gate(&conn, "stet", "quiet", "none").expect_err("no keeper, no gate");
+    assert!(err.to_string().contains("refused"), "{err}");
+
+    // A key is created once, and a bad key is refused before anything is written.
+    assert!(channel::create(&conn, "james", "quiet", "Again", "open", "none").is_err());
+    assert!(channel::create(&conn, "james", "Bad Key!", "x", "open", "none").is_err());
+}
+
+// ── RETENTION (#163) ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn pruning_expires_the_text_and_keeps_the_receipt() {
+    let (_dir, conn) = store();
+    let m = channel::send(&conn, "james", "general", "the cluster is on fire", None).expect("send");
+    // Give the message an age, and the channel a retention.
+    conn.execute(
+        "UPDATE channel_message SET created = datetime('now','-2 hours') WHERE seq = ?1",
+        [m.seq],
+    )
+    .expect("age");
+    channel::set_retention(&conn, "james", "general", 3600).expect("retention");
+
+    let pruned = channel::prune(&conn, None, None).expect("prune");
+    assert!(
+        pruned
+            .iter()
+            .any(|p| p.channel == "general" && p.emptied == 1),
+        "{pruned:?}"
+    );
+
+    let (body, pruned_at): (String, Option<String>) = conn
+        .query_row(
+            "SELECT body, pruned_at FROM channel_message WHERE seq = ?1",
+            [m.seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row survives");
+    assert!(body.is_empty(), "the TEXT is gone");
+    assert!(pruned_at.is_some(), "and it says so");
+
+    // ★ THE RECEIPT SURVIVES: the pen was told, and that is still answerable.
+    assert!(
+        channel::unread(&conn, "cline")
+            .expect("unread")
+            .iter()
+            .any(|u| u.channel == "general" && u.count == 1),
+        "pruning text must not erase the delivery"
+    );
+    assert_eq!(
+        channel::history(&conn, "general", 0, 50)
+            .expect("history")
+            .len(),
+        1,
+        "the log line stays; only its body is empty"
+    );
+
+    // A channel left at 0 is never touched, and retention is keeper-only.
+    let kept = channel::create(&conn, "james", "keepme", "Keep", "open", "none").expect("create");
+    assert_eq!(kept.keep_secs, 0);
+    assert!(channel::set_retention(&conn, "stet", "keepme", 60).is_err());
+}

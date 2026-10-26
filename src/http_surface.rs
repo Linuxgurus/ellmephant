@@ -232,6 +232,81 @@ pub const ROUTES: &[Route] = &[
         path: "/mail/surrogate",
         tool: "mail_surrogate_list",
     },
+    Route {
+        method: "GET",
+        path: "/channels",
+        tool: "channel_list",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/messages",
+        tool: "channel_send",
+    },
+    Route {
+        method: "GET",
+        path: "/channels/{channel}/messages",
+        tool: "channel_history",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/fetch",
+        tool: "channel_fetch",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/present",
+        tool: "channel_present",
+    },
+    Route {
+        method: "GET",
+        path: "/channels/breach",
+        tool: "channel_breach",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/join",
+        tool: "channel_join",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/leave",
+        tool: "channel_leave",
+    },
+    Route {
+        method: "GET",
+        path: "/channels/wait",
+        tool: "channel_wait",
+    },
+    Route {
+        method: "GET",
+        path: "/channels/{channel}/members",
+        tool: "channel_members",
+    },
+    Route {
+        method: "POST",
+        path: "/channels",
+        tool: "channel_create",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/gate",
+        tool: "channel_set_gate",
+    },
+    Route {
+        method: "GET",
+        path: "/channels/{channel}/events",
+        tool: "channel_events",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/retention",
+        tool: "channel_set_retention",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/prune",
+        tool: "channel_prune",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -1711,8 +1786,12 @@ pub async fn claim_release(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // ★ THE HTTP SURFACE HAS NO PEN, ONLY A STORE-WIDE TOKEN, so it cannot check ancestry. It keeps
+    // the owner check and says so: an ancestor release is an MCP act, where the caller is proven.
     match server
-        .with_store("claim_release", move |s| s.claim_release(&name, &owner))
+        .with_store("claim_release", move |s| {
+            s.claim_release(&name, &owner, None)
+        })
         .await
     {
         Ok(out) => {
@@ -1842,6 +1921,9 @@ pub async fn upsert(
     };
     match server
         .with_store("memory_upsert", move |s| {
+            if let Some(caller) = &proven {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
             // ★ A credit needs a LIVE LEND, exactly as on the MCP door: `as` is not a rename of the
             // writer, it is a claim that this pen may act for that one, and parentage alone is not
             // enough to make it true.
@@ -1934,6 +2016,10 @@ pub async fn memory_delete(
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
+            if let Some(caller) = &pen {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+
             if !s.rm(&lookup, pen.as_deref())? {
                 return Ok(None);
             }
@@ -1986,30 +2072,19 @@ pub async fn upvote(
         Ok(b) => b,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
+    // ★ ONE KEY OR MANY (#mem): the tool takes either shape, so the route must too — a client that
+    // sends `{"keys":"one"}` is asking the same question as `{"keys":["one"]}`.
     let keys = match body.as_ref().and_then(|b| b.get("keys")) {
-        Some(serde_json::Value::Array(items)) => {
-            let mut keys = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(k) => keys.push(k.to_string()),
-                    None => {
-                        return error(
-                            json,
-                            StatusCode::BAD_REQUEST,
-                            format!("bad `keys` entry: {item} (a string expected)"),
-                        );
-                    }
-                }
+        Some(value) => match serde_json::from_value::<crate::mcp::OneOrMany>(value.clone()) {
+            Ok(parsed) => parsed.into_vec(),
+            Err(_) => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    format!("bad `keys`: {value} (a string or an array of strings expected)"),
+                );
             }
-            keys
-        }
-        Some(other) => {
-            return error(
-                json,
-                StatusCode::BAD_REQUEST,
-                format!("bad `keys`: {other} (an array of keys expected)"),
-            );
-        }
+        },
         None => vec![key.clone()],
     };
     let named = keys.join(", ");
@@ -2091,6 +2166,10 @@ pub async fn merge(
     let pen = crate::identity::resolve(&headers).ok().flatten();
     match server
         .with_store("memory_merge", move |s| {
+            if let Some(caller) = &pen {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+
             s.merge_into(&from, &target, pen.as_deref())
         })
         .await
@@ -2154,8 +2233,12 @@ pub async fn adopt(
     };
     let adopting = key.clone();
     let owner = pen.clone();
+    let actor = pen.clone();
     match server
-        .with_store("memory_adopt", move |s| s.adopt(&adopting, &owner, force))
+        .with_store("memory_adopt", move |s| {
+            s.channel_gate(&actor, crate::store::channel::Class::Record)?;
+            s.adopt(&adopting, &owner, force)
+        })
         .await
     {
         Ok(()) => {
@@ -2296,12 +2379,20 @@ pub async fn project_upsert(
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
+    // The pen the identity pair proves, if any: a project write may still be anonymous (the row
+    // records it), but a gate can only bite a pen that has one.
+    let proven = crate::identity::resolve(&headers).ok().flatten();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
-        .with_store("project_upsert", move |s| s.project_merge(&patch))
+        .with_store("project_upsert", move |s| {
+            if let Some(caller) = &proven {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+            s.project_merge(&patch)
+        })
         .await
     {
         Ok(out) => {
@@ -3604,5 +3695,708 @@ pub async fn mail_surrogate_list(
             )
         }
         Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+// ── ELLMECHAT (#151): the channels ─────────────────────────────────────────────────────────────
+//
+// Thin on purpose. Every rule — membership, fan-out, the three-event ledger, the gate — lives in
+// `store::channel`, so this door cannot disagree with the MCP door or the store.
+//
+// A READ needs no credential (reads are never gated, and reading is the way out of a lock).
+// A WRITE needs a bearer AND a proven pen: the pen is who is speaking, the bearer says this client
+// may speak at all.
+
+/// Who is asking, if anyone proved it. Reads are open, so `None` is a legitimate answer.
+fn proven(headers: &HeaderMap) -> Option<String> {
+    match crate::identity::resolve(headers) {
+        Ok(Some(name)) => Some(name),
+        _ => None,
+    }
+}
+
+/// GET /channels — policy for every channel, plus this pen's unread counts and breach.
+pub async fn channel_list(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let pen = proven(&headers);
+    let caller = pen.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let out = server
+        .with_read(
+            "channel_list",
+            crate::store::audience::Reader::everything(),
+            move |s| {
+                let channels = s.channels()?;
+                let unread = match caller.as_deref() {
+                    Some(p) => s.channel_unread(p)?,
+                    None => Vec::new(),
+                };
+                let breach = match caller.as_deref() {
+                    Some(p) => s.channel_breach(p)?,
+                    None => None,
+                };
+                Ok((channels, unread, breach))
+            },
+        )
+        .await;
+    match out {
+        Ok((channels, unread, breach)) => {
+            let text = channels
+                .iter()
+                .map(|c| {
+                    let n = unread
+                        .iter()
+                        .find(|u| u.channel == c.key)
+                        .map_or(0, |u| u.count);
+                    format!("#{} ({}) gate={} unread={n}", c.key, c.title, c.gate)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({
+                    "channels": channels,
+                    "unread": unread,
+                    "breach": breach,
+                    "listener": pen,
+                })
+                .to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// GET /channels/{channel}/messages — the LOG, which moves no receipt.
+pub async fn channel_history(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let since = params
+        .maybe("since")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let limit = params
+        .maybe("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let key = channel.clone();
+    match server
+        .with_read(
+            "channel_history",
+            crate::store::audience::Reader::everything(),
+            move |s| s.channel_history(&key, since, limit),
+        )
+        .await
+    {
+        Ok(rows) => {
+            let text = rows
+                .iter()
+                .map(|m| format!("{} {}: {}", m.seq, m.pen, m.body))
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "channel": channel, "messages": rows }).to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// GET /channels/breach — what, if anything, is stopping this pen from changing the record.
+pub async fn channel_breach(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let Some(pen) = proven(&headers) else {
+        return render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "breach": null, "proven": false }).to_string(),
+            "none (pen not proven)\n".to_string(),
+        );
+    };
+    let who = pen.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read(
+            "channel_breach",
+            crate::store::audience::Reader::everything(),
+            move |s| s.channel_breach(&who),
+        )
+        .await
+    {
+        Ok(found) => {
+            let text = match &found {
+                Some(b) => format!(
+                    "#{} seq {} offered {} time(s), {}s ago (gate {})\n",
+                    b.channel, b.seq, b.misses, b.age_secs, b.gate
+                ),
+                None => "none\n".to_string(),
+            };
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "breach": found, "proven": true }).to_string(),
+                text,
+            )
+        }
+        Err(e) => error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// POST /channels/{channel}/messages — say one thing.
+pub async fn channel_send(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let Some(text) = doc.get("body").and_then(|v| v.as_str()).map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`body` is required");
+    };
+    let reply_to = doc.get("reply_to").and_then(|v| v.as_i64());
+    let (who, chan) = (pen.clone(), channel.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_send", move |s| {
+            s.channel_send(&who, &chan, &text, reply_to)
+        })
+        .await
+    {
+        Ok(msg) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into()),
+            format!("sent #{} seq {}\n", msg.channel, msg.seq),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/fetch — LISTEN: take the unread messages and mark them fetched.
+pub async fn channel_fetch(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => serde_json::json!({}),
+    };
+    let channel = doc
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let limit = doc.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let who = pen.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_fetch", move |s| {
+            s.channel_fetch(&who, channel.as_deref(), limit)
+        })
+        .await
+    {
+        Ok(rows) => {
+            let text = rows
+                .iter()
+                .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "fetched": rows.len(), "messages": rows }).to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/present — a turn boundary offered this pen its inbox.
+pub async fn channel_present(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let who = pen.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_present", move |s| s.channel_present(&who))
+        .await
+    {
+        Ok(marked) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "pen": pen, "marked": marked }).to_string(),
+            format!("presented for {pen} ({marked} unread marked)\n"),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/join — join, and `ops_team` brings `emergency` with it.
+pub async fn channel_join(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    channel_membership(state, channel, headers, raw, true).await
+}
+
+/// POST /channels/{channel}/leave — leave; leaving `emergency` on the team is refused.
+pub async fn channel_leave(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    channel_membership(state, channel, headers, raw, false).await
+}
+
+async fn channel_membership(
+    state: HttpState,
+    channel: String,
+    headers: HeaderMap,
+    raw: Option<String>,
+    join: bool,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let (who, chan) = (pen.clone(), channel.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let out = if join {
+        server
+            .with_store("channel_join", move |s| s.channel_join(&who, &chan))
+            .await
+    } else {
+        server
+            .with_store("channel_leave", move |s| s.channel_leave(&who, &chan))
+            .await
+    };
+    match out {
+        Ok(()) => render(
+            StatusCode::OK,
+            json,
+            serde_json::json!({ "pen": pen, "channel": channel, "member": join }).to_string(),
+            format!("{} #{channel}\n", if join { "joined" } else { "left" }),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// GET /channels/wait — block for new messages. A WAIT, not a LISTEN: no receipt moves.
+pub async fn channel_wait(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let Some(pen) = proven(&headers) else {
+        return error(
+            json,
+            StatusCode::UNAUTHORIZED,
+            "refused: waiting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+        );
+    };
+    let after = params
+        .maybe("after")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let timeout = params
+        .maybe("timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(25);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    loop {
+        let who = pen.clone();
+        let server = match session(&state) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        let rows = match server
+            .with_read(
+                "channel_wait",
+                crate::store::audience::Reader::everything(),
+                move |s| s.channel_since(&who, after, 200),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+        if !rows.is_empty() || std::time::Instant::now() >= deadline {
+            let text = rows
+                .iter()
+                .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "after": after, "messages": rows }).to_string(),
+                format!("{text}\n"),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// GET /channels/{channel}/members — effective membership.
+pub async fn channel_members(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let key = channel.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read(
+            "channel_members",
+            crate::store::audience::Reader::everything(),
+            move |s| s.channel_members(&key),
+        )
+        .await
+    {
+        Ok(rows) => {
+            let text = rows
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} {}{}",
+                        m.pen,
+                        m.state,
+                        if m.explicit { " (explicit)" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "channel": channel, "members": rows }).to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels — create one. A gated channel needs `estate` or `james` (the store says so).
+pub async fn channel_create(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let (Some(channel), Some(title)) = (field("channel"), field("title")) else {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`channel` and `title` are required",
+        );
+    };
+    let members = field("members").unwrap_or_else(|| "open".to_string());
+    let gate = field("gate").unwrap_or_else(|| "none".to_string());
+    let (who, key, title2) = (pen.clone(), channel.clone(), title.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_create", move |s| {
+            s.channel_create(&who, &key, &title2, &members, &gate)
+        })
+        .await
+    {
+        Ok(row) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
+            format!(
+                "created #{} (members {}, gate {})\n",
+                row.key, row.members, row.gate
+            ),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/gate — change a gate; the change is a row.
+pub async fn channel_set_gate(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let Some(gate) = doc.get("gate").and_then(|v| v.as_str()).map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`gate` is required");
+    };
+    let (who, chan) = (pen.clone(), channel.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_set_gate", move |s| {
+            s.channel_set_gate(&who, &chan, &gate)
+        })
+        .await
+    {
+        Ok(row) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
+            format!("#{} gate is now {}\n", row.key, row.gate),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// GET /channels/{channel}/events — who made this channel dangerous, and when.
+pub async fn channel_events(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let key = channel.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read(
+            "channel_events",
+            crate::store::audience::Reader::everything(),
+            move |s| s.channel_events(&key),
+        )
+        .await
+    {
+        Ok(rows) => {
+            let text = rows
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{} {} {} {} -> {}",
+                        e.at,
+                        e.pen.clone().unwrap_or_else(|| "-".into()),
+                        e.action,
+                        e.was.clone().unwrap_or_else(|| "-".into()),
+                        e.now.clone().unwrap_or_else(|| "-".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "channel": channel, "events": rows }).to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/retention — how long the text is kept. Keeper-only, recorded.
+pub async fn channel_set_retention(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let Some(keep) = doc.get("keep_secs").and_then(|v| v.as_i64()) else {
+        return error(json, StatusCode::BAD_REQUEST, "`keep_secs` is required");
+    };
+    let (who, chan) = (pen.clone(), channel.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_set_retention", move |s| {
+            s.channel_set_retention(&who, &chan, keep)
+        })
+        .await
+    {
+        Ok(row) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
+            format!(
+                "#{} keeps {}\n",
+                row.key,
+                if row.keep_secs == 0 {
+                    "forever".into()
+                } else {
+                    format!("{}s", row.keep_secs)
+                }
+            ),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/prune — expire the text past retention. Receipts stay.
+pub async fn channel_prune(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    if let Err(r) = proven_pen(&headers, json) {
+        return r;
+    }
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => serde_json::json!({}),
+    };
+    let only = doc
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+        .await
+    {
+        Ok(rows) => {
+            let total: usize = rows.iter().map(|r| r.emptied).sum();
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "pruned": rows, "emptied": total }).to_string(),
+                format!("emptied {total} message body(s)\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
     }
 }

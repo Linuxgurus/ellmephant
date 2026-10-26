@@ -144,6 +144,35 @@ jobs:
           echo "short=$short" >> "$GITHUB_OUTPUT"
           echo "releasing $ver from $ref (sha-$short)"
 
+      # ★ WHICH COMMIT'S BUILD IS THE RELEASE (2026-10-26). A merge commit's parent 1 is main — which
+      # always has a build — so "the parent that has one" promotes the code being replaced. The SECOND
+      # parent is the PR head: the thing being released. If it has no build, the release is BUILT here
+      # (hotfix / not-yet-built), never promoted from the base.
+      - name: Resolve the release's source commit
+        id: src
+        env:
+          HARBOR_USER: ${{ secrets.HARBOR_USER }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          set -eu
+          echo "$HARBOR_TOKEN" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin > /dev/null
+          B="$IMAGE"
+          short=$(git rev-parse --short=7 HEAD)
+          source="$short"
+          if ! docker buildx imagetools inspect "$B:sha-$short" > /dev/null 2>&1; then
+            second=$(git rev-list --parents -n1 HEAD | awk 'NF > 2 { print $3 }')
+            if [ -n "$second" ]; then
+              ps=$(git rev-parse --short=7 "$second")
+              if docker buildx imagetools inspect "$B:sha-$ps" > /dev/null 2>&1; then
+                source="$ps"
+              else
+                echo "the release commit (sha-$ps) has no dev build -- building it here"
+              fi
+            fi
+          fi
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "releasing sha-$short, source sha-$source"
+
       - name: Log in to Harbor
         env:
           HARBOR_USER: ${{ secrets.HARBOR_USER }}
@@ -163,8 +192,8 @@ jobs:
           SHORT="${{ steps.ver.outputs.short }}"
           if docker buildx imagetools inspect "$B:$VER" > /dev/null 2>&1; then
             have=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$VER")
-            if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
-              same=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:sha-$SHORT")
+            if docker buildx imagetools inspect "$B:sha-${{ steps.src.outputs.source }}" > /dev/null 2>&1; then
+              same=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:sha-${{ steps.src.outputs.source }}")
             else
               same=""
             fi
@@ -207,14 +236,15 @@ jobs:
           B="$IMAGE"
           VER="${{ steps.ver.outputs.version }}"
           SHORT="${{ steps.ver.outputs.short }}"
+          SRC="${{ steps.src.outputs.source }}"
           SHA=$(git rev-parse HEAD)
 
           # `latest` never moves for a prerelease.
           case "$VER" in *-*) stable=0 ;; *) stable=1 ;; esac
 
-          if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
-            echo "promoting $B:sha-$SHORT -- built and tested on dev, not rebuilt"
-            docker buildx imagetools create -t "$B:$VER" "$B:sha-$SHORT"
+          if docker buildx imagetools inspect "$B:sha-$SRC" > /dev/null 2>&1; then
+            echo "promoting $B:sha-$SRC -- built and tested on dev, not rebuilt"
+            docker buildx imagetools create -t "$B:$VER" "$B:sha-$SRC"
           else
             echo "no dev build for sha-$SHORT -- building the release here (hotfix path)"
             docker build --platform linux/amd64 \
@@ -243,13 +273,14 @@ jobs:
           B="$IMAGE"
           VER="${{ steps.ver.outputs.version }}"
           SHORT="${{ steps.ver.outputs.short }}"
+          SRC="${{ steps.src.outputs.source }}"
           want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$VER")
           check() { got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1") \
                      || { echo "MISSING: $1"; exit 1; }
                      [ "$got" = "$want" ] || { echo "MISMATCH: $1 is $got, expected $want"; exit 1; }
                      echo "verified $1 -> $got"; }
           check "$B:$VER"
-          check "$B:sha-$SHORT"
+          check "$B:sha-$SRC"
           case "$VER" in *-*) echo "prerelease: latest not expected" ;;
                      *) check "$B:latest" ;; esac
           {

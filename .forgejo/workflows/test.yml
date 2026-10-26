@@ -78,8 +78,9 @@ jobs:
                       - { name: BUILDER,    value: "${builder}" }
                       - { name: CACHE_REPO, value: "harbor.vn.linuxguru.net/library/ellmephant-gate-cache" }
                       - { name: PUSH,       value: "0" }
-                      - { name: GIT_USER, valueFrom: { secretKeyRef: { name: ci-git, key: username } } }
-                      - { name: GIT_PASS, valueFrom: { secretKeyRef: { name: ci-git, key: password } } }
+                      # No git credential: this repo is public and the instance is readable
+                      # anonymously (REQUIRE_SIGNIN_VIEW=false since v0.4.0). The `ci-git` secret
+                      # (Forgejo's breakglass admin) used to be mounted here and bought nothing.
                       - { name: REG_USER, valueFrom: { secretKeyRef: { name: ci-registry, key: username } } }
                       - { name: REG_PASS, valueFrom: { secretKeyRef: { name: ci-registry, key: password } } }
                     resources:

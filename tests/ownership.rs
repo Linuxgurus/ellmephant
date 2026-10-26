@@ -2257,7 +2257,7 @@ fn nobody_can_claim_the_anonymous_exemption_to_address_a_row_to_others_only() {
     };
     let err = format!("{}", common::add_now(&conn, &embedder, &mem).unwrap_err());
     assert!(
-        err.contains("invisible to its own author") || err.contains("unattributed"),
+        err.contains("unattributed"),
         "a NEW row may not buy the exemption by naming itself anonymous: {err}"
     );
 }
@@ -2367,5 +2367,34 @@ fn a_write_that_changes_a_trapped_rows_audience_says_the_new_one_still_excludes_
     assert!(
         !err.contains("does not change the audience"),
         "a false claim about the write, in the message that exists to stop false claims: {err}"
+    );
+}
+
+
+#[test]
+fn a_legacy_anonymous_row_can_be_made_private_by_the_pen_that_answers_for_it() {
+    // ★ HOSTILE REVIEW OF #195, ROUND 6. The exemption and the `private` rule have to compose: a row
+    // #122 backfilled with no author must still be repairable. Exempting it and then refusing the
+    // repair would be a lock with the key on the wrong side.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "orphan", "cline", "public");
+    conn.execute(
+        "UPDATE memory SET asserted_by = 'anonymous' WHERE key = 'orphan'",
+        [],
+    )
+    .expect("make it like a backfilled row");
+
+    let patch = store::Patch {
+        key: Some("orphan".into()),
+        acted_by: Some("cline".into()),
+        private: Some(true),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("an unattributed row can still be made private");
+    let mem = store::get(&conn, "orphan").unwrap().unwrap();
+    assert_eq!(
+        mem.audience, "pen:cline",
+        "private names the pen that acts, even when the author is nobody: {mem:?}"
     );
 }

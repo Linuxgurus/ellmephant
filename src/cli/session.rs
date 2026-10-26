@@ -820,6 +820,11 @@ impl Session {
         channel::fetch(&self.conn, pen, channel, limit)
     }
 
+    /// WHO is in a channel: effective membership, not the override rows.
+    pub fn channel_members(&self, channel: &str) -> Result<Vec<channel::Member>> {
+        channel::members(&self.conn, channel)
+    }
+
     /// What this pen was TOLD after `after_seq`. Moves no receipt: a wait is not a fetch.
     pub fn channel_since(
         &self,

@@ -85,6 +85,7 @@ pub const TOOLS: &[&str] = &[
     "channel_join",
     "channel_leave",
     "channel_wait",
+    "channel_members",
     "mail_surrogate_grant",
     "mail_surrogate_revoke",
     "mail_surrogate_list",
@@ -1272,6 +1273,15 @@ pub struct ChannelWaitParams {
         description = "Seconds to wait for something to arrive (default 0 = answer now, max 25). ★ This is a WAIT, not a listen: it moves no receipt, so it can never make a pen look up to date."
     )]
     pub timeout_secs: Option<u64>,
+}
+
+/// Parameters for [`MemoryServer::channel_members`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelMembersParams {
+    /// Which channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
 }
 
 #[derive(Clone)]
@@ -3721,6 +3731,35 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+
+    /// WHO is in a channel — effective membership, not the override rows.
+    #[tool(
+        name = "channel_members",
+        description = "WHO is in a channel. Effective membership, not the override rows: an OPEN channel is every live self minus those who left on purpose; a LIST channel is its explicit members. Fingers and `estate` are never members. Answers \"am I on the team?\" without reading SQL, and lets a pen verify the rule that joining `ops_team` also joins `emergency`.",
+        annotations(
+            title = "List channel members",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_members(
+        &self,
+        Parameters(p): Parameters<ChannelMembersParams>,
+    ) -> std::result::Result<String, String> {
+        let channel = p.channel;
+        let key = channel.clone();
+        let rows = self
+            .with_read(
+                "channel_members",
+                crate::store::audience::Reader::everything(),
+                move |s| s.channel_members(&key),
+            )
+            .await?;
+        serde_json::to_string(&serde_json::json!({ "channel": channel, "members": rows }))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler]
@@ -3886,6 +3925,10 @@ pub fn http_router(
             axum::routing::get(surface::channel_breach),
         )
         .route("/channels/wait", axum::routing::get(surface::channel_wait))
+        .route(
+            "/channels/{channel}/members",
+            axum::routing::get(surface::channel_members),
+        )
         .route(
             "/channels/fetch",
             axum::routing::post(surface::channel_fetch),

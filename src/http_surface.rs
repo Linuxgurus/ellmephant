@@ -277,6 +277,11 @@ pub const ROUTES: &[Route] = &[
         path: "/channels/wait",
         tool: "channel_wait",
     },
+    Route {
+        method: "GET",
+        path: "/channels/{channel}/members",
+        tool: "channel_members",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -4082,5 +4087,49 @@ pub async fn channel_wait(
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// GET /channels/{channel}/members — effective membership.
+pub async fn channel_members(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let key = channel.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read(
+            "channel_members",
+            crate::store::audience::Reader::everything(),
+            move |s| s.channel_members(&key),
+        )
+        .await
+    {
+        Ok(rows) => {
+            let text = rows
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} {}{}",
+                        m.pen,
+                        m.state,
+                        if m.explicit { " (explicit)" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "channel": channel, "members": rows }).to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
     }
 }

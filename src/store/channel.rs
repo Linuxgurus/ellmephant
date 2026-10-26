@@ -449,6 +449,77 @@ pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
     Ok(rows)
 }
 
+/// WHO is in a channel, as EFFECTIVE membership rather than as a list of override rows.
+///
+/// `open` channels are opt-out: every live self is a member unless it has an `out` row. `list`
+/// channels are opt-in: only `in` rows are members. Fingers are never members — a finger is a
+/// mechanism, not a party — and `estate` is not either: it has no entity behind it and can never
+/// authenticate to read.
+#[derive(Debug, Clone, Serialize)]
+pub struct Member {
+    pub pen: String,
+    /// `in` for every effective member. A member by `open` and a member by invitation look the same
+    /// in the answer, because the question is "who is here", not "why".
+    pub state: String,
+    /// Set when this pen has an EXPLICIT row (an invitation or an opt-out): the audit trail.
+    pub explicit: bool,
+    pub since: Option<String>,
+}
+
+pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
+    let row = channel_row(conn, channel)?;
+    let mut out = Vec::new();
+    if row.members == "list" {
+        let mut stmt = conn.prepare(
+            "SELECT p.name, m.at
+               FROM channel_member m JOIN pen p ON p.id = m.pen_id
+              WHERE m.channel = ?1 AND m.state = 'in' AND p.ceased_at IS NULL
+              ORDER BY p.name",
+        )?;
+        let rows = stmt
+            .query_map(params![row.key], |r| {
+                Ok(Member {
+                    pen: r.get(0)?,
+                    state: "in".to_string(),
+                    explicit: true,
+                    since: Some(r.get(1)?),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(rows);
+    }
+
+    // open: every live self, minus those who left on purpose.
+    let mut stmt = conn.prepare(
+        "SELECT p.name,
+                (SELECT m.at FROM channel_member m
+                  WHERE m.channel = ?1 AND m.pen_id = p.id AND m.state = 'out'),
+                EXISTS (SELECT 1 FROM channel_member m2
+                         WHERE m2.channel = ?1 AND m2.pen_id = p.id AND m2.state = 'in')
+           FROM pen p
+          WHERE p.kind = 'self' AND p.ceased_at IS NULL AND p.name <> 'estate'
+          ORDER BY p.name",
+    )?;
+    let rows = stmt.query_map(params![row.key], |r| {
+        let out_at: Option<String> = r.get(1)?;
+        let invited: bool = r.get(2)?;
+        Ok((r.get::<_, String>(0)?, out_at, invited))
+    })?;
+    for row in rows {
+        let (pen, out_at, invited) = row?;
+        if out_at.is_some() && !invited {
+            continue; // left on purpose
+        }
+        out.push(Member {
+            pen,
+            state: "in".to_string(),
+            explicit: out_at.is_some() || invited,
+            since: None,
+        });
+    }
+    Ok(out)
+}
+
 /// What this pen was TOLD after `after_seq`, oldest first. Moves no receipt.
 ///
 /// This is the delivery primitive a body waits on: a long poll reads from here, so "wait for

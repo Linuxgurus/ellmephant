@@ -89,6 +89,8 @@ pub const TOOLS: &[&str] = &[
     "channel_create",
     "channel_set_gate",
     "channel_events",
+    "channel_set_retention",
+    "channel_prune",
     "mail_surrogate_grant",
     "mail_surrogate_revoke",
     "mail_surrogate_list",
@@ -1334,6 +1336,32 @@ pub struct ChannelEventsParams {
     /// The channel.
     #[schemars(description = "The channel key, without the `#`.")]
     pub channel: String,
+}
+
+/// Parameters for [`MemoryServer::channel_set_retention`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelRetentionParams {
+    /// The channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
+    /// How long the text is kept.
+    #[schemars(
+        description = "Seconds of message TEXT to keep; `0` = forever (the default). ★ A prune empties `body` and sets `pruned_at`; the message row, its seq and every delivery row survive, so 'you were told seq N' stays answerable. `estate` or `james` only, and the change is recorded."
+    )]
+    pub keep_secs: i64,
+}
+
+/// Parameters for [`MemoryServer::channel_prune`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPruneParams {
+    /// One channel, or every channel with a retention.
+    #[serde(default)]
+    #[schemars(
+        description = "Prune only this channel. Omit to prune every channel that has a `keep_secs`."
+    )]
+    pub channel: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3899,6 +3927,66 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         serde_json::to_string(&serde_json::json!({ "channel": channel, "events": rows }))
             .map_err(|e| e.to_string())
     }
+
+    /// Set how long a channel keeps its text.
+    #[tool(
+        name = "channel_set_retention",
+        description = "Set how long a channel keeps its message TEXT. `0` = forever (the default, and silence must never delete anything). ★ `estate` or `james` only, and recorded: how long a channel remembers is a decision, not a preference. ★ A prune empties `body` and sets `pruned_at`; the receipt survives, so 'you were told seq N' stays answerable.",
+        annotations(
+            title = "Set channel retention",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_set_retention(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelRetentionParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let (who, chan, keep) = (pen.clone(), p.channel.clone(), p.keep_secs);
+        let row = self
+            .with_store("channel_set_retention", move |s| {
+                s.channel_set_retention(&who, &chan, keep)
+            })
+            .await?;
+        tracing::warn!(tool = "channel_set_retention", pen = %pen, channel = %row.key, keep_secs = row.keep_secs, "channel retention changed");
+        serde_json::to_string(&row).map_err(|e| e.to_string())
+    }
+
+    /// Expire the text past each channel's retention. Receipts stay.
+    #[tool(
+        name = "channel_prune",
+        description = "Expire the TEXT of messages past their channel's `keep_secs`. ★ This is NOT an erasure of what happened: the body is emptied, `pruned_at` is set, and the message row, its `seq` and every delivery row survive — so 'you were told seq N' is still true. A channel with `keep_secs = 0` is never touched.",
+        annotations(
+            title = "Prune channel text",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_prune(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelPruneParams>,
+    ) -> std::result::Result<String, String> {
+        pen_name(&ctx, self.declared.as_deref())?; // a prune writes; anonymous is read-only
+        let only = p.channel;
+        let rows = self
+            .with_store("channel_prune", move |s| s.channel_prune(only.as_deref()))
+            .await?;
+        let total: usize = rows.iter().map(|r| r.emptied).sum();
+        tracing::info!(
+            tool = "channel_prune",
+            emptied = total,
+            "channel text pruned"
+        );
+        serde_json::to_string(&serde_json::json!({ "pruned": rows, "emptied": total }))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler]
@@ -4078,6 +4166,14 @@ pub fn http_router(
         .route(
             "/channels/{channel}/events",
             axum::routing::get(surface::channel_events),
+        )
+        .route(
+            "/channels/{channel}/retention",
+            axum::routing::post(surface::channel_set_retention),
+        )
+        .route(
+            "/channels/prune",
+            axum::routing::post(surface::channel_prune),
         )
         .route(
             "/channels/fetch",

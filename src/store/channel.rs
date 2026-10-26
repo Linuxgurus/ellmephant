@@ -80,6 +80,8 @@ pub struct Channel {
     /// `open` (every live self unless opted out) or `list` (explicit members only).
     pub members: String,
     pub gate: String,
+    /// Seconds of text this channel keeps; `0` = forever. See [`prune`].
+    pub keep_secs: i64,
     pub grace_secs: i64,
     pub clock: String,
     pub misses_to_gate: i64,
@@ -133,7 +135,7 @@ fn pen_id(conn: &Connection, name: &str) -> Result<i64> {
 
 fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
     conn.query_row(
-        "SELECT key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+        "SELECT key, title, members, gate, keep_secs, grace_secs, clock, misses_to_gate, lock_max_secs
            FROM channel WHERE lower(key) = lower(?1)",
         params![key],
         |r| {
@@ -142,10 +144,11 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
                 title: r.get(1)?,
                 members: r.get(2)?,
                 gate: r.get(3)?,
-                grace_secs: r.get(4)?,
-                clock: r.get(5)?,
-                misses_to_gate: r.get(6)?,
-                lock_max_secs: r.get(7)?,
+                keep_secs: r.get(4)?,
+                grace_secs: r.get(5)?,
+                clock: r.get(6)?,
+                misses_to_gate: r.get(7)?,
+                lock_max_secs: r.get(8)?,
             })
         },
     )
@@ -156,7 +159,7 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
 /// Every channel, in creation order.
 pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
     let mut stmt = conn.prepare(
-        "SELECT key, title, members, gate, grace_secs, clock, misses_to_gate, lock_max_secs
+        "SELECT key, title, members, gate, keep_secs, grace_secs, clock, misses_to_gate, lock_max_secs
            FROM channel ORDER BY rowid",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -165,10 +168,11 @@ pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
             title: r.get(1)?,
             members: r.get(2)?,
             gate: r.get(3)?,
-            grace_secs: r.get(4)?,
-            clock: r.get(5)?,
-            misses_to_gate: r.get(6)?,
-            lock_max_secs: r.get(7)?,
+            keep_secs: r.get(4)?,
+            grace_secs: r.get(5)?,
+            clock: r.get(6)?,
+            misses_to_gate: r.get(7)?,
+            lock_max_secs: r.get(8)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -447,6 +451,89 @@ pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// What a prune did: bodies emptied, receipts untouched.
+#[derive(Debug, Clone, Serialize)]
+pub struct Pruned {
+    pub channel: String,
+    pub emptied: usize,
+}
+
+/// Expire the TEXT of messages past their channel's `keep_secs`, and touch nothing else.
+///
+/// ★ A PRUNE IS NOT AN ERASURE OF WHAT HAPPENED. `body` is emptied and `pruned_at` is set; the
+/// message row, its `seq`, and every delivery row survive, so "you were told seq N" is still true
+/// afterwards. Deleting the rows would erase the receipt along with the conversation, which is the
+/// one thing the ledger exists to keep.
+///
+/// `keep_secs = 0` means forever, and a channel left at 0 is never touched.
+pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result<Vec<Pruned>> {
+    let now = now.map(str::to_string).unwrap_or_else(|| {
+        conn.query_row("SELECT datetime('now')", [], |r| r.get::<_, String>(0))
+            .unwrap_or_default()
+    });
+    let mut stmt = conn.prepare(
+        "SELECT key, keep_secs FROM channel
+          WHERE keep_secs > 0 AND (?1 IS NULL OR key = ?1)
+          ORDER BY key",
+    )?;
+    let channels = stmt
+        .query_map(params![only], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out = Vec::new();
+    for (key, keep) in channels {
+        let emptied = conn.execute(
+            "UPDATE channel_message
+                SET body = '', pruned_at = ?2
+              WHERE channel = ?1
+                AND pruned_at IS NULL
+                AND created <= datetime(?2, ?3)",
+            params![key, now, format!("-{keep} seconds")],
+        )?;
+        out.push(Pruned {
+            channel: key,
+            emptied,
+        });
+    }
+    Ok(out)
+}
+
+/// Set a channel's retention. Keeper-only, and recorded — retention is a policy, not a preference.
+pub fn set_retention(
+    conn: &Connection,
+    pen: &str,
+    channel: &str,
+    keep_secs: i64,
+) -> Result<Channel> {
+    if keep_secs < 0 {
+        return Err(Error::Invalid("keep_secs cannot be negative".into()));
+    }
+    if !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: setting RETENTION needs `estate` or `james`; the proven caller is `{pen}`. \
+             How long a channel keeps its text is a decision, not a preference."
+        )));
+    }
+    let row = channel_row(conn, channel)?;
+    if row.keep_secs == keep_secs {
+        return Ok(row);
+    }
+    let pen_id = pen_id(conn, pen)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE channel SET keep_secs = ?2 WHERE key = ?1",
+        params![row.key, keep_secs],
+    )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'retention', ?3, ?4)",
+        params![row.key, pen_id, row.keep_secs.to_string(), keep_secs.to_string()],
+    )?;
+    tx.commit()?;
+    channel_row(conn, &row.key)
 }
 
 /// One recorded change to a channel: who, when, what it was, what it is now.

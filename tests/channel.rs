@@ -509,3 +509,57 @@ fn a_locked_channel_needs_a_keeper_and_the_change_is_a_row() {
     assert!(channel::create(&conn, "james", "quiet", "Again", "open", "none").is_err());
     assert!(channel::create(&conn, "james", "Bad Key!", "x", "open", "none").is_err());
 }
+
+// ── RETENTION (#163) ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn pruning_expires_the_text_and_keeps_the_receipt() {
+    let (_dir, conn) = store();
+    let m = channel::send(&conn, "james", "general", "the cluster is on fire", None).expect("send");
+    // Give the message an age, and the channel a retention.
+    conn.execute(
+        "UPDATE channel_message SET created = datetime('now','-2 hours') WHERE seq = ?1",
+        [m.seq],
+    )
+    .expect("age");
+    channel::set_retention(&conn, "james", "general", 3600).expect("retention");
+
+    let pruned = channel::prune(&conn, None, None).expect("prune");
+    assert!(
+        pruned
+            .iter()
+            .any(|p| p.channel == "general" && p.emptied == 1),
+        "{pruned:?}"
+    );
+
+    let (body, pruned_at): (String, Option<String>) = conn
+        .query_row(
+            "SELECT body, pruned_at FROM channel_message WHERE seq = ?1",
+            [m.seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row survives");
+    assert!(body.is_empty(), "the TEXT is gone");
+    assert!(pruned_at.is_some(), "and it says so");
+
+    // ★ THE RECEIPT SURVIVES: the pen was told, and that is still answerable.
+    assert!(
+        channel::unread(&conn, "cline")
+            .expect("unread")
+            .iter()
+            .any(|u| u.channel == "general" && u.count == 1),
+        "pruning text must not erase the delivery"
+    );
+    assert_eq!(
+        channel::history(&conn, "general", 0, 50)
+            .expect("history")
+            .len(),
+        1,
+        "the log line stays; only its body is empty"
+    );
+
+    // A channel left at 0 is never touched, and retention is keeper-only.
+    let kept = channel::create(&conn, "james", "keepme", "Keep", "open", "none").expect("create");
+    assert_eq!(kept.keep_secs, 0);
+    assert!(channel::set_retention(&conn, "stet", "keepme", 60).is_err());
+}

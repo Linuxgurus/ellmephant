@@ -170,6 +170,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0032_channel_admin.sql"),
         "`channel_event`: who created a channel and every gate change after it — a lock gets a name (#161)",
     ),
+    (
+        33,
+        include_str!("../../migrations/0033_channel_retention.sql"),
+        "`channel.keep_secs`: retention as a policy on the row; 0 = forever (#163)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

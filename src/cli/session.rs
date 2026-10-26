@@ -842,6 +842,21 @@ impl Session {
         channel::set_gate(&self.conn, pen, channel, gate)
     }
 
+    /// Set a channel's retention. Keeper-only; recorded as a `channel_event`.
+    pub fn channel_set_retention(
+        &self,
+        pen: &str,
+        channel: &str,
+        keep_secs: i64,
+    ) -> Result<channel::Channel> {
+        channel::set_retention(&self.conn, pen, channel, keep_secs)
+    }
+
+    /// Expire the TEXT of messages past their channel's retention. Receipts stay.
+    pub fn channel_prune(&self, only: Option<&str>) -> Result<Vec<channel::Pruned>> {
+        channel::prune(&self.conn, only, None)
+    }
+
     /// The recorded changes to a channel: who made this dangerous, and when.
     pub fn channel_events(&self, channel: &str) -> Result<Vec<channel::Event>> {
         channel::events(&self.conn, channel)

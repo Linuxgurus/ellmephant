@@ -165,6 +165,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0031_mail_sent_under.sql"),
         "`mail.sent_under`: which grant authorised a surrogate letter — a receipt a reader can check (#154)",
     ),
+    (
+        32,
+        include_str!("../../migrations/0032_channel_admin.sql"),
+        "`channel_event`: who created a channel and every gate change after it — a lock gets a name (#161)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

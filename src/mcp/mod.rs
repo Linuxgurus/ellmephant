@@ -86,6 +86,9 @@ pub const TOOLS: &[&str] = &[
     "channel_leave",
     "channel_wait",
     "channel_members",
+    "channel_create",
+    "channel_set_gate",
+    "channel_events",
     "mail_surrogate_grant",
     "mail_surrogate_revoke",
     "mail_surrogate_list",
@@ -1280,6 +1283,55 @@ pub struct ChannelWaitParams {
 #[serde(deny_unknown_fields)]
 pub struct ChannelMembersParams {
     /// Which channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
+}
+
+/// Parameters for [`MemoryServer::channel_create`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelCreateParams {
+    /// The key.
+    #[schemars(
+        description = "The channel key, without the `#`: lowercase letters, digits, `_` and `-`. A key is created once; there is no rename."
+    )]
+    pub channel: String,
+    /// The title.
+    #[schemars(description = "Human title, shown in the listing.")]
+    pub title: String,
+    /// Open or list.
+    #[serde(default)]
+    #[schemars(
+        description = "`open` (every live self unless it opts out, default) or `list` (invite-only)."
+    )]
+    pub members: Option<String>,
+    /// None, writes or all.
+    #[serde(default)]
+    #[schemars(
+        description = "What stops working while a member is behind: `none` (default), `writes`, or `all`. ★ A channel with any gate but `none` can only be created by `estate` or `james`, because a channel that can stop a pen writing to the record is a decision that gets a name attached."
+    )]
+    pub gate: Option<String>,
+}
+
+/// Parameters for [`MemoryServer::channel_set_gate`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelGateParams {
+    /// The channel.
+    #[schemars(description = "The channel key, without the `#`.")]
+    pub channel: String,
+    /// The new gate.
+    #[schemars(
+        description = "`none`, `writes` or `all`. ★ `estate` or `james` only: every change is recorded as a `channel_event` row, so a lock always has a name on it."
+    )]
+    pub gate: String,
+}
+
+/// Parameters for [`MemoryServer::channel_events`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelEventsParams {
+    /// The channel.
     #[schemars(description = "The channel key, without the `#`.")]
     pub channel: String,
 }
@@ -3760,6 +3812,93 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         serde_json::to_string(&serde_json::json!({ "channel": channel, "members": rows }))
             .map_err(|e| e.to_string())
     }
+
+    /// Create a channel.
+    #[tool(
+        name = "channel_create",
+        description = "Create ONE channel. `open` channels are opt-out and may be made by any proven pen — conversation costs nobody anything. ★ A channel with a GATE (`writes` or `all`) can only be created by `estate` or `james`: a lock stops a pen changing the record, so creating one is a decision with a name on it. A key is created once; there is no rename.",
+        annotations(
+            title = "Create a channel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_create(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelCreateParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let (who, key, title) = (pen.clone(), p.channel.clone(), p.title.clone());
+        let members = p.members.unwrap_or_else(|| "open".to_string());
+        let gate = p.gate.unwrap_or_else(|| "none".to_string());
+        let made = self
+            .with_store("channel_create", move |s| {
+                s.channel_create(&who, &key, &title, &members, &gate)
+            })
+            .await?;
+        tracing::info!(tool = "channel_create", pen = %pen, channel = %made.key, gate = %made.gate, "channel created");
+        serde_json::to_string(&made).map_err(|e| e.to_string())
+    }
+
+    /// Change a gate, and record who did it.
+    #[tool(
+        name = "channel_set_gate",
+        description = "Change a channel's gate (`none` / `writes` / `all`). ★ `estate` or `james` only, and EVERY change is written as a `channel_event` row — who, when, from what, to what. A lock that cannot be attributed is a lock nobody answers for.",
+        annotations(
+            title = "Set a channel's gate",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_set_gate(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ChannelGateParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let (who, chan, gate) = (pen.clone(), p.channel.clone(), p.gate.clone());
+        let row = self
+            .with_store("channel_set_gate", move |s| {
+                s.channel_set_gate(&who, &chan, &gate)
+            })
+            .await?;
+        tracing::warn!(tool = "channel_set_gate", pen = %pen, channel = %row.key, gate = %row.gate, "channel gate changed");
+        serde_json::to_string(&row).map_err(|e| e.to_string())
+    }
+
+    /// The recorded changes to a channel.
+    #[tool(
+        name = "channel_events",
+        description = "The recorded changes to a channel: creation, and every gate change — who, when, from what, to what. ★ This is the answer to \"who made this dangerous?\", and it is a stored row rather than a convention.",
+        annotations(
+            title = "Channel change history",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn channel_events(
+        &self,
+        Parameters(p): Parameters<ChannelEventsParams>,
+    ) -> std::result::Result<String, String> {
+        let channel = p.channel;
+        let key = channel.clone();
+        let rows = self
+            .with_read(
+                "channel_events",
+                crate::store::audience::Reader::everything(),
+                move |s| s.channel_events(&key),
+            )
+            .await?;
+        serde_json::to_string(&serde_json::json!({ "channel": channel, "events": rows }))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler]
@@ -3919,7 +4058,10 @@ pub fn http_router(
             axum::routing::get(surface::mail_inbox).post(surface::mail_send),
         )
         .route("/mail/prune", axum::routing::post(surface::mail_prune))
-        .route("/channels", axum::routing::get(surface::channel_list))
+        .route(
+            "/channels",
+            axum::routing::get(surface::channel_list).post(surface::channel_create),
+        )
         .route(
             "/channels/breach",
             axum::routing::get(surface::channel_breach),
@@ -3928,6 +4070,14 @@ pub fn http_router(
         .route(
             "/channels/{channel}/members",
             axum::routing::get(surface::channel_members),
+        )
+        .route(
+            "/channels/{channel}/gate",
+            axum::routing::post(surface::channel_set_gate),
+        )
+        .route(
+            "/channels/{channel}/events",
+            axum::routing::get(surface::channel_events),
         )
         .route(
             "/channels/fetch",

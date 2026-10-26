@@ -449,6 +449,158 @@ pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
     Ok(rows)
 }
 
+/// One recorded change to a channel: who, when, what it was, what it is now.
+#[derive(Debug, Clone, Serialize)]
+pub struct Event {
+    pub at: String,
+    pub pen: Option<String>,
+    pub action: String,
+    pub was: Option<String>,
+    pub now: Option<String>,
+}
+
+/// The pens allowed to create or re-gate a LOCKED channel.
+///
+/// `estate` is in the list because the spec names it, but it cannot authenticate — it has no entity
+/// behind it and only ever acts as somebody's borrow — so in practice this is James, or a pen James
+/// has lent. The check is on the PROVEN caller, never on a name passed in.
+const GATE_KEEPERS: [&str; 2] = ["estate", "james"];
+
+fn keeper(pen: &str) -> bool {
+    GATE_KEEPERS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(pen.trim()))
+}
+
+fn valid_key(key: &str) -> Result<String> {
+    let key = key.trim().to_ascii_lowercase();
+    let ok = !key.is_empty()
+        && key.len() <= 48
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !ok {
+        return Err(Error::Invalid(format!(
+            "{key:?} is not a channel key: lowercase letters, digits, `_` and `-`, starting with a letter or digit"
+        )));
+    }
+    Ok(key)
+}
+
+/// Create a channel.
+///
+/// ★ A LOCKED CHANNEL NEEDS A GATE KEEPER: `gate` other than `none` is refused unless the caller is
+/// `estate` or `james`. A gate is the one thing here that can stop a pen writing to the record, so
+/// creating one is a decision that gets a name attached. A channel with `gate = none` may be made by
+/// any proven pen — conversation costs nobody anything.
+pub fn create(
+    conn: &Connection,
+    pen: &str,
+    key: &str,
+    title: &str,
+    members: &str,
+    gate: &str,
+) -> Result<Channel> {
+    let key = valid_key(key)?;
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(Error::Invalid("a channel needs a title".into()));
+    }
+    let members = members.trim().to_ascii_lowercase();
+    if members != "open" && members != "list" {
+        return Err(Error::Invalid(format!(
+            "members must be `open` or `list`, not {members:?}"
+        )));
+    }
+    let gate = gate.trim().to_ascii_lowercase();
+    if !matches!(gate.as_str(), "none" | "writes" | "all") {
+        return Err(Error::Invalid(format!(
+            "gate must be `none`, `writes` or `all`, not {gate:?}"
+        )));
+    }
+    if gate != "none" && !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: creating a LOCKED channel (gate `{gate}`) needs `estate` or `james`; \
+             the proven caller is `{pen}`. A channel that can stop a pen writing to the record \
+             is not something any pen may make on its own."
+        )));
+    }
+    if channel_row(conn, &key).is_ok() {
+        return Err(Error::Invalid(format!(
+            "#{key} already exists; a channel is created once"
+        )));
+    }
+    let pen_id = pen_id(conn, pen)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO channel (key, title, members, gate) VALUES (?1, ?2, ?3, ?4)",
+        params![key, title, members, gate],
+    )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'create', NULL, ?3)",
+        params![key, pen_id, format!("{members}/{gate}")],
+    )?;
+    tx.commit()?;
+    channel_row(conn, &key)
+}
+
+/// Change a channel's gate, and RECORD it — who, from what, to what (#161).
+pub fn set_gate(conn: &Connection, pen: &str, channel: &str, gate: &str) -> Result<Channel> {
+    let gate = gate.trim().to_ascii_lowercase();
+    if !matches!(gate.as_str(), "none" | "writes" | "all") {
+        return Err(Error::Invalid(format!(
+            "gate must be `none`, `writes` or `all`, not {gate:?}"
+        )));
+    }
+    if !keeper(pen) {
+        return Err(Error::Invalid(format!(
+            "refused: changing a gate needs `estate` or `james`; the proven caller is `{pen}`"
+        )));
+    }
+    let row = channel_row(conn, channel)?;
+    if row.gate == gate {
+        return Ok(row);
+    }
+    let pen_id = pen_id(conn, pen)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE channel SET gate = ?2 WHERE key = ?1",
+        params![row.key, gate],
+    )?;
+    tx.execute(
+        "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'gate', ?3, ?4)",
+        params![row.key, pen_id, row.gate, gate],
+    )?;
+    tx.commit()?;
+    channel_row(conn, &row.key)
+}
+
+/// The recorded changes to one channel, newest last. The answer to "who made this dangerous?".
+pub fn events(conn: &Connection, channel: &str) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.at, p.name, e.action, e.was, e.now
+           FROM channel_event e LEFT JOIN pen p ON p.id = e.pen_id
+          WHERE e.channel = ?1
+          ORDER BY e.id",
+    )?;
+    let rows = stmt
+        .query_map(params![channel], |r| {
+            Ok(Event {
+                at: r.get(0)?,
+                pen: r.get(1)?,
+                action: r.get(2)?,
+                was: r.get(3)?,
+                now: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// WHO is in a channel, as EFFECTIVE membership rather than as a list of override rows.
 ///
 /// `open` channels are opt-out: every live self is a member unless it has an `out` row. `list`

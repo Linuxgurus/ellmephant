@@ -282,6 +282,21 @@ pub const ROUTES: &[Route] = &[
         path: "/channels/{channel}/members",
         tool: "channel_members",
     },
+    Route {
+        method: "POST",
+        path: "/channels",
+        tool: "channel_create",
+    },
+    Route {
+        method: "POST",
+        path: "/channels/{channel}/gate",
+        tool: "channel_set_gate",
+    },
+    Route {
+        method: "GET",
+        path: "/channels/{channel}/events",
+        tool: "channel_events",
+    },
 ];
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -4127,6 +4142,149 @@ pub async fn channel_members(
                 StatusCode::OK,
                 json,
                 serde_json::json!({ "channel": channel, "members": rows }).to_string(),
+                format!("{text}\n"),
+            )
+        }
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels — create one. A gated channel needs `estate` or `james` (the store says so).
+pub async fn channel_create(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let (Some(channel), Some(title)) = (field("channel"), field("title")) else {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`channel` and `title` are required",
+        );
+    };
+    let members = field("members").unwrap_or_else(|| "open".to_string());
+    let gate = field("gate").unwrap_or_else(|| "none".to_string());
+    let (who, key, title2) = (pen.clone(), channel.clone(), title.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_create", move |s| {
+            s.channel_create(&who, &key, &title2, &members, &gate)
+        })
+        .await
+    {
+        Ok(row) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
+            format!(
+                "created #{} (members {}, gate {})\n",
+                row.key, row.members, row.gate
+            ),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /channels/{channel}/gate — change a gate; the change is a row.
+pub async fn channel_set_gate(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    if let Err(r) = authorize(&state, &headers, json) {
+        return r;
+    }
+    let pen = match proven_pen(&headers, json) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+    };
+    let Some(gate) = doc.get("gate").and_then(|v| v.as_str()).map(str::to_string) else {
+        return error(json, StatusCode::BAD_REQUEST, "`gate` is required");
+    };
+    let (who, chan) = (pen.clone(), channel.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("channel_set_gate", move |s| {
+            s.channel_set_gate(&who, &chan, &gate)
+        })
+        .await
+    {
+        Ok(row) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
+            format!("#{} gate is now {}\n", row.key, row.gate),
+        ),
+        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// GET /channels/{channel}/events — who made this channel dangerous, and when.
+pub async fn channel_events(
+    State(state): State<HttpState>,
+    Path(channel): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let key = channel.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read(
+            "channel_events",
+            crate::store::audience::Reader::everything(),
+            move |s| s.channel_events(&key),
+        )
+        .await
+    {
+        Ok(rows) => {
+            let text = rows
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{} {} {} {} -> {}",
+                        e.at,
+                        e.pen.clone().unwrap_or_else(|| "-".into()),
+                        e.action,
+                        e.was.clone().unwrap_or_else(|| "-".into()),
+                        e.now.clone().unwrap_or_else(|| "-".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "channel": channel, "events": rows }).to_string(),
                 format!("{text}\n"),
             )
         }

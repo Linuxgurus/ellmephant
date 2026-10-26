@@ -1922,6 +1922,9 @@ pub async fn upsert(
         _ => None,
     };
     patch.asserted_by = credited.clone().or_else(|| proven.clone());
+    // ★ THE ACTOR IS THE PROVEN PEN ON EVERY DOOR (soma/ellmephant#192): without this an update over
+    // HTTP would have to take its authority from the credited name.
+    patch.acted_by = proven.clone();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,

@@ -386,7 +386,10 @@ fn add_impl(
     // `expected_version` and be told the row's CURRENT VERSION — existence and size — while every read
     // path correctly reported absence. The compare is still inside the transaction, where it belongs;
     // it is the ORDER that changed. A refusal must not be a read.
-    let actor = actor.or(mem.asserted_by.as_deref());
+    // ★ NO FALLBACK TO THE CREDIT (soma/ellmephant#192, Stet's finding). `asserted_by` is the pen being
+    // CREDITED; using it as the actor is #190 through another door. With no actor named, `may_write`
+    // sees `None` — which FAILS CLOSED on an owned row and passes on an unowned one, where visibility
+    // alone decides and there is no authority to steal.
     may_write(&tx, &prepared.key, actor)?;
     if let (Some(credited), Some(proven)) = (credited, actor) {
         if !credited.eq_ignore_ascii_case(proven) {
@@ -695,7 +698,9 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     // is the credited one. Authority, the boundary guard and the write all have to agree about which
     // pen is acting, or a hand crediting its finger gets judged as the finger for some checks and as
     // the hand for others.
-    let writer = patch.acted_by.as_deref().or(patch.asserted_by.as_deref());
+    // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): the guards below must judge the pen that
+    // acts. Falling back to `asserted_by` is how a write gets authorised as the name it credits.
+    let writer = patch.acted_by.as_deref();
     // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
     // `guard_audience` produce different sentences for different states, so running them first let a
     // pen that may not write the row learn that it exists and is not public — a read disguised as a
@@ -805,7 +810,9 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         // is the stored author (write-once, #107), so passing it here would authorise every update as
         // the row's own author (#190). `acted_by` is the proven pen; `asserted_by` is the credited one,
         // and authority needs both.
-        patch.acted_by.as_deref().or(patch.asserted_by.as_deref()),
+        // ★ THE ACTOR, AND NOT THE CREDIT (soma/ellmephant#192): an absent actor must fail closed, not
+        // be filled in from the name being credited.
+        patch.acted_by.as_deref(),
         patch.asserted_by.as_deref(),
     )?;
     Ok(MergeOutcome {

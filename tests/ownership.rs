@@ -1668,6 +1668,9 @@ fn merge_as(
 ) -> String {
     let patch = store::Patch {
         key: Some(key.to_string()),
+        // ★ NAMED, NOT INFERRED (Stet's review of #192): setting only `asserted_by` made these tests
+        // exercise the fallback, so they would have passed with the conjunction deleted.
+        acted_by: Some(actor.to_string()),
         body: Some(format!("changed by {actor}")),
         asserted_by: Some(actor.to_string()),
         audience: audience.map(|a| a.to_string()),
@@ -1953,4 +1956,76 @@ fn a_live_lease_held_by_someone_else_is_not_permission_to_delete() {
     // The holder can.
     store::delete(&conn, "stets-protected", Some("stet")).expect("the holder may delete");
     assert!(store::get(&conn, "stets-protected").unwrap().is_none());
+}
+
+#[test]
+fn an_update_on_an_owned_row_must_name_the_pen_that_acts() {
+    // ★ STET'S FINDING, review of #192 at `1a7cad1`. `acted_by: None` silently fell back to
+    // `asserted_by`, and `asserted_by` is the CREDITED pen — so a caller that omitted the actor was
+    // authorised as the name it typed. That is #190 through a different door. A CREATE may have no
+    // separate actor; an UPDATE on an owned row never does.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "owned-note", "james", "public");
+
+    let patch = store::Patch {
+        key: Some("owned-note".into()),
+        body: Some("no actor named".into()),
+        asserted_by: Some("cline".into()),
+        acted_by: None, // the hole
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        // The refusal comes from `may_write` itself ("a write must name the pen doing it"), which is
+        // the point: with no actor, an owned row FAILS CLOSED rather than being authorised as the
+        // credited name.
+        err.contains("must name the pen"),
+        "the absence is an error, not a fallback: {err}"
+    );
+    let mem = store::get(&conn, "owned-note").unwrap().unwrap();
+    assert_eq!(mem.body, "the facts", "and nothing was written");
+}
+
+#[test]
+fn a_lend_grants_the_credit_and_not_the_owners_blind_write() {
+    // ★ STET'S SECOND FINDING. A hand holding a live lend to its finger writes AS that finger. That buys
+    // the ATTRIBUTION (the finger is credited, and `edited_by` names the hand). It must NOT buy the
+    // finger's ownership rights: the acting pen is the hand, and an ancestor may not write a row it
+    // cannot read.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    store::mint(&conn, "stet", "stet/hand", "self").expect("mint");
+    store::mint(&conn, "stet/hand", "stet/hand/finger-1", "finger").expect("mint");
+    store::sudo::lend(&conn, "stet/hand", "stet/hand/finger-1", 60).expect("lend");
+
+    // A row OWNED by the finger, addressed to someone the hand cannot read for. Planted, because the
+    // D1 guard (correctly) refuses to CREATE it — which is itself the point: the state has to be built
+    // the way a legacy row would have it.
+    // Planted, because the D1 guard (on #195) refuses to create it; this branch does not have that
+    // guard, and building it by hand is what a legacy row looks like either way.
+    row_with_audience(&conn, &embedder, "fingers-private", "stet/hand/finger-1", "public");
+    conn.execute(
+        "UPDATE memory SET audience = 'pen:stet' WHERE key = 'fingers-private'",
+        [],
+    )
+    .expect("re-address it");
+    conn.execute(
+        "UPDATE memory SET owner = (SELECT id FROM pen WHERE name = 'stet/hand/finger-1') WHERE key = 'fingers-private'",
+        [],
+    )
+    .expect("own it as the finger");
+
+    let patch = store::Patch {
+        key: Some("fingers-private".into()),
+        body: Some("the hand writing as its finger".into()),
+        asserted_by: Some("stet/hand/finger-1".into()), // the credit
+        acted_by: Some("stet/hand".into()),             // the pen that acts
+        ..Default::default()
+    };
+    let err = format!("{}", store::merge(&conn, &patch).unwrap_err());
+    assert!(
+        err.contains("audience does not include you"),
+        "the actor must be able to read what it writes, however the credit is spelled: {err}"
+    );
 }

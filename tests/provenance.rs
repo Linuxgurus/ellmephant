@@ -68,6 +68,7 @@ fn a_tag_only_write_moves_the_writer_and_not_the_author() {
         &store::Patch {
             key: Some("handed-to-cline".into()),
             tags: Some(vec!["pen:cline".into()]),
+            acted_by: Some("cline".into()),
             asserted_by: Some("cline".into()),
             ..Default::default()
         },
@@ -109,6 +110,7 @@ fn a_body_write_by_another_pen_keeps_the_author_and_versions_itself() {
         &store::Patch {
             key: Some("edited-later".into()),
             body: Some("the facts, corrected by cline".into()),
+            acted_by: Some("cline".into()),
             asserted_by: Some("cline".into()),
             version_note: Some("correction".into()),
             ..Default::default()
@@ -142,6 +144,7 @@ fn the_same_pen_writing_again_is_not_a_change_of_either_fact() {
         &store::Patch {
             key: Some("james-again".into()),
             tags: Some(vec!["pen:james".into()]),
+            acted_by: Some("james".into()),
             asserted_by: Some("james".into()),
             ..Default::default()
         },

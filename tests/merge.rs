@@ -49,6 +49,7 @@ fn a_source_write_keeps_everything_and_touches_no_vector() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             source: Some("cmd: prove /repo".into()),
             ..bare(&key)
         },
@@ -85,6 +86,7 @@ fn a_title_write_re_embeds_the_document() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             title: Some("a sharper line".into()),
             ..bare(&key)
         },
@@ -111,6 +113,7 @@ fn a_tags_write_re_embeds_nothing() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             tags: Some(vec!["prj:seaweedfs".into(), "Storage".into()]),
             ..bare(&key)
         },
@@ -142,6 +145,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             source: Some("cmd".into()),
             ..bare(&key)
         },
@@ -153,6 +157,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             source: Some(String::new()),
             ..bare(&key)
         },
@@ -164,6 +169,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             tags: Some(vec![]),
             ..bare(&key)
         },
@@ -176,6 +182,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         (
             "title",
             store::Patch {
+            acted_by: None,
                 title: Some(String::new()),
                 ..bare(&key)
             },
@@ -183,6 +190,7 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
         (
             "body",
             store::Patch {
+            acted_by: None,
                 body: Some(String::new()),
                 ..bare(&key)
             },
@@ -211,6 +219,7 @@ fn a_body_write_moves_the_link_graph() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             body: Some("now points at [[target]]".into()),
             ..bare(&key)
         },
@@ -279,6 +288,7 @@ fn key_is_an_address_not_a_field() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             key: Some(key.clone()),
             title: Some("a new title".into()),
             body: Some("new facts".into()),
@@ -359,6 +369,7 @@ fn a_patch_that_changes_nothing_re_embeds_nothing() {
         &conn,
         &embedder,
         &store::Patch {
+            acted_by: None,
             title: Some(before.title.clone()),
             body: Some(before.body.clone()),
             tags: Some(before.tags.clone()),

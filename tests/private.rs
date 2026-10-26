@@ -20,6 +20,7 @@ fn seeded(dir: &std::path::Path) -> rusqlite::Connection {
             key: Some("open-note".into()),
             title: Some("open note".into()),
             body: Some("public facts".into()),
+            acted_by: Some("stet".into()),
             asserted_by: Some("stet".into()),
             ..Default::default()
         },
@@ -31,6 +32,7 @@ fn seeded(dir: &std::path::Path) -> rusqlite::Connection {
             key: Some("stets-note".into()),
             title: Some("stet's own".into()),
             body: Some("private facts".into()),
+            acted_by: Some("stet".into()),
             asserted_by: Some("stet".into()),
             private: Some(true),
             ..Default::default()
@@ -44,6 +46,7 @@ fn seeded(dir: &std::path::Path) -> rusqlite::Connection {
             key: Some("points-at-it".into()),
             title: Some("points".into()),
             body: Some("see [[stets-note]]".into()),
+            acted_by: Some("james".into()),
             asserted_by: Some("james".into()),
             ..Default::default()
         },
@@ -127,6 +130,7 @@ fn a_tag_filter_does_not_answer_questions_about_hidden_rows() -> Result<()> {
         &conn,
         &store::Patch {
             key: Some("stets-note".into()),
+            acted_by: Some("stet".into()),
             tags: Some(vec!["private-topic".into()]),
             ..Default::default()
         },
@@ -170,6 +174,7 @@ fn backlinks_and_history_do_not_name_it() -> Result<()> {
         &conn,
         &store::Patch {
             key: Some("stets-note".into()),
+            acted_by: Some("stet".into()),
             body: Some("private facts, revised".into()),
             ..Default::default()
         },
@@ -205,13 +210,14 @@ fn another_pen_cannot_publish_what_it_cannot_read() -> Result<()> {
         &store::Patch {
             key: Some("stets-note".into()),
             private: Some(false),
+            acted_by: Some("james".into()),
             asserted_by: Some("james".into()),
             ..Default::default()
         },
     )
     .unwrap_err();
     assert!(
-        err.to_string().contains("not yours to change"),
+        err.to_string().contains("does not include you"),
         "a row you cannot read is not a row you may publish: {err}"
     );
     assert_eq!(

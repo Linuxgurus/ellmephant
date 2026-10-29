@@ -389,7 +389,6 @@ fn a_patch_that_changes_nothing_re_embeds_nothing() {
     assert_eq!(vec::get(&conn, id).unwrap(), vector_before);
 }
 
-
 #[test]
 fn private_and_an_explicit_audience_are_refused_together() {
     // soma/ellmephant#189 D5. Asked for both, the store used to keep the `audience` and drop `private`
@@ -423,4 +422,3 @@ fn private_and_an_explicit_audience_are_refused_together() {
         "a refused write changes nothing, in particular not the audience"
     );
 }
-

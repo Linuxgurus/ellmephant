@@ -2489,5 +2489,8 @@ fn private_false_with_an_explicit_audience_is_not_a_contradiction() {
     };
     store::merge(&conn, &patch).expect("private: false plus an audience is consistent");
     let after = store::get(&conn, "published-note").unwrap().unwrap();
-    assert_eq!(after.audience, "pen:james", "the audience is the boundary it names");
+    assert_eq!(
+        after.audience, "pen:james",
+        "the audience is the boundary it names"
+    );
 }

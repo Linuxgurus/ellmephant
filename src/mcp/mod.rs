@@ -3549,7 +3549,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     // tested twice — once inside `own_row_miss`, once here — so a change to one could
                     // leave the other answering the old question. The decision returns a value; this
                     // site renders it.
-                    match Self::own_row_miss(key, caller, &owner, &audience, reader.sees(&audience)) {
+                    match Self::own_row_miss(key, caller, &owner, &audience, reader.sees(&audience))
+                    {
                         OwnRowMiss::ExcludedByItsAudience(msg) => return msg,
                         OwnRowMiss::Divergence(msg) => return msg,
                         OwnRowMiss::NotYours => {}

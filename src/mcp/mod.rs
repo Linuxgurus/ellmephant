@@ -3534,7 +3534,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         // told the difference: it knows the row exists, so the truth leaks nothing.
         if writer_sees == "writer-sees-it" {
             if let Some(caller) = reader.pen_name() {
-                let caller_owned = caller.to_string();
                 let lookup = key.to_string();
                 if let Ok(Some((owner, audience))) = self
                     .with_read("memory_get", reader.clone(), move |s| s.self_facts(&lookup))

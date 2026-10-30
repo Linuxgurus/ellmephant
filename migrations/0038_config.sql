@@ -19,6 +19,13 @@
 -- ★ `set_audience` MAY NOT BE `public`. A value anyone can write is not configuration; it is a
 -- shared scratchpad, and it will be written by whichever pen runs first. Reads may be public.
 --
+-- ★ WRITE IMPLIES READ, AND THE COLUMNS DO NOT SAY SO. `config_set` returns the stored row —
+-- `value`, `source`, `owner` — to the pen that just wrote it, so a writer can always learn the value
+-- it may not `config_get`. `read_audience` bounds READERS, not writers. A row with
+-- `set_audience = pen:a` and `read_audience = pen:b` means "a maintains it, b alone may read it";
+-- it does NOT mean "a cannot see it". The belief is false in the more dangerous direction, because
+-- the read boundary then protects only against pens that do not write.
+--
 -- ★ THE KEY IS AN ADDRESS, NOT A SLUG. `recess_daily_time` is the operator's name; case is folded
 -- (`COLLATE NOCASE`) because two spellings of one setting are one setting.
 

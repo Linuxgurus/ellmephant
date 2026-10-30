@@ -212,6 +212,44 @@ fn an_existing_items_policy_is_not_rewritten_by_a_non_writer() {
 }
 
 #[test]
+fn write_implies_read_the_setter_is_told_what_it_wrote() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    // Provisioned by the root: stet maintains it, James alone reads it.
+    config::define(
+        &conn,
+        &Reader::everything(),
+        None,
+        "maintained",
+        "old",
+        "pen:stet",
+        "pen:james",
+        "who maintains and who reads are different pens",
+    )
+    .unwrap();
+
+    let stet = reader(&conn, "stet");
+    assert!(
+        config::get(&conn, &stet, "maintained").unwrap().is_none(),
+        "the reader boundary holds for a pen that is not a reader"
+    );
+
+    // ...but a WRITE hands the row back. This is the documented consequence, not a leak to fix.
+    let written = config::set(&conn, &stet, "stet", "maintained", "new", None).unwrap();
+    assert_eq!(written.value, "new", "a writer learns the value it wrote");
+    assert_eq!(
+        written.read_audience, "pen:james",
+        "the row says who may READ it, and that is still only James"
+    );
+    assert!(
+        config::get(&conn, &stet, "maintained").unwrap().is_none(),
+        "the write did not widen the read boundary"
+    );
+}
+
+#[test]
 fn set_cannot_invent_an_item() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();

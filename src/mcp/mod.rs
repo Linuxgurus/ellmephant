@@ -3237,7 +3237,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                        value with no written ACL would be whoever writes it first, and that is \
                        `config_define`'s job. The ACL is untouched here, so a pen that may write a \
                        value still cannot widen who else may. Returns the item as stored, with the \
-                       new `owner` and `updated_at`.",
+                       new `owner` and `updated_at` — and that return is why WRITE IMPLIES READ: a \
+                       writer can always learn the value it may not `config_get`, because the write \
+                       hands the row back. `read_audience` bounds readers, not writers.",
         annotations(
             title = "Set config",
             read_only_hint = false,
@@ -3273,7 +3275,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                        authority, not editing it. Two rules stop a pen manufacturing reach: every \
                        address named in `set_audience` or `read_audience` must be one the caller can \
                        reach (itself, a pen below it, or anything under the root's break-glass), and \
-                       an EXISTING item may only be redefined by a caller who could already write it. \
+                       an EXISTING item may only be redefined by a caller who could already WRITE it \
+                       (its `set_audience`, not its `read_audience` — so a writer can republish a row \
+                       it cannot read; that follows from write implying read). `subtree:` is the \
+                       WIDEST grant this permits: one word hands the right to every descendant. \
                        `set_audience` may NOT be `public` — a value anyone can write is a shared \
                        scratchpad. `source` is REQUIRED: the reason belongs on the row. Returns the \
                        item as stored.",

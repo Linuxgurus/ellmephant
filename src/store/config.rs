@@ -19,10 +19,15 @@
 //! it, or anything when it holds the root). A sibling is not a share, and a boundary a caller can
 //! name is a boundary an injection picks.
 //!
-//! ★ ABSENCE, NOT REFUSAL. A caller who may not read an item gets [`None`] from [`get`] and no row
-//! from [`list`] — the same rule as a private memory. A refusal would confirm the item exists, which
-//! is the disclosure. A write refusal *is* reported: the caller asked to change something, and
-//! silence there would look like success.
+//! ★ ABSENCE, NOT REFUSAL — FOR READS. A caller who may not read an item gets [`None`] from [`get`]
+//! and no row from [`list`], the same rule as a private memory: a refusal would confirm the item
+//! exists, which is the disclosure.
+//!
+//! ★ [`set`] IS THE DELIBERATE EXCEPTION, and it must be named as one. A write refusal IS reported,
+//! because the caller asked to change something and silence would look like success; the refusal
+//! necessarily names the item and its `set_audience`, because the caller already named the item.
+//! And a SUCCESSFUL write returns the row unfiltered — so **write authority implies read authority**:
+//! `read_audience` bounds readers, not writers. A pen that maintains a value can always learn it.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -171,6 +176,11 @@ fn pen_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
 
 /// Change an EXISTING item's value. The ACL is untouched: changing who may set an item is
 /// [`define`], a provisioning act, not a value write.
+///
+/// ★ A SUCCESSFUL WRITE RETURNS THE ROW UNFILTERED, so write authority implies read authority: this
+/// hands back `value`, `source` and `owner` to a caller whose `read_audience` may exclude it. That is
+/// deliberate — a pen that just wrote a value being told it wrote it is worth more than the pretence
+/// that the two boundaries are independent. `read_audience` bounds READERS, not writers.
 pub fn set(
     conn: &Connection,
     reader: &Reader,

@@ -851,6 +851,24 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         ..Default::default()
     };
     let key = resolve_key(conn, &probe)?;
+    // ★ TWO INSTRUCTIONS THAT CONTRADICT EACH OTHER ARE REFUSED, NOT RESOLVED SILENTLY
+    // (soma/ellmephant#189 D5). `private` derives an audience from the proven pen; an explicit
+    // `audience` names others. Asked for both, this used to keep the `audience` and drop `private`
+    // without a word — and when that audience did not include the author, the row became invisible to
+    // the pen that wrote it. A caller must not have to guess which of its two sentences was obeyed.
+    // ★ ONLY `private: true` CONTRADICTS AN AUDIENCE (hostile review of #194, round 2). `private: false`
+    // says "not private", and ANY explicit audience satisfies that — refusing the pair rejected a
+    // request that was not contradictory, and every client that always sends `private: false` with an
+    // audience would have broken. The contradiction is a claim of exclusivity alongside a list.
+    if patch.private == Some(true) && patch.audience.is_some() {
+        return Err(Error::Invalid(
+            "`private: true` and `audience` contradict each other: private addresses the row to the \
+             writing pen ALONE, audience names other pens. Pass one. To address several pens INCLUDING \
+             yourself, use `audience: \"pen:<you>,pen:<other>\"` and no `private`; `private: false` \
+             needs no audience, and any audience satisfies it."
+                .into(),
+        ));
+    }
     let existing = get(conn, &key)?;
     // A `protected` row (or a write that would make one) needs a live lease on its own key.
     let was_tags = existing

@@ -1434,6 +1434,20 @@ pub struct MemoryServer {
     declared: Option<String>,
 }
 
+/// What a miss means when the row belongs to the caller (hostile review of #194, round 1). Three
+/// outcomes, decided once and rendered elsewhere: the first version tested the same two conditions in
+/// two places, which is how a diagnostic comes to disagree with itself.
+enum OwnRowMiss {
+    /// The row exists, the caller owns it, and its audience excludes the caller: recoverable, and the
+    /// caller may be told because it already knows the row exists.
+    ExcludedByItsAudience(String),
+    /// Writer sees it, the reader's own predicate says it may see it, the read returned nothing: a real
+    /// divergence between the two connections.
+    Divergence(String),
+    /// Not the caller's row: absence, never a diagnosis.
+    NotYours,
+}
+
 impl MemoryServer {
     /// Build a server over an open session — the `ellmephant mcp` path.
     pub fn new(session: Session) -> Self {
@@ -3524,7 +3538,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         }
         let lookup = key.to_string();
         let facts = match self
-            .with_read("memory_get", reader, move |s| s.miss_facts(&lookup))
+            .with_read("memory_get", reader.clone(), move |s| s.miss_facts(&lookup))
             .await
         {
             Ok(f) => f,
@@ -3563,27 +3577,102 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             }
         };
         tracing::warn!(tool = "memory_get", key = %key, writer_sees, "memory_get miss: writer check");
-        let divergence = if writer_sees == "writer-sees-it" {
-            " ★ THIS PROCESS'S WRITER CONNECTION CAN SEE THIS ROW, so the read is lying about a row the process itself can prove: report the store and this sentence, do not re-write the memory."
-        } else {
-            ""
-        };
+        // ★ A HIDDEN ROW IS NOT A BROKEN READ (soma/ellmephant#189, 2026-10-26). The writer check is
+        // raw SQL on the table, so it says "exists" for every row the reader's AUDIENCE hides — which
+        // is the normal state of affairs in this estate, not a fault. Resolving that disagreement in
+        // favour of "the read is lying" and telling the caller to *report the store* is how I spent an
+        // hour hunting a split store that did not exist. The row's author is the one caller who may be
+        // told the difference: it knows the row exists, so the truth leaks nothing.
+        if writer_sees == "writer-sees-it" {
+            if let Some(caller) = reader.pen_name() {
+                let lookup = key.to_string();
+                if let Ok(Some((owner, audience))) = self
+                    .with_read("memory_get", reader.clone(), move |s| s.self_facts(&lookup))
+                    .await
+                {
+                    // ★ ASK THE READER, DO NOT ASSUME (adversarial review of #194). The first version
+                    // said "its audience does not include you" whenever the writer saw the row — which
+                    // would be a FALSE cause for the one case that is genuinely a divergence: the
+                    // audience DOES include the caller and the reader still cannot see it. Claiming a
+                    // cause without testing it is the defect this whole issue is about.
+                    // ★ ONE PLACE DECIDES (hostile review of #194, round 1): the caller's own row was
+                    // tested twice — once inside `own_row_miss`, once here — so a change to one could
+                    // leave the other answering the old question. The decision returns a value; this
+                    // site renders it.
+                    match Self::own_row_miss(key, caller, &owner, &audience, reader.sees(&audience))
+                    {
+                        OwnRowMiss::ExcludedByItsAudience(msg) => return msg,
+                        OwnRowMiss::Divergence(msg) => return msg,
+                        OwnRowMiss::NotYours => {}
+                    }
+                }
+            }
+            // Not the caller's row: absence is the honest answer, and inventing a fault is not.
+            return err;
+        }
+        // ★ THE COUNT IS THE READER'S, AND SAYS SO (soma/ellmephant#189 D3). It used to read "holds N
+        // memories", i.e. a statement about the file, while it was computed with the reader's own
+        // predicate — so two pens comparing notes at the same moment saw a store that disagreed with
+        // itself by eight rows, which is precisely the "wrong store" hypothesis the sentence invites.
         if facts.versions > 0 {
             format!(
-                "no such memory: {key} — but {} holds {} memories (schema {}) and {} version(s) for this key, newest {}. So this is a DELETED row with history, or a reader looking at the wrong store; `memory_history` lists the versions and `memory_get` with `version=N` fetches one. Do not treat this as 'never existed'. [{}]{divergence}",
+                "no such memory: {key} — but {} holds {} version(s) for this key (newest {}), which you can \
+                 see, and it is not in the live table. So this is a DELETED row with history, or a reader \
+                 looking at the wrong store; `memory_history` lists the versions and `memory_get` with \
+                 `version=N` fetches one. Do not treat this as 'never existed'. (You can see {} memories, \
+                 schema {}.) [{}]",
                 facts.store,
-                facts.memories,
-                facts.schema,
                 facts.versions,
                 facts.newest.as_deref().unwrap_or("unknown"),
+                facts.memories,
+                facts.schema,
                 writer_sees
             )
         } else {
             format!(
-                "no such memory: {key} — {} holds {} memories (schema {}) and has no history for this key, so it has never existed THERE. If you believe it does, the store that holds it is not this one. [{}]{divergence}",
-                facts.store, facts.memories, facts.schema, writer_sees
+                "no such memory: {key} — you can see {} memories in {} (schema {}), and neither this reader \
+                 nor the writer connection has any history for this key, so it has never existed THERE — \
+                 either the key is new, or you are reading a different store. [{}]",
+                facts.memories, facts.store, facts.schema, writer_sees
             )
         }
+    }
+
+    /// The message for a miss that is really the AUTHOR's own row, hidden from the author by its
+    /// audience — or `None` when that is not what happened.
+    ///
+    /// ★ PURE ON PURPOSE (adversarial review of #194): the decision is a question about three facts, and
+    /// a diagnostic that can only be tested by standing up a transport is a diagnostic that will not be
+    /// tested. `reader_can_see` is passed in rather than assumed — claiming "the audience excludes you"
+    /// without checking is the same class of wrong cause this issue exists to remove.
+    fn own_row_miss(
+        key: &str,
+        caller: &str,
+        owner: &str,
+        audience: &str,
+        reader_can_see: bool,
+    ) -> OwnRowMiss {
+        if !owner.eq_ignore_ascii_case(caller) {
+            return OwnRowMiss::NotYours;
+        }
+        if reader_can_see {
+            // The writer sees it, this reader's own predicate says it may see it, and the read still
+            // returned nothing: the ONE case where "the read is lying" is true rather than slander.
+            return OwnRowMiss::Divergence(format!(
+                "no such memory: {key} — but this process's writer connection sees it and its audience \
+                 ({audience}) DOES include you. That is a real divergence between the reading and \
+                 writing connections: report the store and this sentence rather than re-writing the \
+                 memory."
+            ));
+        }
+        OwnRowMiss::ExcludedByItsAudience(format!(
+            "no such memory: {key} — but it EXISTS, it is YOURS (owner: {owner}), and its audience \
+             ({audience}) does not include you, so a read may not return it. This is not a store fault \
+             and not a deletion. Write it with an audience that includes `pen:{caller}` (or `public`) \
+             and it comes back: that write narrows what the row exposes and is always yours to make. \
+             If the row is PROTECTED, take its lease first (`claim_acquire`) — the audience is not the \
+             only gate on that write."
+        ))
     }
 
     /// One letter, body included.
@@ -4738,5 +4827,46 @@ mod tests {
         let cfg = Config::default();
         let spec = crate::model::Spec::from_config(&cfg, &paths);
         Session::open(paths, cfg, spec).expect("open store")
+    }
+}
+
+#[cfg(test)]
+mod miss_answer_tests {
+    //! ★ HOSTILE REVIEW OF #194: the diagnostic is a decision about facts, so it is tested as one.
+    //! Every case here is a different sentence a caller can receive, and the two that matter are the
+    //! middle ones: an author whose audience DOES include them must not be told it excludes them, and a
+    //! stranger must not be told anything.
+    use super::{MemoryServer, OwnRowMiss};
+
+    #[test]
+    fn an_owner_hidden_by_its_own_audience_is_told_so() {
+        match MemoryServer::own_row_miss("trap", "cline", "cline", "pen:james", false) {
+            OwnRowMiss::ExcludedByItsAudience(msg) => {
+                assert!(msg.contains("it is YOURS"), "{msg}");
+                assert!(msg.contains("pen:james"), "and quotes the audience: {msg}");
+                assert!(msg.contains("pen:cline"), "and names what to add: {msg}");
+                assert!(
+                    msg.contains("PROTECTED"),
+                    "and names the OTHER gate on that write, so the advice is not a loop: {msg}"
+                );
+            }
+            _ => panic!("expected the audience explanation"),
+        }
+    }
+
+    #[test]
+    fn an_owner_who_could_see_it_gets_a_divergence_not_an_audience_excuse() {
+        match MemoryServer::own_row_miss("k", "cline", "cline", "pen:cline", true) {
+            OwnRowMiss::Divergence(msg) => assert!(msg.contains("divergence"), "{msg}"),
+            _ => panic!("the audience includes them; the cause must be the divergence"),
+        }
+    }
+
+    #[test]
+    fn someone_elses_row_is_never_explained_to_a_stranger() {
+        assert!(matches!(
+            MemoryServer::own_row_miss("k", "cline", "james", "pen:james", false),
+            OwnRowMiss::NotYours
+        ));
     }
 }

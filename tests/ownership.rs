@@ -2470,3 +2470,30 @@ fn a_reordered_audience_is_not_a_changed_audience() {
         "a reorder changed nothing, and the sentence must not say it did: {err}"
     );
 }
+
+#[test]
+fn private_false_with_an_explicit_audience_is_not_a_contradiction() {
+    // ★ HOSTILE REVIEW OF #194, ROUND 2. `private: false` says "not private", which ANY explicit
+    // audience satisfies. Refusing the pair rejected a request that was not contradictory, and every
+    // client that always sends `private: false` alongside an audience would have broken.
+    let (_dir, conn) = subtree();
+    let embedder = HashEmbedder::new(DIM);
+    row_with_audience(&conn, &embedder, "published-note", "cline", "public");
+
+    // The audience includes the author: D1 (#189), which landed after this test was written,
+    // refuses an audience that excludes the pen who answers for the row. That is a different
+    // rule from the private/audience contradiction under test here.
+    let patch = store::Patch {
+        key: Some("published-note".into()),
+        private: Some(false),
+        audience: Some("pen:james,pen:cline".into()),
+        acted_by: Some("cline".into()),
+        ..Default::default()
+    };
+    store::merge(&conn, &patch).expect("private: false plus an audience is consistent");
+    let after = store::get(&conn, "published-note").unwrap().unwrap();
+    assert_eq!(
+        after.audience, "pen:james,pen:cline",
+        "the audience is the boundary it names"
+    );
+}

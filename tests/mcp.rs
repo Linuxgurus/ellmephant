@@ -1358,9 +1358,17 @@ async fn config_round_trips_with_its_written_acl() {
     let row: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
     assert_eq!(row["value"], "90m");
 
-    let listed = call(&client, "config_list", serde_json::json!({})).await;
+    // A fresh store also carries the recess seed (0039), so assert the row is present rather than
+    // that it is the only row: a count here would make every later seed break this test.
+    let listed = call(
+        &client,
+        "config_list",
+        serde_json::json!({ "prefix": "recess_daily_time" }),
+    )
+    .await;
     let rows: serde_json::Value = serde_json::from_str(&text(&listed)).expect("json");
     assert_eq!(rows["config"].as_array().unwrap().len(), 1);
+    assert_eq!(rows["config"][0]["key"], "recess_daily_time");
 
     // `set` cannot invent an item: the ACL is the point.
     let invented = call(

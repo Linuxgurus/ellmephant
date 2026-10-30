@@ -117,6 +117,63 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
 }
 
 #[test]
+fn the_recess_seed_is_configuration_and_a_reopen_does_not_reset_it() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, value, set_audience, read_audience FROM config
+              WHERE key LIKE 'recess_daily_%' ORDER BY key",
+        )
+        .unwrap();
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "recess_daily_grant_at".into(),
+                "18:00".into(),
+                "pen:estate".into(),
+                "public".into()
+            ),
+            (
+                "recess_daily_seconds".into(),
+                "1800".into(),
+                "pen:estate".into(),
+                "public".into()
+            ),
+        ],
+        "the seed is the default: estate writes it, everyone may read the rate"
+    );
+
+    drop(stmt);
+    // A value changed after the seed must SURVIVE a reopen: the seed is a default, not a reset.
+    conn.execute(
+        "UPDATE config SET value = '7200' WHERE key = 'recess_daily_seconds'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let conn = db::open(&paths).expect("reopen");
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'recess_daily_seconds'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        value, "7200",
+        "INSERT OR IGNORE must not re-seed over a decision"
+    );
+}
+
+#[test]
 fn pragmas_are_applied() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
@@ -206,6 +263,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.execute("ALTER TABLE memory DROP COLUMN edited_by", [])
         .unwrap();
     // ...and predates the PEN REGISTRY (0021), which is a table of its own.
+    // ...config references pen(id), so it must go FIRST or the drop below trips the foreign key.
+    conn.execute("DROP TABLE IF EXISTS config", []).unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
     // ...and predates SUDO (0024), which is two tables of its own.
     conn.execute("DROP TABLE IF EXISTS active_sudo", [])
@@ -297,6 +356,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     conn.execute("ALTER TABLE memory DROP COLUMN edited_by", [])
         .unwrap();
     // ...and predates the PEN REGISTRY (0021), which is a table of its own.
+    // ...config references pen(id), so it must go FIRST or the drop below trips the foreign key.
+    conn.execute("DROP TABLE IF EXISTS config", []).unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
     // ...and predates SUDO (0024), which is two tables of its own.
     conn.execute("DROP TABLE IF EXISTS active_sudo", [])
@@ -495,6 +556,8 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         [],
     )
     .unwrap();
+    // ...config references pen(id), so it must go FIRST or the drop below trips the foreign key.
+    conn.execute("DROP TABLE IF EXISTS config", []).unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
     // ...and predates SUDO (0024), which is two tables of its own.
     conn.execute("DROP TABLE IF EXISTS active_sudo", [])

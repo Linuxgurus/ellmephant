@@ -46,13 +46,22 @@ jobs:
           # dependencies the gate compiles (lockfile + both Dockerfiles). Built by gate-builder.yml.
           # If it is absent — a PR that changes Cargo.lock, or a run before the image exists — fall
           # back to the plain toolchain: one slow build, never a wrong one.
-          gatebase="harbor.vn.linuxguru.net/library/ellmephant-gate-builder:gate-$(cat Cargo.toml Cargo.lock Dockerfile.test Dockerfile.gate-builder | sha256sum | cut -c1-8)"
-          if docker buildx imagetools inspect "$gatebase" > /dev/null 2>&1; then
-            builder="$gatebase"
-            echo "gate dependencies: $gatebase"
+          # The base digest is part of the fingerprint: a re-tagged `rust:1-bookworm` must not
+          # silently reuse artifacts compiled against a different toolchain. If the digest cannot
+          # be resolved, fall back — a slow build is safe; a guessed cache is not.
+          base=$(docker buildx imagetools inspect rust:1-bookworm --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          if [ -n "$base" ]; then
+            gatebase="harbor.vn.linuxguru.net/library/ellmephant-gate-builder:gate-$({ cat Cargo.toml Cargo.lock Dockerfile.test Dockerfile.gate-builder .forgejo/workflows/gate-builder.yml; printf '%s' "$base"; } | sha256sum | cut -c1-8)"
+            if docker buildx imagetools inspect "$gatebase" > /dev/null 2>&1; then
+              builder="$gatebase"
+              echo "gate dependencies: $gatebase"
+            else
+              builder="rust:1-bookworm"
+              echo "gate dependencies: none for this lockfile, compiling from scratch"
+            fi
           else
             builder="rust:1-bookworm"
-            echo "gate dependencies: none for this lockfile, compiling from scratch"
+            echo "gate dependencies: cannot resolve rust:1-bookworm digest, compiling from scratch"
           fi
 
           job=$(kubectl create -f - -o jsonpath='{.metadata.name}' <<YAML
@@ -117,7 +126,10 @@ jobs:
             sleep 5
           done
           if [ "$state" = complete ]; then
-            kubectl -n ci-builds logs "job/$job" --tail=-1
+            # ★ A TRANSIENT LOG FAILURE MUST NOT SKIP THE DELETE (2026-10-30, Stet on #188): under
+            # `set -e` an unguarded `kubectl logs` exits before the cleanup, and a finished Job then
+            # holds one of the five `ci-builds` quota slots until its TTL.
+            kubectl -n ci-builds logs "job/$job" --tail=-1 || true
             kubectl -n ci-builds delete "job/$job" --ignore-not-found || true
           else
             echo "build ${state:-timed out}:"

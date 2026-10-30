@@ -29,7 +29,7 @@ COPY . .
 # -- the stub artifacts inside it look NEWER than the source just copied in, and cargo keeps the
 # stub's empty lib. The build then dies with "cannot find `embed` in `ellmephant`", which names
 # the wrong problem. In normal CI the image is older than the commit and this is a no-op.
-RUN find src tests benches -type f -exec touch {} + 2>/dev/null || true
+RUN if [ -d benches ]; then find src tests benches -type f -exec touch {} +; else find src tests -type f -exec touch {} +; fi
 
 # The official image carries rustup but NOT the `rustfmt`/`clippy` components, and the gates below
 # need both. (Learned the loud way: the first probe died at `cargo fmt` with "'cargo-fmt' is not
@@ -43,13 +43,14 @@ RUN cargo fetch --locked
 # One cargo step at a time, on purpose: they contend on the target-dir lock (DEVELOPMENT.md), and a
 # separate layer makes a failure name itself instead of scrolling past in one long log.
 #
-# `target/` is a CACHE MOUNT, deliberately not part of the image: without it the gate bakes ~3 GB of
-# build artifacts into a throwaway image that nothing ever RUNs -- slow to export (minutes, measured)
-# and it spends the runner's disk for nothing. Mounted, the artifacts stay in the build cache, the
-# later steps reuse the earlier ones, and the image is only the size of the toolchain. (`fmt` reads
-# the source and writes no artifacts, so it needs no mount.)
+# ★ NO CACHE MOUNT HERE (2026-10-30, Stet on #188). A BuildKit cache mount SHADOWS whatever the image
+# put at that path. The dependency image's payload IS `/src/target`, so
+# `--mount=type=cache,target=/src/target` hid the prebuilt crates at every cargo step and the gate
+# recompiled exactly as before — the feature was a no-op. Cargo writes into the image's `/src/target`
+# instead. On the `rust:1-bookworm` fallback those artifacts live in a throwaway container layer,
+# which is exactly what the fallback always did.
 RUN cargo fmt --all --check
-RUN --mount=type=cache,target=/src/target cargo clippy --all-targets --all-features -- -D warnings
-RUN --mount=type=cache,target=/src/target cargo test --locked
+RUN cargo clippy --all-targets --all-features -- -D warnings
+RUN cargo test --locked
 # The store-only build must compile too (the encoder is behind a default-on feature).
-RUN --mount=type=cache,target=/src/target cargo test --locked --no-default-features
+RUN cargo test --locked --no-default-features

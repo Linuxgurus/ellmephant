@@ -43,7 +43,8 @@ jobs:
           export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
 
           # MUST stay identical to the computation in test.yml, or the gate never finds the image.
-          image="harbor.vn.linuxguru.net/library/ellmephant-gate-builder:gate-$(cat Cargo.toml Cargo.lock Dockerfile.test Dockerfile.gate-builder | sha256sum | cut -c1-8)"
+          base=$(docker buildx imagetools inspect rust:1-bookworm --format '{{.Manifest.Digest}}')
+          image="harbor.vn.linuxguru.net/library/ellmephant-gate-builder:gate-$({ cat Cargo.toml Cargo.lock Dockerfile.test Dockerfile.gate-builder .forgejo/workflows/gate-builder.yml; printf '%s' "$base"; } | sha256sum | cut -c1-8)"
 
           # Idempotent: a push that changes nothing about the dependency set rebuilds nothing.
           if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then

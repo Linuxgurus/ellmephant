@@ -200,6 +200,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0038_config.sql"),
         "`config`: a stored value with a written ACL — who may set it and who may read it, in columns",
     ),
+    (
+        39,
+        include_str!("../../migrations/0039_config_seed_recess.sql"),
+        "seed: the daily recess amount and grant time are config rows (estate writes, public reads)",
+    ),
 ];
 
 /// Current schema version recorded in the file.

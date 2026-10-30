@@ -61,11 +61,19 @@ fn an_item_is_absent_when_it_is_not_addressed_to_you() {
             .is_none(),
         "absence, not a refusal: a sibling must not learn the item exists"
     );
+    // Prefix, because a fresh store also carries the public recess seed (0039).
     assert!(
-        config::list(&conn, &cline, None).unwrap().is_empty(),
+        config::list(&conn, &cline, Some("recess_daily_time"))
+            .unwrap()
+            .is_empty(),
         "the list omits what the reader may not see"
     );
-    assert_eq!(config::list(&conn, &stet, None).unwrap().len(), 1);
+    assert_eq!(
+        config::list(&conn, &stet, Some("recess_daily_time"))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

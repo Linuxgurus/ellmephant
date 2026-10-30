@@ -2187,12 +2187,17 @@ async fn pen_mint_creates_a_child_under_the_caller() {
     )
     .await;
     let doc: serde_json::Value = serde_json::from_str(&minted).unwrap();
-    assert_eq!(doc["name"], json!("tester/finger-9f3a1c"), "{minted}");
-    assert_eq!(doc["kind"], json!("finger"), "{minted}");
     assert_eq!(
-        doc["parent"],
-        json!("tester"),
-        "the caller is the parent: {minted}"
+        doc["name"],
+        json!("tester/finger-9f3a1c"),
+        "the minted name"
+    );
+    assert_eq!(doc["kind"], json!("finger"), "the minted kind");
+    assert_eq!(doc["parent"], json!("tester"), "the caller is the parent");
+    assert_eq!(
+        doc["secret"].as_str().map(str::len),
+        Some(64),
+        "the child's secret is returned ONCE"
     );
 
     // The new pen is in the tree, and the walk says what it is to the minting hand.
@@ -2301,18 +2306,33 @@ async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
 
 /// The identity fixture for HTTP writes.
 ///
-/// ★ ONE TABLE, SET ONCE, AS A SUPERSET: cargo runs the tests in this binary in parallel threads, and
-/// `ELLMEPHANT_IDENTITIES` is process-global. A per-test table that each test removes would make
-/// whichever test finished last decide the identity of the one still running. Every HTTP test that
-/// needs a proven pen calls this and none of them removes it.
-fn identity_fixture() {
-    const TABLE: &str = "ELLMEPHANT_IDENTITIES";
-    unsafe {
-        std::env::set_var(
-            TABLE,
-            "http-as-tester:as-secret-1,http-as-gated:as-secret-g",
+/// ★ PROVISIONING, NOT ENV: two pens with credentials hashed into `pen_credential`. The old fixture
+/// set `ELLMEPHANT_IDENTITIES`, which was process-global and made parallel tests influence each
+/// other; a row belongs to one temp store, so these tests no longer share anything.
+fn identity_fixture(paths: &Paths) {
+    let conn = ellmephant::db::open(paths).unwrap();
+    for (name, secret) in [
+        ("http-as-tester", "as-secret-1"),
+        ("http-as-gated", "as-secret-g"),
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO pen (name, kind) VALUES (?1, 'self')",
+            [name],
         )
-    };
+        .unwrap();
+        if ellmephant::store::credential::verify(&conn, name, secret)
+            .unwrap()
+            .is_none()
+        {
+            let hash = ellmephant::store::credential::digest(secret);
+            conn.execute(
+                "INSERT OR REPLACE INTO pen_credential (pen_id, hash)
+                 VALUES ((SELECT id FROM pen WHERE name = ?1), ?2)",
+                [name, hash.as_str()],
+            )
+            .unwrap();
+        }
+    }
 }
 
 /// `as:` on the BODY of `POST /memory` — the same claim as the MCP argument, and the same gate: a
@@ -2336,7 +2356,7 @@ async fn the_http_write_accepts_an_as_claim_but_only_with_a_live_lend() {
         .unwrap();
     }
 
-    identity_fixture();
+    identity_fixture(&paths);
 
     let post = |body: serde_json::Value| {
         let app = app.clone();
@@ -2660,11 +2680,10 @@ async fn reading_a_past_state_of_a_descendants_private_row_is_recorded() {
 #[tokio::test]
 async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
     use serde_json::json;
-    identity_fixture();
-
     let dir = tempfile::tempdir().unwrap();
-    let app = app_with_token(dir.path(), "tok");
     let paths = Paths::from_root(dir.path());
+    identity_fixture(&paths);
+    let app = app_with_token(dir.path(), "tok");
 
     // Provisioning, outside every door: the pen, its membership, and an unread incident.
     let seq;
@@ -2750,8 +2769,9 @@ async fn a_pen_behind_a_gated_channel_cannot_change_the_record() {
 #[tokio::test]
 async fn the_gate_gives_the_same_verdict_on_both_doors() {
     use serde_json::json;
-    identity_fixture();
     let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(dir.path());
+    identity_fixture(&paths);
     let watch = Arc::new(LockWatch::new());
     let shared = Arc::new(Mutex::new(session(dir.path())));
     let mcp = MemoryServer::with_watch(Arc::clone(&shared), Arc::clone(&watch));
@@ -2892,11 +2912,10 @@ async fn the_gate_gives_the_same_verdict_on_both_doors() {
 #[tokio::test]
 async fn a_locked_pen_may_rebuild_but_may_not_prune() {
     use serde_json::json;
-    identity_fixture();
-
     let dir = tempfile::tempdir().unwrap();
-    let app = app_with_token(dir.path(), "tok");
     let paths = Paths::from_root(dir.path());
+    identity_fixture(&paths);
+    let app = app_with_token(dir.path(), "tok");
 
     {
         let conn = ellmephant::db::open(&paths).unwrap();
@@ -2984,5 +3003,73 @@ async fn a_locked_pen_may_rebuild_but_may_not_prune() {
     assert!(
         body.contains("ops_team") && body.contains("not been fetched"),
         "the refusal names the channel and the reason: {body}"
+    );
+}
+
+/// `POST /pen/rotate` — the new secret is returned once, and the old one stops proving at once.
+#[tokio::test]
+async fn pen_rotate_returns_a_new_secret_and_the_old_one_dies() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let paths = Paths::from_root(dir.path());
+    let old = {
+        let conn = ellmephant::db::open(&paths).unwrap();
+        conn.execute(
+            "INSERT INTO pen (name, kind) VALUES ('rotate-tester', 'self')",
+            [],
+        )
+        .unwrap();
+        ellmephant::store::credential::issue(&conn, "rotate-tester", None).unwrap()
+    };
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/pen/rotate?format=json")
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .header("X-Stet-From", "rotate-tester")
+                .header("X-Stet-Auth", &old)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    assert_eq!(status, StatusCode::OK, "{status} {body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let fresh = doc["secret"].as_str().unwrap().to_string();
+    assert_ne!(fresh, old, "a rotation is a new secret");
+    assert_eq!(doc["pen"], json!("rotate-tester"));
+
+    let whoami = |secret: String| {
+        let app = app.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/whoami")
+                        .header("X-Stet-From", "rotate-tester")
+                        .header("X-Stet-Auth", secret)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            String::from_utf8_lossy(&bytes).to_string()
+        }
+    };
+    assert!(
+        whoami(fresh).await.contains("\"proven\":true"),
+        "the new secret proves"
+    );
+    assert!(
+        whoami(old).await.contains("\"proven\":false"),
+        "the old secret is dead on the NEXT call"
     );
 }

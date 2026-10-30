@@ -59,6 +59,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/pen/rotate",
+        tool: "pen_rotate",
+    },
+    Route {
+        method: "POST",
         path: "/pen/lend",
         tool: "pen_lend",
     },
@@ -784,7 +789,7 @@ pub async fn pen_lend(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match crate::identity::resolve(&headers) {
+    let caller = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => name,
         Ok(None) => {
             return error(
@@ -841,8 +846,8 @@ pub async fn pen_lend(
 /// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
 /// because authority is always borrowed BY somebody.
 #[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as in `session`
-fn proven_pen(headers: &HeaderMap, json: bool) -> Result<String, Response> {
-    match crate::identity::resolve(headers) {
+fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, Response> {
+    match crate::identity::resolve(paths, headers) {
         Ok(Some(name)) => Ok(name),
         Ok(None) => Err(error(
             json,
@@ -864,7 +869,7 @@ pub async fn sudo(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match proven_pen(&headers, json) {
+    let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -961,7 +966,7 @@ pub async fn sudo_pass(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match proven_pen(&headers, json) {
+    let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -1016,7 +1021,7 @@ pub async fn sudo_release(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match proven_pen(&headers, json) {
+    let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -1065,7 +1070,7 @@ pub async fn pen_mint(
         Err(r) => return r,
     };
     // A mint is a WRITE: the caller is the parent, and an unproven caller is nobody.
-    let caller = match crate::identity::resolve(&headers) {
+    let caller = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => name,
         Ok(None) => {
             return error(
@@ -1110,9 +1115,74 @@ pub async fn pen_mint(
                 json,
                 value.to_string(),
                 format!(
-                    "minted {} ({}) under {}\n",
-                    minted.name, minted.kind, minted.parent
+                    "minted {} ({}) under {}\nsecret (shown once): {}\n",
+                    minted.name, minted.kind, minted.parent, minted.secret
                 ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /pen/rotate` — replace a credential, returning the new secret once (`pen_rotate`).
+pub async fn pen_rotate(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let caller = match crate::identity::resolve(&state.paths, &headers) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return error(
+                json,
+                StatusCode::UNAUTHORIZED,
+                "refused: rotating a credential needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
+            );
+        }
+        Err(denied) => return error(json, StatusCode::UNAUTHORIZED, denied.to_string()),
+    };
+    let bytes = match body_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        pen: Option<String>,
+    }
+    // An empty body is the common case: "rotate MY secret". It is not a malformed request.
+    let ask: Ask = if bytes.iter().all(u8::is_ascii_whitespace) {
+        Ask { pen: None }
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(a) => a,
+            Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        }
+    };
+    let target = ask.pen.unwrap_or_else(|| caller.clone());
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let for_store = target.clone();
+    match server
+        .with_store("pen_rotate", move |s| {
+            s.rotate_credential(&caller, &for_store)
+        })
+        .await
+    {
+        Ok(secret) => {
+            tracing::info!(area = scope.area, pen = %target, "credential rotated over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::json!({ "pen": target, "secret": secret }).to_string(),
+                format!("rotated {target}; new secret (shown once): {secret}\n"),
             )
         }
         Err(e) => error(json, error_status(&e), e),
@@ -1127,7 +1197,7 @@ pub async fn whois(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let viewer = crate::identity::resolve(&headers)
+    let viewer = crate::identity::resolve(&state.paths, &headers)
         .ok()
         .flatten()
         .unwrap_or_else(|| crate::identity::ANONYMOUS.to_string());
@@ -1136,7 +1206,7 @@ pub async fn whois(
         Err(r) => return r,
     };
     match server
-        .with_read("whois", reader_from(&headers), move |s| {
+        .with_read("whois", reader_from(&headers, &state.paths), move |s| {
             s.whois(&viewer, &pen)
         })
         .await
@@ -1172,8 +1242,8 @@ pub async fn whois(
 /// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
 /// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
 /// same question the model asks instead of guessing from a remembered flag.
-pub async fn whoami(headers: HeaderMap) -> Response {
-    let (doc, text) = match crate::identity::resolve(&headers) {
+pub async fn whoami(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let (doc, text) = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => {
             let text = format!("{name} (proven)\n");
             (
@@ -1187,20 +1257,30 @@ pub async fn whoami(headers: HeaderMap) -> Response {
         ),
         // A claim that failed verification is still worth reporting: the caller learns the name it
         // sent is not the name it has. The secret is never echoed.
-        Err(forged) => {
-            let claimed = forged.0;
-            (
-                serde_json::json!({
-                    "asserted_by": crate::identity::ANONYMOUS,
-                    "proven": false,
-                    "claimed": claimed,
-                    "problem": "the X-Stet-Auth proof is missing or wrong",
-                }),
-                format!(
-                    "{} (not proven; claimed `{claimed}`)\n",
-                    crate::identity::ANONYMOUS
-                ),
-            )
+        Err(denied) => {
+            let mut doc = serde_json::json!({
+                "asserted_by": crate::identity::ANONYMOUS,
+                "proven": false,
+            });
+            let text = match denied {
+                crate::identity::Denied::Forged(claimed) => {
+                    doc["claimed"] = serde_json::json!(claimed);
+                    doc["problem"] = serde_json::json!("the X-Stet-Auth proof is missing or wrong");
+                    format!(
+                        "{} (not proven; claimed `{claimed}`)\n",
+                        crate::identity::ANONYMOUS
+                    )
+                }
+                crate::identity::Denied::Unavailable(why) => {
+                    doc["problem"] =
+                        serde_json::json!(format!("the credential store is unavailable: {why}"));
+                    format!(
+                        "{} (not proven; credential store unavailable)\n",
+                        crate::identity::ANONYMOUS
+                    )
+                }
+            };
+            (doc, text)
         }
     };
     render(StatusCode::OK, true, doc.to_string(), text)
@@ -1208,8 +1288,8 @@ pub async fn whoami(headers: HeaderMap) -> Response {
 
 /// Who this request reads as. A proven pair decides; anything else — including a forged claim — is
 /// nobody, and nobody sees public rows only. Reads never fail for want of a pen.
-fn reader_from(headers: &HeaderMap) -> crate::store::audience::Reader {
-    match crate::identity::resolve(headers) {
+fn reader_from(headers: &HeaderMap, paths: &Paths) -> crate::store::audience::Reader {
+    match crate::identity::resolve(paths, headers) {
         Ok(Some(name)) => crate::store::audience::Reader::pen(&name),
         _ => crate::store::audience::Reader::anonymous(),
     }
@@ -1221,7 +1301,7 @@ pub async fn stats(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tags = params.flag("tags");
@@ -1251,7 +1331,7 @@ pub async fn memory_get(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let version = match params.parse_as::<i64>("version") {
@@ -1345,9 +1425,11 @@ pub async fn unowned(
         Err(r) => return r,
     };
     match server
-        .with_read("memory_unowned", reader_from(&headers), move |s| {
-            s.unowned(limit)
-        })
+        .with_read(
+            "memory_unowned",
+            reader_from(&headers, &state.paths),
+            move |s| s.unowned(limit),
+        )
         .await
     {
         Ok(rows) => {
@@ -1379,7 +1461,7 @@ pub async fn backlinks(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let json = Params::parse(raw.as_deref()).json();
     let server = match session(&state) {
         Ok(s) => s,
@@ -1409,7 +1491,7 @@ pub async fn dangling(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -1441,7 +1523,7 @@ pub async fn history(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let cap = match params.parse_as::<u32>("limit") {
@@ -1512,7 +1594,7 @@ pub async fn search(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let search = match search_params(&params) {
@@ -1536,7 +1618,7 @@ pub async fn semantic_search(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mut fields = Vec::new();
@@ -1584,7 +1666,7 @@ pub async fn dupes(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let max_distance = match params.parse_as::<f32>("max_distance") {
@@ -1624,7 +1706,7 @@ pub async fn projects(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mode = match mode_param(params.maybe("mode")) {
@@ -1666,7 +1748,7 @@ pub async fn project_get(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let hydrate = match project::Hydrate::parse(params.get("hydrate").unwrap_or("none")) {
@@ -1904,7 +1986,9 @@ pub async fn upsert(
     // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
     // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
     // names the pen, and only a PROVEN one is stamped (#109).
-    let proven = crate::identity::resolve(&headers).ok().flatten();
+    let proven = crate::identity::resolve(&state.paths, &headers)
+        .ok()
+        .flatten();
     // ★ A SILENTLY IGNORED ARGUMENT IS A LIE ABOUT WHAT HAPPENED (found reviewing #126): with no
     // proven pen there is nobody to check the claim against, so `as` would be dropped and the write
     // attributed to nobody while the caller believed the finger was credited.
@@ -2022,7 +2106,9 @@ pub async fn memory_delete(
     };
     // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
     // nobody to name in the ledger, and `store::delete` will refuse it on a row somebody owns.
-    let pen = crate::identity::resolve(&headers).ok().flatten();
+    let pen = crate::identity::resolve(&state.paths, &headers)
+        .ok()
+        .flatten();
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
@@ -2104,7 +2190,7 @@ pub async fn upvote(
     };
     // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
     // errors nor the JSON can drift apart.
-    match crate::mcp::upvote_sweep(server, reader_from(&headers), keys).await {
+    match crate::mcp::upvote_sweep(server, reader_from(&headers, &state.paths), keys).await {
         Ok(payload) => {
             tracing::info!(area = scope.area, keys = %named, "upvoted over http");
             render(StatusCode::OK, json, payload, format!("upvoted {named}"))
@@ -2173,7 +2259,9 @@ pub async fn merge(
     let from = key.clone();
     let target = into.clone();
     // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
-    let pen = crate::identity::resolve(&headers).ok().flatten();
+    let pen = crate::identity::resolve(&state.paths, &headers)
+        .ok()
+        .flatten();
     match server
         .with_store("memory_merge", move |s| {
             if let Some(caller) = &pen {
@@ -2227,7 +2315,7 @@ pub async fn adopt(
         .and_then(|b| b.get("force"))
         .and_then(|v| v.as_bool())
         .unwrap_or_else(|| matches!(params.get("force"), Some("true") | Some("1")));
-    let pen = match crate::identity::resolve(&headers) {
+    let pen = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(pen)) => pen,
         _ => {
             return error(
@@ -2282,7 +2370,7 @@ pub async fn reparse(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match proven_pen(&headers, json) {
+    let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -2340,7 +2428,7 @@ pub async fn reembed(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match proven_pen(&headers, json) {
+    let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -2410,7 +2498,9 @@ pub async fn project_upsert(
     };
     // The pen the identity pair proves, if any: a project write may still be anonymous (the row
     // records it), but a gate can only bite a pen that has one.
-    let proven = crate::identity::resolve(&headers).ok().flatten();
+    let proven = crate::identity::resolve(&state.paths, &headers)
+        .ok()
+        .flatten();
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -2859,7 +2949,7 @@ pub async fn bootstrap(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers);
+    let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tools = params.flag("tools");
@@ -3259,8 +3349,12 @@ pub async fn mail_send(
 /// cursor, so `since` (or 0) decides, and nothing is written.
 /// The proven pen behind an HTTP request, or the refusal to send.
 #[allow(clippy::result_large_err)] // the refusal IS the axum response; boxing it would be taste, not safety.
-fn mail_reader_identity(headers: &HeaderMap, json: bool) -> Result<String, Response> {
-    match crate::identity::resolve(headers) {
+fn mail_reader_identity(
+    headers: &HeaderMap,
+    json: bool,
+    paths: &Paths,
+) -> Result<String, Response> {
+    match crate::identity::resolve(paths, headers) {
         Ok(Some(name)) => Ok(name),
         Ok(None) => Err(error(
             json,
@@ -3322,7 +3416,7 @@ pub async fn mail_inbox(
         .maybe("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_usize);
-    let reader = match mail_reader_identity(&headers, json) {
+    let reader = match mail_reader_identity(&headers, json, &state.paths) {
         Ok(name) => name,
         Err(r) => return r,
     };
@@ -3419,7 +3513,7 @@ pub async fn mail_ack(
             "`recipient` and `seq` are required",
         );
     };
-    let reader = match crate::identity::resolve(&headers) {
+    let reader = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => name,
         Ok(None) => {
             return error(
@@ -3465,7 +3559,7 @@ pub async fn mail_read(
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let reader = match mail_reader_identity(&headers, json) {
+    let reader = match mail_reader_identity(&headers, json, &state.paths) {
         Ok(name) => name,
         Err(r) => return r,
     };
@@ -3544,7 +3638,7 @@ pub async fn mail_surrogate_grant(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match crate::identity::resolve(&headers) {
+    let caller = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => name,
         Ok(None) => {
             return error(
@@ -3625,7 +3719,7 @@ pub async fn mail_surrogate_revoke(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match crate::identity::resolve(&headers) {
+    let caller = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => name,
         Ok(None) => {
             return error(
@@ -3687,7 +3781,7 @@ pub async fn mail_surrogate_list(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match crate::identity::resolve(&headers) {
+    let caller = match crate::identity::resolve(&state.paths, &headers) {
         Ok(Some(name)) => name,
         Ok(None) => {
             return error(
@@ -3737,8 +3831,8 @@ pub async fn mail_surrogate_list(
 // may speak at all.
 
 /// Who is asking, if anyone proved it. Reads are open, so `None` is a legitimate answer.
-fn proven(headers: &HeaderMap) -> Option<String> {
-    match crate::identity::resolve(headers) {
+fn proven(headers: &HeaderMap, paths: &Paths) -> Option<String> {
+    match crate::identity::resolve(paths, headers) {
         Ok(Some(name)) => Some(name),
         _ => None,
     }
@@ -3751,7 +3845,7 @@ pub async fn channel_list(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let pen = proven(&headers);
+    let pen = proven(&headers, &state.paths);
     let caller = pen.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -3816,7 +3910,7 @@ pub async fn channel_history(
     let json = params.json();
     // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review): the store filters private memories by audience and
     // a chat log has the same problem — an incident channel is not a public page.
-    if let Err(r) = proven_pen(&headers, json) {
+    if let Err(r) = proven_pen(&headers, json, &state.paths) {
         return r;
     }
     let since = params
@@ -3864,7 +3958,7 @@ pub async fn channel_breach(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let Some(pen) = proven(&headers) else {
+    let Some(pen) = proven(&headers, &state.paths) else {
         return render(
             StatusCode::OK,
             json,
@@ -3916,7 +4010,7 @@ pub async fn channel_send(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -3961,7 +4055,7 @@ pub async fn channel_fetch(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4013,7 +4107,7 @@ pub async fn channel_present(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4077,7 +4171,7 @@ async fn channel_membership(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4114,7 +4208,7 @@ pub async fn channel_wait(
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let Some(pen) = proven(&headers) else {
+    let Some(pen) = proven(&headers, &state.paths) else {
         return error(
             json,
             StatusCode::UNAUTHORIZED,
@@ -4193,7 +4287,7 @@ pub async fn channel_members(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = proven_pen(&headers, json) {
+    if let Err(r) = proven_pen(&headers, json, &state.paths) {
         return r;
     }
     let key = channel.clone();
@@ -4244,7 +4338,7 @@ pub async fn channel_create(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4298,7 +4392,7 @@ pub async fn channel_set_gate(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4338,7 +4432,7 @@ pub async fn channel_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = proven_pen(&headers, json) {
+    if let Err(r) = proven_pen(&headers, json, &state.paths) {
         return r;
     }
     let key = channel.clone();
@@ -4392,7 +4486,7 @@ pub async fn channel_set_retention(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json) {
+    let pen = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4446,7 +4540,7 @@ pub async fn channel_prune(
     // ★ THE PEN IS REQUIRED, AND THEN CONSULTED (#168 review): the gate lives on this door too.
     // The MCP tool gated `channel_prune` and this route did not, so a locked pen could destroy the
     // text it was locked out of knowing — the two doors disagreed exactly where it matters.
-    let caller = match proven_pen(&headers, json) {
+    let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -4494,7 +4588,7 @@ pub async fn channel_invite(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let actor = match proven_pen(&headers, json) {
+    let actor = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
         Err(r) => return r,
     };

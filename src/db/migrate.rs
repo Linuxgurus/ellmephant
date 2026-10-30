@@ -190,6 +190,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0036_claim_release_log.sql"),
         "claim release log: who ended a lease they did not hold, and why",
     ),
+    (
+        37,
+        include_str!("../../migrations/0037_pen_credential.sql"),
+        "pen credentials: a pen's secret is a hashed row, not an environment variable",
+    ),
 ];
 
 /// Current schema version recorded in the file.

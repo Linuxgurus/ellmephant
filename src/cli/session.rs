@@ -295,6 +295,11 @@ impl Session {
         store::mint(&self.conn, caller, name, kind)
     }
 
+    /// Replace a credential: the caller itself, or a descendant. Returns the new secret ONCE.
+    pub fn rotate_credential(&self, caller: &str, target: &str) -> Result<String> {
+        store::credential::rotate(&self.conn, Some(caller), target)
+    }
+
     /// One pen as `viewer` sees it — the tree through this session's connection.
     pub fn whois(&self, viewer: &str, pen: &str) -> Result<store::Whois> {
         store::whois(&self.conn, viewer, pen)

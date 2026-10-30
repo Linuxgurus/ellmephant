@@ -737,6 +737,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
+ "getrandom 0.3.4",
  "libc",
  "regex",
  "rmcp",

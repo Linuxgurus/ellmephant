@@ -8,7 +8,7 @@ the edges exist.
 
 | door | who | how | what it can say |
 |---|---|---|---|
-| **runtime** | a running pen | `pen_mint` (MCP) / `POST /pen/mint` | "here is a pen under me" — parent is the CALLER |
+| **runtime** | a running pen | `pen_mint` (MCP) / `POST /pen/mint` | "here is a pen under me" — parent is the CALLER, and its secret is returned once ([[CREDENTIALS]]) |
 | **provisioning** | whoever can write the database | SQL, terraform, a ConfigMap | "here is the standing of a pen" — kind, parent, and that it exists at all |
 
 The seed in migration `0021` takes **names from history** (`memory.asserted_by`, `mail.asserted_by`)

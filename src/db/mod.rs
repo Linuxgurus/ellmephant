@@ -42,6 +42,10 @@ pub fn open_with(paths: &Paths, cfg: &crate::config::Config) -> Result<Connectio
     // `read` grants once, so the relationship is dated, scoped and revocable instead of inferred from
     // a process variable. Idempotent, and it never revives a revoked grant.
     let _ = crate::store::mail::import_env_surrogates(&conn);
+    // ★ CREDENTIALS LEFT THE ENVIRONMENT (2026-10-30): `ELLMEPHANT_IDENTITIES` pairs become hashed
+    // rows ONCE, so an existing store keeps its proofs across the upgrade. The marker in `meta`
+    // makes it one-shot — a boot must never resurrect a credential an ancestor deleted.
+    let _ = crate::store::credential::import_env(&conn);
     // ★ RETENTION THAT ACTUALLY RUNS (found reviewing #129). `audit::prune` existed and nothing called
     // it, which makes "retention is enforced" a sentence rather than a fact. Pruning at open costs one
     // DELETE on boot and needs no bell; a table that grows forever is a second store nobody maintains.

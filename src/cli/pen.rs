@@ -92,6 +92,23 @@ pub fn mint(paths: &Paths, cfg: &Config, name: &str, parent: &str, kind: &str) -
         "  minted    {} ({}) under {}",
         minted.name, minted.kind, minted.parent
     );
+    println!("  secret    {}", minted.secret);
+    println!("            shown ONCE — hand it to the pen, then have it rotate.");
+    Ok(())
+}
+
+/// `pen rotate <name>` — provisioning: replace a credential and print the new secret once.
+///
+/// Provisioning, not a door: whoever can open the database can already read every hash, so there is
+/// no caller to authorize against. The runtime door (`pen_rotate` over MCP) is the one that checks
+/// self-or-descendant.
+pub fn rotate(paths: &Paths, cfg: &Config, name: &str) -> Result<()> {
+    paths.ensure()?;
+    let conn = db::open_with(paths, cfg)?;
+    let secret = store::credential::rotate(&conn, None, name)?;
+    println!("  rotated   {name}");
+    println!("  secret    {secret}");
+    println!("            shown ONCE — the previous secret is dead on the next call.");
     Ok(())
 }
 

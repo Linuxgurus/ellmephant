@@ -101,7 +101,7 @@ rather than a mechanism.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 
-The MCP surface is 32 tools (`TOOLS` in `src/mcp/mod.rs`) and every one of them has a route. A second door that cannot reach the same
+The MCP surface is 55 tools (`TOOLS` in `src/mcp/mod.rs`) and every one of them has a route. A second door that cannot reach the same
 core is a door with a queue in front of it: boot over HTTP, still write over MCP, and a wedged MCP
 leaves the agent **read-only**. So every tool gets a route over the same `Session` call, and MCP
 becomes a compatibility shim for clients that speak it rather than a dependency of the agent.
@@ -111,6 +111,7 @@ becomes a compatibility shim for clients that speak it rather than a dependency 
 | `whoami` | `GET /whoami` | **implemented** |
 | `whois` | `GET /whois/{pen}` | **implemented** |
 | `pen_mint` | `POST /pen/mint` | **implemented** |
+| `pen_rotate` | `POST /pen/rotate` | **implemented** |
 | `pen_lend` | `POST /pen/lend` | **implemented** |
 | `sudo` | `POST /sudo` | **implemented** |
 | `sudo_pass` | `POST /sudo/pass` | **implemented** |
@@ -150,7 +151,7 @@ time — two tables in one file disagreeing about whether the code existed.
 `/health` and `/bootstrap` are the rows with no MCP equivalent: new capability, not translations.
 
 The table was rebuilt from `ROUTES` on 2026-10-23, when the pen and authority verbs landed
-(`whois`, `pen_mint`, `pen_lend`, `sudo`, `sudo_pass`, `sudo_release`): it had drifted three
+(`whois`, `pen_mint`, `pen_lend`, `sudo`, `sudo_pass`, `sudo_release`), and again on 2026-10-30 for `pen_rotate` (credentials are rows): it had drifted three
 tool generations behind, and a parity table that is wrong is worse than none, because it is
 read as an inventory.
 

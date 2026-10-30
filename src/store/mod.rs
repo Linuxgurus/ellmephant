@@ -5,6 +5,7 @@ pub mod audit;
 pub mod channel;
 pub mod claim;
 pub mod codec;
+pub mod credential;
 pub mod dupes;
 pub mod encode;
 pub mod links;
@@ -1804,6 +1805,16 @@ pub struct Minted {
     pub kind: String,
     /// The pen that minted it: the parent, by right, never by argument.
     pub parent: String,
+    /// ★ THE CHILD'S SECRET, AND THE ONLY TIME IT EXISTS IN PLAINTEXT (2026-10-30).
+    ///
+    /// A credential is issued by the act that creates the pen: the minter sees it once and must pass
+    /// it to the child, exactly as an administrator sets an initial password. The store holds only
+    /// its hash, so a lost response is recovered by `pen_rotate`, never by reading the row back.
+    ///
+    /// ★ THE MINTER CAN IMPERSONATE THE CHILD until the child rotates. That is inherent in "whoever
+    /// creates the credential knows it", and `pen_rotate` is the remedy: a child that rotates makes
+    /// the parent's copy dead on the next call.
+    pub secret: String,
 }
 
 /// **MINT: a pen creates a pen** (James, 2026-10-23). The runtime door.
@@ -1895,14 +1906,20 @@ pub fn mint(conn: &Connection, caller: &str, name: &str, kind: &str) -> Result<M
             None => format!("{name} is already a pen"),
         }));
     }
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO pen (name, kind, parent_id) VALUES (?1, ?2, ?3)",
         params![name, kind, caller_id],
     )?;
+    // The credential is issued by the act that creates the pen, in the same transaction: a pen row
+    // without a secret is a name nobody can prove, and a secret without a row cannot exist.
+    let secret = crate::store::credential::issue(&tx, name, Some(caller))?;
+    tx.commit()?;
     Ok(Minted {
         name: name.to_string(),
         kind: kind.to_string(),
         parent: caller.to_string(),
+        secret,
     })
 }
 
@@ -2130,6 +2147,10 @@ pub fn retire(
         "UPDATE pen SET ceased_at = datetime('now') WHERE id = ?1",
         params![id],
     )?;
+    // ★ A CREDENTIAL DIES WITH ITS PEN (2026-10-30). `verify` already refuses a ceased pen, so this
+    // is not the enforcement — the row is gone as well, because a secret nobody may use is a trap a
+    // later reader would find and trust. `ON DELETE CASCADE` covers the other exit (a deleted row).
+    conn.execute("DELETE FROM pen_credential WHERE pen_id = ?1", params![id])?;
     log_pen_event(
         conn,
         "",

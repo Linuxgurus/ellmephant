@@ -45,6 +45,7 @@ pub const TOOLS: &[&str] = &[
     "memory_unowned",
     "whois",
     "pen_mint",
+    "pen_rotate",
     "pen_lend",
     "sudo",
     "sudo_pass",
@@ -607,6 +608,17 @@ pub struct MintParams {
     pub kind: String,
 }
 
+/// `pen_rotate` — replace a credential, yours or a descendant's.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RotateParams {
+    /// Whose secret to replace. Omitted = the caller's own.
+    #[schemars(
+        description = "The pen whose secret to replace. Omitted = YOURS. A pen may rotate itself or a DESCENDANT, never a peer and never an ancestor."
+    )]
+    pub pen: Option<String>,
+}
+
 /// `pen_lend` — authority lent down to a descendant, for a while.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1155,11 +1167,12 @@ pub struct ProjectListParams {
 /// it is REFUSED rather than downgraded to `anonymous`: an unproven name is a lie with a signature.
 fn identity_of(
     ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
-) -> Result<Option<String>, crate::identity::Forged> {
+    paths: &Paths,
+) -> Result<Option<String>, crate::identity::Denied> {
     let Some(parts) = ctx.extensions.get::<axum::http::request::Parts>() else {
         return Ok(None);
     };
-    crate::identity::resolve(&parts.headers)
+    crate::identity::resolve(paths, &parts.headers)
 }
 
 /// Who this READ is for. A proven pen filters; a transport that declared its pen once is as trusted
@@ -1168,8 +1181,9 @@ fn identity_of(
 fn reader_of(
     ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
     declared: Option<&str>,
+    paths: &Paths,
 ) -> crate::store::audience::Reader {
-    match identity_of(ctx) {
+    match identity_of(ctx, paths) {
         Ok(Some(name)) => crate::store::audience::Reader::pen(&name),
         Ok(None) => match declared {
             Some(name) => crate::store::audience::Reader::pen(name),
@@ -1187,8 +1201,9 @@ fn reader_of(
 fn pen_name(
     ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
     declared: Option<&str>,
+    paths: &Paths,
 ) -> std::result::Result<String, String> {
-    match identity_of(ctx) {
+    match identity_of(ctx, paths) {
         Ok(Some(name)) => Ok(name),
         // ★ A TRANSPORT WITH NO REQUEST MAY DECLARE ITS PEN ONCE, at construction: a stdio or
         // in-process server is started BY a process and is as trusted as that process. HTTP
@@ -1457,12 +1472,12 @@ impl MemoryServer {
         requested: &str,
         scope: &'static str,
     ) -> std::result::Result<String, String> {
-        let who = pen_name(ctx, self.declared.as_deref())?;
+        let who = pen_name(ctx, self.declared.as_deref(), &self.paths)?;
         let (reader, box_name) = (who.clone(), requested.to_string());
         let allowed = self
             .with_read(
                 "mail_box_for",
-                reader_of(ctx, self.declared.as_deref()),
+                reader_of(ctx, self.declared.as_deref(), &self.paths),
                 move |s| {
                     if scope == "ack" {
                         s.mail_may_ack(&reader, &box_name)
@@ -1963,18 +1978,23 @@ impl MemoryServer {
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let body = match identity_of(&ctx) {
+        let body = match identity_of(&ctx, &self.paths) {
             Ok(Some(name)) => serde_json::json!({ "asserted_by": name, "proven": true }),
             Ok(None) => {
                 serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false })
             }
             // A claim that did not verify still deserves an answer: the caller learns the name it
             // sent is not the name it has, which is the whole confusion this tool exists to end.
-            Err(forged) => serde_json::json!({
+            Err(crate::identity::Denied::Forged(claimed)) => serde_json::json!({
                 "asserted_by": crate::identity::ANONYMOUS,
                 "proven": false,
-                "claimed": forged.0,
+                "claimed": claimed,
                 "problem": "the X-Stet-Auth proof is missing or wrong",
+            }),
+            Err(crate::identity::Denied::Unavailable(why)) => serde_json::json!({
+                "asserted_by": crate::identity::ANONYMOUS,
+                "proven": false,
+                "problem": format!("the credential store is unavailable: {why}"),
             }),
         };
         Ok(json_ok(body))
@@ -1997,7 +2017,7 @@ impl MemoryServer {
         Parameters(p): Parameters<UnownedParams>,
     ) -> std::result::Result<String, String> {
         // An ownerless row is a row, so the audience tier applies exactly as it does to a search hit.
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let limit = p.limit.unwrap_or(50).clamp(1, 500);
         let rows = self
             .with_read("memory_unowned", reader, move |s| s.unowned(limit))
@@ -2025,11 +2045,11 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         // An unproven reader may still ask WHO a pen is — the tree is configuration, not content —
         // it simply gets no walk, because it has not proved to be anybody.
-        let viewer = pen_name(&ctx, self.declared.as_deref())
+        let viewer = pen_name(&ctx, self.declared.as_deref(), &self.paths)
             .unwrap_or_else(|_| crate::identity::ANONYMOUS.to_string());
         let pen = p.pen;
         let lookup = pen.clone();
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let facts = self
             .with_read("whois", reader, move |s| s.whois(&viewer, &lookup))
             .await?;
@@ -2041,7 +2061,7 @@ impl MemoryServer {
     /// CREATE a pen under this one — the runtime door (James, 2026-10-23).
     #[tool(
         name = "pen_mint",
-        description = "Create a pen under the CALLER. The parent is the pen that calls, never an argument: you may create downward, never sideways and never upward, because parentage is the grant. A hand mints a finger; `estate`'s children come from provisioning, which is a different door. Returns the new pen's name, kind and parent. `kind` is `self` or `finger` and is never inferred from the name. ★ A NAME IS SPENT: a retired pen keeps its row and its name, so minting over a dead name is refused with the retirement time — generate a unique name (e.g. `finger-9f3a1c`).",
+        description = "Create a pen under the CALLER. The parent is the pen that calls, never an argument: you may create downward, never sideways and never upward, because parentage is the grant. A hand mints a finger; `estate`'s children come from provisioning, which is a different door. Returns the new pen's name, kind, parent, and its SECRET — shown once, because the store keeps only its hash. Hand the secret to the child; the minter can impersonate the child until it rotates with `pen_rotate`. `kind` is `self` or `finger` and is never inferred from the name. ★ A NAME IS SPENT: a retired pen keeps its row and its name, so minting over a dead name is refused with the retirement time — generate a unique name (e.g. `finger-9f3a1c`).",
         annotations(
             title = "Mint a pen",
             read_only_hint = false,
@@ -2056,7 +2076,7 @@ impl MemoryServer {
         Parameters(p): Parameters<MintParams>,
     ) -> std::result::Result<String, String> {
         // A mint is a WRITE: it needs a pen, and the pen is the parent.
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let name = p.name;
         let kind = p.kind;
         let minted = self
@@ -2065,6 +2085,37 @@ impl MemoryServer {
         tracing::info!(tool = "pen_mint", pen = %minted.name, kind = %minted.kind, parent = %minted.parent, "pen minted");
         Ok(json_ok(
             serde_json::to_value(&minted).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// ROTATE a credential — the caller's own, or a descendant's (2026-10-30).
+    #[tool(
+        name = "pen_rotate",
+        description = "Replace a credential and return the NEW secret, once. Omitted `pen` rotates YOURS; naming a pen rotates a DESCENDANT. A pen may rotate itself or a descendant — never a peer and never an ancestor, because authority is granted downward and borrowed only by policy. The old secret stops working on the very next call: authentication reads the row and caches nothing. Use this after minting (the minter knows the child's secret until the child rotates) and after a leak. There is no read-back verb; a lost secret is recovered by rotating again.",
+        annotations(
+            title = "Rotate a credential",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pen_rotate(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<RotateParams>,
+    ) -> std::result::Result<String, String> {
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let target = p.pen.unwrap_or_else(|| caller.clone());
+        let for_store = target.clone();
+        let secret = self
+            .with_store("pen_rotate", move |s| {
+                s.rotate_credential(&caller, &for_store)
+            })
+            .await?;
+        tracing::info!(tool = "pen_rotate", pen = %target, "credential rotated");
+        Ok(json_ok(
+            serde_json::json!({ "pen": target, "secret": secret }),
         ))
     }
 
@@ -2085,7 +2136,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<LendParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let pen = p.pen;
         let secs = p.secs;
         let session = self
@@ -2114,7 +2165,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let powerful = p.powerful;
         let secs = p.secs;
         let session = self
@@ -2143,7 +2194,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoPassParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let powerful = p.powerful;
         let pen = p.pen;
         let secs = p.secs;
@@ -2175,7 +2226,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoReleaseParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let powerful = p.powerful;
         let target = p.pen;
         let killed = self
@@ -2237,7 +2288,7 @@ impl MemoryServer {
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
         // no signature at all. `as` may only ever name a DESCENDANT of that proven pen.
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let credited = match claimed {
             Some(name) if !name.eq_ignore_ascii_case(&caller) => Some(name),
             _ => None,
@@ -2298,7 +2349,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
@@ -2345,7 +2396,7 @@ impl MemoryServer {
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
         // A merge DESTROYS the source, so it is signed like any other write.
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
@@ -2384,7 +2435,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AdoptParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let key = p.key;
         let force = p.force.unwrap_or(false);
         let owner = p.to.unwrap_or_else(|| pen.clone());
@@ -2421,7 +2472,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SemanticSearchParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         self.run_semantic(p, reader).await
     }
 
@@ -2520,7 +2571,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         self.run_search(p, reader).await
     }
 
@@ -2598,7 +2649,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<GetParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
         // A VERSION is reached by address, never resolved through the live row (which need not exist
         // — its history outlives it), and it counts no visit: `visits` measures the memory, not a
@@ -2666,7 +2717,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<HistoryParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let cap = p.limit.unwrap_or(HISTORY_LIMIT as u32) as usize;
         match p.key {
             Some(key) => {
@@ -2717,8 +2768,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         upvote_sweep(self, reader, p.keys.into_vec()).await
     }
 
@@ -2739,7 +2790,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
         let lookup = key.clone();
         let links = self
@@ -2767,7 +2818,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let edges = self
             .with_read("memory_dangling", reader, |s| s.dangling())
             .await?;
@@ -2797,7 +2848,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<StatsParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let with_tags = p.tags.unwrap_or(false);
         let stats = self
             .with_read("memory_stats", reader.clone(), move |s| s.stats(with_tags))
@@ -2823,7 +2874,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<DupesParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let max_distance = p.max_distance.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE);
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
         let pairs = self
@@ -2858,7 +2909,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reembed", move |s| {
                 // ★ NOT GATED, AND THAT IS THE DECISION (#168 review): a rebuild is derived data —
@@ -2916,7 +2967,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
         let report = self
             .with_store("memory_reparse", move |s| {
                 // ★ NOT GATED (#168 review): the link graph is derived data. Rebuilding it is
@@ -2955,7 +3006,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| {
@@ -2992,7 +3043,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectKeyParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
         let hydrate = project::Hydrate::parse(p.hydrate.as_deref().unwrap_or("none"))
             .map_err(|e| e.to_string())?;
@@ -3028,7 +3079,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectListParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref());
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let filter = project::Filter {
             status: p.status,
             tags: p.tags,
@@ -3069,7 +3120,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         } = p;
         // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
         // terminal, never a browser chat. Without it, this stays open exactly as it was.
-        let proven = pen_name(&ctx, self.declared.as_deref())?;
+        let proven = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         crate::identity::may_lease(Some(&proven))?;
         // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
         // someone else's name; an unproven caller's assertion stands, as before.
@@ -3110,7 +3161,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         // ★ WHO MAY END A LEASE (soma/spine#43 fix 4): the PROVEN pen, against the ROW's owner. The
         // holder releases its own; an ancestor releases a descendant's WITH a reason. The `owner`
         // argument no longer grants anything — it never should have.
-        let actor = pen_name(&ctx, self.declared.as_deref())?;
+        let actor = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ClaimReleaseParams {
             name,
             owner,
@@ -3205,7 +3256,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         // They may differ only while the proven pen holds a live `send` grant from the named pen, and
         // the store refuses otherwise. It used to discard the argument and stamp the typist — a
         // silent override that produced a real misattribution (2026-10-25, seq 566).
-        let proven = pen_name(&ctx, self.declared.as_deref())?;
+        let proven = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let sender = sender.trim();
         let sender = if sender.is_empty() {
             proven.clone()
@@ -3253,7 +3304,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailGrantParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         if !caller.eq_ignore_ascii_case(p.grantor.trim()) {
             return Err(format!(
                 "refused: `{caller}` may grant its OWN name only; `{}` must grant itself",
@@ -3298,7 +3349,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailRevokeParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         if !caller.eq_ignore_ascii_case(p.grantor.trim()) {
             return Err(format!(
                 "refused: `{caller}` may revoke its OWN grants only"
@@ -3330,12 +3381,12 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailSurrogatesParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref())?;
+        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let subject = p.surrogate.unwrap_or(caller);
         let rows = self
             .with_read(
                 "mail_surrogate_list",
-                reader_of(&ctx, self.declared.as_deref()),
+                reader_of(&ctx, self.declared.as_deref(), &self.paths),
                 move |s| s.mail_surrogates_of(&subject),
             )
             .await?;
@@ -3588,7 +3639,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailPruneParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
         let keep_days = p.keep_days;
         let removed = self
             .with_store("mail_prune", move |s| s.mail_prune(keep_days))
@@ -3613,7 +3664,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let pen = identity_of(&ctx).ok().flatten();
+        let pen = identity_of(&ctx, &self.paths).ok().flatten();
         let caller = pen.clone();
         let out = self
             .with_read(
@@ -3660,7 +3711,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelSendParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ChannelSendParams {
             channel,
             body,
@@ -3693,7 +3744,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelHistoryParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review)
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review)
         let ChannelHistoryParams {
             channel,
             since,
@@ -3728,7 +3779,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelFetchParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ChannelFetchParams { channel, limit } = p;
         let (who, chan, limit) = (pen.clone(), channel.clone(), limit.unwrap_or(50));
         let rows = self
@@ -3761,7 +3812,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPresentParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let who = pen.clone();
         let boundary = p.boundary;
         let touched = self
@@ -3789,7 +3840,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let pen = identity_of(&ctx).ok().flatten();
+        let pen = identity_of(&ctx, &self.paths).ok().flatten();
         if pen.is_none() {
             return Ok(serde_json::json!({ "breach": null, "proven": false }).to_string());
         }
@@ -3822,7 +3873,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMemberParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let channel = p.channel;
         let (who, chan) = (pen.clone(), channel.clone());
         self.with_store("channel_join", move |s| s.channel_join(&who, &chan))
@@ -3847,7 +3898,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelInviteParams>,
     ) -> std::result::Result<String, String> {
-        let actor = pen_name(&ctx, self.declared.as_deref())?;
+        let actor = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let (who, guest, chan) = (actor.clone(), p.pen.clone(), p.channel.clone());
         self.with_store("channel_invite", move |s| {
             s.channel_invite(&who, &guest, &chan)
@@ -3876,7 +3927,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMemberParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let channel = p.channel;
         let (who, chan) = (pen.clone(), channel.clone());
         self.with_store("channel_leave", move |s| s.channel_leave(&who, &chan))
@@ -3901,7 +3952,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelWaitParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         // ★ NO CURSOR MEANS "FROM NOW", NOT "FROM THE BEGINNING OF TIME" (#168 review): a fresh body
         // that waits should see what arrives next, not the entire backlog.
         let after = match p.after {
@@ -3957,7 +4008,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMembersParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // the roster is configuration, not a public list
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // the roster is configuration, not a public list
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -3988,7 +4039,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelCreateParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let (who, key, title) = (pen.clone(), p.channel.clone(), p.title.clone());
         let members = p.members.unwrap_or_else(|| "open".to_string());
         let gate = p.gate.unwrap_or_else(|| "none".to_string());
@@ -4018,7 +4069,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelGateParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let (who, chan, gate) = (pen.clone(), p.channel.clone(), p.gate.clone());
         let row = self
             .with_store("channel_set_gate", move |s| {
@@ -4046,7 +4097,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelEventsParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref())?; // who gated what is not a public record
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // who gated what is not a public record
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -4077,7 +4128,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelRetentionParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?;
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let (who, chan, keep) = (pen.clone(), p.channel.clone(), p.keep_secs);
         let row = self
             .with_store("channel_set_retention", move |s| {
@@ -4105,7 +4156,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPruneParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref())?; // a prune writes; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // a prune writes; anonymous is read-only
         let only = p.channel;
         let rows = self
             .with_store("channel_prune", move |s| {
@@ -4241,6 +4292,7 @@ pub fn http_router(
         .route("/whoami", axum::routing::get(surface::whoami))
         .route("/whois/{pen}", axum::routing::get(surface::whois))
         .route("/pen/mint", axum::routing::post(surface::pen_mint))
+        .route("/pen/rotate", axum::routing::post(surface::pen_rotate))
         .route("/pen/lend", axum::routing::post(surface::pen_lend))
         .route("/sudo", axum::routing::post(surface::sudo))
         .route("/sudo/pass", axum::routing::post(surface::sudo_pass))

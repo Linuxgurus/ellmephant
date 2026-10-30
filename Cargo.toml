@@ -37,6 +37,8 @@ toml = "0.9"
 thiserror = "2"
 regex = "1"
 sha2 = "0.10"
+# Credential secrets: 32 random bytes per pen, generated at mint/rotate (2026-10-30).
+getrandom = "0.3"
 # Model fetch (SPEC §6.2). ureq 3 defaults to rustls ⇒ no OpenSSL dylib.
 ureq = "3"
 # Advisory `flock` on the cache lock file (SPEC §6.2).

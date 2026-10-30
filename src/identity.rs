@@ -4,15 +4,18 @@
 //! stamps only what a connection **proved**, never what it asserted, so a forged name lands as the
 //! claim it is rather than as fact — and `anonymous` is the truth rather than an insult.
 //!
-//! The table is env (`ELLMEPHANT_IDENTITIES`, `name:secret` comma-separated), so adding a self is
-//! data and not a deploy. A name here is a *speaker*, not a permission: it says who to attribute a
-//! write to, and nothing about what they may do.
+//! ★ THE PROOF IS A ROW (2026-10-30). It used to be a process variable (`ELLMEPHANT_IDENTITIES`,
+//! `name:secret`, re-read every call), which meant a retired pen could still authenticate and a
+//! rotation needed a deploy. The secret now lives in `pen_credential`, owned by a pen, so
+//! retirement revokes it and rotation takes effect on the next call. Nothing is cached here.
 //!
 //! ★ THE SECRET IS NEVER LOGGED, and the comparison is constant-time. Length still leaks — an
 //! attacker who can measure it learns how long the secret is, and if that is fatal the secret was
 //! too short.
 
 use axum::http::HeaderMap;
+
+use crate::config::Paths;
 
 /// The claimed speaker.
 pub const FROM: &str = "x-stet-from";
@@ -21,52 +24,42 @@ pub const AUTH: &str = "x-stet-auth";
 /// What a write is attributed to when nothing was proved.
 pub const ANONYMOUS: &str = "anonymous";
 
-/// A name was claimed and could not be proved. Carries the claim so the refusal can name it.
+/// Why a claim did not become an identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Forged(pub String);
+pub enum Denied {
+    /// A name was claimed and its proof is missing or wrong. Carries the claim so the refusal can
+    /// name it.
+    Forged(String),
+    /// The store could not be read. Distinct from [`Denied::Forged`] on purpose: a database that is
+    /// unavailable is not a caller who lied, and saying so is the difference between a retry and a
+    /// debugging session.
+    Unavailable(String),
+}
 
-impl std::fmt::Display for Forged {
+impl std::fmt::Display for Denied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "`{FROM}: {}` was refused: the `{AUTH}` proof is missing or wrong. A write is stamped \
-             with the connection's proven identity, so an unproven name would be a lie with a \
-             signature. Send the pair, or omit `{FROM}` and write as `{ANONYMOUS}`.",
-            self.0
-        )
+        match self {
+            Denied::Forged(claimed) => write!(
+                f,
+                "`{FROM}: {claimed}` was refused: the `{AUTH}` proof is missing or wrong. A write is \
+                 stamped with the connection's proven identity, so an unproven name would be a lie \
+                 with a signature. Send the pair, or omit `{FROM}` and write as `{ANONYMOUS}`."
+            ),
+            Denied::Unavailable(why) => {
+                write!(f, "authentication is unavailable: {why}")
+            }
+        }
     }
 }
 
-impl std::error::Error for Forged {}
+impl std::error::Error for Denied {}
 
-/// The configured identities, read per call: a cache here would make the tests lie.
-fn table() -> Vec<(String, String)> {
-    let Ok(raw) = std::env::var("ELLMEPHANT_IDENTITIES") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .filter_map(|pair| {
-            let (name, secret) = pair.split_once(':')?;
-            let (name, secret) = (name.trim(), secret.trim());
-            (!name.is_empty() && !secret.is_empty()).then(|| (name.to_string(), secret.to_string()))
-        })
-        .collect()
-}
-
-/// Length-aware, branch-free comparison — no early exit for a wrong byte.
-fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// Resolve the caller's identity from the header pair.
+/// Resolve the caller's identity from the header pair, against the store's credential rows.
 ///
 /// * no `X-Stet-From` → `Ok(None)`: nothing was claimed, so nothing is attributed.
-/// * a claim that does not verify (missing proof, wrong proof, no table configured) → `Err`.
-pub fn resolve(headers: &HeaderMap) -> Result<Option<String>, Forged> {
+/// * a claim that does not verify (missing proof, wrong proof, retired pen, no credential) → `Err`.
+/// * the store cannot be read → `Err(Denied::Unavailable)`.
+pub fn resolve(paths: &Paths, headers: &HeaderMap) -> Result<Option<String>, Denied> {
     let Some(raw) = headers.get(FROM) else {
         return Ok(None);
     };
@@ -78,13 +71,15 @@ pub fn resolve(headers: &HeaderMap) -> Result<Option<String>, Forged> {
         .get(AUTH)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    for (name, secret) in table() {
-        if name.eq_ignore_ascii_case(claimed) && same(proof, &secret) {
-            // The configured spelling wins, so `james` and `James` are one identity.
-            return Ok(Some(name));
-        }
+    // A short-lived read-only connection: authentication must not queue behind a long write, and it
+    // must see a rotation on the very next call. No cache, exactly like sudo.
+    let conn = crate::db::open_read_only(paths).map_err(|e| Denied::Unavailable(e.to_string()))?;
+    match crate::store::credential::verify(&conn, claimed, proof) {
+        // The STORED spelling wins, so `james` and `James` are one identity (migration 0027).
+        Ok(Some(name)) => Ok(Some(name)),
+        Ok(None) => Err(Denied::Forged(claimed.to_string())),
+        Err(e) => Err(Denied::Unavailable(e.to_string())),
     }
-    Err(Forged(claimed.to_string()))
 }
 
 /// The identities allowed to take a LEASE, from `ELLMEPHANT_LEASERS` (comma-separated names).
@@ -147,66 +142,73 @@ mod tests {
         h
     }
 
-    /// The env is process-wide, so every test here takes the same lock.
-    fn with_table<T>(table: &str, f: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `with_table` serialises every reader and writer in this process.
-        unsafe { std::env::set_var("ELLMEPHANT_IDENTITIES", table) };
-        let out = f();
-        unsafe { std::env::remove_var("ELLMEPHANT_IDENTITIES") };
-        out
+    /// A store with one pen (`James`) and one credential. The file is the fixture; no env.
+    fn store() -> (tempfile::TempDir, Paths, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(dir.path());
+        let conn = crate::db::open(&paths).unwrap();
+        // ★ James hangs from the root, not at it (2026-10-30): a root cannot hold a credential, so a
+        // fixture that makes its pen a root is testing a state the code now refuses.
+        conn.execute(
+            "INSERT INTO pen (name, kind, parent_id)
+             VALUES ('James', 'self', (SELECT id FROM pen WHERE name = 'estate'))",
+            [],
+        )
+        .unwrap();
+        let secret = crate::store::credential::issue(&conn, "James", None).unwrap();
+        (dir, paths, secret)
     }
 
     #[test]
     fn no_claim_attributes_nothing() {
-        with_table("James:swordfish", || {
-            assert_eq!(resolve(&headers(None, None)), Ok(None));
-            // An empty name is not a claim, so it is not a refusal either.
-            assert_eq!(resolve(&headers(Some("  "), None)), Ok(None));
-        });
+        let (_dir, paths, _secret) = store();
+        assert_eq!(resolve(&paths, &headers(None, None)), Ok(None));
+        // An empty name is not a claim, so it is not a refusal either.
+        assert_eq!(resolve(&paths, &headers(Some("  "), None)), Ok(None));
     }
 
     #[test]
-    fn a_proved_claim_returns_the_configured_spelling() {
-        with_table("James:swordfish", || {
-            assert_eq!(
-                resolve(&headers(Some("james"), Some("swordfish"))),
-                Ok(Some("James".to_string()))
-            );
-        });
+    fn a_proved_claim_returns_the_stored_spelling() {
+        let (_dir, paths, secret) = store();
+        assert_eq!(
+            resolve(&paths, &headers(Some("james"), Some(&secret))),
+            Ok(Some("James".to_string()))
+        );
     }
 
     #[test]
     fn a_forged_claim_is_refused_and_names_itself() {
-        with_table("James:swordfish", || {
-            assert_eq!(
-                resolve(&headers(Some("James"), Some("hunter2"))),
-                Err(Forged("James".into()))
-            );
-            // A claim with no proof is FORGED, not anonymous: silence is honest, a name is not.
-            assert_eq!(
-                resolve(&headers(Some("James"), None)),
-                Err(Forged("James".into()))
-            );
-        });
+        let (_dir, paths, secret) = store();
+        assert_eq!(
+            resolve(&paths, &headers(Some("James"), Some("hunter2"))),
+            Err(Denied::Forged("James".into()))
+        );
+        // A claim with no proof is FORGED, not anonymous: silence is honest, a name is not.
+        assert_eq!(
+            resolve(&paths, &headers(Some("James"), None)),
+            Err(Denied::Forged("James".into()))
+        );
+        // …and the right proof still works after the refusals.
+        assert_eq!(
+            resolve(&paths, &headers(Some("James"), Some(&secret))),
+            Ok(Some("James".to_string()))
+        );
     }
 
     #[test]
-    fn nothing_is_provable_with_no_table_configured() {
-        with_table("", || {
-            assert_eq!(
-                resolve(&headers(Some("James"), Some("swordfish"))),
-                Err(Forged("James".into()))
-            );
-        });
-    }
-
-    #[test]
-    fn comparison_does_not_short_circuit_on_length_or_prefix() {
-        assert!(same("abc", "abc"));
-        assert!(!same("abc", "abd"));
-        assert!(!same("abc", "ab"));
-        assert!(!same("", "a"));
+    fn a_retired_pen_stops_proving_its_old_secret() {
+        let (_dir, paths, secret) = store();
+        {
+            let conn = crate::db::open(&paths).unwrap();
+            conn.execute(
+                "UPDATE pen SET ceased_at = datetime('now') WHERE name = 'James'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            resolve(&paths, &headers(Some("James"), Some(&secret))),
+            Err(Denied::Forged("James".into()))
+        );
     }
 }

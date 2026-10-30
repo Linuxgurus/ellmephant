@@ -115,6 +115,12 @@ pub enum PenCommand {
         #[arg(long, value_name = "KIND", default_value = "self")]
         kind: String,
     },
+    /// Replace a pen's secret by provisioning; prints the new secret once.
+    Rotate {
+        /// The pen whose credential to replace.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
     /// Print the shape and the root count.
     Tree,
     /// A sudoers policy: `weak` may borrow `powerful` for at most `secs`.
@@ -248,6 +254,7 @@ pub fn run(cli: Cli) -> Result<()> {
             PenCommand::Mint { name, parent, kind } => {
                 pen::mint(&paths, &cfg, &name, &parent, &kind)
             }
+            PenCommand::Rotate { name } => pen::rotate(&paths, &cfg, &name),
             PenCommand::Tree => pen::tree(&paths, &cfg),
             PenCommand::Grant {
                 powerful,

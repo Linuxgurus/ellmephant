@@ -183,6 +183,26 @@ pub const ROUTES: &[Route] = &[
         tool: "project_list",
     },
     Route {
+        method: "GET",
+        path: "/config",
+        tool: "config_list",
+    },
+    Route {
+        method: "POST",
+        path: "/config",
+        tool: "config_define",
+    },
+    Route {
+        method: "GET",
+        path: "/config/{key}",
+        tool: "config_get",
+    },
+    Route {
+        method: "POST",
+        path: "/config/{key}",
+        tool: "config_set",
+    },
+    Route {
         method: "POST",
         path: "/claim",
         tool: "claim_acquire",
@@ -868,6 +888,15 @@ fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, 
         )),
         Err(denied) => Err(denied_response(json, denied, StatusCode::UNAUTHORIZED)),
     }
+}
+
+/// One required string field of a JSON body, or the 400 that names what is missing.
+#[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as elsewhere here
+fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> Result<String, Response> {
+    doc.get(name)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| error(json, StatusCode::BAD_REQUEST, format!("missing `{name}`")))
 }
 
 /// `POST /sudo` — borrow a pen's authority (`sudo`).
@@ -1781,6 +1810,192 @@ pub async fn project_get(
                 json,
                 wire.clone(),
                 list_text("project", &wire),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /config/{key}` — one config item (`config_get`); `null` when absent or not addressed to you.
+pub async fn config_get(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers, &state.paths);
+    let json = Params::parse(raw.as_deref()).json();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("config_get", reader, move |s| s.config_get(&key))
+        .await
+    {
+        Ok(item) => {
+            let wire = serde_json::to_value(&item).unwrap_or(serde_json::Value::Null);
+            let text = wire.to_string();
+            render(
+                StatusCode::OK,
+                json,
+                text.clone(),
+                list_text("config", &text),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /config` — every item this connection may read (`config_list`), with an optional `prefix`.
+pub async fn config_list(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let reader = reader_from(&headers, &state.paths);
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let prefix = params.maybe("prefix").map(str::to_string);
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_read("config_list", reader, move |s| {
+            s.config_list(prefix.as_deref())
+        })
+        .await
+    {
+        Ok(items) => {
+            let wire = serde_json::json!({ "config": items });
+            let text = wire.to_string();
+            render(
+                StatusCode::OK,
+                json,
+                text.clone(),
+                list_text("config", &text),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /config/{key}` — change a value (`config_set`); JSON body `{value, source?}`.
+pub async fn config_set(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let who = match proven_pen(&headers, json, &state.paths) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let value = match doc.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v.to_string(),
+        None => return error(json, StatusCode::BAD_REQUEST, "missing `value`"),
+    };
+    let source = doc
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let log_key = key.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("config_set", move |s| {
+            s.config_set(&who, &key, &value, source.as_deref())
+        })
+        .await
+    {
+        Ok(item) => {
+            tracing::info!(area = scope.area, key = %log_key, "config written over http");
+            let wire = serde_json::to_string(&item).unwrap_or_default();
+            render(
+                StatusCode::OK,
+                json,
+                wire.clone(),
+                list_text("config", &wire),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /config` — create an item or rewrite its ACL (`config_define`); JSON body of the tool's args.
+pub async fn config_define(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let who = match proven_pen(&headers, json, &state.paths) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    let doc = match json_body(&headers, body).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let key = match body_str(&doc, "key", json) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let value = match body_str(&doc, "value", json) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let set_audience = match body_str(&doc, "set_audience", json) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let read_audience = match body_str(&doc, "read_audience", json) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let source = match body_str(&doc, "source", json) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let log_key = key.clone();
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("config_define", move |s| {
+            s.config_define(&who, &key, &value, &set_audience, &read_audience, &source)
+        })
+        .await
+    {
+        Ok(item) => {
+            tracing::info!(area = scope.area, key = %log_key, "config defined over http");
+            let wire = serde_json::to_string(&item).unwrap_or_default();
+            render(
+                StatusCode::OK,
+                json,
+                wire.clone(),
+                list_text("config", &wire),
             )
         }
         Err(e) => error(json, error_status(&e), e),

@@ -18,7 +18,7 @@ use crate::embed::{Embedder, VecSpec};
 use crate::error::{Error, Result};
 use crate::model;
 use crate::search::{self, Bundle, Query};
-use crate::store::{self, Memory, channel, claim, encode, links, mail, maintain, project};
+use crate::store::{self, Memory, channel, claim, config, encode, links, mail, maintain, project};
 
 /// The store's encoder: lazily loaded, and shared by the writer and by every reader.
 ///
@@ -960,6 +960,60 @@ impl Session {
     /// What, if anything, is stopping this pen from changing the record.
     pub fn channel_breach(&self, pen: &str) -> Result<Option<channel::Breach>> {
         channel::breach(&self.conn, pen)
+    }
+
+    /// One config item, if it exists AND this reader may see it. `None` is the honest answer to both
+    /// questions — a caller may not probe an ACL by asking whether a key exists.
+    pub fn config_get(&self, key: &str) -> Result<Option<config::Item>> {
+        config::get(&self.conn, &self.reader, key)
+    }
+
+    /// The config items this reader may see, key order.
+    pub fn config_list(&self, prefix: Option<&str>) -> Result<Vec<config::Item>> {
+        config::list(&self.conn, &self.reader, prefix)
+    }
+
+    /// Change an existing item's value — gated by its `set_audience`, not by the caller's word.
+    ///
+    /// The WRITER session is built as `everything()`, so the permission check cannot use `self.reader`
+    /// (it would pass for every caller); it is resolved from the proven pen, tree and borrowed
+    /// sessions included, exactly as a read is.
+    pub fn config_set(
+        &self,
+        who: &str,
+        key: &str,
+        value: &str,
+        source: Option<&str>,
+    ) -> Result<config::Item> {
+        let reader = store::audience::Reader::pen(who)
+            .in_tree(&self.conn)
+            .with_borrowed(&self.conn);
+        config::set(&self.conn, &reader, who, key, value, source)
+    }
+
+    /// Create an item or rewrite its ACL — the provisioning act behind `config`.
+    pub fn config_define(
+        &self,
+        who: &str,
+        key: &str,
+        value: &str,
+        set_audience: &str,
+        read_audience: &str,
+        source: &str,
+    ) -> Result<config::Item> {
+        let reader = store::audience::Reader::pen(who)
+            .in_tree(&self.conn)
+            .with_borrowed(&self.conn);
+        config::define(
+            &self.conn,
+            &reader,
+            Some(who),
+            key,
+            value,
+            set_audience,
+            read_audience,
+            source,
+        )
     }
 
     /// Write one letter into `recipient`'s box. Nothing is delivered: this is the whole event.

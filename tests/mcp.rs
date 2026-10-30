@@ -1292,3 +1292,90 @@ async fn adopt_takes_responsibility_and_refuses_what_it_should() {
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }
+
+#[tokio::test]
+async fn config_round_trips_with_its_written_acl() {
+    let dir = tempfile::tempdir().unwrap();
+    // The registry is provisioning, not a tool: seed the tree the test speaks from.
+    {
+        let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
+        conn.execute_batch(
+            "DELETE FROM pen;
+             INSERT INTO pen (name, kind) VALUES ('estate', 'self');
+             INSERT INTO pen (name, kind, parent_id) VALUES ('james', 'self', (SELECT id FROM pen WHERE name='estate'));
+             INSERT INTO pen (name, kind, parent_id) VALUES ('stet', 'self', (SELECT id FROM pen WHERE name='james'));",
+        )
+        .expect("pen tree");
+    }
+
+    let server = MemoryServer::new(session(dir.path())).with_identity("james");
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+            .expect("wait");
+    });
+    let client = ().serve(client_io).await.expect("client handshake");
+
+    // Define: the ACL is written on the row, and the caller is recorded as owner.
+    let defined = call(
+        &client,
+        "config_define",
+        serde_json::json!({
+            "key": "recess_daily_time",
+            "value": "2h",
+            "set_audience": "pen:james",
+            "read_audience": "pen:james,pen:stet",
+            "source": "James raised the daily recess",
+        }),
+    )
+    .await;
+    assert!(!defined.is_error.unwrap_or(false), "{}", text(&defined));
+    let row: serde_json::Value = serde_json::from_str(&text(&defined)).expect("json");
+    assert_eq!(row["value"], "2h");
+    assert_eq!(row["owner"], "james");
+
+    // Set: allowed for the written setter.
+    let set = call(
+        &client,
+        "config_set",
+        serde_json::json!({ "key": "recess_daily_time", "value": "90m" }),
+    )
+    .await;
+    assert!(!set.is_error.unwrap_or(false), "{}", text(&set));
+
+    // Get + list agree.
+    let got = call(
+        &client,
+        "config_get",
+        serde_json::json!({ "key": "recess_daily_time" }),
+    )
+    .await;
+    let row: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
+    assert_eq!(row["value"], "90m");
+
+    let listed = call(&client, "config_list", serde_json::json!({})).await;
+    let rows: serde_json::Value = serde_json::from_str(&text(&listed)).expect("json");
+    assert_eq!(rows["config"].as_array().unwrap().len(), 1);
+
+    // `set` cannot invent an item: the ACL is the point.
+    let invented = call(
+        &client,
+        "config_set",
+        serde_json::json!({ "key": "never-defined", "value": "x" }),
+    )
+    .await;
+    assert!(invented.is_error.unwrap_or(false));
+    assert!(
+        text(&invented).contains("define it first"),
+        "{}",
+        text(&invented)
+    );
+
+    client.cancel().await.expect("cancel");
+    handle.await.expect("join");
+}

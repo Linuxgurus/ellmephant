@@ -101,7 +101,7 @@ rather than a mechanism.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 
-The MCP surface is 55 tools (`TOOLS` in `src/mcp/mod.rs`) and every one of them has a route. A second door that cannot reach the same
+The MCP surface is 59 tools (`TOOLS` in `src/mcp/mod.rs`) and every one of them has a route. A second door that cannot reach the same
 core is a door with a queue in front of it: boot over HTTP, still write over MCP, and a wedged MCP
 leaves the agent **read-only**. So every tool gets a route over the same `Session` call, and MCP
 becomes a compatibility shim for clients that speak it rather than a dependency of the agent.
@@ -133,6 +133,10 @@ becomes a compatibility shim for clients that speak it rather than a dependency 
 | `project_upsert` | `POST /project` | **implemented** |
 | `project_get` | `GET /project/{key}` | **implemented** |
 | `project_list` | `GET /projects` | **implemented** |
+| `config_get` | `GET /config/{key}` | **implemented** |
+| `config_set` | `POST /config/{key}` | **implemented** |
+| `config_define` | `POST /config` | **implemented** |
+| `config_list` | `GET /config` | **implemented** |
 | `claim_acquire` | `POST /claim` | **implemented** |
 | `claim_release` | `POST /claim/{key}/release` | **implemented** |
 | `claim_list` | `GET /claim` | **implemented** |

@@ -387,6 +387,13 @@ impl Reader {
         self.pen.as_deref().and_then(|p| p.strip_prefix(PEN))
     }
 
+    /// Does this reader hold the ROOT's break-glass — a session to a parentless pen, or the process
+    /// that holds the file itself? Used by policy writes (`config_define`) that may name any address.
+    /// Deliberately not "high in the tree": root is a grant, never a position.
+    pub fn is_root(&self) -> bool {
+        self.root
+    }
+
     /// A reader with no pen: sees public rows only.
     pub fn anonymous() -> Self {
         Reader::default()

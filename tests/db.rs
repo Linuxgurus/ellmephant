@@ -152,6 +152,20 @@ fn the_recess_seed_is_configuration_and_a_reopen_does_not_reset_it() {
     );
 
     drop(stmt);
+    // One sitting is separate from the daily bank, and its hard ceiling is derived in code.
+    let (sitting, set_aud, read_aud): (String, String, String) = conn
+        .query_row(
+            "SELECT value, set_audience, read_audience FROM config WHERE key = 'recess_sitting_seconds'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (sitting.as_str(), set_aud.as_str(), read_aud.as_str()),
+        ("1200", "pen:estate", "public"),
+        "a sitting is 20m; 2x is the bug threshold, not a second row"
+    );
+
     // A value changed after the seed must SURVIVE a reopen: the seed is a default, not a reset.
     conn.execute(
         "UPDATE config SET value = '7200' WHERE key = 'recess_daily_seconds'",

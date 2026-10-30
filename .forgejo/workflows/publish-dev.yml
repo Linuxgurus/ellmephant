@@ -135,7 +135,22 @@ jobs:
           DEV="${{ steps.name.outputs.dev }}"
           VER="${{ steps.name.outputs.version }}"
           SHORT="${{ steps.name.outputs.short }}"
-          if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
+          image_exists() {
+            # ★ THREE ANSWERS, NOT TWO (soma/hands#43): `imagetools inspect` exits non-zero for "tag absent"
+            # AND for a registry 5xx, a DNS failure or an expired credential. Reading both as "absent" made
+            # the immutable-handle guard fail open on the one condition it exists to catch. Absent is only
+            # absent when the registry says so; anything else aborts the publish.
+            local ref out
+            ref="$1"
+            out=$(docker buildx imagetools inspect "$ref" 2>&1) && return 0
+            if printf '%s' "$out" | grep -qiE 'manifest unknown|not found|404|not_found'; then
+              return 1
+            fi
+            echo "REFUSING: cannot determine whether $ref exists: $out" >&2
+            exit 1
+          }
+
+          if image_exists "$B:sha-$SHORT"; then
             echo "sha-$SHORT already exists -- reusing it, not rebuilding"
           else
             docker build --platform linux/amd64 \
@@ -152,7 +167,7 @@ jobs:
             # immutable handle. Measured in soma/spine and soma/hands tonight: three builds of one
             # commit, `edge` and `sha-` on different digests, and nothing failing loudly. A handle a race
             # can move is not immutable; discard this build instead.
-            if docker buildx imagetools inspect "$B:sha-$SHORT" > /dev/null 2>&1; then
+            if image_exists "$B:sha-$SHORT"; then
               echo "REFUSING: another publish created sha-$SHORT while this one was building; not overwriting"
               exit 1
             fi
@@ -170,7 +185,7 @@ jobs:
           SHORT="${{ steps.name.outputs.short }}"
           want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:sha-$SHORT")
 
-          if docker buildx imagetools inspect "$B:$DEV" > /dev/null 2>&1; then
+          if image_exists "$B:$DEV"; then
             got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$B:$DEV")
             if [ "$got" != "$want" ]; then
               echo "REFUSING: $B:$DEV already exists at $got, but this commit builds $want."

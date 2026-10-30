@@ -36,13 +36,27 @@ fn env_pairs_are_imported_once_and_a_deleted_credential_stays_deleted() {
         "the import refuses the root even when the environment names it"
     );
     let roots: i64 = conn
-        .query_row("SELECT count(*) FROM pen WHERE parent_id IS NULL", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM pen WHERE parent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(roots, 1, "an env-only name is attached, never made a second root");
+    assert_eq!(
+        roots, 1,
+        "an env-only name is attached, never made a second root"
+    );
     let parent: Option<i64> = conn
-        .query_row("SELECT parent_id FROM pen WHERE name = 'import-tester'", [], |r| r.get(0))
+        .query_row(
+            "SELECT parent_id FROM pen WHERE name = 'import-tester'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert!(parent.is_some(), "the imported pen hangs from the root, so it stays retirable");
+    assert!(
+        parent.is_some(),
+        "the imported pen hangs from the root, so it stays retirable"
+    );
 
     // Revoke by deleting the row — the way an ancestor's act would. The env still names it.
     conn.execute(

@@ -847,11 +847,7 @@ pub async fn pen_lend(
 /// because a store that cannot be read is not a caller who lied. This is where it reaches the
 /// client — 503 for the store, the route's own refusal code for a bad proof. Rotating secrets
 /// because a database blinked is the failure this prevents.
-fn denied_response(
-    json: bool,
-    denied: crate::identity::Denied,
-    forged: StatusCode,
-) -> Response {
+fn denied_response(json: bool, denied: crate::identity::Denied, forged: StatusCode) -> Response {
     let code = match denied {
         crate::identity::Denied::Forged(_) => forged,
         crate::identity::Denied::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,

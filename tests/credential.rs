@@ -102,7 +102,10 @@ fn issuing_twice_refuses_with_the_sentence_not_a_constraint() {
     let err = credential::issue(&conn, "cline", Some("James")).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("already has a credential"), "{text}");
-    assert!(!text.contains("UNIQUE"), "the written sentence must surface: {text}");
+    assert!(
+        !text.contains("UNIQUE"),
+        "the written sentence must surface: {text}"
+    );
 }
 
 #[test]

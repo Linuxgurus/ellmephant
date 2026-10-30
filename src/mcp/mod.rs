@@ -69,6 +69,10 @@ pub const TOOLS: &[&str] = &[
     "project_upsert",
     "project_get",
     "project_list",
+    "config_get",
+    "config_set",
+    "config_define",
+    "config_list",
     "claim_acquire",
     "claim_release",
     "claim_list",
@@ -828,6 +832,86 @@ pub struct StatsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {}
+
+/// Parameters for [`MemoryServer::config_get`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigGetParams {
+    /// The item's name.
+    #[schemars(description = "The config item's name, e.g. `recess_daily_time`. Case is folded.")]
+    pub key: String,
+}
+
+/// Parameters for [`MemoryServer::config_set`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSetParams {
+    /// The item's name.
+    #[schemars(
+        description = "The config item's name. It must ALREADY exist: `config_set` cannot \
+                             invent an item, because a value with no written ACL is whoever writes \
+                             it first."
+    )]
+    pub key: String,
+    /// The new value.
+    #[schemars(
+        description = "The new value, as text. Non-empty; the consumer parses its own units \
+                             (`2h`, `true`, a name)."
+    )]
+    pub value: String,
+    /// Why it changed.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional: why this value changed. Recorded on the row beside the \
+                             previous `source`; omitted keeps the existing reason."
+    )]
+    pub source: Option<String>,
+}
+
+/// Parameters for [`MemoryServer::config_define`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigDefineParams {
+    /// The item's name.
+    #[schemars(description = "The config item's name, created if absent.")]
+    pub key: String,
+    /// The value.
+    #[schemars(description = "The value to store, as text. Non-empty.")]
+    pub value: String,
+    /// Who may write the value.
+    #[schemars(
+        description = "Who may WRITE the value: an audience — `pen:<name>`, `subtree:<name>`, or a \
+                       comma-separated list, up to 8. NOT `public`: a value anyone can write is not \
+                       configuration. You may only name addresses you can reach (yourself, a pen \
+                       below you, or anything under the root)."
+    )]
+    pub set_audience: String,
+    /// Who may read it.
+    #[schemars(
+        description = "Who may READ the item: `public` or the same `pen:` / `subtree:` grammar. You \
+                       may only name addresses you can reach."
+    )]
+    pub read_audience: String,
+    /// Why this exists.
+    #[schemars(
+        description = "REQUIRED: why this item exists / where the value came from. Configuration is \
+                       the trust root, and the reason belongs on the row."
+    )]
+    pub source: String,
+}
+
+/// Parameters for [`MemoryServer::config_list`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigListParams {
+    /// Optional name prefix.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional prefix to filter names by, e.g. `recess` or `recess_`. Omit for every \
+                       item you may read."
+    )]
+    pub prefix: Option<String>,
+}
 
 /// Parameters for [`MemoryServer::claim_acquire`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3110,6 +3194,154 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         project::list_to_wire_json(&rows).map_err(|e| e.to_string())
     }
 
+    /// Read one config item — a stored value with a written ACL.
+    #[tool(
+        name = "config_get",
+        description = "Read one CONFIG item: a small stored answer to `how should this run` (e.g. \
+                       `recess_daily_time`), with TWO boundaries written on the row — `set_audience` \
+                       (who may CHANGE the value) and `read_audience` (who may see it). Both use the \
+                       memory audience grammar (`public`, `pen:<name>`, `subtree:<name>`, \
+                       comma-separated), so ancestry and borrowed sessions work exactly as they do on \
+                       a memory. Returns the item, or `null` when there is no such item OR it is not \
+                       addressed to you: ABSENCE, not a refusal, because a refusal would confirm the \
+                       item exists. Use `config_list` to see every item you may read.",
+        annotations(
+            title = "Read config",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn config_get(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ConfigGetParams>,
+    ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
+        let key = p.key;
+        let item = self
+            .with_read("config_get", reader, move |s| s.config_get(&key))
+            .await?;
+        tracing::info!(tool = "config_get", found = item.is_some(), "config read");
+        Ok(json_ok(
+            serde_json::to_value(&item).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// Change an existing config item's value.
+    #[tool(
+        name = "config_set",
+        description = "Change an EXISTING config item's value. The item's `set_audience` is the gate: \
+                       a caller it does not address is REFUSED and told the audience (a write refusal \
+                       is reported — silence would look like success). This cannot create an item: a \
+                       value with no written ACL would be whoever writes it first, and that is \
+                       `config_define`'s job. The ACL is untouched here, so a pen that may write a \
+                       value still cannot widen who else may. Returns the item as stored, with the \
+                       new `owner` and `updated_at`.",
+        annotations(
+            title = "Set config",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn config_set(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ConfigSetParams>,
+    ) -> std::result::Result<String, String> {
+        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let ConfigSetParams { key, value, source } = p;
+        let log_key = key.clone();
+        let item = self
+            .with_store("config_set", move |s| {
+                s.config_set(&who, &key, &value, source.as_deref())
+            })
+            .await?;
+        tracing::info!(tool = "config_set", key = %log_key, "config written");
+        Ok(json_ok(
+            serde_json::to_value(&item).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// Create a config item or rewrite its ACL.
+    #[tool(
+        name = "config_define",
+        description = "Create a config item, or rewrite one's ACL — the PROVISIONING act, separate \
+                       from `config_set` because changing who may write a value is handing out \
+                       authority, not editing it. Two rules stop a pen manufacturing reach: every \
+                       address named in `set_audience` or `read_audience` must be one the caller can \
+                       reach (itself, a pen below it, or anything under the root's break-glass), and \
+                       an EXISTING item may only be redefined by a caller who could already write it. \
+                       `set_audience` may NOT be `public` — a value anyone can write is a shared \
+                       scratchpad. `source` is REQUIRED: the reason belongs on the row. Returns the \
+                       item as stored.",
+        annotations(
+            title = "Define config",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn config_define(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ConfigDefineParams>,
+    ) -> std::result::Result<String, String> {
+        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let ConfigDefineParams {
+            key,
+            value,
+            set_audience,
+            read_audience,
+            source,
+        } = p;
+        let log_key = key.clone();
+        let item = self
+            .with_store("config_define", move |s| {
+                s.config_define(&who, &key, &value, &set_audience, &read_audience, &source)
+            })
+            .await?;
+        tracing::info!(tool = "config_define", key = %log_key, "config defined");
+        Ok(json_ok(
+            serde_json::to_value(&item).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// List the config items this connection may read.
+    #[tool(
+        name = "config_list",
+        description = "List the config items this connection may READ, in key order, optionally \
+                       filtered by a name `prefix` (`recess` finds a namespace). Items outside your \
+                       `read_audience` are simply absent — the same rule as a private memory, so a \
+                       list can never disclose that an item exists. Use it before inventing a name: \
+                       `config_get` on a name nobody defined returns `null`, which is not the same as \
+                       an item you are not allowed to see.",
+        annotations(
+            title = "List config",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn config_list(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ConfigListParams>,
+    ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
+        let prefix = p.prefix;
+        let items = self
+            .with_read("config_list", reader, move |s| {
+                s.config_list(prefix.as_deref())
+            })
+            .await?;
+        tracing::info!(tool = "config_list", items = items.len(), "config listed");
+        Ok(json_ok(serde_json::json!({ "config": items })))
+    }
+
     /// Take or renew an atomic lease over a name — the cross-machine claim.
     #[tool(
         name = "claim_acquire",
@@ -4408,6 +4640,14 @@ pub fn http_router(
         .route("/projects", axum::routing::get(surface::projects))
         .route("/project/{key}", axum::routing::get(surface::project_get))
         .route("/project", axum::routing::post(surface::project_upsert))
+        .route(
+            "/config",
+            axum::routing::get(surface::config_list).post(surface::config_define),
+        )
+        .route(
+            "/config/{key}",
+            axum::routing::get(surface::config_get).post(surface::config_set),
+        )
         .route(
             "/claim",
             axum::routing::get(surface::claims).post(surface::claim_acquire),

@@ -62,8 +62,15 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     assert!(db::migrate::latest() >= 7, "one-home removal exists");
     assert!(db::migrate::latest() >= 8, "encode queue exists");
 
-    for name in ["memory", "memory_link", "meta", "project"] {
+    for name in ["memory", "memory_link", "meta", "project", "config"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
+    }
+    // 0032: configuration carries TWO boundaries, so both columns must be there.
+    for column in ["set_audience", "read_audience"] {
+        assert!(
+            column_exists(&conn, "config", column),
+            "config.{column} is missing"
+        );
     }
     // 0007 dropped the one-home association: membership is a tag now, so the table must be GONE —
     // and must never creep back.
@@ -223,7 +230,8 @@ fn a_v4_store_gains_the_project_tables_on_open() {
          DROP TABLE IF EXISTS channel;
          DROP TABLE IF EXISTS mail_surrogate;
          DROP TABLE IF EXISTS claim_release_log;
-         DROP TABLE IF EXISTS pen_credential;",
+         DROP TABLE IF EXISTS pen_credential;
+         DROP TABLE IF EXISTS config;",
     )
     .unwrap();
     drop_sent_under(&conn);
@@ -313,7 +321,8 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
          DROP TABLE IF EXISTS channel;
          DROP TABLE IF EXISTS mail_surrogate;
          DROP TABLE IF EXISTS claim_release_log;
-         DROP TABLE IF EXISTS pen_credential;",
+         DROP TABLE IF EXISTS pen_credential;
+         DROP TABLE IF EXISTS config;",
     )
     .unwrap();
     drop_sent_under(&conn);
@@ -510,7 +519,8 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
          DROP TABLE IF EXISTS channel;
          DROP TABLE IF EXISTS mail_surrogate;
          DROP TABLE IF EXISTS claim_release_log;
-         DROP TABLE IF EXISTS pen_credential;",
+         DROP TABLE IF EXISTS pen_credential;
+         DROP TABLE IF EXISTS config;",
     )
     .unwrap();
     drop_sent_under(&conn);
@@ -615,7 +625,8 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
          DROP TABLE IF EXISTS channel;
          DROP TABLE IF EXISTS mail_surrogate;
          DROP TABLE IF EXISTS claim_release_log;
-         DROP TABLE IF EXISTS pen_credential;",
+         DROP TABLE IF EXISTS pen_credential;
+         DROP TABLE IF EXISTS config;",
     )
     .unwrap();
     drop_sent_under(&conn);

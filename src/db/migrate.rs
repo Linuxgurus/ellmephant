@@ -195,6 +195,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0037_pen_credential.sql"),
         "pen credentials: a pen's secret is a hashed row, not an environment variable",
     ),
+    (
+        38,
+        include_str!("../../migrations/0038_config.sql"),
+        "`config`: a stored value with a written ACL — who may set it and who may read it, in columns",
+    ),
 ];
 
 /// Current schema version recorded in the file.

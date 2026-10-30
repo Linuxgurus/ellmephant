@@ -5,6 +5,7 @@ pub mod audit;
 pub mod channel;
 pub mod claim;
 pub mod codec;
+pub mod config;
 pub mod credential;
 pub mod dupes;
 pub mod encode;

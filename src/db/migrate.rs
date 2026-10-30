@@ -205,6 +205,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0039_config_seed_recess.sql"),
         "seed: the daily recess amount and grant time are config rows (estate writes, public reads)",
     ),
+    (
+        40,
+        include_str!("../../migrations/0040_config_seed_sitting.sql"),
+        "seed: one recess sitting is 20m; the 2x hard ceiling is derived, and reaching it is a bug",
+    ),
 ];
 
 /// Current schema version recorded in the file.

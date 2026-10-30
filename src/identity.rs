@@ -147,8 +147,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::from_root(dir.path());
         let conn = crate::db::open(&paths).unwrap();
-        conn.execute("INSERT INTO pen (name, kind) VALUES ('James', 'self')", [])
-            .unwrap();
+        // ★ James hangs from the root, not at it (2026-10-30): a root cannot hold a credential, so a
+        // fixture that makes its pen a root is testing a state the code now refuses.
+        conn.execute(
+            "INSERT INTO pen (name, kind, parent_id)
+             VALUES ('James', 'self', (SELECT id FROM pen WHERE name = 'estate'))",
+            [],
+        )
+        .unwrap();
         let secret = crate::store::credential::issue(&conn, "James", None).unwrap();
         (dir, paths, secret)
     }

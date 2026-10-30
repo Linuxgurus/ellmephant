@@ -798,7 +798,7 @@ pub async fn pen_lend(
                 "refused: lending needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
             );
         }
-        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::UNAUTHORIZED),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
@@ -843,6 +843,22 @@ pub async fn pen_lend(
     }
 }
 
+/// ★ UNAVAILABLE IS NOT FORGED (2026-10-30, Stet on #204): the split exists in `identity::Denied`
+/// because a store that cannot be read is not a caller who lied. This is where it reaches the
+/// client — 503 for the store, the route's own refusal code for a bad proof. Rotating secrets
+/// because a database blinked is the failure this prevents.
+fn denied_response(
+    json: bool,
+    denied: crate::identity::Denied,
+    forged: StatusCode,
+) -> Response {
+    let code = match denied {
+        crate::identity::Denied::Forged(_) => forged,
+        crate::identity::Denied::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    error(json, code, denied.to_string())
+}
+
 /// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
 /// because authority is always borrowed BY somebody.
 #[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as in `session`
@@ -854,7 +870,7 @@ fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, 
             StatusCode::UNAUTHORIZED,
             "refused: this needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
         )),
-        Err(forged) => Err(error(json, StatusCode::UNAUTHORIZED, forged.to_string())),
+        Err(denied) => Err(denied_response(json, denied, StatusCode::UNAUTHORIZED)),
     }
 }
 
@@ -1079,7 +1095,7 @@ pub async fn pen_mint(
                 "refused: minting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
             );
         }
-        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::UNAUTHORIZED),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
@@ -1145,7 +1161,7 @@ pub async fn pen_rotate(
                 "refused: rotating a credential needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
             );
         }
-        Err(denied) => return error(json, StatusCode::UNAUTHORIZED, denied.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::UNAUTHORIZED),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
@@ -1255,31 +1271,28 @@ pub async fn whoami(State(state): State<HttpState>, headers: HeaderMap) -> Respo
             serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false }),
             format!("{} (not proven)\n", crate::identity::ANONYMOUS),
         ),
-        // A claim that failed verification is still worth reporting: the caller learns the name it
-        // sent is not the name it has. The secret is never echoed.
-        Err(denied) => {
+        // ★ A FORGED CLAIM IS STILL WORTH REPORTING; AN UNREADABLE STORE IS NOT AN ANSWER
+        // (2026-10-30, Stet on #204). Forged stays a 200 that names the claim, because that is what
+        // `whoami` is for; Unavailable is a 503, because "anonymous" would be a guess presented as a
+        // fact.
+        Err(crate::identity::Denied::Unavailable(why)) => {
+            return error(
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("authentication is unavailable: {why}"),
+            );
+        }
+        Err(crate::identity::Denied::Forged(claimed)) => {
             let mut doc = serde_json::json!({
                 "asserted_by": crate::identity::ANONYMOUS,
                 "proven": false,
             });
-            let text = match denied {
-                crate::identity::Denied::Forged(claimed) => {
-                    doc["claimed"] = serde_json::json!(claimed);
-                    doc["problem"] = serde_json::json!("the X-Stet-Auth proof is missing or wrong");
-                    format!(
-                        "{} (not proven; claimed `{claimed}`)\n",
-                        crate::identity::ANONYMOUS
-                    )
-                }
-                crate::identity::Denied::Unavailable(why) => {
-                    doc["problem"] =
-                        serde_json::json!(format!("the credential store is unavailable: {why}"));
-                    format!(
-                        "{} (not proven; credential store unavailable)\n",
-                        crate::identity::ANONYMOUS
-                    )
-                }
-            };
+            doc["claimed"] = serde_json::json!(claimed);
+            doc["problem"] = serde_json::json!("the X-Stet-Auth proof is missing or wrong");
+            let text = format!(
+                "{} (not proven; claimed `{claimed}`)\n",
+                crate::identity::ANONYMOUS
+            );
             (doc, text)
         }
     };
@@ -3361,7 +3374,7 @@ fn mail_reader_identity(
             StatusCode::FORBIDDEN,
             "refused: reading mail needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
         )),
-        Err(forged) => Err(error(json, StatusCode::FORBIDDEN, forged.to_string())),
+        Err(denied) => Err(denied_response(json, denied, StatusCode::FORBIDDEN)),
     }
 }
 
@@ -3522,7 +3535,7 @@ pub async fn mail_ack(
                 "refused: a cursor belongs to a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
             );
         }
-        Err(forged) => return error(json, StatusCode::FORBIDDEN, forged.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::FORBIDDEN),
     };
     if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
         return r;
@@ -3647,7 +3660,7 @@ pub async fn mail_surrogate_grant(
                 "refused: granting a name needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
             );
         }
-        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::UNAUTHORIZED),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
@@ -3728,7 +3741,7 @@ pub async fn mail_surrogate_revoke(
                 "refused: revoking needs a proven pen",
             );
         }
-        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::UNAUTHORIZED),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
@@ -3790,7 +3803,7 @@ pub async fn mail_surrogate_list(
                 "refused: listing grants needs a proven pen",
             );
         }
-        Err(forged) => return error(json, StatusCode::UNAUTHORIZED, forged.to_string()),
+        Err(denied) => return denied_response(json, denied, StatusCode::UNAUTHORIZED),
     };
     let subject = params
         .maybe("surrogate")

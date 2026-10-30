@@ -56,6 +56,19 @@ only by policy.
 creates a credential sees it". `pen_rotate` is the remedy: a rotation makes the parent's copy dead on
 the next call. There is no read-back verb; a lost secret is recovered by rotating again.
 
+★ **A minted secret is a second door past the lend rule.** `may_act_as` requires a live lend to
+write `as:` a descendant. But a minter holds the child's plaintext, so it can authenticate *as* the
+child directly — the child's name on the proof, no lend at all. That is inherent in "mint returns a
+secret", not a defect in lending: revoking a lend does not revoke the copy the minter was given. The
+remedy is the same rotation. Read the lend rule as a guarantee about the `as:` path, not as a
+guarantee that authority cannot be exercised.
+
+★ **The root never takes a credential.** `issue` and `rotate` refuse a pen whose `parent_id IS NULL`,
+symmetric with `retire`: the root is where identities borrow from, never a party that acts. The
+refusal is a sentence, not a `NULL` that a config happened to omit. The one-shot import follows the
+same rule: a name with no pen row is attached **under** the existing root (so it keeps working and
+stays retirable), and the root itself is skipped with a warning. There is never a second root.
+
 ★ **No cache, exactly like sudo.** Every authenticated call reads the row, so a rotation or a
 retirement takes effect on the very next call.
 

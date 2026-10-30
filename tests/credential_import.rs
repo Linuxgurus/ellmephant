@@ -14,7 +14,7 @@ fn env_pairs_are_imported_once_and_a_deleted_credential_stays_deleted() {
     unsafe {
         std::env::set_var(
             credential::BOOT_ENV,
-            "import-tester:import-secret-1, import-peer:import-secret-2 ,broken",
+            "import-tester:import-secret-1, import-peer:import-secret-2 ,broken,estate:root-secret",
         )
     };
 
@@ -22,13 +22,27 @@ fn env_pairs_are_imported_once_and_a_deleted_credential_stays_deleted() {
     assert_eq!(
         credential::verify(&conn, "import-tester", "import-secret-1").unwrap(),
         Some("import-tester".to_string()),
-        "a name with no pen row is registered and its secret hashed"
+        "a name with no pen row is attached under the root and its secret hashed"
     );
     assert_eq!(
         credential::verify(&conn, "IMPORT-PEER", "import-secret-2").unwrap(),
         Some("import-peer".to_string()),
         "case folds, and the stored spelling wins"
     );
+    // ★ NO SECOND ROOT, AND THE ROOT NEVER ACTS (2026-10-30, Stet on #204).
+    assert_eq!(
+        credential::verify(&conn, "estate", "root-secret").unwrap(),
+        None,
+        "the import refuses the root even when the environment names it"
+    );
+    let roots: i64 = conn
+        .query_row("SELECT count(*) FROM pen WHERE parent_id IS NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(roots, 1, "an env-only name is attached, never made a second root");
+    let parent: Option<i64> = conn
+        .query_row("SELECT parent_id FROM pen WHERE name = 'import-tester'", [], |r| r.get(0))
+        .unwrap();
+    assert!(parent.is_some(), "the imported pen hangs from the root, so it stays retirable");
 
     // Revoke by deleting the row — the way an ancestor's act would. The env still names it.
     conn.execute(

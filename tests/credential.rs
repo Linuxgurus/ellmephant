@@ -78,6 +78,34 @@ fn a_parent_may_rotate_a_descendant_but_a_peer_may_not() {
 }
 
 #[test]
+fn a_root_pen_cannot_issue_or_rotate_a_credential() {
+    let (_dir, paths) = store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    // `James` has no parent in this fixture, so it is a root — and a root is break-glass, not a party.
+    let issued = credential::issue(&conn, "James", None);
+    assert!(
+        format!("{}", issued.unwrap_err()).contains("root pen"),
+        "issue must refuse a root with a sentence"
+    );
+    let rotated = credential::rotate(&conn, None, "James");
+    assert!(
+        format!("{}", rotated.unwrap_err()).contains("root pen"),
+        "the provisioning door does not make the root act either"
+    );
+}
+
+#[test]
+fn issuing_twice_refuses_with_the_sentence_not_a_constraint() {
+    let (_dir, paths) = store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    store::mint(&conn, "James", "cline", "self").unwrap();
+    let err = credential::issue(&conn, "cline", Some("James")).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("already has a credential"), "{text}");
+    assert!(!text.contains("UNIQUE"), "the written sentence must surface: {text}");
+}
+
+#[test]
 fn a_retired_pen_cannot_hold_or_use_a_credential() {
     let (_dir, paths) = store();
     let conn = ellmephant::db::open(&paths).unwrap();

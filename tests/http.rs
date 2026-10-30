@@ -3016,7 +3016,8 @@ async fn pen_rotate_returns_a_new_secret_and_the_old_one_dies() {
     let old = {
         let conn = ellmephant::db::open(&paths).unwrap();
         conn.execute(
-            "INSERT INTO pen (name, kind) VALUES ('rotate-tester', 'self')",
+            "INSERT INTO pen (name, kind, parent_id)
+             VALUES ('rotate-tester', 'self', (SELECT id FROM pen WHERE name = 'estate'))",
             [],
         )
         .unwrap();

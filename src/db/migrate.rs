@@ -210,6 +210,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0040_config_seed_sitting.sql"),
         "seed: one recess sitting is 20m; the 2x hard ceiling is derived, and reaching it is a bug",
     ),
+    (
+        41,
+        include_str!("../../migrations/0041_recess_config_moved.sql"),
+        "retire: the three recess policy rows moved to brain.db with the bank",
+    ),
 ];
 
 /// Current schema version recorded in the file.

@@ -117,74 +117,39 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
 }
 
 #[test]
-fn the_recess_seed_is_configuration_and_a_reopen_does_not_reset_it() {
+fn the_recess_rows_are_retired_and_a_reopen_does_not_resurrect_them() {
+    // ★ MIGRATIONS 0039/0040 SEEDED THESE AND 0041 REMOVED THEM (2026-10-31). The recess bank moved
+    // into brain.db with its policy, so the store must answer NOTHING about a recess. This asserts
+    // the END STATE of the whole chain, not the seed: a fresh store runs every migration in order.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT key, value, set_audience, read_audience FROM config
-              WHERE key LIKE 'recess_daily_%' ORDER BY key",
-        )
-        .unwrap();
-    let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(
-        rows,
-        vec![
-            (
-                "recess_daily_grant_at".into(),
-                "18:00".into(),
-                "pen:estate".into(),
-                "public".into()
-            ),
-            (
-                "recess_daily_seconds".into(),
-                "1800".into(),
-                "pen:estate".into(),
-                "public".into()
-            ),
-        ],
-        "the seed is the default: estate writes it, everyone may read the rate"
-    );
-
-    drop(stmt);
-    // One sitting is separate from the daily bank, and its hard ceiling is derived in code.
-    let (sitting, set_aud, read_aud): (String, String, String) = conn
+    let rows: i64 = conn
         .query_row(
-            "SELECT value, set_audience, read_audience FROM config WHERE key = 'recess_sitting_seconds'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (sitting.as_str(), set_aud.as_str(), read_aud.as_str()),
-        ("1200", "pen:estate", "public"),
-        "a sitting is 20m; 2x is the bug threshold, not a second row"
-    );
-
-    // A value changed after the seed must SURVIVE a reopen: the seed is a default, not a reset.
-    conn.execute(
-        "UPDATE config SET value = '7200' WHERE key = 'recess_daily_seconds'",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-    let conn = db::open(&paths).expect("reopen");
-    let value: String = conn
-        .query_row(
-            "SELECT value FROM config WHERE key = 'recess_daily_seconds'",
+            "SELECT COUNT(*) FROM config WHERE key IN
+                ('recess_daily_seconds','recess_sitting_seconds','recess_daily_grant_at')",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
-        value, "7200",
-        "INSERT OR IGNORE must not re-seed over a decision"
+        rows, 0,
+        "the recess policy lives in brain.db; a second copy here is the copy nobody updates"
     );
+
+    // ★ A REOPEN MUST NOT RE-SEED. The seed rows are INSERT OR IGNORE and 0041 already ran, so the
+    // migration list stops at the current version: a reopen that re-ran 0039/0040 would resurrect
+    // exactly the duplicate this retirement exists to prevent.
+    drop(conn);
+    let conn = db::open(&paths).expect("reopen");
+    let again: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM config WHERE key LIKE 'recess_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(again, 0, "a reopen must not put the retired rows back");
 }
 
 #[test]

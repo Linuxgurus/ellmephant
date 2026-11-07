@@ -478,7 +478,6 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
     let hint = vec::Knn {
         k: 5,
         max_distance: None,
-        semantic_only: false,
     };
 
     // Nothing is buried yet.

@@ -2654,6 +2654,12 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             mode: None,
             k: Some(k),
             max_distance: p.max_distance,
+            // ★ `semantic_search` is the vector door and CANNOT ask for semantic-only here: adding
+            // the knob to `SemanticSearchParams` would let the phrase leg refill a vector query
+            // (the very trap #215 names), but it also changes what this tool returns for existing
+            // callers. Deliberately left as today's behaviour; the refill is now VISIBLE through
+            // `via` and `search.semantic_candidates`, and turning it off is its own change.
+            semantic_only: None,
             expand: None,
             tags: Vec::new(),
             min_chars: None,

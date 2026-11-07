@@ -215,7 +215,7 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     let found: serde_json::Value = serde_json::from_str(&text(&found)).expect("search json");
     // Positional wire, lean default: no `fields` named, so a hit is just its key (SPEC §10).
-    assert_eq!(found["cols"], serde_json::json!(["key"]));
+    assert_eq!(found["cols"], serde_json::json!(["key", "via"]));
     assert_eq!(found["hits"][0][0], serde_json::json!("infra-logs"));
 
     // Naming `fields` adds those columns (canonical order), `key` always leading.
@@ -228,7 +228,7 @@ async fn tools_round_trip_over_the_transport() {
     let named: serde_json::Value = serde_json::from_str(&text(&named)).expect("search json");
     assert_eq!(
         named["cols"],
-        serde_json::json!(["key", "title", "distance"])
+        serde_json::json!(["key", "via", "title", "distance"])
     );
     assert_eq!(named["hits"][0][0], serde_json::json!("infra-logs"));
 
@@ -588,7 +588,7 @@ async fn search_filters_round_trip() {
     .await;
     let filtered: serde_json::Value = serde_json::from_str(&text(&filtered)).expect("search json");
     // A filter with no `fields` named is still key-only.
-    assert_eq!(filtered["cols"], serde_json::json!(["key"]));
+    assert_eq!(filtered["cols"], serde_json::json!(["key", "via"]));
     assert_eq!(filtered["hits"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["hits"][0][0], serde_json::json!("note-long"));
 

@@ -5008,6 +5008,10 @@ mod tests {
                 "mode",
                 "pattern",
                 "query",
+                // ★ The honest empty list (#215): a caller must be able to ask "did my phrase reach
+                // anything real" and get NO rather than a lexical refill. This list is the wire
+                // surface, so a new knob appears here deliberately or not at all.
+                "semantic_only",
                 "tags",
                 "updated_after",
                 "updated_before"

@@ -97,6 +97,7 @@ fn case_query(case: &Case, k: usize) -> Query {
         mode: MatchMode::Literal,
         k,
         max_distance: None,
+        semantic_only: false,
         expand: 0,
         tags: Vec::new(),
         min_chars: None,

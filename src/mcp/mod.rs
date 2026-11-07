@@ -472,8 +472,16 @@ pub struct SearchParams {
     pub k: Option<usize>,
     /// Cosine-distance ceiling.
     #[serde(default)]
-    #[schemars(description = "Cosine-distance ceiling (0-2). Smaller = closer.")]
+    #[schemars(
+        description = "Cosine-distance ceiling (0-2). Smaller = closer. Applies to the SEMANTIC leg only — if it cuts everything the list is filled from the word index and `search.semantic_candidates` reads 0."
+    )]
     pub max_distance: Option<f32>,
+    /// Semantic-only answer.
+    #[serde(default)]
+    #[schemars(
+        description = "Keep only rows the semantic leg ranked. The way to ask 'did my phrase reach anything real': an empty list then means NO instead of being refilled from the word index."
+    )]
+    pub semantic_only: Option<bool>,
     /// Link-neighbourhood hops.
     #[serde(default)]
     #[schemars(description = "Link-neighbour hops drag in (0 = off).")]
@@ -1736,11 +1744,17 @@ fn log_search(
     response_bytes: usize,
     elapsed_ms: u64,
 ) {
+    // The leg counts are the point of the line: `hits` alone cannot distinguish "ten agreements"
+    // from "ten word matches after the phrase leg returned nothing".
+    let semantic_candidates = bundle.search.as_ref().map(|m| m.semantic_candidates);
+    let lexical_candidates = bundle.search.as_ref().map(|m| m.lexical_candidates);
     tracing::info!(
         query = query.unwrap_or("-"),
         expand,
         hits = bundle.hits.len(),
         neighbors = bundle.neighbors.len(),
+        ?semantic_candidates,
+        ?lexical_candidates,
         response_bytes,
         elapsed_ms,
         "memory_search"
@@ -1749,6 +1763,7 @@ fn log_search(
         tracing::info!(
             key = %hit.key,
             tags = ?hit.tags,
+            via = hit.via.name(),
             distance = ?hit.distance,
             "  hit"
         );
@@ -2687,6 +2702,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let max_distance = p.max_distance;
         let expand = p.expand.unwrap_or(0);
         let tags = p.tags;
+        let semantic_only = p.semantic_only;
         let min_chars = p.min_chars;
         let max_chars = p.max_chars;
         let created_after = p.created_after;
@@ -2707,6 +2723,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     k: k.unwrap_or_else(|| s.default_k()),
                     // Fall back to the configured ceiling so a bare semantic search is capped.
                     max_distance: max_distance.or_else(|| s.default_max_distance()),
+                    semantic_only: semantic_only.unwrap_or(false),
                     expand,
                     tags,
                     min_chars,

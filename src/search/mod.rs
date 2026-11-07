@@ -1,16 +1,26 @@
 //! Search: a semantic phrase plus an optional literal/regex leg, over the store (SPEC §10).
 //!
-//! Two legs feed one candidate set. The **semantic** leg embeds `text` as a query-side phrase and
-//! takes the KNN over the stored document vectors (cosine distance). The **lexical** leg
-//! ([`lexical`]) matches `pattern` as a literal substring or a regex against the *raw* `key`,
-//! `title` and `body`. Both compose with the structured filters by **intersection** — every leg
-//! and filter given must hold (the ledger's "filters intersect" law); there is no cross-leg fusion
-//! ranking, so a lexical-only query is unranked (`key` order).
+//! **Two legs ALWAYS run on `text`, and are fused by Reciprocal Rank Fusion** ([`fuse`]): the
+//! **semantic** leg embeds `text` as a query-side phrase and takes the KNN over the stored document
+//! vectors (cosine distance); the **lexical** leg ([`phrase_ids_lexical`]) is FTS5/BM25 over the
+//! same columns. A lexical-only row can therefore outrank a semantic-only one. The `pattern`
+//! argument is a *separate* filter over the raw `key`/`title`/`body` ([`lexical_set`]), not the
+//! trigger for the word index — that index runs on `text` whenever `text` is given.
 //!
-//! Results are distance-ranked only when the phrase was semantic, then capped by `k` and a
-//! `max_distance` ceiling. A hit returns its `key` by default and nothing else; the caller names
-//! the extra [`Field`]s it wants (via [`Fields`]) — never a body; fetch that with
-//! `memory_get`/`show`.
+//! **A fused list is not a similarity list.** `hits.len()` counts rows, not agreements: one real
+//! semantic hit can be dressed as ten word matches, because the lexical leg fills the page when
+//! the semantic leg has nothing. So every hit carries [`Hit::via`] (`semantic` / `lexical` /
+//! `both` / `listing`), `distance` is present **only** when the semantic leg ranked the row, and
+//! the bundle carries [`SearchMeta`], whose `semantic_candidates` is the loud signal: **0 means the
+//! phrase leg answered nothing and the page is the word index's.**
+//!
+//! The `max_distance` ceiling applies to the semantic leg ONLY ([`crate::index::vec`]), so it can
+//! empty that leg completely; the lexical leg is never capped. A caller who needs an uncapped
+//! semantic answer passes `max_distance` explicitly, or `semantic_only` to be told plainly that
+//! there was none.
+//!
+//! A hit returns its `key` and `via` by default and nothing else; the caller names the extra
+//! [`Field`]s it wants (via [`Fields`]) — never a body; fetch that with `memory_get`/`show`.
 
 pub mod lexical;
 
@@ -52,10 +62,14 @@ pub struct Query {
     pub pattern: Option<String>,
     /// How `pattern` is read — a plain substring or a regex ([`MatchMode`]).
     pub mode: MatchMode,
-    /// Result cap (semantic ranking only).
+    /// Result cap — over the FUSED list when both legs ran, over the single leg when only one did.
     pub k: usize,
-    /// Optional cosine-distance ceiling.
+    /// Optional cosine-distance ceiling. Applies to the SEMANTIC leg only, so it can empty that leg
+    /// and leave a purely lexical page (`SearchMeta::semantic_candidates == 0`).
     pub max_distance: Option<f32>,
+    /// Drop every hit the semantic leg did not rank — the plain answer to "did my phrase reach
+    /// anything real", where an empty list means NO, honestly.
+    pub semantic_only: bool,
     /// Link-neighbourhood hops to include (0 = off).
     pub expand: u8,
     /// Tag filter: **every** listed tag must be present (intersection). Empty = no constraint.
@@ -88,7 +102,35 @@ impl Query {
     }
 }
 
-/// One hydrated hit: `key`/`title`/`tags` and (semantic only) `distance`. No body.
+/// Which leg(s) found a hit. Carried on every row because `distance == None` cannot say it: a
+/// `None` means "the lexical leg ranked this", and a page of ten `None`s is a semantic search that
+/// returned nothing and was refilled from the word index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// The phrase leg ranked it.
+    Semantic,
+    /// The word index ranked it.
+    Lexical,
+    /// Both legs ranked it — fused by RRF.
+    Both,
+    /// Neither: a phrase-less, pattern-less query listing rows in key order.
+    Listing,
+}
+
+impl Via {
+    /// The wire name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Via::Semantic => "semantic",
+            Via::Lexical => "lexical",
+            Via::Both => "both",
+            Via::Listing => "listing",
+        }
+    }
+}
+
+/// One hydrated hit: `key`/`via`/`title`/`tags` and (semantic only) `distance`. No body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
     /// `memory.id` (local; not serialized).
@@ -105,7 +147,10 @@ pub struct Hit {
     /// filters key on. Lets a caller sort the fat tail itself (no server-side sort).
     #[serde(default)]
     pub chars: usize,
-    /// Vector distance when the semantic leg ranked this hit.
+    /// Which leg(s) found this row.
+    pub via: Via,
+    /// Vector distance when the semantic leg ranked this hit; `None` when only the word index did
+    /// (BM25 is not a distance and reporting one in this field would be a unit confusion).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f32>,
 }
@@ -129,6 +174,22 @@ pub struct Bundle {
     /// Link neighbours, breadth-first from the hits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub neighbors: Vec<Neighbor>,
+    /// What the legs actually produced, so a caller never has to infer it from `hits.len()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchMeta>,
+}
+
+/// Per-call search instrumentation (soma/ellmephant#59). `semantic_candidates: 0` is the number
+/// that matters: the phrase leg returned nothing after the ceiling, and however long the list looks
+/// it is the word index's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMeta {
+    /// The ceiling applied to the semantic leg on this call (`None` = uncapped).
+    pub max_distance: Option<f32>,
+    /// Semantic rows that survived the ceiling and the visibility filter.
+    pub semantic_candidates: usize,
+    /// Lexical rows that survived the visibility filter.
+    pub lexical_candidates: usize,
 }
 
 /// One selectable hit field on the MCP wire. `key` is always returned (it is the handle you
@@ -137,6 +198,8 @@ pub struct Bundle {
 pub enum Field {
     /// Slug.
     Key,
+    /// Which leg(s) found this row — always present, like `key`.
+    Via,
     /// Salient line.
     Title,
     /// Attached tags.
@@ -149,8 +212,9 @@ pub enum Field {
 
 impl Field {
     /// Every field, in canonical wire order.
-    pub const ALL: [Field; 5] = [
+    pub const ALL: [Field; 6] = [
         Field::Key,
+        Field::Via,
         Field::Title,
         Field::Tags,
         Field::Chars,
@@ -161,6 +225,7 @@ impl Field {
     pub fn name(self) -> &'static str {
         match self {
             Field::Key => "key",
+            Field::Via => "via",
             Field::Title => "title",
             Field::Tags => "tags",
             Field::Chars => "chars",
@@ -193,7 +258,7 @@ impl Fields {
         Self(
             Field::ALL
                 .into_iter()
-                .filter(|f| *f == Field::Key || wanted.contains(f))
+                .filter(|f| matches!(f, Field::Key | Field::Via) || wanted.contains(f))
                 .collect(),
         )
     }
@@ -212,6 +277,7 @@ impl Fields {
     fn value(&self, h: &Hit, f: Field) -> serde_json::Value {
         match f {
             Field::Key => serde_json::json!(h.key),
+            Field::Via => serde_json::json!(h.via.name()),
             Field::Title => serde_json::json!(h.title),
             Field::Tags => serde_json::json!(h.tags),
             Field::Chars => serde_json::json!(h.chars),
@@ -238,6 +304,19 @@ pub fn to_wire_json(bundle: &Bundle, fields: &Fields) -> Result<String> {
 
     let mut out = format!("{{\"cols\":[{header}],\"hits\":");
     out.push_str(&crate::wire::rows_array(&hits));
+
+    // The instrumentation rides the envelope so it cannot be missed by a caller who never learned
+    // to look at a hit's `via`: `semantic_candidates: 0` says the phrase leg answered nothing.
+    if let Some(m) = &bundle.search {
+        let ceiling = match m.max_distance {
+            Some(d) => format!("{}", wire_distance(d)),
+            None => "null".to_string(),
+        };
+        out.push_str(&format!(
+            ",\"search\":{{\"max_distance\":{ceiling},\"semantic_candidates\":{},\"lexical_candidates\":{}}}",
+            m.semantic_candidates, m.lexical_candidates
+        ));
+    }
 
     if !bundle.neighbors.is_empty() {
         let rows: Vec<serde_json::Value> = bundle
@@ -309,6 +388,16 @@ pub fn run(
         (None, None) => all_ranked(conn)?,
     };
     ordered.retain(|(id, _)| !hidden(id));
+    // ★ WHICH LEG FOUND EACH ROW, recorded before any filter can hide the distinction. `distance`
+    // alone cannot say it, and a caller should not have to join two answers to learn whether their
+    // phrase reached anything — that is the defect this carries (soma/ellmephant#213 follow-up).
+    let semantic_ids: HashSet<i64> = phrase.iter().flatten().map(|(id, _)| *id).collect();
+    let lexical_ids: HashSet<i64> = lexical.iter().flatten().map(|(id, _)| *id).collect();
+    let meta = SearchMeta {
+        max_distance: q.max_distance,
+        semantic_candidates: semantic_ids.len(),
+        lexical_candidates: lexical_ids.len(),
+    };
     // Structured filters intersect the candidate set BEFORE the k cap, so a filtered result
     // is exact (the KNN already spans the whole store): filter, then truncate, never the reverse.
     if let Some(set) = filter_set(conn, q)? {
@@ -318,6 +407,11 @@ pub fn run(
     // cap it (like the structured filters).
     if let Some(set) = lexical_set(conn, q)? {
         ordered.retain(|(id, _)| set.contains(id));
+    }
+    // `semantic_only`: the honest empty list. Applied BEFORE the cap so a caller asking for a
+    // semantic answer cannot receive a short page dressed as a complete one.
+    if q.semantic_only {
+        ordered.retain(|(id, _)| semantic_ids.contains(id));
     }
     if ranked && lexical.is_none() {
         ordered.truncate(q.k.max(1)); // k caps a single-leg list; `fuse` already capped a fused one
@@ -334,8 +428,16 @@ pub fn run(
             continue;
         }
         let chars = embedded_len(&mem);
+        let via = match (semantic_ids.contains(&id), lexical_ids.contains(&id)) {
+            (true, true) => Via::Both,
+            (true, false) => Via::Semantic,
+            (false, true) => Via::Lexical,
+            // Neither: `all_ranked` — a query with no phrase and no pattern, listed in key order.
+            (false, false) => Via::Listing,
+        };
         hits.push(Hit {
             id,
+            via,
             key: mem.key,
             title: mem.title,
             tags: mem.tags,
@@ -349,7 +451,11 @@ pub fn run(
     } else {
         Vec::new()
     };
-    Ok(Bundle { hits, neighbors })
+    Ok(Bundle {
+        hits,
+        neighbors,
+        search: Some(meta),
+    })
 }
 
 /// The lexical leg: FTS5 over the same columns, ranked by BM25 (`soma/ellmephant#62`).
@@ -646,6 +752,7 @@ mod tests {
             mode: MatchMode::Literal,
             k: 10,
             max_distance: None,
+            semantic_only: false,
             expand: 0,
             tags: Vec::new(),
             min_chars: None,

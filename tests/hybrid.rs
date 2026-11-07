@@ -28,6 +28,7 @@ fn q(text: &str, k: usize) -> Query {
         mode: Default::default(),
         k,
         max_distance: None,
+        semantic_only: false,
         expand: 0,
         tags: Vec::new(),
         min_chars: None,

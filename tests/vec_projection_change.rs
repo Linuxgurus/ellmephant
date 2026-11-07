@@ -83,6 +83,7 @@ fn a_changed_projection_purges_and_requeues_every_document() {
     let hint = vec::Knn {
         k: 10,
         max_distance: None,
+        semantic_only: false,
     };
     let hits = vec::knn(&conn, &[0.5; 8], &hint, None).expect("knn");
     assert!(

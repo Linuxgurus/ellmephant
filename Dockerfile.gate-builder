@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+#
+# The gate's DEPENDENCIES as an image: ~250 crates compiled from Cargo.lock, in the same profile
+# and with the same feature set the gate uses, so a gate run does not compile them again.
+#
+# Why this exists: `Dockerfile.test` is standalone on purpose (no registry, no secrets) and that
+# costs a full dependency compile on every run. Measured 2026-10-26 on this repo: a cold gate
+# built 336 crates, of which dependency compilation was ~136 s of a 612 s run. Prebuilding the
+# dependencies removes 83% of the compiles (336 -> 57) and 22% of the wall clock (612 s -> 476 s).
+#
+# ★ TWO THINGS MUST MATCH or cargo silently recompiles everything, which looks like "the image
+# did not help" rather than an error:
+#   1. the PROFILE — `cargo test` builds in the dev/test profile, not release. This is why the
+#      publish `ellmephant-builder` image (release profile) cannot be reused here.
+#   2. the FEATURES — the gate runs clippy with `--all-features`, so this builds `--all-features`.
+#
+# `cargo test --no-run`, not `cargo build`: clippy's check-mode artifacts are not what the test
+# step consumes, so a `cargo build` image would leave the 260-crate test compile in place.
+#
+# Rebuilt when Cargo.toml, Cargo.lock, Dockerfile.test or this file changes — see
+# .forgejo/workflows/gate-builder.yml. The tag is a fingerprint of exactly those inputs.
+FROM rust:1-bookworm
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+
+# rust:1-bookworm carries rustup but not the components the gates need. Installed here so the
+# gate inherits them rather than spending a layer on them per run.
+RUN rustup component add rustfmt clippy
+
+# The stub-crate trick: build every dependency against a do-nothing `src/`, so the expensive
+# result depends on Cargo.lock alone and cannot be invalidated by a source change. Identical in
+# spirit to Dockerfile.builder; keep the two in step if the cargo commands ever diverge.
+RUN mkdir -p src \
+ && printf 'fn main() {}\n' > src/main.rs \
+ && printf '\n' > src/lib.rs \
+ && cargo test --no-run --all-features --locked \
+ && rm -rf src
+
+# /src/target is the payload: it carries every compiled dependency. Nothing else here matters.

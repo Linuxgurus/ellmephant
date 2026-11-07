@@ -242,7 +242,10 @@ fn semantic_only_is_never_empty_when_the_phrase_leg_found_something() {
             assert!(
                 page.hits.iter().all(|h| is_semantic(h.via)),
                 "and every row on it must be the phrase leg's: {:?}",
-                page.hits.iter().map(|h| (&h.key, h.via)).collect::<Vec<_>>()
+                page.hits
+                    .iter()
+                    .map(|h| (&h.key, h.via))
+                    .collect::<Vec<_>>()
             );
         }
     }

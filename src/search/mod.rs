@@ -384,7 +384,13 @@ pub fn run(
     if let Some(l) = lexical.as_mut() {
         l.retain(|(id, _)| !hidden(id));
     }
+    // ★ `semantic_only` SKIPS THE FUSION ENTIRELY, and it has to. `fuse` spends `k` slots on the
+    // combined ranking, so a semantic row can be crowded out by word matches before the filter
+    // below ever sees it — which made `semantic_only` able to return EMPTY while
+    // `semantic_candidates > 0`, the one thing the flag exists to make impossible. When the caller
+    // asks for the phrase leg's answer, they get the phrase leg's own top-k, uncosted by the other.
     let mut ordered: Vec<(i64, Option<f32>)> = match (&phrase, &lexical) {
+        (Some(p), _) if q.semantic_only => p.clone(),
         (Some(p), Some(l)) => fuse(p, l, q.k.max(1)),
         (Some(p), None) => p.clone(),
         (None, Some(l)) => l.clone(),
@@ -411,12 +417,11 @@ pub fn run(
     if let Some(set) = lexical_set(conn, q)? {
         ordered.retain(|(id, _)| set.contains(id));
     }
-    // `semantic_only`: the honest empty list. Applied BEFORE the cap so a caller asking for a
-    // semantic answer cannot receive a short page dressed as a complete one.
+    // `semantic_only` is already a single-leg list (see above), so it is capped here like one.
     if q.semantic_only {
         ordered.retain(|(id, _)| semantic_ids.contains(id));
-    }
-    if ranked && lexical.is_none() {
+        ordered.truncate(q.k.max(1));
+    } else if ranked && lexical.is_none() {
         ordered.truncate(q.k.max(1)); // k caps a single-leg list; `fuse` already capped a fused one
     }
 

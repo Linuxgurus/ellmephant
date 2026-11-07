@@ -207,6 +207,61 @@ fn semantic_only_never_returns_a_lexical_hit() {
     );
 }
 
+/// ★ THE GUARANTEE THE FLAG EXISTS FOR, and the one it did not have at first: when the phrase leg
+/// found something, `semantic_only` must return something.
+///
+/// The first version applied the filter AFTER `fuse`, which had already spent all `k` slots on the
+/// combined ranking — so word matches could crowd every semantic row out of the page and
+/// `semantic_only` returned EMPTY while `semantic_candidates` was greater than zero. The flag then
+/// contradicted the envelope it was supposed to corroborate. Fixed by skipping the fusion under
+/// `semantic_only` and taking the phrase leg's own top-k; this test is what keeps it fixed.
+///
+/// The counter-case is deliberate and NOT asserted: a structured filter (`tags`, size, time) can
+/// legitimately empty the semantic page while candidates exist, because the filter removed them.
+/// That is an honest empty list and a different fact from "the phrase leg answered nothing".
+#[test]
+fn semantic_only_is_never_empty_when_the_phrase_leg_found_something() {
+    let (_dir, conn, embedder) = store_with_probes();
+    let reader = Reader::everything();
+    for (question, _answer) in PROBES {
+        let fused =
+            search::run(&conn, Some(&embedder), &reader, &q(Some(question), 5)).expect("search");
+        let candidates = fused
+            .search
+            .as_ref()
+            .map(|m| m.semantic_candidates)
+            .unwrap_or(0);
+        let mut only = q(Some(question), 5);
+        only.semantic_only = true;
+        let page = search::run(&conn, Some(&embedder), &reader, &only).expect("search");
+        if candidates > 0 {
+            assert!(
+                !page.hits.is_empty(),
+                "the phrase leg had {candidates} candidates, so semantic_only must not be empty: {question}"
+            );
+            assert!(
+                page.hits.iter().all(|h| is_semantic(h.via)),
+                "and every row on it must be the phrase leg's: {:?}",
+                page.hits.iter().map(|h| (&h.key, h.via)).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// The word index must not be able to crowd the phrase leg out of its own answer: with `k` smaller
+/// than the semantic candidate set, `semantic_only` still returns a full page of semantic rows.
+#[test]
+fn a_crowded_page_does_not_starve_semantic_only() {
+    let (_dir, conn, embedder) = store_with_probes();
+    let reader = Reader::everything();
+    let question = "the thing that wakes a person in the night when nothing is wrong";
+    let mut only = q(Some(question), 1);
+    only.semantic_only = true;
+    let page = search::run(&conn, Some(&embedder), &reader, &only).expect("search");
+    assert_eq!(page.hits.len(), 1, "k=1 is one row, not zero");
+    assert!(is_semantic(page.hits[0].via), "and it is the phrase leg's");
+}
+
 /// No phrase and no pattern is a listing, not a search — and it says so rather than looking like a
 /// perfect match.
 #[test]

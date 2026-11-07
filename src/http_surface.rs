@@ -2795,6 +2795,9 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         mode: Some(match_mode_param(p.maybe("mode"))?),
         k: p.parse_as::<usize>("k")?,
         max_distance: p.parse_as::<f32>("max_distance")?,
+        // The MCP door has `semantic_only`; the HTTP door must not be the one place it is
+        // unreachable. Absent stays `None`, so today's callers see no change.
+        semantic_only: p.maybe("semantic_only").map(|_| p.flag("semantic_only")),
         expand: p.parse_as::<u8>("expand")?,
         tags,
         min_chars: p.parse_as::<usize>("min_chars")?,

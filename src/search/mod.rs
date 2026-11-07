@@ -247,9 +247,12 @@ impl Field {
 pub struct Fields(Vec<Field>);
 
 impl Fields {
-    /// Just `key` — the lean default.
+    /// Just `key` and `via` — the lean default. ★ `via` is NEVER optional (2026-11-07): the whole
+    /// point of the label is that a page cannot be blind without saying so, and a constructor that
+    /// omits it is a second definition of the wire shape waiting to disagree with `selection`.
+    /// Delegating is the fix; `key_only()` used to build `vec![Field::Key]` and silently dropped it.
     pub fn key_only() -> Self {
-        Self(vec![Field::Key])
+        Self::selection(Vec::new())
     }
 
     /// Canonical order; `key` is always present, `wanted` adds the rest (duplicates ignored).

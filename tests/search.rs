@@ -320,12 +320,12 @@ fn fields_always_include_key_and_keep_canonical_order() {
     let fields = Fields::selection([Field::Distance, Field::Title]);
     assert_eq!(
         fields.names().collect::<Vec<_>>(),
-        ["key", "title", "distance"]
+        ["key", "via", "title", "distance"]
     );
 
-    // An empty selection still yields `key`.
+    // An empty selection still yields `key` — and `via`, which is never optional.
     let empty = Fields::selection(Vec::new());
-    assert_eq!(empty.names().collect::<Vec<_>>(), ["key"]);
+    assert_eq!(empty.names().collect::<Vec<_>>(), ["key", "via"]);
 
     // Wire names round-trip through `parse`.
     for f in Field::ALL {

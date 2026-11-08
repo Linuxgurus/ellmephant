@@ -1678,13 +1678,19 @@ pub async fn semantic_search(
             }
         }
     }
+    // `bool_param` is fallible, and this handler answers `Response` rather than `Result`, so the
+    // error becomes a 400 here instead of `?` (which cannot be used in this return type).
+    let deleted = match params.maybe("deleted") {
+        Some(v) => match bool_param(v, "deleted") {
+            Ok(b) => Some(b),
+            Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        },
+        None => None,
+    };
     let p = SemanticSearchParams {
         query: params.maybe("q").map(str::to_string),
         doc_type: params.maybe("type").map(str::to_string),
-        deleted: params
-            .maybe("deleted")
-            .map(|v| bool_param(v, "deleted"))
-            .transpose()?,
+        deleted,
         k: params.maybe("k").and_then(|v| v.parse().ok()),
         max_distance: params.maybe("max_distance").and_then(|v| v.parse().ok()),
         fields,

@@ -457,6 +457,7 @@ fn a_project_tag_is_how_memories_join() {
             mode: MatchMode::Literal,
             k: 10,
             max_distance: None,
+            semantic_only: false,
             expand: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             min_chars: None,

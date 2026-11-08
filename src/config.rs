@@ -31,21 +31,21 @@ pub const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
 /// Largest embedding dimension MRL allows (SPEC §6); the frozen `vec0` width.
 pub const MAX_DIM: usize = 1024;
 
-/// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance` (SPEC §10).
+/// Default cosine-distance ceiling for the KNN leg when a search omits `max_distance`
+/// (SPEC §10).
 ///
-/// ★ RE-CALIBRATED 2026-10-21 on the live store (Qwen3-Embedding-0.6B, dim 1024), because the old
-/// 0.6 was measured on a different model and admitted every nonsense hit on this one:
+/// ★ UNDER REVIEW 2026-11-07 (`soma/ellmephant#59`). This comment used to claim "the separation is
+/// 0.489 -> 0.529 and **0.52** sits in it: every measured genuine hit survives, nothing measured as
+/// noise does." **That is falsified by measurement.** Eight rows that are unambiguously the right
+/// answer to a paraphrase query — and that share no tokens with it — sit at 0.5290, 0.5523, 0.5631,
+/// 0.5680, 0.5737, 0.5760, 0.5805 and 0.5813, i.e. entirely ABOVE the claimed noise floor. The
+/// calibration sample behind the old comment was too narrow for paraphrase-shaped queries, which
+/// are exactly the queries where the vector leg is the only leg with anything to say.
 ///
-/// | query | rank-1 | rank-5 |
-/// |---|---|---|
-/// | a relevant phrase | 0.338 | 0.483 |
-/// | a vague-but-real phrase | 0.455 | 0.489 |
-/// | four nonsense phrases | 0.529 | 0.591 |
-///
-/// So the separation is 0.489 -> 0.529 and **0.52** sits in it: every measured genuine hit survives,
-/// nothing measured as noise does. The old comment's "noise floor ≳0.63" was false here. High-precision
-/// callers can still pass `max_distance` per call (≈0.45 for confident-only). A single number cannot
-/// separate "nothing similar" from "cut by the threshold" — a `match` verdict is the follow-up (#59).
+/// The value is deliberately NOT changed here: it may only move once the known-answer probe set
+/// (`tests/search_probe.rs`, added with this change) reports a number. Until then, what this
+/// ceiling does is *visible* rather than silent — a search that the ceiling emptied reports
+/// `search.semantic_candidates == 0` and every hit carries `via: lexical`.
 pub const DEFAULT_MAX_DISTANCE: f32 = 0.52;
 
 /// Resolved on-disk locations. `ELLMEPHANT_HOME` wins over `$HOME/.ellmephant`, which

@@ -37,6 +37,7 @@ fn query(text: Option<&str>) -> Query {
         mode: MatchMode::Literal,
         k: 10,
         max_distance: None,
+        semantic_only: false,
         expand: 0,
         tags: Vec::new(),
         min_chars: None,
@@ -261,9 +262,11 @@ fn wire_json_is_positional_with_a_cols_header() {
             title: "T".into(),
             tags: vec!["a".into(), "b".into()],
             chars: 3,
+            via: search::Via::Semantic,
             distance: Some(0.42),
         }],
         neighbors: vec![],
+        search: None,
     };
     // Every field requested: the full five-column shape, in canonical order.
     let all = Fields::selection(Field::ALL);
@@ -271,11 +274,11 @@ fn wire_json_is_positional_with_a_cols_header() {
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "title", "tags", "chars", "distance"])
+        serde_json::json!(["key", "via", "title", "tags", "chars", "distance"])
     );
     assert_eq!(
         v["hits"][0],
-        serde_json::json!(["k", "T", ["a", "b"], 3, 0.42])
+        serde_json::json!(["k", "semantic", "T", ["a", "b"], 3, 0.42])
     );
     assert!(
         v.get("neighbors").is_none(),
@@ -297,15 +300,17 @@ fn wire_json_defaults_to_key_only() {
             title: "T".into(),
             tags: vec!["a".into()],
             chars: 3,
+            via: search::Via::Semantic,
             distance: Some(0.42),
         }],
         neighbors: vec![],
+        search: None,
     };
     // Nothing asked for: a hit is just its key — the lean default (SPEC §10).
     let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
-    assert_eq!(v["cols"], serde_json::json!(["key"]));
-    assert_eq!(v["hits"][0], serde_json::json!(["k"]));
+    assert_eq!(v["cols"], serde_json::json!(["key", "via"]));
+    assert_eq!(v["hits"][0], serde_json::json!(["k", "semantic"]));
 }
 
 #[test]
@@ -315,12 +320,12 @@ fn fields_always_include_key_and_keep_canonical_order() {
     let fields = Fields::selection([Field::Distance, Field::Title]);
     assert_eq!(
         fields.names().collect::<Vec<_>>(),
-        ["key", "title", "distance"]
+        ["key", "via", "title", "distance"]
     );
 
-    // An empty selection still yields `key`.
+    // An empty selection still yields `key` — and `via`, which is never optional.
     let empty = Fields::selection(Vec::new());
-    assert_eq!(empty.names().collect::<Vec<_>>(), ["key"]);
+    assert_eq!(empty.names().collect::<Vec<_>>(), ["key", "via"]);
 
     // Wire names round-trip through `parse`.
     for f in Field::ALL {
@@ -344,6 +349,7 @@ fn wire_json_emits_a_neighbors_table_when_expanded() {
                 ..Default::default()
             },
         }],
+        search: None,
     };
     let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");

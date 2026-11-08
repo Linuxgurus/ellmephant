@@ -50,7 +50,7 @@ The decisions the code obeys:
   `memory_link.to_type` on the edge.
 - **Local-first, offline-capable.** `--offline` opens no socket. Weights are data fetched once,
   not code compiled in.
-- **Keys, not dumps.** A hit is `key` alone — the caller names the extra `fields` it wants
+- **Keys, not dumps.** A hit is `key` + `via` — the caller names the extra `fields` it wants
   (`title`, `tags`, `chars`, `distance`) — so a search can never bloat context, and the
   body is always a deliberate `memory_get` away.
 - **One binary, no runtime.** No interpreter, no service, no shared library.
@@ -165,7 +165,7 @@ it, not `k`. There is no regex/key leg — `key`/`tags` are part of the embedded
 ```
 
 Results are ordered by ascending distance. A hit carries no body: the terminal shows
-`key`/`title`/`tags`/`distance`; the MCP wire returns **`key` alone by default** unless the
+`key`/`title`/`tags`/`distance`; the MCP wire returns **`key` + `via` by default** unless the
 caller names extra `fields` (§10 of `SPEC.md`). The read policy is **keys by default, titles and
 tags and distances when asked, never dumps**; a body is a `show`/`memory_get` away.
 

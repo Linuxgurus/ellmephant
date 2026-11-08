@@ -1073,7 +1073,7 @@ async fn boot_text_renders_arguments_from_the_schema() {
     );
     // An array of an enum is parenthesised, so the `[]` cannot be misread.
     assert!(
-        doc.contains("(\"key\"|\"title\"|\"tags\"|\"chars\"|\"distance\")[]"),
+        doc.contains("(\"key\"|\"via\"|\"title\"|\"tags\"|\"chars\"|\"distance\")[]"),
         "{doc}"
     );
     // A required argument says so; a plain boolean resolves without a ref.

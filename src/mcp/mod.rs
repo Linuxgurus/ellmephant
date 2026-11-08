@@ -236,7 +236,8 @@ a half-remembered string (a key, a filename, an error). `mode` reads `pattern` a
 substring, the default) or `regex`. Both legs and the filters intersect (all must hold); omit all to \
 filter the whole store. `created_after`/`created_before` and `updated_after`/`updated_before` are ISO \
 windows over the timestamps (`updated_after` is the \"what changed since I last woke\" filter). Hits \
-are `key`-only by default; `fields` adds more, body never. `memory_get` \
+carry `key` and `via` (which leg — `semantic`/`lexical`/`both`/`listing` — found the row) by \
+default; `fields` adds more, body never. `memory_get` \
 the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
 `max_distance`.";
 
@@ -472,8 +473,16 @@ pub struct SearchParams {
     pub k: Option<usize>,
     /// Cosine-distance ceiling.
     #[serde(default)]
-    #[schemars(description = "Cosine-distance ceiling (0-2). Smaller = closer.")]
+    #[schemars(
+        description = "Cosine-distance ceiling (0-2). Smaller = closer. Applies to the SEMANTIC leg only — if it cuts everything the list is filled from the word index and `search.semantic_candidates` reads 0."
+    )]
     pub max_distance: Option<f32>,
+    /// Semantic-only answer.
+    #[serde(default)]
+    #[schemars(
+        description = "Keep only rows the semantic leg ranked. An empty list then means NO instead of being refilled from the word index. Still subject to `max_distance`, so at the default ceiling it asks 'did my phrase reach anything under the ceiling', not 'anything real' — pass a wide `max_distance` (e.g. 1.2) when testing existence."
+    )]
+    pub semantic_only: Option<bool>,
     /// Link-neighbourhood hops.
     #[serde(default)]
     #[schemars(description = "Link-neighbour hops drag in (0 = off).")]
@@ -513,7 +522,7 @@ pub struct SearchParams {
     /// Hit fields to return beyond `key`.
     #[serde(default)]
     #[schemars(
-        description = "Extra hit fields to return, alongside the always-present `key`. Omit for `key` only (lean). E.g. `[\"title\",\"tags\",\"distance\"]`."
+        description = "Extra hit fields to return, alongside the always-present `key` and `via`. Omit for the lean default (`key` + `via`); `via` may be named but is always returned. E.g. `[\"title\",\"tags\",\"distance\"]`."
     )]
     pub fields: Vec<FieldParam>,
 }
@@ -525,6 +534,8 @@ pub struct SearchParams {
 pub enum FieldParam {
     /// Slug.
     Key,
+    /// Which leg(s) found the row — always returned; naming it is a no-op.
+    Via,
     /// Salient line.
     Title,
     /// Attached tags.
@@ -540,6 +551,7 @@ impl FieldParam {
     fn to_field(self) -> Field {
         match self {
             FieldParam::Key => Field::Key,
+            FieldParam::Via => Field::Via,
             FieldParam::Title => Field::Title,
             FieldParam::Tags => Field::Tags,
             FieldParam::Chars => Field::Chars,
@@ -1736,11 +1748,17 @@ fn log_search(
     response_bytes: usize,
     elapsed_ms: u64,
 ) {
+    // The leg counts are the point of the line: `hits` alone cannot distinguish "ten agreements"
+    // from "ten word matches after the phrase leg returned nothing".
+    let semantic_candidates = bundle.search.as_ref().map(|m| m.semantic_candidates);
+    let lexical_candidates = bundle.search.as_ref().map(|m| m.lexical_candidates);
     tracing::info!(
         query = query.unwrap_or("-"),
         expand,
         hits = bundle.hits.len(),
         neighbors = bundle.neighbors.len(),
+        ?semantic_candidates,
+        ?lexical_candidates,
         response_bytes,
         elapsed_ms,
         "memory_search"
@@ -1749,6 +1767,7 @@ fn log_search(
         tracing::info!(
             key = %hit.key,
             tags = ?hit.tags,
+            via = hit.via.name(),
             distance = ?hit.distance,
             "  hit"
         );
@@ -2639,6 +2658,12 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             mode: None,
             k: Some(k),
             max_distance: p.max_distance,
+            // ★ `semantic_search` is the vector door and does not expose `semantic_only`: not
+            // because the knob is dangerous (it can only *remove* the lexical refill, never add
+            // one) but because changing this tool's default answer for existing callers is its own
+            // change. Today's refill is VISIBLE through `via` and `search.semantic_candidates`, so
+            // turning it off is an opt-in that can wait.
+            semantic_only: None,
             expand: None,
             tags: Vec::new(),
             min_chars: None,
@@ -2687,6 +2712,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let max_distance = p.max_distance;
         let expand = p.expand.unwrap_or(0);
         let tags = p.tags;
+        let semantic_only = p.semantic_only;
         let min_chars = p.min_chars;
         let max_chars = p.max_chars;
         let created_after = p.created_after;
@@ -2707,6 +2733,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     k: k.unwrap_or_else(|| s.default_k()),
                     // Fall back to the configured ceiling so a bare semantic search is capped.
                     max_distance: max_distance.or_else(|| s.default_max_distance()),
+                    semantic_only: semantic_only.unwrap_or(false),
                     expand,
                     tags,
                     min_chars,
@@ -4985,6 +5012,10 @@ mod tests {
                 "mode",
                 "pattern",
                 "query",
+                // ★ The honest empty list (#215): a caller must be able to ask "did my phrase reach
+                // anything real" and get NO rather than a lexical refill. This list is the wire
+                // surface, so a new knob appears here deliberately or not at all.
+                "semantic_only",
                 "tags",
                 "updated_after",
                 "updated_before"
@@ -5009,7 +5040,7 @@ mod tests {
                 "missing mode {want}: {mode_vals:?}"
             );
         }
-        // The projection selection rides on `fields` (a hit returns `key` alone by default).
+        // The projection selection rides on `fields` (a hit returns `key` + `via` by default).
         assert!(props.contains_key("fields"), "search must expose `fields`");
         // The `fields` *values* live in the schema (a `FieldParam` enum), never in the description —
         // that is how the model learns them; the prose stays policy-only.
@@ -5025,7 +5056,7 @@ mod tests {
             .filter_map(|v| v.get("const"))
             .filter_map(|v| v.as_str())
             .collect();
-        for want in ["key", "title", "tags", "chars", "distance"] {
+        for want in ["key", "via", "title", "tags", "chars", "distance"] {
             assert!(
                 field_vals.contains(&want),
                 "missing field {want}: {field_vals:?}"

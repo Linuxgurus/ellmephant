@@ -114,7 +114,7 @@ pub enum Via {
     Lexical,
     /// Both legs ranked it — fused by RRF.
     Both,
-    /// Neither: a phrase-less, pattern-less query listing rows in key order.
+    /// Neither leg ranked it: an unranked list (phrase-less, or a pattern-only query).
     Listing,
 }
 
@@ -184,11 +184,12 @@ pub struct Bundle {
 /// it is the word index's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMeta {
-    /// The ceiling applied to the semantic leg on this call (`None` = uncapped).
+    /// The ceiling applied to the semantic leg on this call (`None` = uncapped). On a listing /
+    /// pattern-only query no semantic leg ran, so this is the configured ceiling that *would* apply.
     pub max_distance: Option<f32>,
     /// Semantic rows that survived the ceiling and the visibility filter.
     pub semantic_candidates: usize,
-    /// Lexical rows that survived the visibility filter.
+    /// Lexical rows returned by the word index (after the visibility filter and the retrieval cap).
     pub lexical_candidates: usize,
 }
 

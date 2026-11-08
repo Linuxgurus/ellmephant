@@ -236,7 +236,8 @@ a half-remembered string (a key, a filename, an error). `mode` reads `pattern` a
 substring, the default) or `regex`. Both legs and the filters intersect (all must hold); omit all to \
 filter the whole store. `created_after`/`created_before` and `updated_after`/`updated_before` are ISO \
 windows over the timestamps (`updated_after` is the \"what changed since I last woke\" filter). Hits \
-are `key`-only by default; `fields` adds more, body never. `memory_get` \
+carry `key` and `via` (which leg — `semantic`/`lexical`/`both`/`listing` — found the row) by \
+default; `fields` adds more, body never. `memory_get` \
 the hit(s) you'll use; a known `key` goes straight there. Nothing fits? Widen — raise `k`, loosen \
 `max_distance`.";
 
@@ -479,7 +480,7 @@ pub struct SearchParams {
     /// Semantic-only answer.
     #[serde(default)]
     #[schemars(
-        description = "Keep only rows the semantic leg ranked. The way to ask 'did my phrase reach anything real': an empty list then means NO instead of being refilled from the word index."
+        description = "Keep only rows the semantic leg ranked. An empty list then means NO instead of being refilled from the word index. Still subject to `max_distance`, so at the default ceiling it asks 'did my phrase reach anything under the ceiling', not 'anything real' — pass a wide `max_distance` (e.g. 1.2) when testing existence."
     )]
     pub semantic_only: Option<bool>,
     /// Link-neighbourhood hops.
@@ -521,7 +522,7 @@ pub struct SearchParams {
     /// Hit fields to return beyond `key`.
     #[serde(default)]
     #[schemars(
-        description = "Extra hit fields to return, alongside the always-present `key`. Omit for `key` only (lean). E.g. `[\"title\",\"tags\",\"distance\"]`."
+        description = "Extra hit fields to return, alongside the always-present `key` and `via`. Omit for the lean default (`key` + `via`); `via` may be named but is always returned. E.g. `[\"title\",\"tags\",\"distance\"]`."
     )]
     pub fields: Vec<FieldParam>,
 }
@@ -533,6 +534,8 @@ pub struct SearchParams {
 pub enum FieldParam {
     /// Slug.
     Key,
+    /// Which leg(s) found the row — always returned; naming it is a no-op.
+    Via,
     /// Salient line.
     Title,
     /// Attached tags.
@@ -548,6 +551,7 @@ impl FieldParam {
     fn to_field(self) -> Field {
         match self {
             FieldParam::Key => Field::Key,
+            FieldParam::Via => Field::Via,
             FieldParam::Title => Field::Title,
             FieldParam::Tags => Field::Tags,
             FieldParam::Chars => Field::Chars,
@@ -2654,11 +2658,11 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             mode: None,
             k: Some(k),
             max_distance: p.max_distance,
-            // ★ `semantic_search` is the vector door and CANNOT ask for semantic-only here: adding
-            // the knob to `SemanticSearchParams` would let the phrase leg refill a vector query
-            // (the very trap #215 names), but it also changes what this tool returns for existing
-            // callers. Deliberately left as today's behaviour; the refill is now VISIBLE through
-            // `via` and `search.semantic_candidates`, and turning it off is its own change.
+            // ★ `semantic_search` is the vector door and does not expose `semantic_only`: not
+            // because the knob is dangerous (it can only *remove* the lexical refill, never add
+            // one) but because changing this tool's default answer for existing callers is its own
+            // change. Today's refill is VISIBLE through `via` and `search.semantic_candidates`, so
+            // turning it off is an opt-in that can wait.
             semantic_only: None,
             expand: None,
             tags: Vec::new(),
@@ -5036,7 +5040,7 @@ mod tests {
                 "missing mode {want}: {mode_vals:?}"
             );
         }
-        // The projection selection rides on `fields` (a hit returns `key` alone by default).
+        // The projection selection rides on `fields` (a hit returns `key` + `via` by default).
         assert!(props.contains_key("fields"), "search must expose `fields`");
         // The `fields` *values* live in the schema (a `FieldParam` enum), never in the description —
         // that is how the model learns them; the prose stays policy-only.
@@ -5052,7 +5056,7 @@ mod tests {
             .filter_map(|v| v.get("const"))
             .filter_map(|v| v.as_str())
             .collect();
-        for want in ["key", "title", "tags", "chars", "distance"] {
+        for want in ["key", "via", "title", "tags", "chars", "distance"] {
             assert!(
                 field_vals.contains(&want),
                 "missing field {want}: {field_vals:?}"

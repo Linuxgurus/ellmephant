@@ -551,7 +551,7 @@ async fn tools_round_trip_over_http() {
 
 #[tokio::test]
 async fn search_filters_round_trip() {
-    // `memory_search` filters on tags and size, intersecting; a lean reply is still key-only.
+    // `memory_search` filters on tags and size, intersecting; a lean reply is `key` + `via`.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path())).with_identity("tester");
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -587,7 +587,7 @@ async fn search_filters_round_trip() {
     )
     .await;
     let filtered: serde_json::Value = serde_json::from_str(&text(&filtered)).expect("search json");
-    // A filter with no `fields` named is still key-only.
+    // A filter with no `fields` named is the lean `key` + `via` shape.
     assert_eq!(filtered["cols"], serde_json::json!(["key", "via"]));
     assert_eq!(filtered["hits"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["hits"][0][0], serde_json::json!("note-long"));

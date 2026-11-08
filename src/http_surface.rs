@@ -1683,7 +1683,8 @@ pub async fn semantic_search(
         doc_type: params.maybe("type").map(str::to_string),
         deleted: params
             .maybe("deleted")
-            .map(|v| matches!(v, "1" | "true" | "yes")),
+            .map(|v| bool_param(v, "deleted"))
+            .transpose()?,
         k: params.maybe("k").and_then(|v| v.parse().ok()),
         max_distance: params.maybe("max_distance").and_then(|v| v.parse().ok()),
         fields,
@@ -2797,7 +2798,10 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         max_distance: p.parse_as::<f32>("max_distance")?,
         // The MCP door has `semantic_only`; the HTTP door must not be the one place it is
         // unreachable. Absent stays `None`, so today's callers see no change.
-        semantic_only: p.maybe("semantic_only").map(|_| p.flag("semantic_only")),
+        semantic_only: p
+            .maybe("semantic_only")
+            .map(|v| bool_param(v, "semantic_only"))
+            .transpose()?,
         expand: p.parse_as::<u8>("expand")?,
         tags,
         min_chars: p.parse_as::<usize>("min_chars")?,
@@ -2828,10 +2832,22 @@ fn mode_param(raw: Option<&str>) -> Result<MatchMode, String> {
     }
 }
 
+/// A query-string boolean: `1`/`true`/`yes` and `0`/`false`/`no`; anything else is a clean
+/// error. A silently-false `semantic_only=1` would answer a different question than the caller
+/// asked, which is the failure mode #215 exists to expose.
+fn bool_param(raw: &str, name: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => Err(format!("bad `{name}`: {other} (want 1/true/yes or 0/false/no)")),
+    }
+}
+
 /// One hit field name, or `None` if it is not a field.
 fn field_param(name: &str) -> Option<FieldParam> {
     match name {
         "key" => Some(FieldParam::Key),
+        "via" => Some(FieldParam::Via),
         "title" => Some(FieldParam::Title),
         "tags" => Some(FieldParam::Tags),
         "chars" => Some(FieldParam::Chars),

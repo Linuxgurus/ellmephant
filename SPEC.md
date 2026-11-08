@@ -417,8 +417,11 @@ plus a pattern keeps the semantic ranking and merely drops the rows the pattern 
 - **Params:** `query` (the semantic phrase), `pattern` (a literal/regex over the raw `key`/`title`/
   `body` — for a half-remembered string), `mode` (`literal`, the substring default, or `regex`;
   both case-insensitive), `k` (default `5`; caps the ranked case only), `max_distance` (optional,
-  falling back to `default_max_distance`, `0.6`; `null` disables), `expand`, `fields` (the extra hit
-  columns to return; default = `key` only), and the filters:
+  falling back to `default_max_distance`, `0.52`; `null` disables), `semantic_only` (keep only rows
+  the semantic leg ranked, so an empty list means *no* instead of being refilled from the word index
+  — it is still bounded by `max_distance`, so pass a wide ceiling, e.g. `1.2`, when testing whether
+  a phrase reaches anything), `expand`, `fields` (the extra hit columns to return; default =
+  `key` + `via`), and the filters:
   - `tags` — every listed tag must be present (AND).
   - `min_chars` / `max_chars` — bounds on the **embedded-document** length (chars).
   - `created_after` / `created_before` / `updated_after` / `updated_before` — ISO windows over the
@@ -431,10 +434,15 @@ plus a pattern keeps the semantic ranking and merely drops the rows the pattern 
   The KNN is taken over the whole store and `k` truncates the ranked
   result, so **a result shorter than `k` means the ceiling, not `k`, cut it** — widen by
   loosening `max_distance`, else by raising `k`.
-- **Returns:** `key` **alone by default** — **never the body** (fetch it with `memory_get`/`show`).
-  The caller names any extra `fields` it wants (`title`, `tags`, `chars`, `distance`);
-  they are added in that **canonical order**, `key` always leading. So a hit says *which* memory,
-  and nothing more unless asked — the lean default keeps a search from bloating context. Over MCP
+- **Returns:** `key` and `via` **by default** — **never the body** (fetch it with
+  `memory_get`/`show`). `via` (`semantic`, `lexical`, `both`, `listing`) names the leg that found
+  the row, so a page can never look semantic when it was refilled from the word index; it is
+  always returned, like `key`, and naming it in `fields` is a harmless no-op. The caller names any
+  extra `fields` it wants (`title`, `tags`, `chars`, `distance`); they are added in that
+  **canonical order** — `key`, `via`, `title`, `tags`, `chars`, `distance` — so a hit says *which*
+  memory, and nothing more unless asked; the lean default keeps a search from bloating context.
+  The bundle also carries `search` (`max_distance`, `semantic_candidates`, `lexical_candidates`),
+  and `semantic_candidates: 0` is the loud signal that the phrase leg answered nothing. Over MCP
   this is emitted as **positional JSON**: a top-level `cols` header names the returned fields and
   each row is a bare array (§11); `--json`/core keep the keyed form.
 - **`--expand N`:** pull N-hop link neighbourhoods into the result bundle (derived profiles);
@@ -469,7 +477,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   write *rules* (one topic, trim, merge); each field's `key`/`title`/`body`/`source`/`tags`
   meaning lives in that field's schema.
 - `memory_search` takes a semantic `query`, a lexical `pattern` (+ `mode`), the ranking knobs
-  `k`/`max_distance`/`expand`, the `fields` projection (default `key` only), and the structured
+  `k`/`max_distance`/`semantic_only`/`expand`, the `fields` projection (default `key` + `via`), and the structured
   filters `tags` (AND) and `min_chars`/`max_chars` (§10); there is still no `key` leg —
   `memory_get` reads a known key.
 - The list-shaped reads return **positional JSON** to keep the LLM-facing payload small: a

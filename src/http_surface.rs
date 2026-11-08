@@ -2845,7 +2845,9 @@ fn bool_param(raw: &str, name: &str) -> Result<bool, String> {
     match raw.trim() {
         "1" | "true" | "yes" => Ok(true),
         "0" | "false" | "no" => Ok(false),
-        other => Err(format!("bad `{name}`: {other} (want 1/true/yes or 0/false/no)")),
+        other => Err(format!(
+            "bad `{name}`: {other} (want 1/true/yes or 0/false/no)"
+        )),
     }
 }
 

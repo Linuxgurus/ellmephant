@@ -570,6 +570,9 @@ struct FrontMatter {
     version_note: Option<String>,
     private: Option<bool>,
     audience: Option<String>,
+    /// `Force: true` — write a run shape here anyway (soma/ellmephant#221). Consumed by the header
+    /// parse, so it never reaches the body: a leaked `Force: true` would live in every future diff.
+    force: Option<bool>,
     body: String,
 }
 
@@ -613,6 +616,13 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
                 })
             }
             "Audience" => out.audience = Some(value.to_string()),
+            "Force" => {
+                out.force = Some(match value.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "1" => true,
+                    "false" | "no" | "0" | "" => false,
+                    other => return Err(format!("`Force: {other}` is not true|false")),
+                })
+            }
             "Tags" => {
                 out.tags = Some(
                     value
@@ -653,6 +663,10 @@ fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), Strin
             audience: fm.audience,
             version_note: fm.version_note,
             expected_version: None,
+            // ★ THE TEXT DOOR HAS THE OVERRIDE TOO (Stet, review of #221). Without it the only way
+            // past the gate here is to EDIT THE PROSE until it stops looking like a receipt, which
+            // corrupts the record to satisfy a linter — worse than the log we are stopping.
+            force: fm.force.unwrap_or(false),
         },
         None,
     ))
@@ -680,6 +694,8 @@ struct MemoryJson {
     audience: Option<String>,
     /// The CAS token, as `memory_get` returns it.
     expected_version: Option<i64>,
+    /// Bypass the run-shape gate (soma/ellmephant#217).
+    force: Option<bool>,
 }
 
 /// A `memory_upsert` patch from a JSON body.
@@ -700,6 +716,7 @@ fn memory_patch_json(bytes: &[u8]) -> Result<(store::Patch, Option<String>), Str
             audience: m.audience,
             version_note: m.version_note,
             expected_version: m.expected_version,
+            force: m.force.unwrap_or(false),
         },
         as_pen,
     ))
@@ -4868,5 +4885,38 @@ pub async fn channel_invite(
             format!("invited {guest} to #{channel}\n"),
         ),
         Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[cfg(test)]
+mod front_matter_tests {
+    use super::front_matter;
+
+    /// ★ THE OVERRIDE MUST NOT LEAK INTO THE DOCUMENT (Stet, review of #221): `Force:` is consumed by
+    /// the header parse, so the versioned body is byte-identical with and without it.
+    #[test]
+    fn force_is_consumed_and_never_stored() {
+        let text =
+            "Key: a-run\nTitle: a run\nForce: true\n---\n14:41Z one\n14:42Z two\n14:43Z three";
+        let fm = front_matter(text).expect("front matter");
+        assert_eq!(fm.force, Some(true));
+        assert!(
+            !fm.body.contains("Force"),
+            "the override must not reach the body: {}",
+            fm.body
+        );
+        let plain =
+            front_matter("Key: a-run\nTitle: a run\n---\n14:41Z one\n14:42Z two\n14:43Z three")
+                .expect("front matter");
+        assert_eq!(
+            plain.body, fm.body,
+            "same body with and without the override"
+        );
+    }
+
+    #[test]
+    fn a_bad_force_says_so() {
+        let err = front_matter("Key: k\nForce: perhaps\n---\nbody").unwrap_err();
+        assert!(err.contains("Force"), "{err}");
     }
 }

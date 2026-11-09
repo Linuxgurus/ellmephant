@@ -14,6 +14,7 @@ pub mod mail;
 pub mod maintain;
 pub mod project;
 pub mod relation;
+pub mod shape;
 pub mod slug;
 pub mod snapshot;
 pub mod stats;
@@ -657,6 +658,10 @@ pub struct Patch {
     /// An explicit audience: `public`, or addresses (`pen:<name>` exact, `subtree:<name>` inclusive).
     /// Unlike `private`, this NAMES others, so it is validated against the registry at write time.
     pub audience: Option<String>,
+    /// ★ WRITE A RUN SHAPE ANYWAY (soma/ellmephant#217). The store refuses a body that looks like a
+    /// play-by-play and names `record append` instead; a caller that has read that refusal and still
+    /// means it passes `force: true`, and the body is written unchanged.
+    pub force: bool,
     /// Why THIS change is being made. Not a field of the memory: it rides beside the version the
     /// write supersedes, so a later reader learns the intent without reconstructing it. It creates
     /// no version on its own — only a DOCUMENT change does (see `store::version`).
@@ -852,6 +857,17 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         ..Default::default()
     };
     let key = resolve_key(conn, &probe)?;
+    // ★ THE DOOR THAT STOPS THE TAP (soma/ellmephant#217). A body whose SHAPE is a run record is
+    // refused, and the refusal names the verb and the arguments it inferred. `force: true` writes it
+    // anyway: an agent that read the refusal may still be right.
+    if let Some(hint) = patch
+        .body
+        .as_deref()
+        .filter(|_| !patch.force)
+        .and_then(|body| shape::record_hint(body, &key))
+    {
+        return Err(Error::Invalid(shape::refusal(&hint, &key)));
+    }
     // ★ TWO INSTRUCTIONS THAT CONTRADICT EACH OTHER ARE REFUSED, NOT RESOLVED SILENTLY
     // (soma/ellmephant#189 D5). `private` derives an audience from the proven pen; an explicit
     // `audience` names others. Asked for both, this used to keep the `audience` and drop `private`

@@ -372,6 +372,12 @@ pub struct UpsertParams {
     )]
     pub version_note: Option<String>,
     /// The CAS token: the `version` a `memory_get` returned.
+    /// Write a run shape anyway.
+    #[serde(default)]
+    #[schemars(
+        description = "Bypass the run-shape gate. `memory_upsert` REFUSES a body that looks like a play-by-play (three timestamps, or one plus two run markers) and names `record append` on the brain instead, because a memory is a claim and an occurrence belongs on the shelf. Pass `force: true` when you read that refusal and still mean it."
+    )]
+    pub force: Option<bool>,
     #[serde(default)]
     #[schemars(
         description = "Write only if the memory is STILL at this `version` (the field `memory_get` returns). A mismatch writes nothing and returns `status: conflict` with the current version — the safe way to read-modify-write (a bank balance, a counter). `0` means 'this key does not exist yet'. Omit for last-write-wins."
@@ -397,6 +403,7 @@ impl UpsertParams {
             audience: self.audience,
             version_note: self.version_note,
             expected_version: self.expected_version,
+            force: self.force.unwrap_or(false),
         }
     }
 }

@@ -301,6 +301,7 @@ fn key_is_an_address_not_a_field() {
             audience: None,
             version_note: None,
             expected_version: None,
+            force: false,
         },
     )
     .expect("merge everything");
@@ -421,4 +422,65 @@ fn private_and_an_explicit_audience_are_refused_together() {
         after.audience, "public",
         "a refused write changes nothing, in particular not the audience"
     );
+}
+
+/// ★ THE GATE (#217): a body whose shape is a run record is refused, the refusal names the shelf and
+/// the arguments it inferred, and `force: true` writes it anyway.
+#[test]
+fn a_run_shape_is_refused_and_force_writes_it() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("store");
+    let embedder = HashEmbedder::new(DIM);
+    let receipt = "EXIT=0 at 14:41Z\nchecked 5 repos\n14:42Z no change\n14:43Z no change";
+
+    let refused = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("pr-watch-run-2026-11-08".into()),
+            title: Some("a run".into()),
+            body: Some(receipt.into()),
+            ..Default::default()
+        },
+    );
+    let err = format!("{}", refused.unwrap_err());
+    assert!(err.contains("RUN RECORD"), "{err}");
+    assert!(
+        err.contains("record append source=pr-watch"),
+        "the fix is a paste: {err}"
+    );
+    assert!(err.contains("force: true"), "the override is named: {err}");
+
+    // The door is not a wall: the same body with `force` is written unchanged.
+    let forced = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("pr-watch-run-2026-11-08".into()),
+            title: Some("a run".into()),
+            body: Some(receipt.into()),
+            force: true,
+            ..Default::default()
+        },
+    );
+    assert!(forced.is_ok(), "force must override: {:?}", forced.err());
+
+    // And a lesson that merely cites a date is not touched.
+    let lesson = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("a-lesson".into()),
+            title: Some("a lesson".into()),
+            body: Some("★ A TOOL THAT REPORTS SUCCESS MUST BE CHECKED (2026-10-24).".into()),
+            ..Default::default()
+        },
+    );
+    assert!(lesson.is_ok(), "one date is a citation: {:?}", lesson.err());
 }

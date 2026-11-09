@@ -48,6 +48,18 @@ document; the store's encode worker indexes it a moment later, so a `GET /search
 write may not see it. The row's `encode_hash` reads `encode_pending` until the worker settles it. The
 write's reply carries `queued: true|false` to say what happened.
 
+**A body shaped like a run receipt is refused.** `POST /memory` (and `memory_upsert`) returns a
+`400`-class error if the body carries three time-of-day timestamps, or one plus two run markers
+(`EXIT=`, `VERBATIM`, `VISITS=`, …): that is a play-by-play, not a claim, and it belongs on the
+brain's `record` shelf. The refusal names the inferred call —
+`record append source=… kind=… level=… summary="…"` — so the fix is one paste.
+
+**The override, on both doors.** JSON sends `"force": true`; a text/markdown body puts `Force: true`
+in its front matter beside `Key:`. The key is consumed by the header parse and is **never** stored —
+the body is byte-identical with and without it. Without the text-door override the only way past the
+gate is to edit the prose until it stops looking like a receipt, which corrupts the record to satisfy
+a linter — worse than the log the gate exists to stop.
+
 `?wait=true` on `POST /memory` is the exception: the request settles that one document before it
 answers, so the row is searchable the moment it returns. It holds the store lock across the model call
 — exactly the coupling the queue exists to remove — so it is opt-in and for callers that genuinely

@@ -98,6 +98,11 @@ pub const ROUTES: &[Route] = &[
         tool: "memory_delete",
     },
     Route {
+        method: "DELETE",
+        path: "/history",
+        tool: "memory_history_erase",
+    },
+    Route {
         method: "GET",
         path: "/unowned",
         tool: "memory_unowned",
@@ -2393,6 +2398,91 @@ pub async fn memory_delete(
             format!("no such memory: {key}"),
         ),
         Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `DELETE /history?key=<slug>` or `?orphans=true` — erase HISTORY (`memory_history_erase`).
+///
+/// The store's only act that destroys text. `memory_delete` snapshots the row and keeps its versions,
+/// so a deleted key still holds its body in full; this is the door out. `confirm=true` is required on
+/// both shapes, and a LIVE key is refused: its history is the only copy of what it said.
+pub async fn history_erase(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let ask_key = params.get("key").map(str::to_string);
+    let ask_orphans = matches!(params.get("orphans"), Some("true") | Some("1"));
+    let ask_confirm = matches!(params.get("confirm"), Some("true") | Some("1"));
+    let json = true;
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !ask_confirm {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "this destroys text and nothing can restore it: pass confirm=true",
+        );
+    }
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match (ask_key, ask_orphans) {
+        (Some(key), false) => {
+            let lookup = key.clone();
+            match server
+                .with_store("memory_history_erase", move |s| s.erase_history(&lookup))
+                .await
+            {
+                Ok(n) => {
+                    tracing::info!(area = scope.area, key = %key, versions = n, "history erased over http");
+                    render(
+                        StatusCode::OK,
+                        json,
+                        json_ok(serde_json::json!({
+                            "status": "erased",
+                            "key": key,
+                            "versions_erased": n,
+                        })),
+                        format!("erased {n} version(s) of {key}"),
+                    )
+                }
+                Err(e) => error(json, error_status(&e), e),
+            }
+        }
+        (None, true) => match server
+            .with_store("memory_history_erase", move |s| s.erase_orphan_history())
+            .await
+        {
+            Ok((keys, versions)) => {
+                tracing::info!(
+                    area = scope.area,
+                    keys,
+                    versions,
+                    "orphan history erased over http"
+                );
+                render(
+                    StatusCode::OK,
+                    json,
+                    json_ok(serde_json::json!({
+                        "status": "erased",
+                        "orphan_keys": keys,
+                        "versions_erased": versions,
+                    })),
+                    format!("erased {versions} version(s) of {keys} deleted key(s)"),
+                )
+            }
+            Err(e) => error(json, error_status(&e), e),
+        },
+        _ => error(
+            json,
+            StatusCode::BAD_REQUEST,
+            "pass exactly one of key=<slug> or orphans=true",
+        ),
     }
 }
 

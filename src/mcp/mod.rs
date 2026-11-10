@@ -53,6 +53,7 @@ pub const TOOLS: &[&str] = &[
     "sudo_sessions",
     "memory_upsert",
     "memory_delete",
+    "memory_history_erase",
     "memory_merge",
     "memory_adopt",
     "memory_search",
@@ -309,6 +310,30 @@ List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `
 `start_date`, `end_date`; never `state`, which is a `project_get` away). Filters intersect: `status`, `tags` (every listed \
 tag must be present) and a literal/regex `pattern` over `key`/`title`/`goal`/`state`. Omit them \
 all to list every project.";
+
+/// Parameters for [`MemoryServer::memory_history_erase`]. Exactly one of `key` / `orphans`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryEraseParams {
+    /// One key's history.
+    #[serde(default)]
+    #[schemars(
+        description = "One key's history to erase. It must have NO live memory row — delete the row first, which snapshots it, then erase the history."
+    )]
+    pub key: Option<String>,
+    /// Every orphan's history.
+    #[serde(default)]
+    #[schemars(
+        description = "Erase the history of EVERY key whose memory row is gone — the pile a delete leaves behind. One transaction; reports how many keys and versions went."
+    )]
+    pub orphans: Option<bool>,
+    /// The act is irreversible.
+    #[serde(default)]
+    #[schemars(
+        description = "REQUIRED and must be true. This is the store's only act that destroys text: versions are not backed up anywhere else, and nothing can restore them afterwards."
+    )]
+    pub confirm: Option<bool>,
+}
 
 /// Parameters for [`MemoryServer::memory_upsert`]. Every field is optional: an omitted field keeps
 /// the value already stored under `key`.
@@ -2502,6 +2527,60 @@ impl MemoryServer {
         }
     }
 
+    /// The store's only true destroyer: erase deleted keys' history.
+    #[tool(
+        name = "memory_history_erase",
+        description = "Erase HISTORY — the versions a delete keeps. This is the store's only act that destroys text: `memory_delete` snapshots the row and keeps its versions, so every deleted key still holds its body in full, and a hygiene sweep reduces ROWS while the BYTES stay. \n\n`orphans: true` erases every key whose memory row is gone (the pile that grows by itself), in one transaction, and reports how many keys and versions went. `key: <slug>` erases one, and only if its row is already gone — a live row's history is the only copy of what it said, so delete first, then erase. \n\n`confirm: true` is required: nothing can restore this.",
+        annotations(
+            title = "Erase memory history",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_history_erase(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<HistoryEraseParams>,
+    ) -> std::result::Result<String, String> {
+        if p.confirm != Some(true) {
+            return Err(
+                "this destroys text and nothing can restore it: pass `confirm: true`".to_string(),
+            );
+        }
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        match (p.key, p.orphans.unwrap_or(false)) {
+            (Some(key), false) => {
+                let done = self
+                    .with_store("memory_history_erase", move |s| {
+                        s.erase_history(&key).map(|n| (key.clone(), n))
+                    })
+                    .await?;
+                Ok(json_ok(serde_json::json!({
+                    "status": "erased",
+                    "key": done.0,
+                    "versions_erased": done.1,
+                })))
+            }
+            (None, true) => {
+                let (keys, versions) = self
+                    .with_store("memory_history_erase", move |s| s.erase_orphan_history())
+                    .await?;
+                tracing::info!(tool = "memory_history_erase", keys, versions, pen = %pen, "orphan history erased");
+                Ok(json_ok(serde_json::json!({
+                    "status": "erased",
+                    "orphan_keys": keys,
+                    "versions_erased": versions,
+                })))
+            }
+            _ => Err(
+                "pass exactly one of `key` (one deleted key) or `orphans: true` (all of them)"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Integrate one memory into another and delete it — the safe way to merge.
     #[tool(
         name = "memory_merge",
@@ -4661,7 +4740,10 @@ pub fn http_router(
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
         .route("/dangling", axum::routing::get(surface::dangling))
-        .route("/history", axum::routing::get(surface::history))
+        .route(
+            "/history",
+            axum::routing::get(surface::history).delete(surface::history_erase),
+        )
         .route(
             "/memory/{key}",
             axum::routing::get(surface::memory_get).delete(surface::memory_delete),

@@ -452,6 +452,24 @@ impl Session {
     }
 
     /// How many versions one key holds — what a delete does NOT remove.
+    /// ★ THE DOOR THE DELETE DOC PROMISES (soma/brain#82). It erases ONE key's history and only for a
+    /// key whose row is GONE: a live row's history is the only copy of what it said, so erasing it
+    /// while the row exists would be a delete with none of a delete's receipts. Delete first (which
+    /// snapshots), then erase — two deliberate acts rather than one that hides a second.
+    pub fn erase_history(&self, key: &str) -> Result<usize> {
+        if store::get(&self.conn, key)?.is_some() {
+            return Err(Error::Invalid(format!(
+                "`{key}` still exists: its history is the only copy of what it said. Delete the                  memory first (which snapshots it), then erase its history."
+            )));
+        }
+        store::version::erase(&self.conn, key)
+    }
+
+    /// Every orphan key's history, in one transaction. Returns `(keys, versions)`.
+    pub fn erase_orphan_history(&self) -> Result<(usize, usize)> {
+        store::version::erase_orphans(&self.conn)
+    }
+
     pub fn version_count(&self, key: &str) -> Result<i64> {
         store::version::count_for(&self.conn, key)
     }

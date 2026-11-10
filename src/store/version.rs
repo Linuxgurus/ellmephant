@@ -195,6 +195,38 @@ pub fn erase(conn: &Connection, key: &str) -> Result<usize> {
     )?)
 }
 
+/// ★ THE PILE THAT GROWS BY ITSELF (soma/brain#82): every key whose memory row is GONE but whose
+/// versions still hold its text. A delete snapshots the row, so this list grows with every hygiene
+/// pass — rows go down, bytes do not. Nothing reads an orphan by accident: its address is dead, and
+/// only `memory_history`/`memory_get version=N` can reach it.
+pub fn orphan_keys(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.key FROM memory_version v
+           LEFT JOIN memory m ON m.key = v.key
+          WHERE v.type = ?1 AND m.id IS NULL
+          GROUP BY v.key
+          ORDER BY v.key",
+    )?;
+    let rows = stmt.query_map(params![MEMORY], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Erase the history of every key whose row is gone. One transaction, so a sweep is all or nothing.
+/// Returns `(keys, versions)`. THIS DESTROYS TEXT — the caller gates it (see the tool's `confirm`).
+pub fn erase_orphans(conn: &Connection) -> Result<(usize, usize)> {
+    let keys = orphan_keys(conn)?;
+    if keys.is_empty() {
+        return Ok((0, 0));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut versions = 0usize;
+    for k in &keys {
+        versions += erase(&tx, k)?;
+    }
+    tx.commit()?;
+    Ok((keys.len(), versions))
+}
+
 /// One key's roll-up for the history INDEX: what you can see without fetching a single body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryIndex {
@@ -237,4 +269,54 @@ pub fn index(conn: &Connection) -> Result<Vec<HistoryIndex>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+#[cfg(test)]
+mod erase_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::config::Paths::from_root(dir.path());
+        let conn = crate::db::open(&paths).expect("store");
+        (dir, conn)
+    }
+
+    #[test]
+    fn an_orphans_history_is_the_only_copy_until_it_is_erased() {
+        let (_dir, conn) = store();
+        let mem = crate::store::Memory {
+            key: "a-key".into(),
+            title: "t".into(),
+            body: "the body".into(),
+            ..Default::default()
+        };
+        crate::store::add(&conn, &mem).expect("add");
+        // A delete SNAPSHOTS the row, so the text survives as a version and the key becomes an orphan.
+        crate::store::delete(&conn, "a-key", None).expect("delete");
+        assert_eq!(orphan_keys(&conn).unwrap(), vec!["a-key".to_string()]);
+        assert!(!history(&conn, "a-key").unwrap().is_empty());
+
+        let (keys, versions) = erase_orphans(&conn).unwrap();
+        assert_eq!(keys, 1, "one orphan key");
+        assert!(versions >= 1, "and the versions that held the text");
+        assert!(orphan_keys(&conn).unwrap().is_empty(), "the pile is gone");
+        assert!(history(&conn, "a-key").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_live_key_is_not_an_orphan() {
+        let (_dir, conn) = store();
+        let mem = crate::store::Memory {
+            key: "still-here".into(),
+            title: "t".into(),
+            body: "body".into(),
+            ..Default::default()
+        };
+        crate::store::add(&conn, &mem).expect("add");
+        assert!(
+            orphan_keys(&conn).unwrap().is_empty(),
+            "a live row is not history"
+        );
+    }
 }

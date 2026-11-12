@@ -200,3 +200,134 @@ fn a_tag_filter_still_applies_to_a_fused_search() {
     );
     assert_eq!(bundle.hits[0].key, "tagged");
 }
+
+/// ★ THE SHAPE JAMES ASKED FOR (2026-11-11): `{semantic: [...], lexical: [...]}`, each sorted by its
+/// own metric — distance for meaning, BM25 for words — instead of one fused order that ranks leg
+/// membership above closeness. `None` means the leg never ran; `Some(vec![])` means it ran and found
+/// nothing (Stet, review of #224).
+#[test]
+fn the_two_legs_are_reported_separately_each_in_its_own_order() {
+    let (_d, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let _spec = VecSpec::of(&embedder);
+    for (k, body) in [
+        (
+            "cache-warm-up",
+            "how long the cache takes to warm before the first request",
+        ),
+        (
+            "runner-has-no-cargo",
+            "the build runner is missing cargo, so the job fails",
+        ),
+        ("unrelated", "a note about lunch"),
+    ] {
+        common::add_now(&conn, &embedder, &mem(k, k, body)).expect("add");
+    }
+    let reader = ellmephant::store::audience::Reader::everything();
+    let b = search::run(&conn, Some(&embedder), &reader, &q("cargo runner", 5)).expect("run");
+
+    let lexical = b.lexical.as_ref().expect("the word leg ran");
+    let semantic = b.semantic.as_ref().expect("the phrase leg ran");
+    assert!(!lexical.is_empty(), "the word leg answered");
+    assert!(
+        lexical.iter().all(|h| h.score.is_some()),
+        "each lexical row carries its score: {:?}",
+        lexical
+            .iter()
+            .map(|h| (h.key.clone(), h.score))
+            .collect::<Vec<_>>()
+    );
+    // Best-first: SQLite's BM25 is lower-is-better, the same direction as distance.
+    let scores: Vec<f64> = lexical.iter().filter_map(|h| h.score).collect();
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, c| a.partial_cmp(c).unwrap());
+    assert_eq!(
+        scores, sorted,
+        "lexical rows are ordered by keyword quality"
+    );
+
+    assert!(
+        semantic.len() <= 5 && lexical.len() <= 5,
+        "each list honours k"
+    );
+    assert!(
+        !b.hits.is_empty(),
+        "the fused page survives as the deprecated view"
+    );
+}
+
+/// ★ A FILTER APPLIES TO EVERY LIST (Stet, review of #224): the leg lists used to bypass the
+/// structured filters, so the very rows this PR exists to expose could violate the caller's filter.
+#[test]
+fn a_tag_filter_applies_to_the_leg_lists_too() {
+    let (_d, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let _spec = VecSpec::of(&embedder);
+    let mut in_prj = mem("wanted", "wanted", "the cargo runner note");
+    in_prj.tags = vec!["prj:x".into()];
+    common::add_now(&conn, &embedder, &in_prj).expect("add");
+    let mut out_prj = mem("not-wanted", "not-wanted", "another cargo runner note");
+    out_prj.tags = vec!["prj:y".into()];
+    common::add_now(&conn, &embedder, &out_prj).expect("add");
+
+    let reader = ellmephant::store::audience::Reader::everything();
+    let mut q = q("cargo runner", 5);
+    q.tags = vec!["prj:x".into()];
+    let b = search::run(&conn, Some(&embedder), &reader, &q).expect("run");
+    // ★ A TEST MUST NOT PASS BY FINDING NOTHING (Stet, review of #224, again): both legs ran here.
+    assert!(b.semantic.is_some(), "the phrase leg ran");
+    assert!(b.lexical.is_some(), "the word leg ran");
+    for (name, list) in [("semantic", &b.semantic), ("lexical", &b.lexical)] {
+        if let Some(hits) = list {
+            assert!(
+                hits.iter().all(|h| h.key == "wanted"),
+                "`{name}` leaked a row the tag filter excludes: {:?}",
+                hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+    assert!(
+        b.hits.iter().all(|h| h.key == "wanted"),
+        "and the fused page agrees"
+    );
+}
+
+#[test]
+fn a_row_both_legs_found_appears_in_both_lists() {
+    let (_d, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let _spec = VecSpec::of(&embedder);
+    for (k, body) in [
+        (
+            "runner-has-no-cargo",
+            "the build runner is missing cargo, so the job fails",
+        ),
+        ("cache-warm-up", "how long the cache takes to warm"),
+    ] {
+        common::add_now(&conn, &embedder, &mem(k, k, body)).expect("add");
+    }
+    let reader = ellmephant::store::audience::Reader::everything();
+    let b = search::run(&conn, Some(&embedder), &reader, &q("runner cargo", 5)).expect("run");
+    // ★ THE TEST MUST NOT PASS BY FINDING NOTHING (Stet, review of #224): collect first.
+    let both: Vec<&ellmephant::search::Hit> = b
+        .hits
+        .iter()
+        .filter(|h| h.via == ellmephant::search::Via::Both)
+        .collect();
+    assert!(
+        !both.is_empty(),
+        "the fixture must produce a row both legs found"
+    );
+    let lexical = b.lexical.as_ref().expect("the word leg ran");
+    let semantic = b.semantic.as_ref().expect("the phrase leg ran");
+    for h in both {
+        assert!(
+            lexical.iter().any(|l| l.key == h.key) && semantic.iter().any(|s| s.key == h.key),
+            "`{}` was found by both legs, so it is in both lists — found twice is the signal",
+            h.key
+        );
+    }
+}

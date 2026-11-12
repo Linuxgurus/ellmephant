@@ -2976,6 +2976,7 @@ fn field_param(name: &str) -> Option<FieldParam> {
         "tags" => Some(FieldParam::Tags),
         "chars" => Some(FieldParam::Chars),
         "distance" => Some(FieldParam::Distance),
+        "score" => Some(FieldParam::Score),
         _ => None,
     }
 }

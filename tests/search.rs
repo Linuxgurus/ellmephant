@@ -260,6 +260,8 @@ fn no_constraints_returns_everything_in_key_order() {
 #[test]
 fn wire_json_is_positional_with_a_cols_header() {
     let bundle = search::Bundle {
+        semantic: None,
+        lexical: None,
         hits: vec![Hit {
             id: 1,
             key: "k".into(),
@@ -268,21 +270,23 @@ fn wire_json_is_positional_with_a_cols_header() {
             chars: 3,
             via: search::Via::Semantic,
             distance: Some(0.42),
+            score: None,
         }],
         neighbors: vec![],
         search: None,
     };
-    // Every field requested: the full five-column shape, in canonical order.
+    // Every field requested: the full column shape, in canonical order. `score` joined the list with
+    // the two-leg report (2026-11-11): it is the lexical leg's number, beside the semantic distance.
     let all = Fields::selection(Field::ALL);
     let wire = search::to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
-        serde_json::json!(["key", "via", "title", "tags", "chars", "distance"])
+        serde_json::json!(["key", "via", "title", "tags", "chars", "distance", "score"])
     );
     assert_eq!(
         v["hits"][0],
-        serde_json::json!(["k", "semantic", "T", ["a", "b"], 3, 0.42])
+        serde_json::json!(["k", "semantic", "T", ["a", "b"], 3, 0.42, null])
     );
     assert!(
         v.get("neighbors").is_none(),
@@ -298,6 +302,8 @@ fn wire_json_is_positional_with_a_cols_header() {
 #[test]
 fn wire_json_defaults_to_key_only() {
     let bundle = search::Bundle {
+        semantic: None,
+        lexical: None,
         hits: vec![Hit {
             id: 1,
             key: "k".into(),
@@ -306,6 +312,7 @@ fn wire_json_defaults_to_key_only() {
             chars: 3,
             via: search::Via::Semantic,
             distance: Some(0.42),
+            score: None,
         }],
         neighbors: vec![],
         search: None,
@@ -341,6 +348,8 @@ fn fields_always_include_key_and_keep_canonical_order() {
 #[test]
 fn wire_json_emits_a_neighbors_table_when_expanded() {
     let bundle = search::Bundle {
+        semantic: None,
+        lexical: None,
         hits: vec![],
         neighbors: vec![Neighbor {
             hop: 1,

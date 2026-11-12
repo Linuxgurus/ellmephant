@@ -92,6 +92,33 @@ impl Encoder {
     }
 }
 
+/// The visibility rule for history, WITHOUT the audit side effect: a search asks "may this reader
+/// see it" for rows it is not returning, and logging a read for a row nobody read would be a lie
+/// in the ledger. The rule is `version_guard`'s: the row's audience, or — for an orphan — the
+/// audience in its latest snapshot, which is the last thing it said about who may read it.
+fn reader_allows(conn: &Connection, reader: &crate::store::audience::Reader, key: &str) -> bool {
+    let class = match store::get(conn, key) {
+        Ok(Some(mem)) => Some(mem.audience),
+        _ => store::version::read_latest(conn, key)
+            .ok()
+            .flatten()
+            .and_then(|snap| {
+                snap.get("audience")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string)
+            }),
+    };
+    match class {
+        Some(a) => reader.sees(&a),
+        // No row and no recorded class: a snapshot from before the audience travelled with the
+        // version. Treated as NOT VISIBLE — a content search must not be the door through which an
+        // unclassed private body becomes readable. Older history keeps its address-gated doors, which
+        // resolve the same `None` the other way; that divergence is stated on #226 rather than
+        // papered over, because tightening `version_guard` is its own change.
+        None => false,
+    }
+}
+
 /// A store handle: one connection, the settings, and a share of the encoder.
 pub struct Session {
     paths: Paths,
@@ -474,13 +501,14 @@ impl Session {
         phrase: &str,
         limit: usize,
     ) -> Result<Vec<store::version::HistoryMatch>> {
-        let mut out = Vec::new();
-        for hit in store::version::search(&self.conn, phrase, limit)? {
-            if self.version_guard(&hit.key).is_ok() {
-                out.push(hit);
-            }
-        }
-        Ok(out)
+        // ★ THE BOUNDARY IS APPLIED BEFORE THE CAP (Stet, review of #226). This used to truncate in
+        // SQL and then drop what the reader may not see, so a narrow reader could be told "nothing
+        // ever said this" while matching history they ARE entitled to sat just past the cut. The
+        // predicate now travels INTO the ranked walk, and the cap counts only visible hits.
+        let reader = &self.reader;
+        store::version::search_visible(&self.conn, phrase, limit, |key| {
+            reader_allows(&self.conn, reader, key)
+        })
     }
 
     /// Every orphan key's history, in one transaction. Returns `(keys, versions)`.

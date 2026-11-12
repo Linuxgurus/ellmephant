@@ -54,7 +54,7 @@ pub struct Version {
 /// Called immediately before the update that supersedes it, so the read here is exactly the state
 /// being replaced. `note` records why, when the writer knows.
 pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) -> Result<i64> {
-    let (k, title, body, tags, source, created, updated): (
+    let (k, title, body, tags, source, created, updated, audience): (
         String,
         String,
         String,
@@ -62,8 +62,9 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
         Option<String>,
         String,
         String,
+        String,
     ) = tx.query_row(
-        "SELECT key, title, body, tags, source, created, updated FROM memory WHERE id = ?1",
+        "SELECT key, title, body, tags, source, created, updated, audience FROM memory WHERE id = ?1",
         params![id],
         |r| {
             Ok((
@@ -74,6 +75,7 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         },
     )?;
@@ -88,6 +90,11 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
         "source": source,
         "created": created,
         "updated": updated,
+        // ★ THE CLASS TRAVELS WITH THE SNAPSHOT (Stet, review of #226, note 1). Without it, an
+        // orphan's history had no audience to consult and every content search had to guess — the
+        // one thing a privacy boundary must never do. A snapshot written before this line has no
+        // class; `reader_allows` treats that as "not visible", which is the safe direction.
+        "audience": audience,
     })
     .to_string();
 
@@ -362,23 +369,58 @@ pub struct HistoryMatch {
     pub snippet: String,
 }
 
-/// Quote every term and OR them, so a sentence cannot become an FTS syntax error.
-fn terms(phrase: &str) -> String {
-    phrase
+/// Quote every term and AND them: this axis answers "which document EVER said this", so a phrase
+/// means ALL its words. (It was OR when first written, which returned hits matching one word of a
+/// distinctive phrase — looser than the description promised.)
+///
+/// ★ A ONE-CHARACTER TOKEN IS NOT IGNORED (Stet, review of #226): dropping it made a real query
+/// return nothing, indistinguishable from "never written" — the failure this tool exists to remove.
+/// The caller refuses such a query instead, by name.
+fn terms(phrase: &str) -> Result<String> {
+    let parts: Vec<String> = phrase
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
-        .filter(|t| t.len() > 1)
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .map(|t| t.replace('"', ""))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err(crate::error::Error::Invalid(
+            "the phrase has no searchable terms".into(),
+        ));
+    }
+    if let Some(short) = parts.iter().find(|t| t.len() < 2) {
+        return Err(crate::error::Error::Invalid(format!(
+            "`{short}` is a single character: a one-letter term is not a word search. Use a longer \
+             fragment, or `pattern` over `memory_search` for a literal substring."
+        )));
+    }
+    Ok(parts
+        .iter()
+        .map(|t| format!("\"{t}\""))
         .collect::<Vec<_>>()
-        .join(" OR ")
+        .join(" AND "))
 }
 
 /// Search the words every version ever held. Never fused into `memory_search`: a hit here is a past
 /// state, and a ranking that mixed the two would put deleted text in a live page.
 pub fn search(conn: &Connection, phrase: &str, limit: usize) -> Result<Vec<HistoryMatch>> {
-    let expr = terms(phrase);
-    if expr.is_empty() {
-        return Ok(Vec::new());
-    }
+    search_visible(conn, phrase, limit, |_| true)
+}
+
+/// ★ THE VISIBLE WALK (Stet, review of #226). The audience filter is a PRIVACY BOUNDARY, so it
+/// cannot be applied after a `LIMIT`: a narrow reader whose top-k are all another pen's private
+/// history would be told "nothing ever said this" while the words sit at rank k+1. The ranked rows
+/// are walked here, the predicate is asked about each, and the walk stops at `limit` VISIBLE hits.
+/// Filter, then truncate — never the reverse.
+pub fn search_visible<F>(
+    conn: &Connection,
+    phrase: &str,
+    limit: usize,
+    visible: F,
+) -> Result<Vec<HistoryMatch>>
+where
+    F: Fn(&str) -> bool,
+{
+    let expr = terms(phrase)?;
     let mut stmt = conn.prepare(
         "SELECT h.key, h.n, v.written_at, (m.id IS NULL) AS orphan,
                 snippet(history_fts, 0, '[', ']', '…', 12)
@@ -386,19 +428,26 @@ pub fn search(conn: &Connection, phrase: &str, limit: usize) -> Result<Vec<Histo
            JOIN memory_version v ON v.key = h.key AND v.n = h.n AND v.type = ?1
            LEFT JOIN memory m ON m.key = h.key
           WHERE history_fts MATCH ?2
-          ORDER BY rank
-          LIMIT ?3",
+          ORDER BY rank",
     )?;
-    let rows = stmt.query_map(params![MEMORY, expr, limit as i64], |r| {
-        Ok(HistoryMatch {
+    let mut rows = stmt.query(params![MEMORY, expr])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let hit = HistoryMatch {
             key: r.get(0)?,
             n: r.get(1)?,
             written_at: r.get(2)?,
             orphan: r.get(3)?,
             snippet: r.get(4)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        };
+        if visible(&hit.key) {
+            out.push(hit);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -455,5 +504,86 @@ mod history_search_tests {
             search(&conn, "zebracorn", 10).expect("search").is_empty(),
             "after erase the words are gone — the index follows the history"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_visibility_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::config::Paths::from_root(dir.path());
+        let conn = crate::db::open(&paths).expect("store");
+        // An audience may only NAME A PEN THAT EXISTS, so the fixture needs two of them.
+        conn.execute_batch(
+            "INSERT INTO pen (name, kind) VALUES ('stet','self'), ('cline','self');",
+        )
+        .expect("pens");
+        (dir, conn)
+    }
+
+    #[test]
+    fn the_audience_is_applied_before_the_cap() {
+        // ★ Stet's review of #226: a narrow reader whose top-k are all another pen's private
+        // history must still see the public rows BEYOND the cut — not "nothing ever said this".
+        let (_d, conn) = store();
+        // Two private rows rank ahead of one public row for the same word.
+        for key in ["secret-a", "secret-b"] {
+            let m = crate::store::Memory {
+                key: key.into(),
+                title: "private".into(),
+                body: "zebracorn appears in a private note".into(),
+                audience: "pen:stet".into(),
+                // An audience that names others must also name its author, or the row is
+                // unreadable by the pen that wrote it.
+                asserted_by: Some("stet".to_string()),
+                ..Default::default()
+            };
+            crate::store::add(&conn, &m).expect("add");
+            crate::store::delete(&conn, key, Some("stet")).expect("delete"); // history is what we search
+        }
+        let public = crate::store::Memory {
+            key: "public-c".into(),
+            title: "public".into(),
+            body: "zebracorn appears in a public note".into(),
+            asserted_by: Some("stet".to_string()),
+            ..Default::default()
+        };
+        crate::store::add(&conn, &public).expect("add");
+        crate::store::delete(&conn, "public-c", Some("stet")).expect("delete");
+
+        // A different pen may see the public row's history and not the private ones, and the walk
+        // must keep going past the private hits to reach it — the whole point of filtering first.
+        let other = crate::store::audience::Reader::pen("cline");
+        let hits = search_visible(&conn, "zebracorn", 1, |key| {
+            other.sees(&class_of(&conn, key))
+        })
+        .expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the visible row is found, not the private ones"
+        );
+        assert_eq!(hits[0].key, "public-c");
+    }
+
+    fn class_of(conn: &Connection, key: &str) -> String {
+        read_latest(conn, key)
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                s.get("audience")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "public".into())
+    }
+
+    #[test]
+    fn a_one_character_term_is_refused_rather_than_silently_empty() {
+        let (_d, conn) = store();
+        let err = search(&conn, "a", 5).unwrap_err().to_string();
+        assert!(err.contains("single character"), "{err}");
     }
 }

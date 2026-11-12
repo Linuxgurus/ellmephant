@@ -465,6 +465,24 @@ impl Session {
         store::version::erase(&self.conn, key)
     }
 
+    /// ★ WORDS OVER HISTORY (soma/ellmephant#115). Every hit is a PAST state, and a hit whose row is
+    /// gone is the only copy of that text. Audience is enforced exactly as reading a version is —
+    /// a private note's history must not surface to a reader without the pen — so a hit the caller
+    /// may not see is simply absent, never redacted.
+    pub fn history_search(
+        &self,
+        phrase: &str,
+        limit: usize,
+    ) -> Result<Vec<store::version::HistoryMatch>> {
+        let mut out = Vec::new();
+        for hit in store::version::search(&self.conn, phrase, limit)? {
+            if self.version_guard(&hit.key).is_ok() {
+                out.push(hit);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every orphan key's history, in one transaction. Returns `(keys, versions)`.
     pub fn erase_orphan_history(&self) -> Result<(usize, usize)> {
         store::version::erase_orphans(&self.conn)

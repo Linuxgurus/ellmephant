@@ -111,6 +111,15 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
          VALUES (?1, ?2, ?3, 'json', ?4, ?5, ?6)",
         params![MEMORY, key, n, note, content, edited_by],
     )?;
+    // ★ THE WORDS, INDEXED WITH THE SNAPSHOT (soma/ellmephant#115). Insert-only: a version is
+    // immutable, so this index never needs an UPDATE path — and the body is already in hand here,
+    // so nothing has to parse the JSON back out later.
+    if history_fts_ready(tx) {
+        tx.execute(
+            "INSERT INTO history_fts (body, key, n) VALUES (?1, ?2, ?3)",
+            params![body, key, n],
+        )?;
+    }
     Ok(n)
 }
 
@@ -132,6 +141,18 @@ pub fn history(conn: &Connection, key: &str) -> Result<Vec<Version>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Is the words-over-history index present? A fixture that builds a partial schema (or a store
+/// created before 0042) must keep working: the index is an addition, not a precondition.
+fn history_fts_ready(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'history_fts'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
 }
 
 /// One version's snapshot, as stored — the row as it WAS, not a reconstruction of it.
@@ -189,6 +210,11 @@ pub fn count_for(conn: &Connection, key: &str) -> Result<i64> {
 /// This exists so that "the store keeps a copy of what you asked it to remove" is never true by
 /// accident. It is narrow on purpose — history is the only thing it can delete.
 pub fn erase(conn: &Connection, key: &str) -> Result<usize> {
+    // ★ ERASE REACHES THE INDEX IN THE SAME STATEMENT (soma/ellmephant#115): the test for this is
+    // the EFFECT — a phrase from an erased history must stop being findable — not the return value.
+    if history_fts_ready(conn) {
+        conn.execute("DELETE FROM history_fts WHERE key = ?1", params![key])?;
+    }
     Ok(conn.execute(
         "DELETE FROM memory_version WHERE type = ?1 AND key = ?2",
         params![MEMORY, key],
@@ -317,6 +343,117 @@ mod erase_tests {
         assert!(
             orphan_keys(&conn).unwrap().is_empty(),
             "a live row is not history"
+        );
+    }
+}
+
+/// ★ THE THIRD AXIS: exact words over HISTORY (soma/ellmephant#115).
+///
+/// One hit is a PAST state, not a current row: `key`, which version `n`, when it was written, and
+/// whether the memory still exists. A reader that gets this must not mistake it for the document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryMatch {
+    pub key: String,
+    pub n: i64,
+    pub written_at: String,
+    /// The memory row is GONE — this is the only copy of that text.
+    pub orphan: bool,
+    /// The matching words in context.
+    pub snippet: String,
+}
+
+/// Quote every term and OR them, so a sentence cannot become an FTS syntax error.
+fn terms(phrase: &str) -> String {
+    phrase
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .filter(|t| t.len() > 1)
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Search the words every version ever held. Never fused into `memory_search`: a hit here is a past
+/// state, and a ranking that mixed the two would put deleted text in a live page.
+pub fn search(conn: &Connection, phrase: &str, limit: usize) -> Result<Vec<HistoryMatch>> {
+    let expr = terms(phrase);
+    if expr.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT h.key, h.n, v.written_at, (m.id IS NULL) AS orphan,
+                snippet(history_fts, 0, '[', ']', '…', 12)
+           FROM history_fts h
+           JOIN memory_version v ON v.key = h.key AND v.n = h.n AND v.type = ?1
+           LEFT JOIN memory m ON m.key = h.key
+          WHERE history_fts MATCH ?2
+          ORDER BY rank
+          LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![MEMORY, expr, limit as i64], |r| {
+        Ok(HistoryMatch {
+            key: r.get(0)?,
+            n: r.get(1)?,
+            written_at: r.get(2)?,
+            orphan: r.get(3)?,
+            snippet: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+#[cfg(test)]
+mod history_search_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::config::Paths::from_root(dir.path());
+        let conn = crate::db::open(&paths).expect("store");
+        (dir, conn)
+    }
+
+    #[test]
+    fn a_deleted_bodys_words_are_findable_and_then_erasable() {
+        // ★ #115 acceptance 1-3: write, rewrite, delete; the phrase is found, named as a PAST state
+        // and an orphan; and after erase it is GONE — tested by the effect, not the return value.
+        let (_d, conn) = store();
+        let mem = crate::store::Memory {
+            key: "a-note".into(),
+            title: "t".into(),
+            body: "the widget calibration constant is zebracorn".into(),
+            ..Default::default()
+        };
+        crate::store::add(&conn, &mem).expect("add");
+        // A rewrite snapshots the old body into history.
+        let mut patch = crate::store::Patch {
+            key: Some("a-note".into()),
+            body: Some("rewritten, the constant moved".into()),
+            ..Default::default()
+        };
+        crate::store::merge(&conn, &patch).expect("merge");
+        crate::store::delete(&conn, "a-note", None).expect("delete");
+        patch.key = None;
+
+        let hits = search(&conn, "zebracorn", 10).expect("search");
+        assert_eq!(hits.len(), 1, "the old words are found: {hits:?}");
+        assert_eq!(hits[0].key, "a-note");
+        assert!(
+            hits[0].orphan,
+            "and the row is gone, so this is the only copy"
+        );
+        assert!(hits[0].snippet.contains("zebracorn"), "{}", hits[0].snippet);
+
+        // The same phrase is NOT in the live word index — that is the whole point of a third axis.
+        assert!(
+            crate::index::fts::search(&conn, "zebracorn", 10)
+                .expect("live fts")
+                .is_empty()
+        );
+
+        erase(&conn, "a-note").expect("erase");
+        assert!(
+            search(&conn, "zebracorn", 10).expect("search").is_empty(),
+            "after erase the words are gone — the index follows the history"
         );
     }
 }

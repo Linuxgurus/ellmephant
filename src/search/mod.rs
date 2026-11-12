@@ -86,6 +86,18 @@ pub struct Query {
     pub updated_after: Option<String>,
     /// Only rows whose `updated` is at or before this ISO timestamp.
     pub updated_before: Option<String>,
+    /// ★ EXACT ADDRESS (soma/ellmephant#114): the key, whole. Never a body scan — the difference
+    /// between "this row" and "this word appears somewhere" is the whole point of the field.
+    pub key: Option<String>,
+    /// Read `key` as a PREFIX instead of an exact match. Explicit, because a prefix that silently
+    /// widened an exact request is the failure this predicate exists to remove.
+    pub key_prefix: bool,
+    /// Scoped to the title field, case-insensitive substring — the FTS table has `title` as a
+    /// column, but the word leg ranks whole documents; this filters on the field.
+    pub title: Option<String>,
+    /// PROJECTS ONLY. Accepted on `Query` so a memory search can REFUSE it by name instead of
+    /// silently ignoring it (the #87 lesson: a dropped parameter is a widened search).
+    pub status: Option<String>,
 }
 
 impl Query {
@@ -191,6 +203,10 @@ pub struct SearchMeta {
     pub semantic_candidates: usize,
     /// Lexical rows returned by the word index (after the visibility filter and the retrieval cap).
     pub lexical_candidates: usize,
+    /// ★ WHICH PREDICATES FILTERED (soma/ellmephant#114). Named so "no hits" is distinguishable from
+    /// "the filter was dropped": a search that silently widens is worse than one that refuses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predicates: Vec<String>,
 }
 
 /// One selectable hit field on the MCP wire. `key` is always returned (it is the handle you
@@ -316,8 +332,14 @@ pub fn to_wire_json(bundle: &Bundle, fields: &Fields) -> Result<String> {
             Some(d) => format!("{}", wire_distance(d)),
             None => "null".to_string(),
         };
+        let preds: String = m
+            .predicates
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(",");
         out.push_str(&format!(
-            ",\"search\":{{\"max_distance\":{ceiling},\"semantic_candidates\":{},\"lexical_candidates\":{}}}",
+            ",\"search\":{{\"max_distance\":{ceiling},\"semantic_candidates\":{},\"lexical_candidates\":{},\"predicates\":[{preds}]}}",
             m.semantic_candidates, m.lexical_candidates
         ));
     }
@@ -403,11 +425,30 @@ pub fn run(
     // phrase reached anything — that is the defect this carries (soma/ellmephant#213 follow-up).
     let semantic_ids: HashSet<i64> = phrase.iter().flatten().map(|(id, _)| *id).collect();
     let lexical_ids: HashSet<i64> = lexical.iter().flatten().map(|(id, _)| *id).collect();
-    let meta = SearchMeta {
+    let mut predicates: Vec<String> = Vec::new();
+    let mut meta = SearchMeta {
         max_distance: q.max_distance,
         semantic_candidates: semantic_ids.len(),
         lexical_candidates: lexical_ids.len(),
+        predicates: predicates.clone(),
     };
+    // ★ A PREDICATE THAT DOES NOT APPLY IS AN ERROR, NOT A SHRUG (soma/ellmephant#114): `status`
+    // filters PROJECTS, and a memory search that ignored it would widen silently — the #87 lesson,
+    // where a dropped `kind` made every "filtered" search return the store.
+    if q.status.is_some() {
+        return Err(crate::error::Error::Invalid(
+            "`status` filters PROJECTS: this search is over memories. Use `project_list` with \
+             `status`, or drop the parameter — it is not applied here."
+                .into(),
+        ));
+    }
+    if let Some(set) = predicate_set(conn, q, &mut predicates)? {
+        ordered.retain(|(id, _)| set.contains(id));
+    }
+    // The reply names the predicates that actually filtered, so "no hits" is distinguishable from
+    // "the filter was dropped".
+    meta.predicates = predicates.clone();
+
     // Structured filters intersect the candidate set BEFORE the k cap, so a filtered result
     // is exact (the KNN already spans the whole store): filter, then truncate, never the reverse.
     if let Some(set) = filter_set(conn, q)? {
@@ -465,6 +506,57 @@ pub fn run(
         neighbors,
         search: Some(meta),
     })
+}
+
+/// ★ FIELD PREDICATES — `key` (exact or prefix) and `title` (substring) (soma/ellmephant#114).
+///
+/// They FILTER; the legs rank. A predicate never contributes a score, and the names of the ones
+/// that applied are returned in `search.predicates` so a caller can tell "nothing matched" from
+/// "nothing was filtered". `status` is refused one level up, because it belongs to projects.
+fn predicate_set(
+    conn: &Connection,
+    q: &Query,
+    applied: &mut Vec<String>,
+) -> Result<Option<HashSet<i64>>> {
+    let mut sets: Vec<HashSet<i64>> = Vec::new();
+    if let Some(key) = q.key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if q.key_prefix {
+            let mut st = conn.prepare("SELECT id FROM memory WHERE key LIKE ?1 || '%'")?;
+            let ids = st
+                .query_map(rusqlite::params![key], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<HashSet<i64>>>()?;
+            applied.push("key_prefix".into());
+            sets.push(ids);
+        } else {
+            let mut st = conn.prepare("SELECT id FROM memory WHERE key = ?1")?;
+            let ids = st
+                .query_map(rusqlite::params![key], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<HashSet<i64>>>()?;
+            applied.push("key".into());
+            sets.push(ids);
+        }
+    }
+    if let Some(title) = q.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // LIKE is case-insensitive for ASCII in SQLite, which is the behaviour a human expects from
+        // "in the title"; the escape keeps a `%` in the term from becoming a wildcard.
+        let term = title.replace('%', "\\%").replace('_', "\\_");
+        let mut st =
+            conn.prepare("SELECT id FROM memory WHERE title LIKE '%' || ?1 || '%' ESCAPE '\\'")?;
+        let ids = st
+            .query_map(rusqlite::params![term], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<HashSet<i64>>>()?;
+        applied.push("title".into());
+        sets.push(ids);
+    }
+    if sets.is_empty() {
+        return Ok(None);
+    }
+    // AND across predicates: every one must hold, like every other filter on this query.
+    let mut out = sets.remove(0);
+    for s in sets {
+        out.retain(|id| s.contains(id));
+    }
+    Ok(Some(out))
 }
 
 /// The lexical leg: FTS5 over the same columns, ranked by BM25 (`soma/ellmephant#62`).
@@ -770,6 +862,10 @@ mod tests {
             created_before: None,
             updated_after: None,
             updated_before: None,
+            key: None,
+            key_prefix: false,
+            title: None,
+            status: None,
         };
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         // No phrase ⇒ no candidates, and no embedder required.

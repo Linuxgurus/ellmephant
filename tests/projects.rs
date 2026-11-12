@@ -466,6 +466,10 @@ fn a_project_tag_is_how_memories_join() {
             created_before: None,
             updated_after: None,
             updated_before: None,
+            key: None,
+            key_prefix: false,
+            title: None,
+            status: None,
         };
         ellmephant::search::run(
             &conn,

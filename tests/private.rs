@@ -110,6 +110,10 @@ fn search_shows_it_to_the_author_and_nobody_else() -> Result<()> {
         created_before: None,
         updated_after: None,
         updated_before: None,
+        key: None,
+        key_prefix: false,
+        title: None,
+        status: None,
     };
 
     let author = keys(&search::run(&conn, None, &Reader::pen("stet"), &q)?);
@@ -151,6 +155,10 @@ fn a_tag_filter_does_not_answer_questions_about_hidden_rows() -> Result<()> {
         created_before: None,
         updated_after: None,
         updated_before: None,
+        key: None,
+        key_prefix: false,
+        title: None,
+        status: None,
     };
     let peek = search::run(&conn, None, &Reader::pen("james"), &q)?;
     assert!(
@@ -294,6 +302,10 @@ fn all_q() -> Query {
         created_before: None,
         updated_after: None,
         updated_before: None,
+        key: None,
+        key_prefix: false,
+        title: None,
+        status: None,
     }
 }
 

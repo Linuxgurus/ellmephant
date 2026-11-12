@@ -551,6 +551,28 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Only memories last written at or before this ISO timestamp.")]
     pub updated_before: Option<String>,
+    /// Exact key.
+    #[serde(default)]
+    #[schemars(
+        description = "EXACT address: return only the row whose key is this. Never a body scan — use `pattern` for \"this word appears somewhere\"."
+    )]
+    pub key: Option<String>,
+    /// Key prefix mode.
+    #[serde(default)]
+    #[schemars(
+        description = "Read `key` as a PREFIX (`alerts-2026-11-`). Explicit on purpose: a prefix that silently widened an exact request is the failure this predicate removes."
+    )]
+    pub key_prefix: Option<bool>,
+    /// Title-scoped.
+    #[serde(default)]
+    #[schemars(description = "Case-insensitive substring, scoped to the TITLE field only.")]
+    pub title: Option<String>,
+    /// Projects only.
+    #[serde(default)]
+    #[schemars(
+        description = "PROJECTS ONLY (`active`, `paused`, …). A memory search REFUSES it by name rather than ignoring it — a dropped filter is a widened search."
+    )]
+    pub status: Option<String>,
     /// Hit fields to return beyond `key`.
     #[serde(default)]
     #[schemars(
@@ -2758,6 +2780,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             created_before: None,
             updated_after: None,
             updated_before: None,
+            key: None,
+            key_prefix: None,
+            title: None,
+            status: None,
             fields: p.fields,
         };
         self.run_search(params, reader).await
@@ -2805,6 +2831,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let created_before = p.created_before;
         let updated_after = p.updated_after;
         let updated_before = p.updated_before;
+        let key = p.key;
+        let key_prefix = p.key_prefix.unwrap_or(false);
+        let title = p.title;
+        let status = p.status;
         // Default: `key` only (lean). Named fields are added, in canonical order.
         let fields = Fields::selection(p.fields.into_iter().map(FieldParam::to_field));
         // Keep a copy for the log line: the original moves into the store closure.
@@ -2828,6 +2858,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     created_before,
                     updated_after,
                     updated_before,
+                    key,
+                    key_prefix,
+                    title,
+                    status,
                 };
                 s.search(&q)
             })
@@ -5071,15 +5105,21 @@ mod tests {
             "start_date is not stamped at creation time: {start_desc}"
         );
 
-        // Search carries the semantic phrase (`query`), the lexical leg (`pattern` + `mode`) and the
-        // structured filters — but no `key` leg (a known key is `memory_get`).
+        // Search carries the semantic phrase (`query`), the lexical leg (`pattern` + `mode`), the
+        // FIELD PREDICATES (`key`/`key_prefix`/`title`) and the structured filters. `key` was absent
+        // until #114 on the reasoning that a known key is `memory_get`; the issue overruled it — the
+        // only way to match a key was `pattern`, which scans key, title AND body, so "this row" and
+        // "this word appears somewhere" were the same request.
+        //
+        // `status` is here ON PURPOSE and refuses: it filters projects, and a memory search that
+        // silently ignored it would widen — the #87 lesson.
         let props = find("memory_search")
             .input_schema
             .get("properties")
             .and_then(|v| v.as_object())
             .cloned()
             .expect("search schema has properties");
-        for gone in ["key", "tag_match", "field", "match"] {
+        for gone in ["tag_match", "field", "match"] {
             assert!(
                 !props.contains_key(gone),
                 "memory_search must not expose {gone}: {props:?}"
@@ -5095,6 +5135,8 @@ mod tests {
                 "expand",
                 "fields",
                 "k",
+                "key",
+                "key_prefix",
                 "max_chars",
                 "max_distance",
                 "min_chars",
@@ -5105,7 +5147,9 @@ mod tests {
                 // anything real" and get NO rather than a lexical refill. This list is the wire
                 // surface, so a new knob appears here deliberately or not at all.
                 "semantic_only",
+                "status",
                 "tags",
+                "title",
                 "updated_after",
                 "updated_before"
             ]

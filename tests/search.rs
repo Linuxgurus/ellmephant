@@ -46,6 +46,10 @@ fn query(text: Option<&str>) -> Query {
         created_before: None,
         updated_after: None,
         updated_before: None,
+        key: None,
+        key_prefix: false,
+        title: None,
+        status: None,
     }
 }
 
@@ -591,4 +595,92 @@ fn time_bounds_filter_created_and_updated() {
             .collect::<Vec<_>>(),
         ["old"]
     );
+}
+
+/// ★ #114: predicates FILTER, the legs rank, and a predicate that does not apply is an ERROR.
+#[test]
+fn key_is_exact_and_prefix_is_explicit() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(
+        &conn,
+        &embedder,
+        "alpha",
+        "a body that mentions beta in passing",
+        &[],
+    );
+    seed(&conn, &embedder, "beta", "a different body", &[]);
+    let reader = ellmephant::store::audience::Reader::everything();
+    // Exact: the row, and nothing whose body merely mentions the key.
+    let mut q = query(None);
+    q.key = Some("alpha".into());
+    let b = search::run(&conn, None, &reader, &q).expect("run");
+    assert_eq!(
+        b.hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+        vec!["alpha".to_string()],
+        "an exact key returns that row alone"
+    );
+    assert!(b.search.unwrap().predicates.contains(&"key".to_string()));
+
+    // Prefix, when asked for.
+    let mut q = query(None);
+    q.key = Some("alp".into());
+    q.key_prefix = true;
+    let b = search::run(&conn, None, &reader, &q).expect("run");
+    assert!(b.hits.iter().any(|h| h.key == "alpha"));
+    assert!(
+        b.search
+            .unwrap()
+            .predicates
+            .contains(&"key_prefix".to_string()),
+        "the reply names the predicate that filtered"
+    );
+}
+
+#[test]
+fn title_is_scoped_to_the_title_field() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(
+        &conn,
+        &embedder,
+        "alpha",
+        "a body that mentions beta in passing",
+        &[],
+    );
+    seed(&conn, &embedder, "beta", "a different body", &[]);
+    let reader = ellmephant::store::audience::Reader::everything();
+    let mut q = query(None);
+    // `beta` is in alpha's BODY and in beta's TITLE: the predicate must pick only the latter.
+    q.title = Some("beta".into());
+    let b = search::run(&conn, None, &reader, &q).expect("run");
+    assert_eq!(
+        b.hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+        vec!["beta".to_string()],
+        "a body mention is not a title match"
+    );
+}
+
+#[test]
+fn status_on_a_memory_search_is_an_error_that_names_the_field() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(
+        &conn,
+        &embedder,
+        "alpha",
+        "a body that mentions beta in passing",
+        &[],
+    );
+    seed(&conn, &embedder, "beta", "a different body", &[]);
+    let reader = ellmephant::store::audience::Reader::everything();
+    let mut q = query(None);
+    q.status = Some("active".into());
+    let err = search::run(&conn, None, &reader, &q)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("status") && err.contains("PROJECTS"), "{err}");
 }

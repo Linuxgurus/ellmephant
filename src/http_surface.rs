@@ -2923,6 +2923,15 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         created_before: p.maybe("created_before").map(str::to_string),
         updated_after: p.maybe("updated_after").map(str::to_string),
         updated_before: p.maybe("updated_before").map(str::to_string),
+        // ★ THE SAME PREDICATES ON BOTH DOORS (soma/ellmephant#114): a filter reachable from one
+        // door and not the other is a search that answers differently depending on how it was asked.
+        key: p.maybe("key").map(str::to_string),
+        key_prefix: p
+            .maybe("key_prefix")
+            .map(|v| bool_param(v, "key_prefix"))
+            .transpose()?,
+        title: p.maybe("title").map(str::to_string),
+        status: p.maybe("status").map(str::to_string),
         fields,
     })
 }

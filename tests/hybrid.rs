@@ -37,6 +37,10 @@ fn q(text: &str, k: usize) -> Query {
         created_before: None,
         updated_after: None,
         updated_before: None,
+        key: None,
+        key_prefix: false,
+        title: None,
+        status: None,
     }
 }
 

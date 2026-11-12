@@ -92,6 +92,10 @@ impl Eval {
 /// The semantic query a golden case runs: the phrase against both embedded fields.
 fn case_query(case: &Case, k: usize) -> Query {
     Query {
+        key: None,
+        key_prefix: false,
+        title: None,
+        status: None,
         text: Some(case.query.clone()),
         pattern: None,
         mode: MatchMode::Literal,

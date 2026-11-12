@@ -200,3 +200,85 @@ fn a_tag_filter_still_applies_to_a_fused_search() {
     );
     assert_eq!(bundle.hits[0].key, "tagged");
 }
+
+/// ★ THE SHAPE JAMES ASKED FOR (2026-11-11): `{semantic: [...], lexical: [...]}`, each sorted by its
+/// own metric — distance for meaning, BM25 for words — instead of one fused order that ranks leg
+/// membership above closeness.
+#[test]
+fn the_two_legs_are_reported_separately_each_in_its_own_order() {
+    let (_d, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let _spec = VecSpec::of(&embedder);
+    for (k, body) in [
+        (
+            "cache-warm-up",
+            "how long the cache takes to warm before the first request",
+        ),
+        (
+            "runner-has-no-cargo",
+            "the build runner is missing cargo, so the job fails",
+        ),
+        ("unrelated", "a note about lunch"),
+    ] {
+        common::add_now(&conn, &embedder, &mem(k, k, body)).expect("add");
+    }
+    let reader = ellmephant::store::audience::Reader::everything();
+    let b = search::run(&conn, Some(&embedder), &reader, &q("cargo runner", 5)).expect("run");
+
+    // The lexical leg found the row, and every lexical row carries its BM25.
+    assert!(!b.lexical.is_empty(), "the word leg answered");
+    assert!(
+        b.lexical.iter().all(|h| h.score.is_some()),
+        "each lexical row carries its score: {:?}",
+        b.lexical
+            .iter()
+            .map(|h| (h.key.clone(), h.score))
+            .collect::<Vec<_>>()
+    );
+    // Best-first: BM25 comes back from SQLite negative-lower-is-better, the same direction as distance.
+    let scores: Vec<f32> = b.lexical.iter().filter_map(|h| h.score).collect();
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, c| a.partial_cmp(c).unwrap());
+    assert_eq!(
+        scores, sorted,
+        "lexical rows are ordered by keyword quality"
+    );
+
+    // Each list is capped at k, and the fused view is still there for the callers that read it.
+    assert!(b.semantic.len() <= 5 && b.lexical.len() <= 5);
+    assert!(
+        !b.hits.is_empty(),
+        "the fused page survives as the deprecated view"
+    );
+}
+
+#[test]
+fn a_row_both_legs_found_appears_in_both_lists() {
+    let (_d, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(8);
+    let _spec = VecSpec::of(&embedder);
+    for (k, body) in [
+        (
+            "runner-has-no-cargo",
+            "the build runner is missing cargo, so the job fails",
+        ),
+        ("cache-warm-up", "how long the cache takes to warm"),
+    ] {
+        common::add_now(&conn, &embedder, &mem(k, k, body)).expect("add");
+    }
+    let reader = ellmephant::store::audience::Reader::everything();
+    let b = search::run(&conn, Some(&embedder), &reader, &q("runner cargo", 5)).expect("run");
+    for h in b
+        .hits
+        .iter()
+        .filter(|h| h.via == ellmephant::search::Via::Both)
+    {
+        assert!(
+            b.lexical.iter().any(|l| l.key == h.key) && b.semantic.iter().any(|s| s.key == h.key),
+            "`{}` was found by both legs, so it is in both lists — found twice is the signal",
+            h.key
+        );
+    }
+}

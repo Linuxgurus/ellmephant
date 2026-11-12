@@ -165,6 +165,11 @@ pub struct Hit {
     /// (BM25 is not a distance and reporting one in this field would be a unit confusion).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f32>,
+    /// ★ BM25 as SQLite reports it (James, 2026-11-11: "each of which is sorted by distances, and
+    /// keyword quality match"). Deliberately a SEPARATE field from `distance`: same direction
+    /// (lower is better), different unit and different leg. A row found by both legs carries both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
 }
 
 /// A link-neighbour pulled in by `--expand` (SPEC §10).
@@ -181,7 +186,18 @@ pub struct Neighbor {
 /// The result bundle: hits plus (when asked) their link neighbourhood.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Bundle {
-    /// Hits, distance-ranked when the phrase was semantic.
+    /// ★ THE TWO LEGS, EACH IN ITS OWN ORDER (2026-11-11). This is the answer fusion cannot give: a
+    /// row's position in `semantic` is its distance, and its position in `lexical` is its BM25 — so
+    /// "found by meaning, ranked seventh" and "found by words, ranked first" are both visible, and
+    /// neither can hide the other. A row found by both appears in both, marked `via: both`.
+    ///
+    /// `hits` remains the fused (RRF) page **for compatibility**: it is what every caller read
+    /// before this change, and it is scheduled to be removed once the consumers move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic: Vec<Hit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lexical: Vec<Hit>,
+    /// Hits, distance-ranked when the phrase was semantic — the FUSED view (deprecated).
     pub hits: Vec<Hit>,
     /// Link neighbours, breadth-first from the hits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -225,17 +241,20 @@ pub enum Field {
     Chars,
     /// Cosine distance (semantic ranking only).
     Distance,
+    /// BM25 as SQLite returns it (lexical ranking only; lower is better, like `distance`).
+    Score,
 }
 
 impl Field {
     /// Every field, in canonical wire order.
-    pub const ALL: [Field; 6] = [
+    pub const ALL: [Field; 7] = [
         Field::Key,
         Field::Via,
         Field::Title,
         Field::Tags,
         Field::Chars,
         Field::Distance,
+        Field::Score,
     ];
 
     /// The wire name (a `cols` header entry).
@@ -247,6 +266,7 @@ impl Field {
             Field::Tags => "tags",
             Field::Chars => "chars",
             Field::Distance => "distance",
+            Field::Score => "score",
         }
     }
 
@@ -290,6 +310,8 @@ impl Fields {
 
     /// One hit as a positional row matching [`names`](Self::names).
     pub fn row(&self, h: &Hit) -> serde_json::Value {
+        // `score` rides with `distance` when either is asked for: the two legs are reported
+        // separately, so a caller comparing their orders needs both numbers on the same row.
         serde_json::Value::Array(self.0.iter().map(|f| self.value(h, *f)).collect())
     }
 
@@ -302,6 +324,9 @@ impl Fields {
             Field::Tags => serde_json::json!(h.tags),
             Field::Chars => serde_json::json!(h.chars),
             Field::Distance => serde_json::json!(h.distance.map(wire_distance)),
+            Field::Score => {
+                serde_json::json!(h.score.map(|b| ((b as f64) * 10_000.0).round() / 10_000.0))
+            }
         }
     }
 }
@@ -324,6 +349,21 @@ pub fn to_wire_json(bundle: &Bundle, fields: &Fields) -> Result<String> {
 
     let mut out = format!("{{\"cols\":[{header}],\"hits\":");
     out.push_str(&crate::wire::rows_array(&hits));
+
+    // ★ THE TWO LEGS, EACH IN ITS OWN ORDER (2026-11-11). `hits` stays for one release as the fused
+    // view; these are the answer a caller can actually trust — a row's position in `semantic` is its
+    // distance, and its position in `lexical` is its BM25. Absent when that leg did not run, so an
+    // empty array never impersonates "the leg found nothing".
+    if !bundle.semantic.is_empty() {
+        let rows: Vec<serde_json::Value> = bundle.semantic.iter().map(|h| fields.row(h)).collect();
+        out.push_str(",\"semantic\":");
+        out.push_str(&crate::wire::rows_array(&rows));
+    }
+    if !bundle.lexical.is_empty() {
+        let rows: Vec<serde_json::Value> = bundle.lexical.iter().map(|h| fields.row(h)).collect();
+        out.push_str(",\"lexical\":");
+        out.push_str(&crate::wire::rows_array(&rows));
+    }
 
     // The instrumentation rides the envelope so it cannot be missed by a caller who never learned
     // to look at a hit's `via`: `semantic_candidates: 0` says the phrase leg answered nothing.
@@ -394,7 +434,12 @@ pub fn run(
     // are different units in different directions (lower-better and negative-lower-better) — adding
     // them would need a calibration nobody has. `k=60` is the constant from the RRF literature: it
     // flattens the top of each list so one leg's runaway first place does not veto the other.
-    let mut lexical = phrase_ids_lexical(conn, q)?;
+    let mut lexical_leg = phrase_ids_lexical(conn, q)?;
+    let mut lex_scores: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+    let mut lexical: Option<Vec<Candidate>> = lexical_leg.take().map(|(ids, scores)| {
+        lex_scores = scores;
+        ids
+    });
     // ★ VISIBILITY IS APPLIED TO EACH LEG BEFORE ANY CAP. A private row that survived into `fuse`
     // would take one of the k slots and then be dropped, and the caller would see a short page with
     // no way to tell it from a thin result set — the absence has to be indistinguishable from
@@ -406,6 +451,7 @@ pub fn run(
     }
     if let Some(l) = lexical.as_mut() {
         l.retain(|(id, _)| !hidden(id));
+        lex_scores.retain(|id, _| !hidden(id));
     }
     // ★ `semantic_only` SKIPS THE FUSION ENTIRELY, and it has to. `fuse` spends `k` slots on the
     // combined ranking, so a semantic row can be crowded out by word matches before the filter
@@ -493,8 +539,51 @@ pub fn run(
             tags: mem.tags,
             chars,
             distance,
+            score: lex_scores.get(&id).copied(),
         });
     }
+
+    // ★ THE TWO LEGS, EACH RANKED BY ITS OWN METRIC (2026-11-11). Built from the post-visibility
+    // candidate lists, so the same filters that apply to the fused page apply here — and a row that
+    // both legs found appears in BOTH, because "found twice" is the signal, not a duplicate to hide.
+    let leg = |ids: &[Candidate], k: usize| -> Result<Vec<Hit>> {
+        let mut out = Vec::new();
+        for (id, distance) in ids.iter().take(k) {
+            let Some(mem) = store::get_by_id(conn, *id)? else {
+                continue;
+            };
+            if !reader.sees(&mem.audience) {
+                continue;
+            }
+            let via = match (semantic_ids.contains(id), lexical_ids.contains(id)) {
+                (true, true) => Via::Both,
+                (true, false) => Via::Semantic,
+                (false, true) => Via::Lexical,
+                (false, false) => Via::Listing,
+            };
+            let chars = embedded_len(&mem);
+            out.push(Hit {
+                id: *id,
+                via,
+                key: mem.key,
+                title: mem.title,
+                tags: mem.tags,
+                chars,
+                distance: *distance,
+                score: lex_scores.get(id).copied(),
+            });
+        }
+        Ok(out)
+    };
+    let cap = q.k.max(1);
+    let semantic_rows = match &phrase {
+        Some(p) => leg(p, cap)?,
+        None => Vec::new(),
+    };
+    let lexical_rows = match &lexical {
+        Some(l) => leg(l, cap)?,
+        None => Vec::new(),
+    };
 
     let neighbors = if q.expand > 0 {
         expand(conn, &hits, q.expand, &visible)?
@@ -502,6 +591,8 @@ pub fn run(
         Vec::new()
     };
     Ok(Bundle {
+        semantic: semantic_rows,
+        lexical: lexical_rows,
         hits,
         neighbors,
         search: Some(meta),
@@ -565,7 +656,11 @@ fn predicate_set(
 /// error rather than an empty list: a leg that cannot run must not silently shrink a search that the
 /// other leg would have answered — the caller asked for a phrase and deserves to know halving it was
 /// not possible.
-fn phrase_ids_lexical(conn: &Connection, q: &Query) -> Result<Option<Vec<Candidate>>> {
+#[allow(clippy::type_complexity)]
+fn phrase_ids_lexical(
+    conn: &Connection,
+    q: &Query,
+) -> Result<Option<(Vec<Candidate>, std::collections::HashMap<i64, f32>)>> {
     let Some(text) = q.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -578,7 +673,16 @@ fn phrase_ids_lexical(conn: &Connection, q: &Query) -> Result<Option<Vec<Candida
     }
     // `distance` stays None: BM25 is not a distance, and reporting a negative number in a field
     // documented as cosine distance is the unit confusion #59 exists to prevent.
-    Ok(Some(hits.into_iter().map(|h| (h.id, None)).collect()))
+    // ★ THE SCORE IS KEPT (2026-11-11). It was thrown away on purpose when both legs were fused into
+    // one rank, because a BM25 in a `distance` field is a unit confusion. With the legs reported
+    // separately, the score IS the ordering of the lexical list, so it travels beside the ids and
+    // never into `distance`.
+    let scores: std::collections::HashMap<i64, f32> =
+        hits.iter().map(|h| (h.id, h.bm25 as f32)).collect();
+    Ok(Some((
+        hits.into_iter().map(|h| (h.id, None)).collect(),
+        scores,
+    )))
 }
 
 /// Reciprocal Rank Fusion: `score = Σ 1/(60 + rank)` over the legs that found the row.

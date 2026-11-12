@@ -54,7 +54,7 @@ pub struct Version {
 /// Called immediately before the update that supersedes it, so the read here is exactly the state
 /// being replaced. `note` records why, when the writer knows.
 pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) -> Result<i64> {
-    let (k, title, body, tags, source, created, updated): (
+    let (k, title, body, tags, source, created, updated, audience): (
         String,
         String,
         String,
@@ -62,8 +62,9 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
         Option<String>,
         String,
         String,
+        String,
     ) = tx.query_row(
-        "SELECT key, title, body, tags, source, created, updated FROM memory WHERE id = ?1",
+        "SELECT key, title, body, tags, source, created, updated, audience FROM memory WHERE id = ?1",
         params![id],
         |r| {
             Ok((
@@ -74,6 +75,7 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         },
     )?;
@@ -88,6 +90,11 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
         "source": source,
         "created": created,
         "updated": updated,
+        // ★ THE CLASS TRAVELS WITH THE SNAPSHOT (Stet, review of #226, note 1). Without it, an
+        // orphan's history had no audience to consult and every content search had to guess — the
+        // one thing a privacy boundary must never do. A snapshot written before this line has no
+        // class; `reader_allows` treats that as "not visible", which is the safe direction.
+        "audience": audience,
     })
     .to_string();
 
@@ -111,6 +118,15 @@ pub(crate) fn snapshot(tx: &Connection, id: i64, key: &str, note: Option<&str>) 
          VALUES (?1, ?2, ?3, 'json', ?4, ?5, ?6)",
         params![MEMORY, key, n, note, content, edited_by],
     )?;
+    // ★ THE WORDS, INDEXED WITH THE SNAPSHOT (soma/ellmephant#115). Insert-only: a version is
+    // immutable, so this index never needs an UPDATE path — and the body is already in hand here,
+    // so nothing has to parse the JSON back out later.
+    if history_fts_ready(tx) {
+        tx.execute(
+            "INSERT INTO history_fts (body, key, n) VALUES (?1, ?2, ?3)",
+            params![body, key, n],
+        )?;
+    }
     Ok(n)
 }
 
@@ -132,6 +148,18 @@ pub fn history(conn: &Connection, key: &str) -> Result<Vec<Version>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Is the words-over-history index present? A fixture that builds a partial schema (or a store
+/// created before 0042) must keep working: the index is an addition, not a precondition.
+fn history_fts_ready(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'history_fts'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
 }
 
 /// One version's snapshot, as stored — the row as it WAS, not a reconstruction of it.
@@ -189,6 +217,11 @@ pub fn count_for(conn: &Connection, key: &str) -> Result<i64> {
 /// This exists so that "the store keeps a copy of what you asked it to remove" is never true by
 /// accident. It is narrow on purpose — history is the only thing it can delete.
 pub fn erase(conn: &Connection, key: &str) -> Result<usize> {
+    // ★ ERASE REACHES THE INDEX IN THE SAME STATEMENT (soma/ellmephant#115): the test for this is
+    // the EFFECT — a phrase from an erased history must stop being findable — not the return value.
+    if history_fts_ready(conn) {
+        conn.execute("DELETE FROM history_fts WHERE key = ?1", params![key])?;
+    }
     Ok(conn.execute(
         "DELETE FROM memory_version WHERE type = ?1 AND key = ?2",
         params![MEMORY, key],
@@ -318,5 +351,239 @@ mod erase_tests {
             orphan_keys(&conn).unwrap().is_empty(),
             "a live row is not history"
         );
+    }
+}
+
+/// ★ THE THIRD AXIS: exact words over HISTORY (soma/ellmephant#115).
+///
+/// One hit is a PAST state, not a current row: `key`, which version `n`, when it was written, and
+/// whether the memory still exists. A reader that gets this must not mistake it for the document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryMatch {
+    pub key: String,
+    pub n: i64,
+    pub written_at: String,
+    /// The memory row is GONE — this is the only copy of that text.
+    pub orphan: bool,
+    /// The matching words in context.
+    pub snippet: String,
+}
+
+/// Quote every term and AND them: this axis answers "which document EVER said this", so a phrase
+/// means ALL its words. (It was OR when first written, which returned hits matching one word of a
+/// distinctive phrase — looser than the description promised.)
+///
+/// ★ A ONE-CHARACTER TOKEN IS NOT IGNORED (Stet, review of #226): dropping it made a real query
+/// return nothing, indistinguishable from "never written" — the failure this tool exists to remove.
+/// The caller refuses such a query instead, by name.
+fn terms(phrase: &str) -> Result<String> {
+    let parts: Vec<String> = phrase
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .map(|t| t.replace('"', ""))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err(crate::error::Error::Invalid(
+            "the phrase has no searchable terms".into(),
+        ));
+    }
+    if let Some(short) = parts.iter().find(|t| t.len() < 2) {
+        return Err(crate::error::Error::Invalid(format!(
+            "`{short}` is a single character: a one-letter term is not a word search. Use a longer \
+             fragment, or `pattern` over `memory_search` for a literal substring."
+        )));
+    }
+    Ok(parts
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+/// Search the words every version ever held. Never fused into `memory_search`: a hit here is a past
+/// state, and a ranking that mixed the two would put deleted text in a live page.
+pub fn search(conn: &Connection, phrase: &str, limit: usize) -> Result<Vec<HistoryMatch>> {
+    search_visible(conn, phrase, limit, |_| true)
+}
+
+/// ★ THE VISIBLE WALK (Stet, review of #226). The audience filter is a PRIVACY BOUNDARY, so it
+/// cannot be applied after a `LIMIT`: a narrow reader whose top-k are all another pen's private
+/// history would be told "nothing ever said this" while the words sit at rank k+1. The ranked rows
+/// are walked here, the predicate is asked about each, and the walk stops at `limit` VISIBLE hits.
+/// Filter, then truncate — never the reverse.
+pub fn search_visible<F>(
+    conn: &Connection,
+    phrase: &str,
+    limit: usize,
+    visible: F,
+) -> Result<Vec<HistoryMatch>>
+where
+    F: Fn(&str) -> bool,
+{
+    let expr = terms(phrase)?;
+    let mut stmt = conn.prepare(
+        "SELECT h.key, h.n, v.written_at, (m.id IS NULL) AS orphan,
+                snippet(history_fts, 0, '[', ']', '…', 12)
+           FROM history_fts h
+           JOIN memory_version v ON v.key = h.key AND v.n = h.n AND v.type = ?1
+           LEFT JOIN memory m ON m.key = h.key
+          WHERE history_fts MATCH ?2
+          ORDER BY rank",
+    )?;
+    let mut rows = stmt.query(params![MEMORY, expr])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let hit = HistoryMatch {
+            key: r.get(0)?,
+            n: r.get(1)?,
+            written_at: r.get(2)?,
+            orphan: r.get(3)?,
+            snippet: r.get(4)?,
+        };
+        if visible(&hit.key) {
+            out.push(hit);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod history_search_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::config::Paths::from_root(dir.path());
+        let conn = crate::db::open(&paths).expect("store");
+        (dir, conn)
+    }
+
+    #[test]
+    fn a_deleted_bodys_words_are_findable_and_then_erasable() {
+        // ★ #115 acceptance 1-3: write, rewrite, delete; the phrase is found, named as a PAST state
+        // and an orphan; and after erase it is GONE — tested by the effect, not the return value.
+        let (_d, conn) = store();
+        let mem = crate::store::Memory {
+            key: "a-note".into(),
+            title: "t".into(),
+            body: "the widget calibration constant is zebracorn".into(),
+            ..Default::default()
+        };
+        crate::store::add(&conn, &mem).expect("add");
+        // A rewrite snapshots the old body into history.
+        let mut patch = crate::store::Patch {
+            key: Some("a-note".into()),
+            body: Some("rewritten, the constant moved".into()),
+            ..Default::default()
+        };
+        crate::store::merge(&conn, &patch).expect("merge");
+        crate::store::delete(&conn, "a-note", None).expect("delete");
+        patch.key = None;
+
+        let hits = search(&conn, "zebracorn", 10).expect("search");
+        assert_eq!(hits.len(), 1, "the old words are found: {hits:?}");
+        assert_eq!(hits[0].key, "a-note");
+        assert!(
+            hits[0].orphan,
+            "and the row is gone, so this is the only copy"
+        );
+        assert!(hits[0].snippet.contains("zebracorn"), "{}", hits[0].snippet);
+
+        // The same phrase is NOT in the live word index — that is the whole point of a third axis.
+        assert!(
+            crate::index::fts::search(&conn, "zebracorn", 10)
+                .expect("live fts")
+                .is_empty()
+        );
+
+        erase(&conn, "a-note").expect("erase");
+        assert!(
+            search(&conn, "zebracorn", 10).expect("search").is_empty(),
+            "after erase the words are gone — the index follows the history"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_visibility_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::config::Paths::from_root(dir.path());
+        let conn = crate::db::open(&paths).expect("store");
+        // An audience may only NAME A PEN THAT EXISTS, so the fixture needs two of them.
+        conn.execute_batch(
+            "INSERT INTO pen (name, kind) VALUES ('stet','self'), ('cline','self');",
+        )
+        .expect("pens");
+        (dir, conn)
+    }
+
+    #[test]
+    fn the_audience_is_applied_before_the_cap() {
+        // ★ Stet's review of #226: a narrow reader whose top-k are all another pen's private
+        // history must still see the public rows BEYOND the cut — not "nothing ever said this".
+        let (_d, conn) = store();
+        // Two private rows rank ahead of one public row for the same word.
+        for key in ["secret-a", "secret-b"] {
+            let m = crate::store::Memory {
+                key: key.into(),
+                title: "private".into(),
+                body: "zebracorn appears in a private note".into(),
+                audience: "pen:stet".into(),
+                // An audience that names others must also name its author, or the row is
+                // unreadable by the pen that wrote it.
+                asserted_by: Some("stet".to_string()),
+                ..Default::default()
+            };
+            crate::store::add(&conn, &m).expect("add");
+            crate::store::delete(&conn, key, Some("stet")).expect("delete"); // history is what we search
+        }
+        let public = crate::store::Memory {
+            key: "public-c".into(),
+            title: "public".into(),
+            body: "zebracorn appears in a public note".into(),
+            asserted_by: Some("stet".to_string()),
+            ..Default::default()
+        };
+        crate::store::add(&conn, &public).expect("add");
+        crate::store::delete(&conn, "public-c", Some("stet")).expect("delete");
+
+        // A different pen may see the public row's history and not the private ones, and the walk
+        // must keep going past the private hits to reach it — the whole point of filtering first.
+        let other = crate::store::audience::Reader::pen("cline");
+        let hits = search_visible(&conn, "zebracorn", 1, |key| {
+            other.sees(&class_of(&conn, key))
+        })
+        .expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the visible row is found, not the private ones"
+        );
+        assert_eq!(hits[0].key, "public-c");
+    }
+
+    fn class_of(conn: &Connection, key: &str) -> String {
+        read_latest(conn, key)
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                s.get("audience")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "public".into())
+    }
+
+    #[test]
+    fn a_one_character_term_is_refused_rather_than_silently_empty() {
+        let (_d, conn) = store();
+        let err = search(&conn, "a", 5).unwrap_err().to_string();
+        assert!(err.contains("single character"), "{err}");
     }
 }

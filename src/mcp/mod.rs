@@ -54,6 +54,7 @@ pub const TOOLS: &[&str] = &[
     "memory_upsert",
     "memory_delete",
     "memory_history_erase",
+    "memory_history_search",
     "memory_merge",
     "memory_adopt",
     "memory_search",
@@ -310,6 +311,21 @@ List projects — the cheap index over them (`key`, `status`, `owner`, `tags`, `
 `start_date`, `end_date`; never `state`, which is a `project_get` away). Filters intersect: `status`, `tags` (every listed \
 tag must be present) and a literal/regex `pattern` over `key`/`title`/`goal`/`state`. Omit them \
 all to list every project.";
+
+/// Parameters for [`MemoryServer::memory_history_search`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySearchParams {
+    /// Words to find in any past state.
+    #[schemars(
+        description = "Words to find in ANY past state of any document — superseded, rewritten or deleted. Exact tokens, not meaning: this is the axis for hashes, keys and negations."
+    )]
+    pub query: String,
+    /// How many hits.
+    #[serde(default)]
+    #[schemars(description = "Most hits to return (default 10).")]
+    pub k: Option<usize>,
+}
 
 /// Parameters for [`MemoryServer::memory_history_erase`]. Exactly one of `key` / `orphans`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2552,6 +2568,46 @@ impl MemoryServer {
         }
     }
 
+    /// Words over HISTORY — the third axis (address, meaning, words).
+    #[tool(
+        name = "memory_history_search",
+        description = "Find the EXACT WORDS in any PAST state of any document — superseded, rewritten or deleted. The axis that answers hashes, keys and negations, where embeddings are blind. \n\nEvery hit is a PAST state, never a current row: it names the key, which version, when it was written, and whether the memory still exists (`orphan` — this is then the only copy of that text). It is never fused into `memory_search`, because mixing deleted text into a live page is the thing this store keeps having to undo.",
+        annotations(
+            title = "Search memory history",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_history_search(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<HistorySearchParams>,
+    ) -> std::result::Result<String, String> {
+        let _pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let limit = p.k.unwrap_or(10).clamp(1, 200);
+        let hits = self
+            .with_store("memory_history_search", move |s| {
+                s.history_search(&p.query, limit)
+            })
+            .await?;
+        let rows: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "key": h.key,
+                    "version": h.n,
+                    "written_at": h.written_at,
+                    "orphan": h.orphan,
+                    "state": "past",
+                    "snippet": h.snippet,
+                })
+            })
+            .collect();
+        Ok(json_ok(serde_json::json!({ "hits": rows })))
+    }
+
     /// The store's only true destroyer: erase deleted keys' history.
     #[tool(
         name = "memory_history_erase",
@@ -4780,6 +4836,10 @@ pub fn http_router(
         .route(
             "/history",
             axum::routing::get(surface::history).delete(surface::history_erase),
+        )
+        .route(
+            "/history/search",
+            axum::routing::get(surface::history_search),
         )
         .route(
             "/memory/{key}",

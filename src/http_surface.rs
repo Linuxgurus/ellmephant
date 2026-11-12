@@ -104,6 +104,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/history/search",
+        tool: "memory_history_search",
+    },
+    Route {
+        method: "GET",
         path: "/unowned",
         tool: "memory_unowned",
     },
@@ -2398,6 +2403,66 @@ pub async fn memory_delete(
             format!("no such memory: {key}"),
         ),
         Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `GET /history/search?q=<words>` — exact words over every PAST state (`memory_history_search`).
+pub async fn history_search(
+    State(state): State<HttpState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let Some(phrase) = params.get("q").map(str::to_string) else {
+        return error(true, StatusCode::BAD_REQUEST, "need `q` (words to find)");
+    };
+    let limit = params
+        .get("k")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10)
+        .clamp(1, 200);
+    // Reads need no bearer beyond the door's own, like every other GET on this surface.
+    let scope = match authorize(&state, &headers, true) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match server
+        .with_store("memory_history_search", move |s| {
+            s.history_search(&phrase, limit)
+        })
+        .await
+    {
+        Ok(hits) => {
+            let rows: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "key": h.key,
+                        "version": h.n,
+                        "written_at": h.written_at,
+                        "orphan": h.orphan,
+                        "state": "past",
+                        "snippet": h.snippet,
+                    })
+                })
+                .collect();
+            tracing::info!(
+                area = scope.area,
+                hits = rows.len(),
+                "history searched over http"
+            );
+            render(
+                StatusCode::OK,
+                true,
+                json_ok(serde_json::json!({ "hits": rows })),
+                format!("{} past state(s) matched", rows.len()),
+            )
+        }
+        Err(e) => error(true, error_status(&e), e),
     }
 }
 

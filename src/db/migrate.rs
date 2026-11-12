@@ -215,6 +215,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0041_recess_config_moved.sql"),
         "retire: the three recess policy rows moved to brain.db with the bank",
     ),
+    (
+        42,
+        include_str!("../../migrations/0042_history_fts.sql"),
+        "words over history: an FTS index of every version, backfilled once",
+    ),
 ];
 
 /// Current schema version recorded in the file.

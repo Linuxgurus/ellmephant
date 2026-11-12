@@ -62,7 +62,8 @@ pub struct Query {
     pub pattern: Option<String>,
     /// How `pattern` is read — a plain substring or a regex ([`MatchMode`]).
     pub mode: MatchMode,
-    /// Result cap — over the FUSED list when both legs ran, over the single leg when only one did.
+    /// Result cap — over the FUSED list when both legs ran (`hits`), and ALSO over each leg's own
+    /// list (`semantic`, `lexical`): `k` truncates, it never reorders.
     pub k: usize,
     /// Optional cosine-distance ceiling. Applies to the SEMANTIC leg only, so it can empty that leg
     /// and leave a purely lexical page (`SearchMeta::semantic_candidates == 0`).
@@ -193,10 +194,10 @@ pub struct Bundle {
     ///
     /// `hits` remains the fused (RRF) page **for compatibility**: it is what every caller read
     /// before this change, and it is scheduled to be removed once the consumers move.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub semantic: Vec<Hit>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lexical: Vec<Hit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<Vec<Hit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical: Option<Vec<Hit>>,
     /// Hits, distance-ranked when the phrase was semantic — the FUSED view (deprecated).
     pub hits: Vec<Hit>,
     /// Link neighbours, breadth-first from the hits.
@@ -310,8 +311,8 @@ impl Fields {
 
     /// One hit as a positional row matching [`names`](Self::names).
     pub fn row(&self, h: &Hit) -> serde_json::Value {
-        // `score` rides with `distance` when either is asked for: the two legs are reported
-        // separately, so a caller comparing their orders needs both numbers on the same row.
+        // `score` is a COLUMN, not an automatic companion to `distance`: it appears only when the
+        // caller asks for it, like every other field on this wire.
         serde_json::Value::Array(self.0.iter().map(|f| self.value(h, *f)).collect())
     }
 
@@ -354,13 +355,13 @@ pub fn to_wire_json(bundle: &Bundle, fields: &Fields) -> Result<String> {
     // view; these are the answer a caller can actually trust — a row's position in `semantic` is its
     // distance, and its position in `lexical` is its BM25. Absent when that leg did not run, so an
     // empty array never impersonates "the leg found nothing".
-    if !bundle.semantic.is_empty() {
-        let rows: Vec<serde_json::Value> = bundle.semantic.iter().map(|h| fields.row(h)).collect();
+    if let Some(hits) = &bundle.semantic {
+        let rows: Vec<serde_json::Value> = hits.iter().map(|h| fields.row(h)).collect();
         out.push_str(",\"semantic\":");
         out.push_str(&crate::wire::rows_array(&rows));
     }
-    if !bundle.lexical.is_empty() {
-        let rows: Vec<serde_json::Value> = bundle.lexical.iter().map(|h| fields.row(h)).collect();
+    if let Some(hits) = &bundle.lexical {
+        let rows: Vec<serde_json::Value> = hits.iter().map(|h| fields.row(h)).collect();
         out.push_str(",\"lexical\":");
         out.push_str(&crate::wire::rows_array(&rows));
     }
@@ -453,6 +454,25 @@ pub fn run(
         l.retain(|(id, _)| !hidden(id));
         lex_scores.retain(|id, _| !hidden(id));
     }
+    // EVERY LIST DESCENDS FROM ONE FILTERED CANDIDATE SET (Stet, review of #224). The structured
+    // filters (`tags`/size/time) and the `pattern` leg used to be applied to the FUSED page only, so
+    // the leg lists could return rows that violated the caller's own filter — and the comment above
+    // them claimed otherwise. They are applied once, here, to `phrase` and `lexical` themselves;
+    // `ordered`, `hits`, `semantic` and `lexical` are then all built from what is left.
+    let structured = filter_set(conn, q)?;
+    let pattern_set = lexical_set(conn, q)?;
+    let keep = |id: &i64| {
+        structured.as_ref().is_none_or(|s| s.contains(id))
+            && pattern_set.as_ref().is_none_or(|s| s.contains(id))
+    };
+    if let Some(p) = phrase.as_mut() {
+        p.retain(|(id, _)| keep(id));
+    }
+    if let Some(l) = lexical.as_mut() {
+        l.retain(|(id, _)| keep(id));
+    }
+    lex_scores.retain(|id, _| keep(id));
+
     // ★ `semantic_only` SKIPS THE FUSION ENTIRELY, and it has to. `fuse` spends `k` slots on the
     // combined ranking, so a semantic row can be crowded out by word matches before the filter
     // below ever sees it — which made `semantic_only` able to return EMPTY while
@@ -466,6 +486,11 @@ pub fn run(
         (None, None) => all_ranked(conn)?,
     };
     ordered.retain(|(id, _)| !hidden(id));
+    // ★ AND THE FILTERS, ONCE MORE ON `ordered` ITSELF: the leg lists were filtered above, but a
+    // query with no phrase and no pattern ranks `all_ranked` — which no leg filtered, so a
+    // tag/size/time filter must still apply to it (found by the #224 re-review: two rows where the
+    // caller asked for one).
+    ordered.retain(|(id, _)| keep(id));
     // ★ WHICH LEG FOUND EACH ROW, recorded before any filter can hide the distinction. `distance`
     // alone cannot say it, and a caller should not have to join two answers to learn whether their
     // phrase reached anything — that is the defect this carries (soma/ellmephant#213 follow-up).
@@ -495,16 +520,9 @@ pub fn run(
     // "the filter was dropped".
     meta.predicates = predicates.clone();
 
-    // Structured filters intersect the candidate set BEFORE the k cap, so a filtered result
-    // is exact (the KNN already spans the whole store): filter, then truncate, never the reverse.
-    if let Some(set) = filter_set(conn, q)? {
-        ordered.retain(|(id, _)| set.contains(id));
-    }
-    // The lexical leg intersects the same way; a lexical-only query is unranked, so `k` does not
-    // cap it (like the structured filters).
-    if let Some(set) = lexical_set(conn, q)? {
-        ordered.retain(|(id, _)| set.contains(id));
-    }
+    // (the structured and `pattern` filters are applied EARLIER, to the candidate lists themselves —
+    // see the block above `semantic_only`. Applying them here as well would leave the two leg lists
+    // unfiltered, which is the defect Stet found in the review of #224.)
     // `semantic_only` is already a single-leg list (see above), so it is capped here like one.
     if q.semantic_only {
         ordered.retain(|(id, _)| semantic_ids.contains(id));
@@ -576,13 +594,16 @@ pub fn run(
         Ok(out)
     };
     let cap = q.k.max(1);
+    // ★ `None` MEANS THE LEG DID NOT RUN; `Some(vec![])` MEANS IT RAN AND FOUND NOTHING (Stet,
+    // review of #224). The two were byte-identical while an empty list was skipped by serde, so the
+    // next consumer would read "absent" as "no phrase given" and re-derive the wrong world.
     let semantic_rows = match &phrase {
-        Some(p) => leg(p, cap)?,
-        None => Vec::new(),
+        Some(p) => Some(leg(p, cap)?),
+        None => None,
     };
     let lexical_rows = match &lexical {
-        Some(l) => leg(l, cap)?,
-        None => Vec::new(),
+        Some(l) => Some(leg(l, cap)?),
+        None => None,
     };
 
     let neighbors = if q.expand > 0 {
@@ -669,7 +690,9 @@ fn phrase_ids_lexical(
     let want = (q.k.max(1) * 4).max(50);
     let hits = index::fts::search(conn, text, want)?;
     if hits.is_empty() {
-        return Ok(None);
+        // The leg RAN — the phrase was there, the index was there, nothing matched. Returning
+        // `None` here would say "no phrase was given", which is a different world.
+        return Ok(Some((Vec::new(), std::collections::HashMap::new())));
     }
     // `distance` stays None: BM25 is not a distance, and reporting a negative number in a field
     // documented as cosine distance is the unit confusion #59 exists to prevent.

@@ -260,8 +260,8 @@ fn no_constraints_returns_everything_in_key_order() {
 #[test]
 fn wire_json_is_positional_with_a_cols_header() {
     let bundle = search::Bundle {
-        semantic: Vec::new(),
-        lexical: Vec::new(),
+        semantic: None,
+        lexical: None,
         hits: vec![Hit {
             id: 1,
             key: "k".into(),
@@ -302,8 +302,8 @@ fn wire_json_is_positional_with_a_cols_header() {
 #[test]
 fn wire_json_defaults_to_key_only() {
     let bundle = search::Bundle {
-        semantic: Vec::new(),
-        lexical: Vec::new(),
+        semantic: None,
+        lexical: None,
         hits: vec![Hit {
             id: 1,
             key: "k".into(),
@@ -348,8 +348,8 @@ fn fields_always_include_key_and_keep_canonical_order() {
 #[test]
 fn wire_json_emits_a_neighbors_table_when_expanded() {
     let bundle = search::Bundle {
-        semantic: Vec::new(),
-        lexical: Vec::new(),
+        semantic: None,
+        lexical: None,
         hits: vec![],
         neighbors: vec![Neighbor {
             hop: 1,

@@ -239,7 +239,7 @@ fn the_two_legs_are_reported_separately_each_in_its_own_order() {
             .collect::<Vec<_>>()
     );
     // Best-first: SQLite's BM25 is lower-is-better, the same direction as distance.
-    let scores: Vec<f32> = lexical.iter().filter_map(|h| h.score).collect();
+    let scores: Vec<f64> = lexical.iter().filter_map(|h| h.score).collect();
     let mut sorted = scores.clone();
     sorted.sort_by(|a, c| a.partial_cmp(c).unwrap());
     assert_eq!(
@@ -276,6 +276,9 @@ fn a_tag_filter_applies_to_the_leg_lists_too() {
     let mut q = q("cargo runner", 5);
     q.tags = vec!["prj:x".into()];
     let b = search::run(&conn, Some(&embedder), &reader, &q).expect("run");
+    // ★ A TEST MUST NOT PASS BY FINDING NOTHING (Stet, review of #224, again): both legs ran here.
+    assert!(b.semantic.is_some(), "the phrase leg ran");
+    assert!(b.lexical.is_some(), "the word leg ran");
     for (name, list) in [("semantic", &b.semantic), ("lexical", &b.lexical)] {
         if let Some(hits) = list {
             assert!(

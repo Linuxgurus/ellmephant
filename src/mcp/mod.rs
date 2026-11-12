@@ -598,6 +598,8 @@ pub enum FieldParam {
     Chars,
     /// Cosine distance (semantic ranking only).
     Distance,
+    /// BM25 for the lexical leg (lower is better, like distance — a different unit).
+    Score,
 }
 
 impl FieldParam {
@@ -610,6 +612,7 @@ impl FieldParam {
             FieldParam::Tags => Field::Tags,
             FieldParam::Chars => Field::Chars,
             FieldParam::Distance => Field::Distance,
+            FieldParam::Score => Field::Score,
         }
     }
 }
@@ -5189,7 +5192,7 @@ mod tests {
             .filter_map(|v| v.get("const"))
             .filter_map(|v| v.as_str())
             .collect();
-        for want in ["key", "via", "title", "tags", "chars", "distance"] {
+        for want in ["key", "via", "title", "tags", "chars", "distance", "score"] {
             assert!(
                 field_vals.contains(&want),
                 "missing field {want}: {field_vals:?}"

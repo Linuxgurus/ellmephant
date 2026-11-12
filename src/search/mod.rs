@@ -170,7 +170,7 @@ pub struct Hit {
     /// keyword quality match"). Deliberately a SEPARATE field from `distance`: same direction
     /// (lower is better), different unit and different leg. A row found by both legs carries both.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f32>,
+    pub score: Option<f64>,
 }
 
 /// A link-neighbour pulled in by `--expand` (SPEC §10).
@@ -325,9 +325,10 @@ impl Fields {
             Field::Tags => serde_json::json!(h.tags),
             Field::Chars => serde_json::json!(h.chars),
             Field::Distance => serde_json::json!(h.distance.map(wire_distance)),
-            Field::Score => {
-                serde_json::json!(h.score.map(|b| ((b as f64) * 10_000.0).round() / 10_000.0))
-            }
+            // ★ NO ROUNDING FOR BM25 (Stet, review of #224): `wire_distance` rounds because a cosine
+            // distance lives in [0,2]; BM25 clusters near zero, where -2.0e-06 and -1.5e-06 are
+            // different match qualities and both would print `0.0`.
+            Field::Score => serde_json::json!(h.score),
         }
     }
 }
@@ -436,7 +437,7 @@ pub fn run(
     // them would need a calibration nobody has. `k=60` is the constant from the RRF literature: it
     // flattens the top of each list so one leg's runaway first place does not veto the other.
     let mut lexical_leg = phrase_ids_lexical(conn, q)?;
-    let mut lex_scores: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+    let mut lex_scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
     let mut lexical: Option<Vec<Candidate>> = lexical_leg.take().map(|(ids, scores)| {
         lex_scores = scores;
         ids
@@ -459,6 +460,12 @@ pub fn run(
     // the leg lists could return rows that violated the caller's own filter — and the comment above
     // them claimed otherwise. They are applied once, here, to `phrase` and `lexical` themselves;
     // `ordered`, `hits`, `semantic` and `lexical` are then all built from what is left.
+    // ★ THE CANDIDATE COUNTS ARE WHAT THE LEGS PRODUCED (Stet, review of #224): they are taken
+    // BEFORE the structured filters, so `semantic_candidates: 0` keeps its one meaning — the phrase
+    // leg answered nothing — instead of also meaning "a tag filter excluded every phrase hit".
+    let semantic_ids: HashSet<i64> = phrase.iter().flatten().map(|(id, _)| *id).collect();
+    let lexical_ids: HashSet<i64> = lexical.iter().flatten().map(|(id, _)| *id).collect();
+
     let structured = filter_set(conn, q)?;
     let pattern_set = lexical_set(conn, q)?;
     let keep = |id: &i64| {
@@ -494,8 +501,6 @@ pub fn run(
     // ★ WHICH LEG FOUND EACH ROW, recorded before any filter can hide the distinction. `distance`
     // alone cannot say it, and a caller should not have to join two answers to learn whether their
     // phrase reached anything — that is the defect this carries (soma/ellmephant#213 follow-up).
-    let semantic_ids: HashSet<i64> = phrase.iter().flatten().map(|(id, _)| *id).collect();
-    let lexical_ids: HashSet<i64> = lexical.iter().flatten().map(|(id, _)| *id).collect();
     let mut predicates: Vec<String> = Vec::new();
     let mut meta = SearchMeta {
         max_distance: q.max_distance,
@@ -681,7 +686,7 @@ fn predicate_set(
 fn phrase_ids_lexical(
     conn: &Connection,
     q: &Query,
-) -> Result<Option<(Vec<Candidate>, std::collections::HashMap<i64, f32>)>> {
+) -> Result<Option<(Vec<Candidate>, std::collections::HashMap<i64, f64>)>> {
     let Some(text) = q.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -700,8 +705,9 @@ fn phrase_ids_lexical(
     // one rank, because a BM25 in a `distance` field is a unit confusion. With the legs reported
     // separately, the score IS the ordering of the lexical list, so it travels beside the ids and
     // never into `distance`.
-    let scores: std::collections::HashMap<i64, f32> =
-        hits.iter().map(|h| (h.id, h.bm25 as f32)).collect();
+    // ★ f64, NOT f32 (Stet, review of #224): SQLite's BM25 values cluster near zero — 2e-06 and
+    // 1.5e-06 are different qualities, and an f32 round-trip loses the digits that distinguish them.
+    let scores: std::collections::HashMap<i64, f64> = hits.iter().map(|h| (h.id, h.bm25)).collect();
     Ok(Some((
         hits.into_iter().map(|h| (h.id, None)).collect(),
         scores,

@@ -56,6 +56,7 @@ pub const TOOLS: &[&str] = &[
     "memory_history_erase",
     "memory_history_search",
     "memory_merge",
+    "memory_fold",
     "memory_adopt",
     "memory_search",
     "semantic_search",
@@ -257,6 +258,19 @@ call has nothing to integrate. Returns `integrated` — the lines it appended on
 made for you is visible. Both keys must exist: a merge into a typo would destroy the source. To \
 discard prose on purpose use `memory_delete`: a merge integrates, a delete discards. `[[prj:from]]` \
 is not rewritten (that names a project). Reports what moved.";
+
+/// `memory_fold` description. The append-only cross-pen fold (#199).
+const FOLD_DESCRIPTION: &str = "\
+Fold one memory's lines into another WITHOUT deleting the source and WITHOUT needing write \
+authority on the keeper. This is the cross-pen maintenance verb: `memory_merge` is a PATCH, so it \
+needs the survivor's write authority, and two sibling pens can never tidy each other's rows with \
+it. A fold can only APPEND — it cannot change the keeper's title, audience, tags, or any line it \
+already carries — so it takes only the READ gate on both rows, plus the keeper's lease if it is \
+PROTECTED. It records `edited_by` (the pen that folded) and the absorbed key, and it names both in \
+its report. It never deletes `from`, never repoints `[[links]]`, and never touches a project \
+preload: removing the absorbed row is the act of the pen that answers for it, and this verb \
+deliberately cannot do it. If the keeper already carries every line, it says so and writes nothing \
+rather than paraphrasing. Use `memory_merge` when you DO hold the survivor and want the source gone.";
 
 /// `memory_adopt` description. Responsibility, not authorship — and the two rules that stop it
 /// becoming a land-grab.
@@ -838,6 +852,22 @@ pub struct MergeParams {
     /// The key that survives.
     #[schemars(
         description = "The key that survives — the stronger memory. You are judging which is which by naming it here. Any line of `from` this does not already carry is appended to it verbatim, so its information is in it when the call returns."
+    )]
+    pub into: String,
+}
+
+/// Parameters for [`MemoryServer::memory_fold`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FoldParams {
+    /// The key whose lines move. It is NOT deleted.
+    #[schemars(
+        description = "The key whose lines are appended to `into`. It is NOT deleted, keeps its owner, and can only be removed by the pen that answers for it."
+    )]
+    pub from: String,
+    /// The key that gains the lines. It is not otherwise changed.
+    #[schemars(
+        description = "The key that gains the lines. Its title, audience and tags are untouched; only its body grows, by the lines of `from` it does not already carry."
     )]
     pub into: String,
 }
@@ -2660,6 +2690,46 @@ impl MemoryServer {
                     .to_string(),
             ),
         }
+    }
+
+    /// Fold one memory's lines into another without deleting the source — the append-only,
+    /// cross-pen maintenance verb.
+    #[tool(
+        name = "memory_fold",
+        description = FOLD_DESCRIPTION,
+        annotations(
+            title = "Fold memory",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_fold(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<FoldParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let from = p.from;
+        let into = p.into;
+        let log_from = from.clone();
+        let log_into = into.clone();
+        let out = self
+            .with_store("memory_fold", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+                s.fold_into(&from, &into, Some(&pen))
+            })
+            .await?;
+        tracing::info!(
+            tool = "memory_fold",
+            from = %log_from,
+            into = %log_into,
+            lines = out.integrated.len(),
+            changed = out.changed,
+            "memory folded"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Integrate one memory into another and delete it — the safe way to merge.
@@ -4851,6 +4921,7 @@ pub fn http_router(
         )
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
+        .route("/memory/{key}/fold", axum::routing::post(surface::fold))
         .route("/memory/{key}/adopt", axum::routing::post(surface::adopt))
         .route("/memory", axum::routing::post(surface::upsert))
         .route("/search", axum::routing::get(surface::search))

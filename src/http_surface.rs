@@ -119,6 +119,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/memory/{key}/fold",
+        tool: "memory_fold",
+    },
+    Route {
+        method: "POST",
         path: "/memory/{key}/adopt",
         tool: "memory_adopt",
     },
@@ -2685,6 +2690,99 @@ pub async fn merge(
                     "merged {key} -> {into} ({} line(s) integrated, {} refs repointed)",
                     out.integrated.len(),
                     out.bodies
+                ),
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
+/// `POST /memory/{key}/fold?into=` — append one memory's lines to another (`memory_fold`).
+///
+/// The cross-pen maintenance verb: `from` (the path key) keeps existing, and `into` is appended to
+/// without needing its write authority. The two rows' arguments are parsed exactly as `merge`'s so a
+/// caller can send the MCP tool's arguments unchanged.
+pub async fn fold(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    if let Some(given) = body
+        .as_ref()
+        .and_then(|b| b.get("from"))
+        .and_then(|f| f.as_str())
+        && given != key
+    {
+        return error(
+            json,
+            StatusCode::BAD_REQUEST,
+            format!("body `from` is `{given}` but the path names `{key}`"),
+        );
+    }
+    let into = match body
+        .as_ref()
+        .and_then(|b| b.get("into"))
+        .and_then(|i| i.as_str())
+    {
+        Some(into) => into.to_string(),
+        None => match params.maybe("into") {
+            Some(into) => into.to_string(),
+            None => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    "missing `into`: send `?into=<key>`, or a JSON body {\"into\": \"<key>\"}",
+                );
+            }
+        },
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let from = key.clone();
+    let target = into.clone();
+    // A fold changes the record, so it takes the same channel gate a merge does; it does NOT take
+    // the source's write authority, which is the whole point.
+    let pen = crate::identity::resolve(&state.paths, &headers)
+        .ok()
+        .flatten();
+    match server
+        .with_store("memory_fold", move |s| {
+            if let Some(caller) = &pen {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+
+            s.fold_into(&from, &target, pen.as_deref())
+        })
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, from = %key, into = %into, changed = out.changed, "folded over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                format!(
+                    "folded {key} into {into} ({} line(s) appended{})",
+                    out.integrated.len(),
+                    if out.changed {
+                        ""
+                    } else {
+                        "; nothing was missing"
+                    }
                 ),
             )
         }

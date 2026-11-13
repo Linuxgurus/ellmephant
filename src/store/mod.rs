@@ -235,7 +235,7 @@ fn held_authority(conn: &Connection, caller: &str) -> Result<Vec<i64>> {
         .collect())
 }
 
-fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {
+pub(crate) fn may_read_audience(conn: &Connection, caller: &str, audience: &str) -> Result<bool> {
     // ★ ONE PREDICATE, ONE PLACE (2026-10-24). This used to hand-roll the rule; now it asks the very
     // same [`Reader`] the read paths ask, so a write's visibility check and a read cannot disagree
     // about a list audience, a `subtree:` share, or a borrowed root.
@@ -751,8 +751,13 @@ fn guard_protected(
     Ok(())
 }
 
-/// A delete has no patch to inspect, so it only asks: is a live lease held on this key?
-fn guard_protected_delete(conn: &Connection, key: &str, writer: Option<&str>) -> Result<()> {
+/// A write with no patch to inspect — a delete, or a fold's append — only asks: is this row
+/// PROTECTED, and if so does `writer` hold a live lease on it?
+pub(crate) fn guard_protected_lease(
+    conn: &Connection,
+    key: &str,
+    writer: Option<&str>,
+) -> Result<()> {
     let Some(mem) = get(conn, key)? else {
         return Ok(());
     };
@@ -2282,7 +2287,7 @@ pub fn unowned(conn: &Connection, reader: &audience::Reader, limit: i64) -> Resu
 /// Delete a memory by key. `memory_link` follows via FK cascade; the vector is dropped explicitly, and
 /// so is the key's queue entry. Returns whether a row was removed.
 pub fn delete(conn: &Connection, key: &str, acted_by: Option<&str>) -> Result<bool> {
-    guard_protected_delete(conn, key, acted_by)?;
+    guard_protected_lease(conn, key, acted_by)?;
     // ★ A DELETE IS A WRITE OF ABSENCE (soma/ellmephant#109). It takes the same reach as an edit —
     // the owner, the pen acting for the owner, or an ancestor — and it leaves the same kind of
     // record. Removal that nobody is named for is indistinguishable from a mistake.

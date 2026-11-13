@@ -458,7 +458,7 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 ## 11. Interfaces
 
 **MCP tools** (served over Streamable HTTP by default, `--stdio` optional): `memory_upsert`,
-`memory_delete`, `memory_merge`,
+`memory_delete`, `memory_merge`, `memory_fold`,
 `memory_search`,
 `memory_get`, `memory_backlinks`, `memory_upvote`, `memory_stats`,
 `memory_dupes`, `memory_reembed`, `project_upsert`, `project_get`, `project_list`.
@@ -514,8 +514,14 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
 - `memory_dupes` is the **finder for the §9 merge rule**: a read-only audit returning memory
   *pairs* whose document embeddings sit within a tight cosine ceiling (default `0.05`), nearest
   first, `key`/title per side (`store::dupes::find` — one KNN pass per memory, pairs deduped).
-  A **finder, not a judge**: same-topic memories still cluster (the documents are tersely worded),
-  so candidates are judged (`memory_get` both) before merging. No bodies.
+  A **finder AND a classifier, not a judge**: same-topic memories still cluster (the documents are
+  tersely worded), so each pair carries a `class` — `duplicate` (near-identical content: a
+  keeper/loser plan is safe), `series` (both keys are dated steps of one series: NEVER a merge
+  candidate), `artifact` (verbatim captures with a recoverable source: collapse only into one row
+  that cites it), `distinct` (close by embedding, different by content). The class is decided by a
+  readable rule, never by distance. `plan: true` returns the merge plan: keeper/absorbed steps for
+  `duplicate` only, with the reason the keeper is the keeper, and a named refusal for every other
+  pair. No bodies.
 - `memory_merge` **integrates one memory into another and deletes it**: every line of `from`'s body
   that `into` does not already carry is appended to `into` **verbatim** (`store::links::missing_lines`),
   so nothing is lost and nothing is paraphrased — the invariant "every line of `from` survives in
@@ -532,6 +538,13 @@ SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 AND k = ?2 O
   to notice it. `[[prj:from]]` is not rewritten (that names a project). This is the actor that makes
   hygiene safe: without it a merge leaves dangling references, so merging never happened. Returns
   `integrated` — the lines it appended on the caller's behalf (`store::links::merge_into`).
+- `memory_fold` is the **append-only cross-pen maintenance verb** (#199). `memory_merge` is a patch,
+  so it takes the survivor's write authority — which two sibling pens never have over each other.
+  A fold appends the source's lines the keeper does not already carry, changes nothing that already
+  exists (title, audience, tags, or any existing line), records `edited_by` and the absorbed key in
+  `memory_fold`, and **never deletes the source, repoints a link, or touches a preload**. It takes
+  the READ gate on both rows (copying is reading) and the keeper's lease if it is PROTECTED
+  (`store::links::fold_into`).
 
 **CLI** — the shipped verbs, and nothing else:
 

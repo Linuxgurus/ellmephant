@@ -482,6 +482,138 @@ pub fn merge_into(
     })
 }
 
+/// What a fold changed. It names the keeper, the row whose lines moved, and the lines it appended.
+///
+/// ★ NO DELETION IS REPORTED BECAUSE NONE HAPPENS. A fold moves prose; removing the absorbed row is
+/// the act of the pen that answers for it, and this verb deliberately cannot do it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FoldOutcome {
+    /// The row that gained lines.
+    pub into: String,
+    /// The row those lines came from. It still exists.
+    pub from: String,
+    /// The lines appended to `into`, verbatim. Empty means `into` already carried every line.
+    pub integrated: Vec<String>,
+    /// Whether anything was written at all.
+    pub changed: bool,
+}
+
+/// Fold `from` into `into` WITHOUT deleting `from` and WITHOUT write authority on `into`.
+///
+/// This is the one cross-pen maintenance verb (soma/ellmephant#199). `merge_into` requires full
+/// write authority on the survivor because it is a PATCH; exempting it would let any reader rewrite
+/// the title, audience and tags of a row it does not answer for — the #190 defect wearing a tidy
+/// excuse. A fold is narrower by construction:
+///
+/// - it appends only the source's lines the keeper does not already carry ([`missing_lines`]), so
+///   nothing existing can be changed, reworded or reordered;
+/// - it records `edited_by` (the pen that acted) and a row in `memory_fold` naming what was absorbed;
+/// - it never deletes the source, never repoints a `[[link]]`, and never touches a project preload;
+/// - it works in either direction, so a sibling pair has no impossible direction.
+///
+/// The gate is READ, not write: a pen must be able to see both rows (you cannot fold prose you are
+/// not allowed to read), and a PROTECTED keeper still needs its lease. Nothing else is asked,
+/// because nothing else can be changed.
+pub fn fold_into(
+    conn: &Connection,
+    from: &str,
+    into: &str,
+    acted_by: Option<&str>,
+) -> Result<FoldOutcome> {
+    let from = slug::slugify(from);
+    let into = slug::slugify(into);
+    if from == into {
+        return Err(Error::Config(
+            "a memory cannot be folded into itself".into(),
+        ));
+    }
+    let row = |key: &str| -> Result<(i64, String, String, String)> {
+        conn.query_row(
+            "SELECT id, title, body, audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(key.to_string()))
+    };
+    let (from_id, from_title, from_body, from_audience) = row(&from)?;
+    let (into_id, into_title, into_body, into_audience) = row(&into)?;
+
+    // ★ THE DOOR IS VISIBILITY, AND IT OPENS BOTH WAYS. A pen that cannot read the keeper must not
+    // append to it (it would be writing words it cannot see), and a pen that cannot read the source
+    // must not fold it (folding is copying, and copying is reading). An absent actor is a client that
+    // cannot be told apart from any other; the rows it may fold are the public ones, because every
+    // other read path treats an unproven reader the same way.
+    let reads = |audience: &str| -> Result<bool> {
+        match acted_by {
+            Some(pen) => crate::store::may_read_audience(conn, pen, audience),
+            // An unproven caller is allowed exactly what a public row offers.
+            None => Ok(audience == crate::store::audience::PUBLIC),
+        }
+    };
+    if !reads(&from_audience)? {
+        return Err(Error::Forbidden(format!(
+            "cannot fold `{from}`: its audience does not include the pen doing it. Folding copies \
+             prose, and copying is reading."
+        )));
+    }
+    if !reads(&into_audience)? {
+        return Err(Error::Forbidden(format!(
+            "cannot fold into `{into}`: its audience does not include the pen doing it. A row you \
+             cannot read is not a row you may append to."
+        )));
+    }
+    // A protected keeper is still protected: an append is a write, and the lease is what makes it
+    // visible. Asked by the same predicate the delete path asks.
+    crate::store::guard_protected_lease(conn, &into, acted_by)?;
+
+    let integrated = missing_lines(&from_body, &into_body);
+    if integrated.is_empty() {
+        return Ok(FoldOutcome {
+            into,
+            from,
+            integrated,
+            changed: false,
+        });
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    // The keeper's PREVIOUS text survives as a version, exactly as any document write does: a fold
+    // that is later judged wrong must be reversible by reading what it replaced.
+    crate::store::version::snapshot(&tx, into_id, &into, Some(&format!("fold from {from}")))?;
+    let body = format!("{}\n{}", into_body.trim_end(), integrated.join("\n"));
+    tx.execute(
+        "UPDATE memory SET body = ?2, edited_by = ?3, updated = datetime('now') WHERE id = ?1",
+        params![into_id, body, acted_by],
+    )?;
+    // The keeper's body moved, so its outgoing edges moved with it — and the new lines may carry
+    // `[[links]]` of their own. `write_links` is the one home for that write, and a changed document
+    // is queued for a new vector like any other write. The TITLE is read, never written.
+    crate::store::write_links(&tx, into_id, &into, &body)?;
+    let doc = projection::embed_document(&into, &into_title, &body);
+    crate::store::encode::enqueue(
+        &tx,
+        &Kind::Memory.keyslug(&into),
+        &doc,
+        crate::store::encode::PRIORITY_LIVE,
+    )?;
+    // The record that this happened, and where the lines came from. Append-only, like the prose.
+    tx.execute(
+        "INSERT INTO memory_fold (keeper_id, absorbed_key, actor) VALUES (?1, ?2, ?3)",
+        params![into_id, from, acted_by],
+    )?;
+    tx.commit()?;
+    // `from_id`/`from_title` are read so that the source is proven to exist before anything is
+    // written; it is deliberately not modified.
+    let _ = (from_id, from_title);
+    Ok(FoldOutcome {
+        into,
+        from,
+        integrated,
+        changed: true,
+    })
+}
+
 /// What a [`rename`] changed.
 #[derive(Debug, Clone)]
 pub struct RenameOutcome {

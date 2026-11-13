@@ -359,6 +359,17 @@ impl Session {
         links::merge_into(&self.conn, from, into, acted_by)
     }
 
+    /// Fold one row's lines into another WITHOUT deleting the source and WITHOUT write authority on
+    /// the keeper — the append-only cross-pen maintenance verb (#199).
+    pub fn fold_into(
+        &self,
+        from: &str,
+        into: &str,
+        acted_by: Option<&str>,
+    ) -> Result<links::FoldOutcome> {
+        links::fold_into(&self.conn, from, into, acted_by)
+    }
+
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
     /// point, backing `memory_get` on **both** doors: MCP's tool and `GET /memory/{key}`.
     ///

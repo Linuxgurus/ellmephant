@@ -131,6 +131,7 @@ becomes a compatibility shim for clients that speak it rather than a dependency 
 | `memory_upsert` | `POST /memory` | **implemented** |
 | `memory_delete` | `DELETE /memory/{key}` | **implemented** |
 | `memory_merge` | `POST /memory/{key}/merge` | **implemented** |
+| `memory_fold` | `POST /memory/{key}/fold` | **implemented** |
 | `memory_search` | `GET /search` | **implemented** |
 | `semantic_search` | `GET /semantic` | **implemented** |
 | `memory_get` | `GET /memory/{key}` | **implemented** |
@@ -286,7 +287,7 @@ Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 | GET | `/memory/{key}` | `memory_get` | counts a `visits` read, exactly as MCP does |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
 | GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&fields=a,b&tag=x&tag=y` |
-| GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=` |
+| GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=&plan=1` |
 | GET | `/projects` | `project_list` | `?status=&pattern=&mode=&tag=` |
 | GET | `/project/{key}` | `project_get` | `?hydrate=none\|snippet\|full` |
 
@@ -297,6 +298,7 @@ Writes — **auth-gated by design and OPEN today** (invariant 3; set `ELLMEPHANT
 | POST | `/memory` | `memory_upsert` | text front-matter, or JSON if `Content-Type: application/json` |
 | POST | `/memory/{key}/upvote` | `memory_upvote` | — |
 | POST | `/memory/{key}/merge` | `memory_merge` | `?into=<key>`, or a JSON body `{"from","into"}` |
+| POST | `/memory/{key}/fold` | `memory_fold` | `?into=<key>`, or a JSON body `{"from","into"}` |
 | DELETE | `/memory/{key}` | `memory_delete` | — |
 | POST | `/project` | `project_upsert` | JSON — a project patch is structured (owner / preload / tags) and front-matter has no grammar for it |
 | POST | `/reembed` | `memory_reembed` | — **last**: heaviest lock holder, and `/health` watches it |

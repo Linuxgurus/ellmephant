@@ -220,6 +220,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0042_history_fts.sql"),
         "words over history: an FTS index of every version, backfilled once",
     ),
+    (
+        43,
+        include_str!("../../migrations/0043_memory_fold.sql"),
+        "fold: an append-only cross-pen fold, and the row it absorbed",
+    ),
 ];
 
 /// Current schema version recorded in the file.

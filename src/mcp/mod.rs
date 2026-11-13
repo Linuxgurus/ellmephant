@@ -221,11 +221,16 @@ answers for a deleted key exactly as it does for a live one.";
 /// truncated list is a visible fact rather than a silent one.
 pub(crate) const HISTORY_LIMIT: usize = 100;
 
-/// `memory_dupes` description. A finder for the merge rule, not a merger.
+/// `memory_dupes` description. A finder and a classifier for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
 Find duplicate *candidates*: memory pairs whose documents sit closer than a tight `max_distance` \
 (default 0.05). Nearest first, titles shown. Candidates, not verdicts — `memory_get` both before \
-merging. The finder for the merge rule.";
+merging. **Every pair carries a `class`, and distance cannot decide it**: `duplicate` (near-identical \
+bodies — a keeper/loser plan is safe), `series` (both keys are dated steps of one series: NEVER merge \
+— each row is the only record of its day), `artifact` (both bodies are verbatim captures with a \
+recoverable source — collapse into ONE row that cites it), `distinct` (close by embedding, different \
+by content: report and move on). `plan: true` returns the merge plan instead: keeper/absorbed steps \
+for `duplicate` only, and a refusal with its reason for every other pair.";
 
 /// Cap on returned dupe pairs for a bare `memory_dupes` call.
 pub(crate) const DUPES_LIMIT: usize = 50;
@@ -1206,6 +1211,12 @@ pub struct DupesParams {
     #[serde(default)]
     #[schemars(description = "Most pairs to return, nearest first.")]
     pub limit: Option<usize>,
+    /// Emit the merge plan instead of the pair list.
+    #[serde(default)]
+    #[schemars(
+        description = "Emit the MERGE PLAN instead of the pair list: one keeper/absorbed step per `duplicate` pair, with the reason the keeper is the keeper, and every other pair REFUSED with its class and reason. A `series` pair is refused here by construction — a dated sequence is not redundancy, and the refusal is what stops a hand-run merge being ordered against one."
+    )]
+    pub plan: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::project_get`].
@@ -3181,6 +3192,22 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let max_distance = p.max_distance.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE);
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
+        if p.plan.unwrap_or(false) {
+            let plan = self
+                .with_read("memory_dupes", reader.clone(), move |s| {
+                    s.dupes_plan(max_distance, limit)
+                })
+                .await?;
+            tracing::info!(
+                tool = "memory_dupes",
+                plan = true,
+                steps = plan.steps.len(),
+                refused = plan.refused.len(),
+                max_distance,
+                "dupes plan"
+            );
+            return store::dupes::plan_to_wire_json(&plan).map_err(|e| e.to_string());
+        }
         let pairs = self
             .with_read("memory_dupes", reader.clone(), move |s| {
                 s.dupes(max_distance, limit)

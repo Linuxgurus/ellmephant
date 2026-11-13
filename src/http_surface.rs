@@ -1753,6 +1753,25 @@ pub async fn dupes(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if params.flag("plan") {
+        return match server
+            .with_read("memory_dupes", reader, move |s| {
+                s.dupes_plan(max_distance, limit)
+            })
+            .await
+        {
+            Ok(plan) => {
+                let wire = store::dupes::plan_to_wire_json(&plan).unwrap_or_default();
+                render(
+                    StatusCode::OK,
+                    json,
+                    wire.clone(),
+                    list_text("merge plan", &wire),
+                )
+            }
+            Err(e) => error(json, error_status(&e), e),
+        };
+    }
     match server
         .with_read("memory_dupes", reader, move |s| {
             s.dupes(max_distance, limit)

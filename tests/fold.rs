@@ -196,6 +196,33 @@ fn you_may_not_fold_a_row_you_cannot_read() {
 }
 
 #[test]
+fn an_unproven_caller_cannot_fold_even_a_public_row() {
+    // Stet's finding at `fb9ade3`: both rows public (the default) and no pen at all used to append,
+    // leaving `memory_fold.actor` NULL — a write nobody is named for. The read gate answers *may it
+    // see this*, never *whose act is this*, so an absent actor is a refusal, not a public allowance.
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    pen(&conn, "pen-a");
+    seed(&conn, &embedder, "keeper", "public words");
+    seed(&conn, &embedder, "duplicate", "other words");
+    own(&conn, "keeper", "pen-a");
+
+    let err = links::fold_into(&conn, "duplicate", "keeper", None)
+        .expect_err("an append must name the pen doing it");
+    assert!(format!("{err}").contains("must name"), "{err}");
+
+    // The refusal left nothing behind: no body change, no editor, no ledger row.
+    let keeper = store::get(&conn, "keeper").unwrap().unwrap();
+    assert_eq!(keeper.body, "public words");
+    assert_eq!(keeper.edited_by.as_deref(), Some("anonymous"));
+    let folds: i64 = conn
+        .query_row("SELECT count(*) FROM memory_fold", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(folds, 0, "a refused fold records nothing");
+}
+
+#[test]
 fn a_missing_row_is_a_refusal_not_a_silent_no_op() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");

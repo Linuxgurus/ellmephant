@@ -269,7 +269,9 @@ already carries — so it takes only the READ gate on both rows, plus the keeper
 PROTECTED. It records `edited_by` (the pen that folded) and the absorbed key, and it names both in \
 its report. It never deletes `from`, never repoints `[[links]]`, and never touches a project \
 preload: removing the absorbed row is the act of the pen that answers for it, and this verb \
-deliberately cannot do it. If the keeper already carries every line, it says so and writes nothing \
+deliberately cannot do it. It requires a PROVEN pen: an append nobody is named for is \
+indistinguishable from a mistake, so an unproven caller is refused rather than recorded with no \
+actor. If the keeper already carries every line, it says so and writes nothing \
 rather than paraphrasing. Use `memory_merge` when you DO hold the survivor and want the source gone.";
 
 /// `memory_adopt` description. Responsibility, not authorship — and the two rules that stop it

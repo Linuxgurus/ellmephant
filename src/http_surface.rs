@@ -2755,7 +2755,9 @@ pub async fn fold(
     let from = key.clone();
     let target = into.clone();
     // A fold changes the record, so it takes the same channel gate a merge does; it does NOT take
-    // the source's write authority, which is the whole point.
+    // the source's write authority, which is the whole point. It DOES require a proven pen: the
+    // store refuses a fold with no actor (an append nobody is named for), so an unproven caller gets
+    // a 403 from `fold_into` rather than a ledger row with a NULL actor.
     let pen = crate::identity::resolve(&state.paths, &headers)
         .ok()
         .flatten();

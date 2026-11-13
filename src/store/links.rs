@@ -514,6 +514,13 @@ pub struct FoldOutcome {
 /// The gate is READ, not write: a pen must be able to see both rows (you cannot fold prose you are
 /// not allowed to read), and a PROTECTED keeper still needs its lease. Nothing else is asked,
 /// because nothing else can be changed.
+///
+/// ★ AN ACTOR IS REQUIRED (Stet's finding at `fb9ade3`, 2026-11-13). The read gate answers *may this
+/// pen see the row*; it never answers *whose act is this*. An append made by a client that cannot be
+/// told apart from any other would land in the keeper with `memory_fold.actor` NULL — "a write nobody
+/// is named for is indistinguishable from a mistake", the delete doctrine (#109), one verb over. The
+/// hole would also outlive the open-write window: a bearer-token client passes `authorize` and still
+/// resolves to no pen.
 pub fn fold_into(
     conn: &Connection,
     from: &str,
@@ -527,37 +534,54 @@ pub fn fold_into(
             "a memory cannot be folded into itself".into(),
         ));
     }
-    let row = |key: &str| -> Result<(i64, String, String, String)> {
-        conn.query_row(
-            "SELECT id, title, body, audience FROM memory WHERE key = ?1",
+    let Some(actor) = acted_by else {
+        return Err(Error::Forbidden(
+            "a fold must name the pen doing it: appending to a row is a write, and an append \
+             nobody is named for is indistinguishable from a mistake"
+                .into(),
+        ));
+    };
+
+    // ★ ONE SERIALIZED UNIT: take the write lock, THEN read (soma/ellmephant#199). `missing_lines` is
+    // computed from both bodies and the append lands against what was read, so a rival commit landing
+    // between the read and the write is a lost update — a fold racing the keeper's owner's `upsert`
+    // is deleted silently, and a fold racing a fold loses one of the two appends. DEFERRED cannot fix
+    // this: it reads first and then promotes its lock, which in WAL fails as `SQLITE_BUSY_SNAPSHOT`
+    // the caller cannot tell apart from a conflict. IMMEDIATE makes compare-then-write one unit, the
+    // same idiom `upsert` uses for its version CAS.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+
+    let body_of = |key: &str| -> Result<(String, String)> {
+        tx.query_row(
+            "SELECT body, audience FROM memory WHERE key = ?1",
             params![key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| -> rusqlite::Result<(String, String)> { Ok((r.get(0)?, r.get(1)?)) },
         )
         .optional()?
         .ok_or_else(|| Error::NotFound(key.to_string()))
     };
-    let (from_id, from_title, from_body, from_audience) = row(&from)?;
-    let (into_id, into_title, into_body, into_audience) = row(&into)?;
+    let (into_id, into_title, into_body, into_audience) = tx
+        .query_row(
+            "SELECT id, title, body, audience FROM memory WHERE key = ?1",
+            params![into],
+            |r| -> rusqlite::Result<(i64, String, String, String)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(into.clone()))?;
+    let (from_body, from_audience) = body_of(&from)?;
 
     // ★ THE DOOR IS VISIBILITY, AND IT OPENS BOTH WAYS. A pen that cannot read the keeper must not
     // append to it (it would be writing words it cannot see), and a pen that cannot read the source
-    // must not fold it (folding is copying, and copying is reading). An absent actor is a client that
-    // cannot be told apart from any other; the rows it may fold are the public ones, because every
-    // other read path treats an unproven reader the same way.
-    let reads = |audience: &str| -> Result<bool> {
-        match acted_by {
-            Some(pen) => crate::store::may_read_audience(conn, pen, audience),
-            // An unproven caller is allowed exactly what a public row offers.
-            None => Ok(audience == crate::store::audience::PUBLIC),
-        }
-    };
-    if !reads(&from_audience)? {
+    // must not fold it (folding is copying, and copying is reading).
+    if !crate::store::may_read_audience(&tx, actor, &from_audience)? {
         return Err(Error::Forbidden(format!(
             "cannot fold `{from}`: its audience does not include the pen doing it. Folding copies \
              prose, and copying is reading."
         )));
     }
-    if !reads(&into_audience)? {
+    if !crate::store::may_read_audience(&tx, actor, &into_audience)? {
         return Err(Error::Forbidden(format!(
             "cannot fold into `{into}`: its audience does not include the pen doing it. A row you \
              cannot read is not a row you may append to."
@@ -565,10 +589,12 @@ pub fn fold_into(
     }
     // A protected keeper is still protected: an append is a write, and the lease is what makes it
     // visible. Asked by the same predicate the delete path asks.
-    crate::store::guard_protected_lease(conn, &into, acted_by)?;
+    crate::store::guard_protected_lease(&tx, &into, Some(actor))?;
 
     let integrated = missing_lines(&from_body, &into_body);
     if integrated.is_empty() {
+        // Nothing to append: no version, no `edited_by`, no ledger row. The transaction is dropped
+        // uncommitted, which is the rollback this branch means.
         return Ok(FoldOutcome {
             into,
             from,
@@ -577,7 +603,6 @@ pub fn fold_into(
         });
     }
 
-    let tx = conn.unchecked_transaction()?;
     // The keeper's PREVIOUS text survives as a version, exactly as any document write does: a fold
     // that is later judged wrong must be reversible by reading what it replaced.
     crate::store::version::snapshot(&tx, into_id, &into, Some(&format!("fold from {from}")))?;
@@ -603,9 +628,6 @@ pub fn fold_into(
         params![into_id, from, acted_by],
     )?;
     tx.commit()?;
-    // `from_id`/`from_title` are read so that the source is proven to exist before anything is
-    // written; it is deliberately not modified.
-    let _ = (from_id, from_title);
     Ok(FoldOutcome {
         into,
         from,

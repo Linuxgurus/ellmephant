@@ -528,9 +528,9 @@ impl Params {
         }
     }
 
-    /// A boolean flag (`true`/`false`, default `false`).
+    /// A boolean flag (`true` or `1`; everything else, including absent, is `false`).
     fn flag(&self, name: &str) -> bool {
-        matches!(self.maybe(name), Some("true"))
+        matches!(self.maybe(name), Some("true") | Some("1"))
     }
 }
 
@@ -1732,7 +1732,9 @@ pub async fn semantic_search(
     }
 }
 
-/// `GET /dupes` — near-duplicate candidate pairs (`memory_dupes`).
+/// `GET /dupes` — near-duplicate candidate pairs (`memory_dupes`). `?plan=1` (or `?plan=true`)
+/// answers the merge plan instead: one keeper/absorb step per duplicate CLUSTER, and a named refusal
+/// for every other pair.
 pub async fn dupes(
     State(state): State<HttpState>,
     headers: HeaderMap,

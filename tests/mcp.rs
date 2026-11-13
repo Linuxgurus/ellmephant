@@ -964,6 +964,38 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         d["count"].as_u64().expect("count") >= 1,
         "near-identical rows must pair: {d}"
     );
+    assert!(
+        d["pairs"]
+            .as_array()
+            .expect("pairs")
+            .iter()
+            .any(|p| p[5] == serde_json::json!("duplicate")),
+        "each pair carries its class: {d}"
+    );
+
+    // The other half of the same tool: `plan: true` must arrive through the transport, not only
+    // through the store. A typo in the parameter name would pass every store-level test.
+    let plan = call(
+        &client,
+        "memory_dupes",
+        serde_json::json!({ "max_distance": 1.0, "plan": true }),
+    )
+    .await;
+    assert!(!plan.is_error.unwrap_or(false), "{}", text(&plan));
+    let p: serde_json::Value = serde_json::from_str(&text(&plan)).expect("json");
+    assert_eq!(
+        p["cols"],
+        serde_json::json!(["keep", "absorb", "reason"]),
+        "the plan table is self-describing"
+    );
+    assert_eq!(
+        p["refused_cols"],
+        serde_json::json!(["key_a", "key_b", "class", "reason"]),
+    );
+    let steps = p["plan"].as_array().expect("plan");
+    assert_eq!(steps.len(), 1, "one duplicate pair, one step: {p}");
+    assert_eq!(steps[0][0], serde_json::json!("dup-a"), "the keeper: {p}");
+    assert_eq!(steps[0][1], serde_json::json!("dup-b"), "the absorbed: {p}");
 
     // Tear the index, the way a killed rebuild would: drop one row's vector and leave its `encode_hash`
     // still saying "indexed". That is precisely the case the hash alone cannot see.

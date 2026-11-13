@@ -173,6 +173,97 @@ fn a_verbatim_capture_with_an_address_is_an_artifact() {
 }
 
 #[test]
+fn a_cluster_of_three_gets_one_keeper_and_executable_steps() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+
+    // Three rows, one content, one vector: with NEIGHBOURS = 3 this is the ordinary mutual cluster,
+    // not an edge case, and it is where a pair-per-step plan stops being executable.
+    let body = "the turn boundary is offered once per wake, and a miss is not a failure.";
+    for key in ["aaa-cluster", "bbb-cluster", "ccc-cluster"] {
+        let (id, _) = common::add_now(&conn, &embedder, &memory(key, key, body)).unwrap();
+        vec::upsert(&conn, id, "memory", key, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+    }
+
+    let pairs = dupes::find(&conn, 0.05, 50).unwrap();
+    assert_eq!(
+        pairs.len(),
+        3,
+        "three mutually-close rows are three pairs: {pairs:?}"
+    );
+
+    let plan = dupes::plan(&conn, &pairs).unwrap();
+    let absorbed: Vec<&str> = plan.steps.iter().map(|s| s.absorb.as_str()).collect();
+    assert_eq!(absorbed.len(), 2, "a cluster of 3 is N-1 steps: {plan:?}");
+
+    let mut unique = absorbed.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        absorbed.len(),
+        "a row is absorbed TWICE: {absorbed:?}"
+    );
+    for step in &plan.steps {
+        assert!(
+            !absorbed.contains(&step.keep.as_str()),
+            "keeper {} is itself absorbed: {plan:?}",
+            step.keep
+        );
+        assert_eq!(
+            step.keep, "aaa-cluster",
+            "one keeper for the component: {plan:?}"
+        );
+        assert!(
+            step.reason.contains("cluster of 3"),
+            "the reason must name the cluster: {plan:?}"
+        );
+    }
+
+    // The pair order is not deterministic (`find_seen` sorts by distance alone), so the plan must
+    // not inherit it: the same pairs in another order must produce the same plan.
+    let mut backwards = pairs.clone();
+    backwards.reverse();
+    let again = dupes::plan(&conn, &backwards).unwrap();
+    assert_eq!(
+        serde_json::to_string(&plan).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "the plan must not depend on the order the pairs arrived in"
+    );
+}
+
+#[test]
+fn a_capture_quoted_by_a_lesson_is_refused_not_merged() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+    let capture = "```text\nerror: the gate refused\ncommit 643eeb8\n```\n";
+    let lesson = format!(
+        "{capture}\nThe lesson: read the log before inventing a cause.\n\
+         A cache push is not a test.\n\
+         A re-run that claims a cause is indistinguishable from a fix.\n"
+    );
+    pair(
+        &conn,
+        &embedder,
+        "pr192-gate-log",
+        capture,
+        "a-lesson-about-the-gate",
+        &lesson,
+    );
+
+    let pairs = dupes::find(&conn, 0.05, 50).unwrap();
+    assert_eq!(pairs[0].class, dupes::Class::Artifact);
+    let plan = dupes::plan(&conn, &pairs).unwrap();
+    assert!(
+        plan.steps.is_empty(),
+        "a lesson may quote the receipt; it must not be merged with it: {plan:?}"
+    );
+    assert_eq!(plan.refused.len(), 1, "{plan:?}");
+}
+
+#[test]
 fn close_by_embedding_but_different_in_content_is_distinct() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");

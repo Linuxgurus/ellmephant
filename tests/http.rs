@@ -535,6 +535,36 @@ async fn reading_a_memory_counts_a_visit() {
     assert_eq!(total(&before), total(&after), "no other read counts");
 }
 
+/// `?plan=1` is a real door: it must reach the plan builder and answer the plan table, not the pair
+/// list. A flag typo would otherwise pass every store-level test in the PR.
+#[tokio::test]
+async fn the_dupes_plan_flag_is_a_door() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let body = "the turn boundary is offered once per wake, and a miss is not a failure.";
+    seed(&app, "tok", "aaa-plan", "Same thing twice", body).await;
+    seed(&app, "tok", "bbb-plan", "Same thing twice", body).await;
+    settle(dir.path());
+
+    let (status, body, _) = get(&app, "/dupes?plan=1&max_distance=1&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        plan["cols"],
+        serde_json::json!(["keep", "absorb", "reason"]),
+        "the plan table is self-describing: {plan}"
+    );
+    let steps = plan["plan"].as_array().expect("plan");
+    assert_eq!(steps.len(), 1, "one duplicate pair, one step: {plan}");
+    assert_eq!(steps[0][0], serde_json::json!("aaa-plan"), "{plan}");
+    assert_eq!(steps[0][1], serde_json::json!("bbb-plan"), "{plan}");
+
+    // The pair door still answers pairs, and each carries its class.
+    let (status, body, _) = get(&app, "/dupes?max_distance=1&format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"class\""), "{body}");
+}
+
 /// Auth before writes: with a token configured, every write route refuses a bare credential and a
 /// wrong one, and the challenge is a bare `Bearer`.
 #[tokio::test]

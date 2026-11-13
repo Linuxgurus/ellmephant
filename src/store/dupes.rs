@@ -9,12 +9,12 @@
 //!
 //! The embedded document is `key` + title + body, so merely-related memories cluster here too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index::vec::{self, Knn};
 
 /// Default cosine-distance ceiling. Tight on purpose: a loose ceiling returns same-topic
@@ -59,8 +59,9 @@ pub enum Class {
     Duplicate,
     /// Both keys end in the same shape of date or clock marker: a series, never a merge candidate.
     Series,
-    /// A verbatim capture (diff, issue body, log dump) whose source is recoverable: collapsing is
-    /// safe only into ONE row that cites the source.
+    /// A verbatim capture (diff, issue body, log dump) whose source is recoverable — or such a
+    /// capture paired with the row that carries it. Collapsing is safe only into ONE row that cites
+    /// the source.
     Artifact,
     /// Close by embedding, different in content: the false-positive class that made the finder
     /// untrustworthy. Report it and move on.
@@ -100,6 +101,10 @@ pub struct Refusal {
 }
 
 /// The merge plan over the candidate pairs.
+///
+/// ★ A plan step is a WHOLE-ROW merge, so a plan over a cluster of N is N−1 steps against ONE keeper
+/// or it is not a plan: two steps may share a keeper but never a member, and a keeper is never
+/// absorbed by another step.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MergePlan {
     pub steps: Vec<PlanEntry>,
@@ -192,46 +197,117 @@ pub fn plan_seen(
 
 /// Build the merge plan: a keeper/loser step for every `duplicate`, and a named refusal for
 /// everything else. The keeper is chosen by evidence the store already keeps, never by distance.
+///
+/// ★ A PLAN STEP IS A WHOLE-ROW OPERATION, so the plan is over connected COMPONENTS, not edges. Fold
+/// and delete is not commutative or associative: three rows that all match are one cluster, and a
+/// pair-per-step plan absorbs the same row twice and can absorb its own keeper — an instruction that
+/// cannot be followed in any order. With `NEIGHBOURS = 3` a mutual triple is the ordinary case in a
+/// store that has ever held a dated series or an artifact. One keeper per component, N−1 steps
+/// against it.
 pub fn plan(conn: &Connection, pairs: &[DupePair]) -> Result<MergePlan> {
     let mut out = MergePlan::default();
+
+    // Union-find over the keys that appear in a `duplicate` pair.
+    let mut ids: HashMap<String, usize> = HashMap::new();
+    let mut parent: Vec<usize> = Vec::new();
     for pair in pairs {
-        match pair.class {
-            Class::Duplicate => {
-                let (keep, absorb, reason) = keeper(conn, &pair.key_a, &pair.key_b)?;
-                out.steps.push(PlanEntry {
-                    keep,
-                    absorb,
-                    reason,
-                });
-            }
-            Class::Series => out.refused.push(Refusal {
-                key_a: pair.key_a.clone(),
-                key_b: pair.key_b.clone(),
-                class: pair.class,
-                reason: "a dated series: each row is the only record of its day, so merging them \
-                         destroys the series to save nothing. If the newest supersedes the older, \
-                         delete the older and leave a pointer — do not merge."
-                    .into(),
-            }),
-            Class::Artifact => out.refused.push(Refusal {
-                key_a: pair.key_a.clone(),
-                key_b: pair.key_b.clone(),
-                class: pair.class,
-                reason: "a verbatim capture: collapsing is safe only into ONE row that CITES the \
-                         source (SHA, issue or URL). Cite it first, then merge."
-                    .into(),
-            }),
-            Class::Distinct => out.refused.push(Refusal {
-                key_a: pair.key_a.clone(),
-                key_b: pair.key_b.clone(),
-                class: pair.class,
-                reason: "close by embedding, different in content: a false positive, not a merge \
-                         candidate."
-                    .into(),
-            }),
+        if pair.class != Class::Duplicate {
+            out.refused.push(refusal(pair, pair.class));
+            continue;
+        }
+        let a = slot(&mut ids, &mut parent, &pair.key_a);
+        let b = slot(&mut ids, &mut parent, &pair.key_b);
+        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+        if ra != rb {
+            parent[ra] = rb;
         }
     }
+
+    // One keeper per component, chosen by the same evidence rule; every other member is absorbed by
+    // it. `members.sort()` makes a cluster's plan stable even though the pair order is not.
+    let mut components: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (key, &id) in &ids {
+        let r = root(&mut parent, id);
+        components.entry(r).or_default().push(key.clone());
+    }
+    for mut members in components.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort();
+        let mut keep = members[0].clone();
+        for m in &members[1..] {
+            keep = keeper(conn, &keep, m)?.0;
+        }
+        let cluster = members.len();
+        for m in &members {
+            if *m == keep {
+                continue;
+            }
+            let (_, _, mut reason) = keeper(conn, &keep, m)?;
+            if cluster > 2 {
+                reason.push_str(&format!(" (one keeper for a cluster of {cluster})"));
+            }
+            out.steps.push(PlanEntry {
+                keep: keep.clone(),
+                absorb: m.clone(),
+                reason,
+            });
+        }
+    }
+    // The plan is a set of independent steps, but a reader (or a fingerprint) deserves the same
+    // bytes for the same store: sort, so `find_seen`'s pair order cannot leak into the plan.
+    out.steps
+        .sort_by(|a, b| a.keep.cmp(&b.keep).then_with(|| a.absorb.cmp(&b.absorb)));
+    out.refused
+        .sort_by(|a, b| a.key_a.cmp(&b.key_a).then_with(|| a.key_b.cmp(&b.key_b)));
     Ok(out)
+}
+
+/// The union-find slot for one key.
+fn slot(ids: &mut HashMap<String, usize>, parent: &mut Vec<usize>, key: &str) -> usize {
+    if let Some(&i) = ids.get(key) {
+        return i;
+    }
+    let i = parent.len();
+    parent.push(i);
+    ids.insert(key.to_string(), i);
+    i
+}
+
+/// The component root for one slot, with path compression.
+fn root(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
+}
+
+/// Why this pair is not a merge step. A refusal without a reason is a veto, not an answer.
+fn refusal(pair: &DupePair, class: Class) -> Refusal {
+    let reason = match class {
+        Class::Series => "a dated series: each row is the only record of its day, so merging them \
+                         destroys the series to save nothing. If the newest supersedes the older, \
+                         delete the older and leave a pointer — do not merge."
+            .to_string(),
+        Class::Artifact => "a verbatim capture: collapsing is safe only into ONE row that CITES the \
+                            source (SHA, issue or URL). Cite it first, then merge — and never merge \
+                            a capture into a lesson that already carries it."
+            .to_string(),
+        Class::Distinct => "close by embedding, different in content: a false positive, not a merge \
+                            candidate."
+            .to_string(),
+        // A duplicate is never refused; the arm keeps the match total so a new class cannot slip
+        // through as an empty reason.
+        Class::Duplicate => "a duplicate: merged into its component's keeper".to_string(),
+    };
+    Refusal {
+        key_a: pair.key_a.clone(),
+        key_b: pair.key_b.clone(),
+        class,
+        reason,
+    }
 }
 
 /// Pick the keeper by what the store already knows: inbound references, then reads, then age.
@@ -280,6 +356,10 @@ fn keeper(conn: &Connection, a: &str, b: &str) -> Result<(String, String, String
 }
 
 /// `(inbound memory edges, visits, created)` for one row.
+///
+/// ★ NO DEFAULTING. `.unwrap_or(0)` here would read "the query failed" as "no reads, no edges" and
+/// quietly change who wins the keeper — a negative result is a claim about the method first, so a
+/// broken handle or a schema change fails the plan loudly instead.
 fn evidence(conn: &Connection, key: &str) -> Result<(i64, i64, String)> {
     let (visits, created): (i64, String) = conn
         .query_row(
@@ -287,14 +367,15 @@ fn evidence(conn: &Connection, key: &str) -> Result<(i64, i64, String)> {
             rusqlite::params![key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap_or((0, String::new()));
-    let edges: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM memory_link WHERE to_key = ?1 AND to_type = 'memory'",
-            rusqlite::params![key],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Error::NotFound(key.to_string()),
+            other => Error::Db(other),
+        })?;
+    let edges: i64 = conn.query_row(
+        "SELECT count(*) FROM memory_link WHERE to_key = ?1 AND to_type = 'memory'",
+        rusqlite::params![key],
+        |r| r.get(0),
+    )?;
     Ok((edges, visits, created))
 }
 
@@ -307,7 +388,14 @@ fn classify(key_a: &str, body_a: &str, key_b: &str, body_b: &str) -> Class {
     {
         return Class::Series;
     }
-    if is_artifact(key_a, body_a) && is_artifact(key_b, body_b) {
+    let (art_a, art_b) = (is_artifact(key_a, body_a), is_artifact(key_b, body_b));
+    if art_a && art_b {
+        return Class::Artifact;
+    }
+    // ONE capture beside a row that carries it (the lesson quoting the diff) is a refusal too:
+    // `same_content` would call it a duplicate, and then the keeper rule could pick the dump over
+    // the lesson by refs/reads/age — the inversion of "extract the lesson, then delete the receipt".
+    if art_a != art_b && same_content(body_a, body_b) {
         return Class::Artifact;
     }
     if same_content(body_a, body_b) {
@@ -327,14 +415,20 @@ enum Marker {
 
 fn key_marker(key: &str) -> Option<Marker> {
     // Clock first: `alerts-2026-11-03-0538z` ends in a clock, and its day is context, not identity.
-    // Keys are slugs (`[a-z0-9-]+`), so byte slicing is safe.
+    // Keys are slugs today (`resolve_key` slugifies even an explicit key), but these slices go
+    // through `get`: a cheap boundary check must not rest on a caller's invariant.
     if let Some(stem) = key.strip_suffix('z') {
-        let digits = stem.len() >= 5 && stem[stem.len() - 4..].bytes().all(|b| b.is_ascii_digit());
-        if digits && stem.as_bytes()[stem.len() - 5] == b'-' {
+        let tail = stem.len().checked_sub(4).and_then(|i| stem.get(i..));
+        let dash = stem.len().checked_sub(5).and_then(|i| stem.get(i..i + 1));
+        if let (Some(tail), Some("-")) = (tail, dash)
+            && tail.bytes().all(|b| b.is_ascii_digit())
+        {
             return Some(Marker::Clock);
         }
     }
-    if key.len() >= 10 && is_day(&key[key.len() - 10..]) {
+    if let Some(day) = key.len().checked_sub(10).and_then(|i| key.get(i..))
+        && is_day(day)
+    {
         return Some(Marker::Day);
     }
     None
@@ -356,6 +450,7 @@ fn is_day(s: &str) -> bool {
 /// Two questions, both required: it must LOOK like a capture (a diff, or a body that is mostly one
 /// fenced block) and it must NAME where the original lives (a SHA, a commit/issue URL, or `issue #N`).
 /// A lesson that quotes a SHA is not an artifact; a dump with no address is not safely collapsible.
+/// (A capture beside a lesson that CARRIES it is a refusal too — see [`classify`].)
 fn is_artifact(key: &str, body: &str) -> bool {
     let capture = body.starts_with("diff --git")
         || body.contains("\n@@ ") && body.contains("\n+++ ")
@@ -404,10 +499,19 @@ fn is_pr_key(key: &str) -> bool {
     digits > 0 && rest.as_bytes().get(digits) == Some(&b'-')
 }
 
-/// A 7–40 character hex run that is not merely a word: a git SHA.
+/// A 7–40 character hex run that looks like a git SHA, not a word or a number.
+///
+/// ★ BOTH ALPHABETS, because either alone is not evidence: `defaced` and `accede` are hex-only
+/// English words, and `1234567` is a number. A real abbreviated SHA almost always mixes digits and
+/// letters; the ~4% of 7-char SHAs that do not are missed on purpose — a missed address costs a
+/// refusal, while a false one licenses a merge.
 fn has_sha(body: &str) -> bool {
-    body.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|tok| (7..=40).contains(&tok.len()) && tok.bytes().all(|b| b.is_ascii_hexdigit()))
+    body.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+        (7..=40).contains(&tok.len())
+            && tok.bytes().all(|b| b.is_ascii_hexdigit())
+            && tok.bytes().any(|b| b.is_ascii_digit())
+            && tok.bytes().any(|b| b.is_ascii_alphabetic())
+    })
 }
 
 /// Are these two bodies the same content, not merely nearby?
@@ -424,7 +528,9 @@ fn same_content(a: &str, b: &str) -> bool {
         return true;
     }
     // A verbatim append: every line of the shorter body is already carried by the longer one. The
-    // length floor is load-bearing: without it a one-line "ok" is carried by every row that says it.
+    // 40-char floor is load-bearing: below roughly a sentence fragment, stock phrasing ("ok",
+    // "done", "no change") is carried by unrelated rows, so containment would read sameness where
+    // there is only a shared vocabulary.
     let la: Vec<&str> = a.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let lb: Vec<&str> = b.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let (short, long) = if la.len() <= lb.len() {
@@ -617,6 +723,44 @@ mod tests {
             ),
             Class::Artifact
         );
+    }
+
+    /// A capture and a row that CARRIES it (plus commentary) is a refusal, not a duplicate. Under
+    /// the old both-sides rule this fell through to `same_content` and could pick the dump as keeper.
+    #[test]
+    fn a_capture_beside_the_lesson_that_carries_it_is_an_artifact() {
+        let capture = "```text\nerror: the gate refused\ncommit 643eeb8\n```\n";
+        let lesson = format!(
+            "{capture}\nThe lesson: read the log before inventing a cause.\n\
+             A cache push is not a test.\n\
+             A re-run that claims a cause is indistinguishable from a fix.\n"
+        );
+        assert!(is_artifact("pr192-gate-log", capture));
+        assert!(
+            !is_artifact("a-lesson", &lesson),
+            "the lesson is mostly prose, so it is not itself a capture"
+        );
+        assert_eq!(
+            classify("pr192-gate-log", capture, "a-lesson", &lesson),
+            Class::Artifact
+        );
+    }
+
+    /// The address test is "is a SHA", not "looks hex": hex-only words are not addresses.
+    #[test]
+    fn hex_shaped_words_are_not_addresses() {
+        assert!(!has_sha("defaced accede"));
+        assert!(!has_sha("the id is 1234567"), "a number is not an address");
+        assert!(has_sha("see 643eeb8"), "a mixed-alphabet short SHA is one");
+        assert!(has_sha(&"a1".repeat(20)), "a full 40-char SHA is one");
+    }
+
+    /// A non-ASCII key must not panic on a byte-offset slice, whatever `resolve_key` does today.
+    #[test]
+    fn key_markers_do_not_slice_through_a_char_boundary() {
+        assert_eq!(key_marker("héllo-☃z"), None);
+        assert_eq!(key_marker("日本-0538z"), Some(Marker::Clock));
+        assert_eq!(key_marker("offsite-2026-11-05"), Some(Marker::Day));
     }
 
     #[test]

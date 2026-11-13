@@ -957,7 +957,7 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
     let d: serde_json::Value = serde_json::from_str(&text(&dupes)).expect("json");
     assert_eq!(
         d["cols"],
-        serde_json::json!(["key_a", "title_a", "key_b", "title_b", "distance"]),
+        serde_json::json!(["key_a", "title_a", "key_b", "title_b", "distance", "class"]),
         "the positional table is self-describing"
     );
     assert!(

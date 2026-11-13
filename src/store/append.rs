@@ -54,6 +54,7 @@ pub fn append(
     key: &str,
     line: &str,
     acted_by: Option<&str>,
+    force: bool,
 ) -> Result<Appended> {
     let key = crate::store::slug::slugify(key);
     let line = line.trim();
@@ -69,18 +70,32 @@ pub fn append(
                 .into(),
         ));
     }
+    // ★ THE READ IS INSIDE THE WRITE'S TRANSACTION (Stet, review of #229, point 4). Reading the body
+    // before `BEGIN` is a read-modify-write: two pens appending to one subject row both read, both
+    // write, and one line is lost with a 200. A deferred transaction that reads and then writes
+    // refuses to upgrade once another writer has committed (SQLITE_BUSY_SNAPSHOT) — an error the
+    // caller retries, which is the correct failure for a lost update. This verb exists to be used by
+    // several pens on ONE row, so the window is the common case, not the corner.
+    let tx = conn.unchecked_transaction()?;
     // ★ THE SAME REACH AN EDIT TAKES. An append changes the document — it is a body write, and the
     // permission question is identical. (Cross-pen appending is a separate question, soma/ellmephant#199.)
-    crate::store::may_write(conn, &key, acted_by)?;
+    crate::store::may_write(&tx, &key, acted_by)?;
 
-    let row: Option<(i64, String, String)> = conn
+    let row: Option<(i64, String, String, Vec<String>)> = tx
         .query_row(
-            "SELECT id, title, body FROM memory WHERE key = ?1",
+            "SELECT id, title, body, tags FROM memory WHERE key = ?1",
             params![key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    crate::store::tags::decode(&r.get::<_, String>(3)?),
+                ))
+            },
         )
         .optional()?;
-    let Some((id, title, body)) = row else {
+    let Some((id, title, body, tags)) = row else {
         return Err(Error::NotFound(format!(
             "{key} — an append CONTINUES a subject. To start one, `memory_upsert` with a key, a \
              title and a body; the next line can then be an append."
@@ -95,6 +110,19 @@ pub fn append(
         });
     }
     let next = format!("{}\n{line}", body.trim_end());
+    // ★ THE SHAPE GATE APPLIES TO THE RESULT, NOT TO THE LINE (Stet, review of #229). A pen that
+    // cannot write a play-by-play in one call must not be able to write one in three: three appends
+    // of an `HH:MMZ ...` line produce exactly the body `memory_upsert` refuses. Refused with the same
+    // sentence, and `force` is the same deliberate override.
+    if !force {
+        if let Some(hint) = crate::store::shape::record_hint(&next, &key) {
+            return Err(Error::Invalid(crate::store::shape::refusal(&hint, &key)));
+        }
+    }
+    // ★ A PROTECTED ROW KEEPS ITS LEASE GATE (Stet, same review). `may_write` is the reach; the lease
+    // is the half that matters for the rows that matter, and an append with no patch to inspect is
+    // exactly the write `guard_protected` exists for. Same rule, same sentence as `merge`.
+    super::guard_protected(&tx, &key, &tags, &crate::store::Patch::default(), acted_by)?;
     if next.chars().count() > crate::store::MAX_BODY_CHARS {
         return Err(Error::TooLarge(format!(
             "{key} would pass {} chars: a subject this large is several subjects — write the new one \
@@ -103,7 +131,6 @@ pub fn append(
         )));
     }
 
-    let tx = conn.unchecked_transaction()?;
     // The state this append supersedes is history like any other write's.
     let version = crate::store::version::snapshot(
         &tx,
@@ -138,12 +165,9 @@ pub fn append(
 /// Does the body already carry this line? Whitespace- and case-insensitive, per line: an append that
 /// would duplicate a line is a retry, not a fact.
 fn carries(body: &str, line: &str) -> bool {
-    let squash = |s: &str| {
-        s.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    };
+    // ★ WHITESPACE ONLY (Stet, review of #229). Case is part of the fact for a route, a verb, an
+    // identifier or a SQL keyword: folding it silently dropped `post /memory ...` as "already there".
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let want = squash(line);
     body.lines().map(squash).any(|have| have == want)
 }
@@ -155,7 +179,11 @@ mod tests {
     #[test]
     fn a_line_already_present_is_a_retry_and_whitespace_does_not_hide_it() {
         assert!(carries("one fact\nsecond  fact", "second fact"));
-        assert!(carries("One Fact", "one  fact"));
+        assert!(
+            !carries("One Fact", "one  fact"),
+            "case is part of the fact"
+        );
+        assert!(carries("One  Fact", "One Fact"));
         assert!(!carries("one fact", "one fact and more"));
         assert!(!carries("", "anything"));
     }

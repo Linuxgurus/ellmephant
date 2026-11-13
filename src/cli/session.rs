@@ -366,8 +366,9 @@ impl Session {
         key: &str,
         line: &str,
         acted_by: Option<&str>,
+        force: bool,
     ) -> Result<store::append::Appended> {
-        store::append::append(&self.conn, key, line, acted_by)
+        store::append::append(&self.conn, key, line, acted_by, force)
     }
 
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry

@@ -185,11 +185,10 @@ embeds the documents one at a time, so a rebuild is no longer an hour-long write
 dimension change still blocks, and only for the table's drop and recreate.";
 
 const UPSERT_DESCRIPTION: &str = "\
-Upsert one memory: ONE SUBJECT, WHOLE — the facts about one thing, enough to recognise it and \
-decide. WRITE in smart-caveman, one fact per line. This is how a subject STARTS; to CONTINUE one, \
-use `memory_append` (one line, one call, no body resent, no read) — the cheap verb, and the one to \
-reach for mid-work. Two failures this rule names: a subject split across rows is a TRAIL nobody can \
-read (24 rows for one review); two subjects in one row is a GRAB-BAG. Neither is a memory. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete`. \
+Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clustered facts, one \
+per line; never a misc/gotchas bucket. Before saving, check: body hold ≥2 distinct topics? Split — \
+one call each, each atom stands alone (≥2-3 facts). Trim junk on edit — deepen the topic, never add \
+a second. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete` \
 Skip facts cheap to derive, live state, or one-off. PATCHING: every field is optional — omit one and \
 the stored value is left alone, so a single field can change without resending the row. Empty is an \
 instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
@@ -852,6 +851,12 @@ pub struct AppendParams {
         description = "ONE line, the fact to add. No newlines — one call per line. A line the body already carries is a no-op, so retrying is safe."
     )]
     pub line: String,
+    /// Write a line the shape gate would refuse.
+    #[serde(default)]
+    #[schemars(
+        description = "Write even if the RESULT would look like a run record. The gate inspects the body after the append, not the line, because three terse appends of an `HH:MMZ ...` line build exactly the body `memory_upsert` refuses. Deliberate override, same as upsert's."
+    )]
+    pub force: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::memory_merge`].
@@ -2710,11 +2715,12 @@ impl MemoryServer {
         let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let key = p.key;
         let line = p.line;
+        let force = p.force.unwrap_or(false);
         let log_key = key.clone();
         let out = self
             .with_store("memory_append", move |s| {
                 s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.append(&key, &line, Some(&pen))
+                s.append(&key, &line, Some(&pen), force)
             })
             .await?;
         tracing::info!(
@@ -5139,17 +5145,15 @@ mod tests {
             .description
             .clone()
             .expect("description");
-        // The unit is the SUBJECT, not the fact and not the topic-count: one subject, whole.
-        assert!(upsert.to_lowercase().contains("one subject"), "{upsert}");
+        assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
-        // The two failures the rule names, and the cheap verb that prevents one of them.
-        assert!(upsert.to_lowercase().contains("trail"), "{upsert}");
-        assert!(upsert.to_lowercase().contains("grab-bag"), "{upsert}");
-        assert!(upsert.to_lowercase().contains("memory_append"), "{upsert}");
-        // Growth law is *coherence, not size*: no "never grow".
+        // The pre-write split nudge: *evaluate* ("before saving"), then *action* (split, one call each).
+        assert!(upsert.to_lowercase().contains("before saving"), "{upsert}");
+        assert!(upsert.to_lowercase().contains("split"), "{upsert}");
+        // Growth law is *coherence, not size*: deepen a topic, never add a second; no "never grow".
         assert!(
-            !upsert.to_lowercase().contains("one topic per memory"),
-            "the count of topics is not the unit: {upsert}"
+            upsert.to_lowercase().contains("deepen the topic"),
+            "{upsert}"
         );
         assert!(!upsert.to_lowercase().contains("never grow"), "{upsert}");
         // The feedback nudge must carry a *trigger*, not just a quality bar.

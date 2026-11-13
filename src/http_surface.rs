@@ -2655,13 +2655,14 @@ pub async fn append(
     let pen = crate::identity::resolve(&state.paths, &headers)
         .ok()
         .flatten();
+    let force = params.flag("force");
     let target = key.clone();
     match server
         .with_store("memory_append", move |s| {
             if let Some(caller) = &pen {
                 s.channel_gate(caller, crate::store::channel::Class::Record)?;
             }
-            s.append(&target, &line, pen.as_deref())
+            s.append(&target, &line, pen.as_deref(), force)
         })
         .await
     {

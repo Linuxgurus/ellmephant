@@ -119,6 +119,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/memory/{key}/append",
+        tool: "memory_append",
+    },
+    Route {
+        method: "POST",
         path: "/memory/{key}/adopt",
         tool: "memory_adopt",
     },
@@ -2602,6 +2607,78 @@ pub async fn upvote(
             let status = error_status(&message);
             error(json, status, message)
         }
+    }
+}
+
+/// `POST /memory/{key}/append` — continue a subject with one line (`memory_append`).
+///
+/// Body: `{"line": "..."}`. The line is the whole payload; there is no body resend, which is the
+/// entire point of the verb.
+pub async fn append(
+    State(state): State<HttpState>,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    let scope = match authorize(&state, &headers, json) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let body = match json_body(&headers, body).await {
+        Ok(b) => b,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+    };
+    let line = match body
+        .as_ref()
+        .and_then(|b| b.get("line"))
+        .and_then(|l| l.as_str())
+    {
+        Some(line) => line.to_string(),
+        None => match params.maybe("line") {
+            Some(line) => line.to_string(),
+            None => {
+                return error(
+                    json,
+                    StatusCode::BAD_REQUEST,
+                    "missing `line`: send a JSON body {\"line\": \"...\"}, or `?line=...`",
+                );
+            }
+        },
+    };
+    let server = match session(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let pen = crate::identity::resolve(&state.paths, &headers)
+        .ok()
+        .flatten();
+    let target = key.clone();
+    match server
+        .with_store("memory_append", move |s| {
+            if let Some(caller) = &pen {
+                s.channel_gate(caller, crate::store::channel::Class::Record)?;
+            }
+            s.append(&target, &line, pen.as_deref())
+        })
+        .await
+    {
+        Ok(out) => {
+            tracing::info!(area = scope.area, key = %key, appended = out.appended, "appended over http");
+            render(
+                StatusCode::OK,
+                json,
+                serde_json::to_string(&out).unwrap_or_default(),
+                if out.appended {
+                    format!("appended one line to {key}")
+                } else {
+                    format!("{key} already carries that line — nothing written")
+                },
+            )
+        }
+        Err(e) => error(json, error_status(&e), e),
     }
 }
 

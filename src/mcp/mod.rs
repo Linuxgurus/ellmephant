@@ -52,6 +52,7 @@ pub const TOOLS: &[&str] = &[
     "sudo_release",
     "sudo_sessions",
     "memory_upsert",
+    "memory_append",
     "memory_delete",
     "memory_history_erase",
     "memory_history_search",
@@ -184,10 +185,11 @@ embeds the documents one at a time, so a rebuild is no longer an hour-long write
 dimension change still blocks, and only for the table's drop and recreate.";
 
 const UPSERT_DESCRIPTION: &str = "\
-Upsert one memory. WRITE in smart-caveman. One topic per memory — closely clustered facts, one \
-per line; never a misc/gotchas bucket. Before saving, check: body hold ≥2 distinct topics? Split — \
-one call each, each atom stands alone (≥2-3 facts). Trim junk on edit — deepen the topic, never add \
-a second. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete` \
+Upsert one memory: ONE SUBJECT, WHOLE — the facts about one thing, enough to recognise it and \
+decide. WRITE in smart-caveman, one fact per line. This is how a subject STARTS; to CONTINUE one, \
+use `memory_append` (one line, one call, no body resent, no read) — the cheap verb, and the one to \
+reach for mid-work. Two failures this rule names: a subject split across rows is a TRAIL nobody can \
+read (24 rows for one review); two subjects in one row is a GRAB-BAG. Neither is a memory. Merge redundant memories by hand: weaker is folded into stronger and `memory_delete`. \
 Skip facts cheap to derive, live state, or one-off. PATCHING: every field is optional — omit one and \
 the stored value is left alone, so a single field can change without resending the row. Empty is an \
 instruction: `source: \"\"` clears it and `tags: []` clears them, but `title`/`body` may never be \
@@ -824,6 +826,32 @@ pub struct HistoryParams {
     #[schemars(description = "Most rows to return. The reply states the true total regardless.")]
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// `memory_append` description.
+const APPEND_DESCRIPTION: &str = "\
+Continue a subject with ONE line — the cheap verb, and the one to reach for mid-work. No key read, \
+no title, no tags, no body resent: one call appends the line to the existing memory and returns the \
+version it superseded. It NEVER creates (a missing key is refused and names `memory_upsert`, because \
+a subject that does not exist yet needs a title) and it never changes the title, audience, tags or \
+an existing line. A line the body already carries is a no-op, so a retry is safe. Use this instead \
+of writing a second memory about the same thing: a subject split across rows is a trail nobody can \
+read, and 24 rows for one review is what that looks like.";
+
+/// Parameters for [`MemoryServer::memory_append`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppendParams {
+    /// The existing memory to continue.
+    #[schemars(
+        description = "The memory to continue. It must exist: an append is a continuation, not a create."
+    )]
+    pub key: String,
+    /// The one line to append.
+    #[schemars(
+        description = "ONE line, the fact to add. No newlines — one call per line. A line the body already carries is a no-op, so retrying is safe."
+    )]
+    pub line: String,
 }
 
 /// Parameters for [`MemoryServer::memory_merge`].
@@ -2660,6 +2688,43 @@ impl MemoryServer {
                     .to_string(),
             ),
         }
+    }
+
+    /// Continue a subject with one line — the cheap verb (`memory_append`).
+    #[tool(
+        name = "memory_append",
+        description = APPEND_DESCRIPTION,
+        annotations(
+            title = "Append a line",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_append(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<AppendParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let key = p.key;
+        let line = p.line;
+        let log_key = key.clone();
+        let out = self
+            .with_store("memory_append", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+                s.append(&key, &line, Some(&pen))
+            })
+            .await?;
+        tracing::info!(
+            tool = "memory_append",
+            key = %log_key,
+            appended = out.appended,
+            version = ?out.version,
+            "memory appended"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Integrate one memory into another and delete it — the safe way to merge.
@@ -4851,6 +4916,7 @@ pub fn http_router(
         )
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
+        .route("/memory/{key}/append", axum::routing::post(surface::append))
         .route("/memory/{key}/adopt", axum::routing::post(surface::adopt))
         .route("/memory", axum::routing::post(surface::upsert))
         .route("/search", axum::routing::get(surface::search))
@@ -5073,15 +5139,17 @@ mod tests {
             .description
             .clone()
             .expect("description");
-        assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
+        // The unit is the SUBJECT, not the fact and not the topic-count: one subject, whole.
+        assert!(upsert.to_lowercase().contains("one subject"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
-        // The pre-write split nudge: *evaluate* ("before saving"), then *action* (split, one call each).
-        assert!(upsert.to_lowercase().contains("before saving"), "{upsert}");
-        assert!(upsert.to_lowercase().contains("split"), "{upsert}");
-        // Growth law is *coherence, not size*: deepen a topic, never add a second; no "never grow".
+        // The two failures the rule names, and the cheap verb that prevents one of them.
+        assert!(upsert.to_lowercase().contains("trail"), "{upsert}");
+        assert!(upsert.to_lowercase().contains("grab-bag"), "{upsert}");
+        assert!(upsert.to_lowercase().contains("memory_append"), "{upsert}");
+        // Growth law is *coherence, not size*: no "never grow".
         assert!(
-            upsert.to_lowercase().contains("deepen the topic"),
-            "{upsert}"
+            !upsert.to_lowercase().contains("one topic per memory"),
+            "the count of topics is not the unit: {upsert}"
         );
         assert!(!upsert.to_lowercase().contains("never grow"), "{upsert}");
         // The feedback nudge must carry a *trigger*, not just a quality bar.

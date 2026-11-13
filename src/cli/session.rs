@@ -359,6 +359,17 @@ impl Session {
         links::merge_into(&self.conn, from, into, acted_by)
     }
 
+    /// Continue a subject with one line — one call, no read, no body resend (`memory_append`).
+    /// See [`store::append`] for why the cheap verb is the point.
+    pub fn append(
+        &self,
+        key: &str,
+        line: &str,
+        acted_by: Option<&str>,
+    ) -> Result<store::append::Appended> {
+        store::append::append(&self.conn, key, line, acted_by)
+    }
+
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
     /// point, backing `memory_get` on **both** doors: MCP's tool and `GET /memory/{key}`.
     ///
@@ -382,8 +393,7 @@ impl Session {
         store::record_useful_many(&self.conn, keys)
     }
 
-    /// Find near-duplicate candidate pairs (the merge finder, SPEC §9). No encoder needed —
-    /// it reads the stored document vectors.
+    /// Find near-duplicate candidate pairs (the merge finder, SPEC §9). No encoder needed —    /// it reads the stored document vectors.
     pub fn dupes(&self, max_distance: f32, limit: usize) -> Result<Vec<store::dupes::DupePair>> {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }

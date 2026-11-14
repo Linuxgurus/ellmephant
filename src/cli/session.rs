@@ -388,6 +388,12 @@ impl Session {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
+    /// The merge plan behind the finder (#219): a keeper/loser step per `duplicate` pair, and a
+    /// refusal carrying its class and reason for every other pair.
+    pub fn dupes_plan(&self, max_distance: f32, limit: usize) -> Result<store::dupes::MergePlan> {
+        store::dupes::plan_seen(&self.conn, &self.reader, max_distance, limit)
+    }
+
     /// Rows nobody owns, newest first — the list behind the counts, filtered by this session's reader.
     pub fn unowned(&self, limit: i64) -> Result<Vec<store::Unowned>> {
         store::unowned(&self.conn, &self.reader, limit)

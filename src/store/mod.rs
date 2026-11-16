@@ -1,5 +1,6 @@
 //! The write/read path over `memory` and its derived indexes (P4).
 
+pub mod append;
 pub mod audience;
 pub mod audit;
 pub mod channel;

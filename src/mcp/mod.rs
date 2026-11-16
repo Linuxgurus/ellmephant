@@ -52,6 +52,7 @@ pub const TOOLS: &[&str] = &[
     "sudo_release",
     "sudo_sessions",
     "memory_upsert",
+    "memory_append",
     "memory_delete",
     "memory_history_erase",
     "memory_history_search",
@@ -845,6 +846,38 @@ pub struct HistoryParams {
     #[schemars(description = "Most rows to return. The reply states the true total regardless.")]
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// `memory_append` description.
+const APPEND_DESCRIPTION: &str = "\
+Continue a subject with ONE line — the cheap verb, and the one to reach for mid-work. No key read, \
+no title, no tags, no body resent: one call appends the line to the existing memory and returns the \
+version it superseded. It NEVER creates (a missing key is refused and names `memory_upsert`, because \
+a subject that does not exist yet needs a title) and it never changes the title, audience, tags or \
+an existing line. A line the body already carries is a no-op, so a retry is safe. Use this instead \
+of writing a second memory about the same thing: a subject split across rows is a trail nobody can \
+read, and 24 rows for one review is what that looks like.";
+
+/// Parameters for [`MemoryServer::memory_append`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppendParams {
+    /// The existing memory to continue.
+    #[schemars(
+        description = "The memory to continue. It must exist: an append is a continuation, not a create."
+    )]
+    pub key: String,
+    /// The one line to append.
+    #[schemars(
+        description = "ONE line, the fact to add. No newlines — one call per line. A line the body already carries is a no-op, so retrying is safe."
+    )]
+    pub line: String,
+    /// Write a line the shape gate would refuse.
+    #[serde(default)]
+    #[schemars(
+        description = "Write even if the RESULT would look like a run record. The gate inspects the body after the append, not the line, because three terse appends of an `HH:MMZ ...` line build exactly the body `memory_upsert` refuses. Deliberate override, same as upsert's."
+    )]
+    pub force: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::memory_merge`].
@@ -2703,6 +2736,44 @@ impl MemoryServer {
                     .to_string(),
             ),
         }
+    }
+
+    /// Continue a subject with one line — the cheap verb (`memory_append`).
+    #[tool(
+        name = "memory_append",
+        description = APPEND_DESCRIPTION,
+        annotations(
+            title = "Append a line",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_append(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<AppendParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let key = p.key;
+        let line = p.line;
+        let force = p.force.unwrap_or(false);
+        let log_key = key.clone();
+        let out = self
+            .with_store("memory_append", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+                s.append(&key, &line, Some(&pen), force)
+            })
+            .await?;
+        tracing::info!(
+            tool = "memory_append",
+            key = %log_key,
+            appended = out.appended,
+            version = ?out.version,
+            "memory appended"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Fold one memory's lines into another without deleting the source — the append-only,
@@ -4950,6 +5021,7 @@ pub fn http_router(
         )
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
+        .route("/memory/{key}/append", axum::routing::post(surface::append))
         .route("/memory/{key}/fold", axum::routing::post(surface::fold))
         .route("/memory/{key}/adopt", axum::routing::post(surface::adopt))
         .route("/memory", axum::routing::post(surface::upsert))

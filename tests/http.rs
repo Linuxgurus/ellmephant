@@ -3104,3 +3104,56 @@ async fn pen_rotate_returns_a_new_secret_and_the_old_one_dies() {
         "the old secret is dead on the NEXT call"
     );
 }
+
+/// The core door's map: `/api` names every route the expanded MCP carries, stays lean by default,
+/// and `?full=true` adds the schemas a proxy needs. This is the thing that makes the core surface
+/// honest — a hidden tool with no map is an unfindable tool.
+#[tokio::test]
+async fn api_index_names_the_rest_of_the_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_open(dir.path());
+
+    let (status, body, _) = get(&app, "/api?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let ops = doc["ops"].as_array().expect("ops");
+    assert_eq!(
+        ops.len(),
+        ellmephant::http_surface::ROUTES.len(),
+        "every REST route is in the index"
+    );
+    assert!(
+        ops.iter().all(|op| op.get("schema").is_none()),
+        "the default index is lean"
+    );
+    assert!(
+        ops.iter().any(|op| op["group"] == "hygiene"),
+        "hygiene is the group the core door leaves out"
+    );
+
+    let (status, body, _) = get(&app, "/api?format=json&full=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let full: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        full["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|op| op.get("schema").is_some()),
+        "?full=true carries the schemas"
+    );
+
+    let (status, body, _) = get(&app, "/api/hygiene?format=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let group: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        group["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|op| op["group"] == "hygiene")
+    );
+
+    let (status, _, _) = get(&app, "/api/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

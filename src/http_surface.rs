@@ -5252,6 +5252,119 @@ pub async fn channel_invite(
     }
 }
 
+/// One op in the API index. Deliberately lean by default: a caller reads this to LEARN the surface,
+/// and a full catalogue (every schema, the whole law) is 80 KB — the exact cost the core door exists
+/// to avoid. `?full=true` carries the schema and the untrimmed description for a proxy that has to
+/// construct calls.
+fn api_op(route: &Route, card: &crate::mcp::ToolCard, full: bool) -> serde_json::Value {
+    let ann = &card.annotations;
+    let flag = |name: &str| ann.get(name).and_then(serde_json::Value::as_bool);
+    let read_only = flag("readOnlyHint")
+        .or(flag("read_only_hint"))
+        .unwrap_or(false);
+    let destructive = flag("destructiveHint")
+        .or(flag("destructive_hint"))
+        .unwrap_or(false);
+    let description = if full {
+        card.description.clone()
+    } else {
+        card.description
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect()
+    };
+    let mut op = serde_json::json!({
+        "op": route.tool,
+        "group": crate::mcp::group_of(route.tool),
+        "method": route.method,
+        "path": route.path,
+        "core": crate::mcp::CORE_TOOLS.contains(&route.tool),
+        "read_only": read_only,
+        "destructive": destructive,
+        "description": description,
+    });
+    if full {
+        op["schema"] = card.input_schema.clone();
+    }
+    op
+}
+
+/// The index, optionally narrowed to one group. `None` on an unknown group.
+fn api_doc(group: Option<&str>, full: bool) -> Option<serde_json::Value> {
+    let cards = tool_catalog();
+    let ops: Vec<serde_json::Value> = ROUTES
+        .iter()
+        .filter_map(|route| {
+            let card = cards.iter().find(|c| c.name == route.tool)?;
+            let g = crate::mcp::group_of(route.tool);
+            if group.is_some_and(|want| want != g) {
+                return None;
+            }
+            Some(api_op(route, card, full))
+        })
+        .collect();
+    if group.is_some() && ops.is_empty() {
+        return None;
+    }
+    let mut groups = std::collections::BTreeMap::<&str, usize>::new();
+    for route in ROUTES {
+        *groups.entry(crate::mcp::group_of(route.tool)).or_default() += 1;
+    }
+    let mut doc = serde_json::json!({
+        "surface": "core",
+        "endpoint": "/mcp/core",
+        "expanded": "/mcp",
+        "note": "The core door advertises the `core` group only. Every op here is reachable over REST at the route shown; `?full=true` adds each argument schema. The expanded door (/mcp) advertises all of them.",
+        "groups": groups,
+        "ops": ops,
+    });
+    if let Some(g) = group {
+        doc["group"] = serde_json::Value::String(g.to_string());
+    }
+    Some(doc)
+}
+
+/// `GET /api` — the map of the surface the core MCP does not carry.
+pub async fn api_index(RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let full = params.flag("full");
+    match api_doc(None, full) {
+        Some(doc) => render(
+            StatusCode::OK,
+            params.json(),
+            json_ok(doc),
+            format!("{} ops; add ?full=true for schemas\n", ROUTES.len()),
+        ),
+        None => error(
+            params.json(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the API index is empty",
+        ),
+    }
+}
+
+/// `GET /api/{group}` — one shelf of the same index.
+pub async fn api_group(Path(group): Path<String>, RawQuery(raw): RawQuery) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let full = params.flag("full");
+    match api_doc(Some(&group), full) {
+        Some(doc) => render(
+            StatusCode::OK,
+            params.json(),
+            json_ok(doc),
+            format!("group {group}; add ?full=true for schemas\n"),
+        ),
+        None => error(
+            params.json(),
+            StatusCode::NOT_FOUND,
+            format!("no group {group:?}: try /api"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod front_matter_tests {
     use super::front_matter;
@@ -5282,5 +5395,50 @@ mod front_matter_tests {
     fn a_bad_force_says_so() {
         let err = front_matter("Key: k\nForce: perhaps\n---\nbody").unwrap_err();
         assert!(err.contains("Force"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+
+    #[test]
+    fn the_index_carries_every_route_and_stays_lean() {
+        let doc = api_doc(None, false).expect("index");
+        let ops = doc["ops"].as_array().expect("ops");
+        assert_eq!(ops.len(), ROUTES.len(), "every route, once");
+        assert!(
+            ops.iter().all(|op| op.get("schema").is_none()),
+            "the default index must not carry schemas — that is the cost it exists to avoid"
+        );
+        assert!(
+            ops.iter().any(|op| op["group"] == "hygiene"),
+            "the hygiene group is the reason the index exists"
+        );
+        assert!(
+            ops.iter().all(|op| op["core"].as_bool().is_some()),
+            "every op says whether the core door already carries it"
+        );
+    }
+
+    #[test]
+    fn full_adds_schemas_and_a_group_narrows() {
+        let full = api_doc(None, true).expect("full index");
+        assert!(
+            full["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|op| op.get("schema").is_some())
+        );
+        let hygiene = api_doc(Some("hygiene"), false).expect("hygiene group");
+        assert!(
+            hygiene["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|op| op["group"] == "hygiene")
+        );
+        assert!(api_doc(Some("no-such-group"), false).is_none());
     }
 }

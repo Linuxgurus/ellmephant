@@ -129,6 +129,13 @@ pub enum Surface {
 ///
 /// Chosen by frequency, not by power: these are the calls a turn makes without thinking. Hygiene,
 /// identity, admin and repair are rare and live on the expanded door and the API.
+///
+/// Four calls that look like siblings are deliberately outside it, and the reason is the
+/// "without thinking" half rather than rarity: `semantic_search` is the wide door (every document
+/// type, plus the graveyard) against `memory_search`'s cheap memory-only pass; `memory_append` and
+/// `memory_fold` are edits whose correctness depends on a `memory_get` first, so the turn reads
+/// before it writes; `channel_wait` blocks the turn for up to 25 seconds. Add one only with a
+/// measurement of how often it is called, never because it reads like the others.
 pub const CORE_TOOLS: &[&str] = &[
     "whoami",
     "memory_search",
@@ -5102,8 +5109,8 @@ pub fn http_router(
             full_sessions.into(),
             config.clone(),
         );
-    // The second door: the same server, the same session, a shorter advertised list. A client that
-    // can call REST points here; a client that cannot stays on `/mcp`.
+    // The second door: the same server, its own session store, a shorter advertised list. A client
+    // that can call REST points here; a client that cannot stays on `/mcp`.
     let mut core_sessions = LocalSessionManager::default();
     core_sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
     let core_service: StreamableHttpService<MemoryServer, LocalSessionManager> =

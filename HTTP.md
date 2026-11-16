@@ -47,7 +47,8 @@ wrappers over the same `Session`. This adds a door; it does not move one.
 ## Two MCP doors, one store
 
 Tool schemas are re-read on every model step, and the full surface is ~80 KB. So the same process
-serves two MCP endpoints over the same sessions and the same auth:
+serves two MCP endpoints over the same auth and the same call path; each door mints its own session,
+so a client that falls back between them must `initialize` twice:
 
 | endpoint | `tools/list` | for |
 | --- | --- | --- |
@@ -55,10 +56,11 @@ serves two MCP endpoints over the same sessions and the same auth:
 | `/mcp/core` | [`CORE_TOOLS`] — recall, writes, projects, communication | a brain that can call the REST API for the rest |
 
 The split is an **advertisement**, not a permission: a client on `/mcp/core` that names a non-core
-tool still reaches it. `GET /api` is the map of everything the core door does not carry — one entry
-per op with its group, HTTP method and path, whether the core door already has it, and its read-only
-/ destructive hints. It is lean by default; `?full=true` adds each argument schema for a proxy that
-has to construct calls. Groups: `core`, `hygiene`, `identity`, `config`, `claim`, `mail`, `channel`.
+tool still reaches it. `GET /api` is the surface map: every op, the core door's included, one entry
+per op with its group, HTTP method and path, whether the core door already carries it (`core`), and
+its read-only / destructive hints. It is lean by default; `?full=true` adds each argument schema for
+a proxy that has to construct calls. Groups: `core`, `hygiene`, `identity`, `config`, `claim`, `mail`,
+`channel`.
 
 
 **A write returns before its vector exists.** `POST /memory` upserts the row and *schedules* its

@@ -114,10 +114,8 @@ pub fn append(
     // cannot write a play-by-play in one call must not be able to write one in three: three appends
     // of an `HH:MMZ ...` line produce exactly the body `memory_upsert` refuses. Refused with the same
     // sentence, and `force` is the same deliberate override.
-    if !force {
-        if let Some(hint) = crate::store::shape::record_hint(&next, &key) {
-            return Err(Error::Invalid(crate::store::shape::refusal(&hint, &key)));
-        }
+    if !force && let Some(hint) = crate::store::shape::record_hint(&next, &key) {
+        return Err(Error::Invalid(crate::store::shape::refusal(&hint, &key)));
     }
     // ★ A PROTECTED ROW KEEPS ITS LEASE GATE (Stet, same review). `may_write` is the reach; the lease
     // is the half that matters for the rows that matter, and an append with no patch to inspect is

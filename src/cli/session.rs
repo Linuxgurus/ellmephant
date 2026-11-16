@@ -371,6 +371,17 @@ impl Session {
         store::append::append(&self.conn, key, line, acted_by, force)
     }
 
+    /// Fold one row's lines into another WITHOUT deleting the source and WITHOUT write authority on
+    /// the keeper — the append-only cross-pen maintenance verb (#199).
+    pub fn fold_into(
+        &self,
+        from: &str,
+        into: &str,
+        acted_by: Option<&str>,
+    ) -> Result<links::FoldOutcome> {
+        links::fold_into(&self.conn, from, into, acted_by)
+    }
+
     /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
     /// point, backing `memory_get` on **both** doors: MCP's tool and `GET /memory/{key}`.
     ///
@@ -397,6 +408,12 @@ impl Session {
     /// Find near-duplicate candidate pairs (the merge finder, SPEC §9). No encoder needed —    /// it reads the stored document vectors.
     pub fn dupes(&self, max_distance: f32, limit: usize) -> Result<Vec<store::dupes::DupePair>> {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
+    }
+
+    /// The merge plan behind the finder (#219): a keeper/loser step per `duplicate` pair, and a
+    /// refusal carrying its class and reason for every other pair.
+    pub fn dupes_plan(&self, max_distance: f32, limit: usize) -> Result<store::dupes::MergePlan> {
+        store::dupes::plan_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
     /// Rows nobody owns, newest first — the list behind the counts, filtered by this session's reader.

@@ -57,6 +57,7 @@ pub const TOOLS: &[&str] = &[
     "memory_history_erase",
     "memory_history_search",
     "memory_merge",
+    "memory_fold",
     "memory_adopt",
     "memory_search",
     "semantic_search",
@@ -222,11 +223,16 @@ answers for a deleted key exactly as it does for a live one.";
 /// truncated list is a visible fact rather than a silent one.
 pub(crate) const HISTORY_LIMIT: usize = 100;
 
-/// `memory_dupes` description. A finder for the merge rule, not a merger.
+/// `memory_dupes` description. A finder and a classifier for the merge rule, not a merger.
 const DUPES_DESCRIPTION: &str = "\
 Find duplicate *candidates*: memory pairs whose documents sit closer than a tight `max_distance` \
 (default 0.05). Nearest first, titles shown. Candidates, not verdicts — `memory_get` both before \
-merging. The finder for the merge rule.";
+merging. **Every pair carries a `class`, and distance cannot decide it**: `duplicate` (near-identical \
+bodies — a keeper/loser plan is safe), `series` (both keys are dated steps of one series: NEVER merge \
+— each row is the only record of its day), `artifact` (both bodies are verbatim captures with a \
+recoverable source — collapse into ONE row that cites it), `distinct` (close by embedding, different \
+by content: report and move on). `plan: true` returns the merge plan instead: keeper/absorbed steps \
+for `duplicate` only, and a refusal with its reason for every other pair.";
 
 /// Cap on returned dupe pairs for a bare `memory_dupes` call.
 pub(crate) const DUPES_LIMIT: usize = 50;
@@ -258,6 +264,21 @@ call has nothing to integrate. Returns `integrated` — the lines it appended on
 made for you is visible. Both keys must exist: a merge into a typo would destroy the source. To \
 discard prose on purpose use `memory_delete`: a merge integrates, a delete discards. `[[prj:from]]` \
 is not rewritten (that names a project). Reports what moved.";
+
+/// `memory_fold` description. The append-only cross-pen fold (#199).
+const FOLD_DESCRIPTION: &str = "\
+Fold one memory's lines into another WITHOUT deleting the source and WITHOUT needing write \
+authority on the keeper. This is the cross-pen maintenance verb: `memory_merge` is a PATCH, so it \
+needs the survivor's write authority, and two sibling pens can never tidy each other's rows with \
+it. A fold can only APPEND — it cannot change the keeper's title, audience, tags, or any line it \
+already carries — so it takes only the READ gate on both rows, plus the keeper's lease if it is \
+PROTECTED. It records `edited_by` (the pen that folded) and the absorbed key, and it names both in \
+its report. It never deletes `from`, never repoints `[[links]]`, and never touches a project \
+preload: removing the absorbed row is the act of the pen that answers for it, and this verb \
+deliberately cannot do it. It requires a PROVEN pen: an append nobody is named for is \
+indistinguishable from a mistake, so an unproven caller is refused rather than recorded with no \
+actor. If the keeper already carries every line, it says so and writes nothing \
+rather than paraphrasing. Use `memory_merge` when you DO hold the survivor and want the source gone.";
 
 /// `memory_adopt` description. Responsibility, not authorship — and the two rules that stop it
 /// becoming a land-grab.
@@ -875,6 +896,22 @@ pub struct MergeParams {
     pub into: String,
 }
 
+/// Parameters for [`MemoryServer::memory_fold`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FoldParams {
+    /// The key whose lines move. It is NOT deleted.
+    #[schemars(
+        description = "The key whose lines are appended to `into`. It is NOT deleted, keeps its owner, and can only be removed by the pen that answers for it."
+    )]
+    pub from: String,
+    /// The key that gains the lines. It is not otherwise changed.
+    #[schemars(
+        description = "The key that gains the lines. Its title, audience and tags are untouched; only its body grows, by the lines of `from` it does not already carry."
+    )]
+    pub into: String,
+}
+
 /// `memory_adopt` — take responsibility for a row.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1239,6 +1276,12 @@ pub struct DupesParams {
     #[serde(default)]
     #[schemars(description = "Most pairs to return, nearest first.")]
     pub limit: Option<usize>,
+    /// Emit the merge plan instead of the pair list.
+    #[serde(default)]
+    #[schemars(
+        description = "Emit the MERGE PLAN instead of the pair list: one keeper/absorbed step per `duplicate` pair, with the reason the keeper is the keeper, and every other pair REFUSED with its class and reason. A `series` pair is refused here by construction — a dated sequence is not redundancy, and the refusal is what stops a hand-run merge being ordered against one."
+    )]
+    pub plan: Option<bool>,
 }
 
 /// Parameters for [`MemoryServer::project_get`].
@@ -2733,6 +2776,46 @@ impl MemoryServer {
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
+    /// Fold one memory's lines into another without deleting the source — the append-only,
+    /// cross-pen maintenance verb.
+    #[tool(
+        name = "memory_fold",
+        description = FOLD_DESCRIPTION,
+        annotations(
+            title = "Fold memory",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_fold(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<FoldParams>,
+    ) -> std::result::Result<String, String> {
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let from = p.from;
+        let into = p.into;
+        let log_from = from.clone();
+        let log_into = into.clone();
+        let out = self
+            .with_store("memory_fold", move |s| {
+                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+                s.fold_into(&from, &into, Some(&pen))
+            })
+            .await?;
+        tracing::info!(
+            tool = "memory_fold",
+            from = %log_from,
+            into = %log_into,
+            lines = out.integrated.len(),
+            changed = out.changed,
+            "memory folded"
+        );
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
     /// Integrate one memory into another and delete it — the safe way to merge.
     #[tool(
         name = "memory_merge",
@@ -3252,6 +3335,22 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let max_distance = p.max_distance.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE);
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
+        if p.plan.unwrap_or(false) {
+            let plan = self
+                .with_read("memory_dupes", reader.clone(), move |s| {
+                    s.dupes_plan(max_distance, limit)
+                })
+                .await?;
+            tracing::info!(
+                tool = "memory_dupes",
+                plan = true,
+                steps = plan.steps.len(),
+                refused = plan.refused.len(),
+                max_distance,
+                "dupes plan"
+            );
+            return store::dupes::plan_to_wire_json(&plan).map_err(|e| e.to_string());
+        }
         let pairs = self
             .with_read("memory_dupes", reader.clone(), move |s| {
                 s.dupes(max_distance, limit)
@@ -4923,6 +5022,7 @@ pub fn http_router(
         .route("/memory/{key}/upvote", axum::routing::post(surface::upvote))
         .route("/memory/{key}/merge", axum::routing::post(surface::merge))
         .route("/memory/{key}/append", axum::routing::post(surface::append))
+        .route("/memory/{key}/fold", axum::routing::post(surface::fold))
         .route("/memory/{key}/adopt", axum::routing::post(surface::adopt))
         .route("/memory", axum::routing::post(surface::upsert))
         .route("/search", axum::routing::get(surface::search))

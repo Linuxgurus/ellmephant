@@ -482,6 +482,160 @@ pub fn merge_into(
     })
 }
 
+/// What a fold changed. It names the keeper, the row whose lines moved, and the lines it appended.
+///
+/// ★ NO DELETION IS REPORTED BECAUSE NONE HAPPENS. A fold moves prose; removing the absorbed row is
+/// the act of the pen that answers for it, and this verb deliberately cannot do it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FoldOutcome {
+    /// The row that gained lines.
+    pub into: String,
+    /// The row those lines came from. It still exists.
+    pub from: String,
+    /// The lines appended to `into`, verbatim. Empty means `into` already carried every line.
+    pub integrated: Vec<String>,
+    /// Whether anything was written at all.
+    pub changed: bool,
+}
+
+/// Fold `from` into `into` WITHOUT deleting `from` and WITHOUT write authority on `into`.
+///
+/// This is the one cross-pen maintenance verb (soma/ellmephant#199). `merge_into` requires full
+/// write authority on the survivor because it is a PATCH; exempting it would let any reader rewrite
+/// the title, audience and tags of a row it does not answer for — the #190 defect wearing a tidy
+/// excuse. A fold is narrower by construction:
+///
+/// - it appends only the source's lines the keeper does not already carry ([`missing_lines`]), so
+///   nothing existing can be changed, reworded or reordered;
+/// - it records `edited_by` (the pen that acted) and a row in `memory_fold` naming what was absorbed;
+/// - it never deletes the source, never repoints a `[[link]]`, and never touches a project preload;
+/// - it works in either direction, so a sibling pair has no impossible direction.
+///
+/// The gate is READ, not write: a pen must be able to see both rows (you cannot fold prose you are
+/// not allowed to read), and a PROTECTED keeper still needs its lease. Nothing else is asked,
+/// because nothing else can be changed.
+///
+/// ★ AN ACTOR IS REQUIRED (Stet's finding at `fb9ade3`, 2026-11-13). The read gate answers *may this
+/// pen see the row*; it never answers *whose act is this*. An append made by a client that cannot be
+/// told apart from any other would land in the keeper with `memory_fold.actor` NULL — "a write nobody
+/// is named for is indistinguishable from a mistake", the delete doctrine (#109), one verb over. The
+/// hole would also outlive the open-write window: a bearer-token client passes `authorize` and still
+/// resolves to no pen.
+pub fn fold_into(
+    conn: &Connection,
+    from: &str,
+    into: &str,
+    acted_by: Option<&str>,
+) -> Result<FoldOutcome> {
+    let from = slug::slugify(from);
+    let into = slug::slugify(into);
+    if from == into {
+        return Err(Error::Config(
+            "a memory cannot be folded into itself".into(),
+        ));
+    }
+    let Some(actor) = acted_by else {
+        return Err(Error::Forbidden(
+            "a fold must name the pen doing it: appending to a row is a write, and an append \
+             nobody is named for is indistinguishable from a mistake"
+                .into(),
+        ));
+    };
+
+    // ★ ONE SERIALIZED UNIT: take the write lock, THEN read (soma/ellmephant#199). `missing_lines` is
+    // computed from both bodies and the append lands against what was read, so a rival commit landing
+    // between the read and the write is a lost update — a fold racing the keeper's owner's `upsert`
+    // is deleted silently, and a fold racing a fold loses one of the two appends. DEFERRED cannot fix
+    // this: it reads first and then promotes its lock, which in WAL fails as `SQLITE_BUSY_SNAPSHOT`
+    // the caller cannot tell apart from a conflict. IMMEDIATE makes compare-then-write one unit, the
+    // same idiom `upsert` uses for its version CAS.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+
+    let body_of = |key: &str| -> Result<(String, String)> {
+        tx.query_row(
+            "SELECT body, audience FROM memory WHERE key = ?1",
+            params![key],
+            |r| -> rusqlite::Result<(String, String)> { Ok((r.get(0)?, r.get(1)?)) },
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(key.to_string()))
+    };
+    let (into_id, into_title, into_body, into_audience) = tx
+        .query_row(
+            "SELECT id, title, body, audience FROM memory WHERE key = ?1",
+            params![into],
+            |r| -> rusqlite::Result<(i64, String, String, String)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(into.clone()))?;
+    let (from_body, from_audience) = body_of(&from)?;
+
+    // ★ THE DOOR IS VISIBILITY, AND IT OPENS BOTH WAYS. A pen that cannot read the keeper must not
+    // append to it (it would be writing words it cannot see), and a pen that cannot read the source
+    // must not fold it (folding is copying, and copying is reading).
+    if !crate::store::may_read_audience(&tx, actor, &from_audience)? {
+        return Err(Error::Forbidden(format!(
+            "cannot fold `{from}`: its audience does not include the pen doing it. Folding copies \
+             prose, and copying is reading."
+        )));
+    }
+    if !crate::store::may_read_audience(&tx, actor, &into_audience)? {
+        return Err(Error::Forbidden(format!(
+            "cannot fold into `{into}`: its audience does not include the pen doing it. A row you \
+             cannot read is not a row you may append to."
+        )));
+    }
+    // A protected keeper is still protected: an append is a write, and the lease is what makes it
+    // visible. Asked by the same predicate the delete path asks.
+    crate::store::guard_protected_lease(&tx, &into, Some(actor))?;
+
+    let integrated = missing_lines(&from_body, &into_body);
+    if integrated.is_empty() {
+        // Nothing to append: no version, no `edited_by`, no ledger row. The transaction is dropped
+        // uncommitted, which is the rollback this branch means.
+        return Ok(FoldOutcome {
+            into,
+            from,
+            integrated,
+            changed: false,
+        });
+    }
+
+    // The keeper's PREVIOUS text survives as a version, exactly as any document write does: a fold
+    // that is later judged wrong must be reversible by reading what it replaced.
+    crate::store::version::snapshot(&tx, into_id, &into, Some(&format!("fold from {from}")))?;
+    let body = format!("{}\n{}", into_body.trim_end(), integrated.join("\n"));
+    tx.execute(
+        "UPDATE memory SET body = ?2, edited_by = ?3, updated = datetime('now') WHERE id = ?1",
+        params![into_id, body, acted_by],
+    )?;
+    // The keeper's body moved, so its outgoing edges moved with it — and the new lines may carry
+    // `[[links]]` of their own. `write_links` is the one home for that write, and a changed document
+    // is queued for a new vector like any other write. The TITLE is read, never written.
+    crate::store::write_links(&tx, into_id, &into, &body)?;
+    let doc = projection::embed_document(&into, &into_title, &body);
+    crate::store::encode::enqueue(
+        &tx,
+        &Kind::Memory.keyslug(&into),
+        &doc,
+        crate::store::encode::PRIORITY_LIVE,
+    )?;
+    // The record that this happened, and where the lines came from. Append-only, like the prose.
+    tx.execute(
+        "INSERT INTO memory_fold (keeper_id, absorbed_key, actor) VALUES (?1, ?2, ?3)",
+        params![into_id, from, acted_by],
+    )?;
+    tx.commit()?;
+    Ok(FoldOutcome {
+        into,
+        from,
+        integrated,
+        changed: true,
+    })
+}
+
 /// What a [`rename`] changed.
 #[derive(Debug, Clone)]
 pub struct RenameOutcome {

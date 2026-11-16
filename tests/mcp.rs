@@ -497,9 +497,19 @@ async fn post(
     session_id: Option<&str>,
     body: serde_json::Value,
 ) -> (StatusCode, Option<String>, String) {
+    post_to(app, "/mcp", session_id, body).await
+}
+
+/// One JSON-RPC POST to a named door (`/mcp` or `/mcp/core`).
+async fn post_to(
+    app: &axum::Router,
+    uri: &str,
+    session_id: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, Option<String>, String) {
     let mut builder = Request::builder()
         .method("POST")
-        .uri("/mcp")
+        .uri(uri)
         .header("host", "127.0.0.1")
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
@@ -1488,4 +1498,92 @@ async fn config_round_trips_with_its_written_acl() {
 
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
+}
+
+/// `/mcp/core` advertises the hot path and nothing else — and still ANSWERS for a tool it did not
+/// advertise. The split is an advertisement, not a permission.
+#[tokio::test]
+async fn the_core_door_advertises_only_the_hot_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = ellmephant::http::HttpState::new(
+        Paths::from_root(dir.path()),
+        Config::default(),
+        std::sync::Arc::new(ellmephant::http::LockWatch::new()),
+        std::time::Instant::now(),
+    );
+    let app = http_router(
+        MemoryServer::new(session(dir.path())).with_identity("tester"),
+        "127.0.0.1",
+        state,
+    );
+
+    let (status, session, body) = post_to(
+        &app,
+        "/mcp/core",
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let session = session.expect("Mcp-Session-Id header");
+    assert!(
+        payload(&body)["result"]["instructions"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CORE SURFACE"),
+        "the core door names what it is not carrying: {body}"
+    );
+    let _ = post_to(
+        &app,
+        "/mcp/core",
+        Some(&session),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+
+    let (status, _, body) = post_to(
+        &app,
+        "/mcp/core",
+        Some(&session),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = payload(&body);
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), ellmephant::mcp::CORE_TOOLS.len());
+    assert!(!names.contains(&"memory_dupes"), "hygiene is not core");
+    assert!(
+        !names.contains(&"channel_prune"),
+        "channel admin is not core"
+    );
+
+    // Not advertised, still callable: the door filters the list, not the handler.
+    let (status, _, body) = post_to(
+        &app,
+        "/mcp/core",
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "memory_dupes", "arguments": {} }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        payload(&body)["result"]["isError"] != serde_json::json!(true),
+        "a named non-core tool still runs on the core door: {body}"
+    );
 }

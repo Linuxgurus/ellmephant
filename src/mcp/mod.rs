@@ -110,6 +110,70 @@ pub const TOOLS: &[&str] = &[
 /// `initialize` cannot disagree about who is answering.
 pub(crate) const SERVER_NAME: &str = "ellmephant";
 
+/// Which tools an MCP door ADVERTISES.
+///
+/// The store serves two doors over the same [`Session`] and the same auth: `/mcp` (the whole
+/// surface) and `/mcp/core` (the hot path). The split exists because tool schemas are re-read on
+/// every model step — the full surface is ~80 KB, and a client that can call the REST API does not
+/// need most of it in context. The call path is NOT filtered: a core client that names a non-core
+/// tool still reaches it, so this is an advertisement decision, never a permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// Every tool. `/mcp`.
+    Full,
+    /// The hot path: memory recall/write, projects, and communication. `/mcp/core`.
+    Core,
+}
+
+/// The tools `/mcp/core` advertises. Everything else is reachable over REST and indexed at `GET /api`.
+///
+/// Chosen by frequency, not by power: these are the calls a turn makes without thinking. Hygiene,
+/// identity, admin and repair are rare and live on the expanded door and the API.
+pub const CORE_TOOLS: &[&str] = &[
+    "whoami",
+    "memory_search",
+    "memory_get",
+    "memory_upsert",
+    "memory_delete",
+    "memory_stats",
+    "memory_backlinks",
+    "memory_history",
+    "memory_upvote",
+    "project_get",
+    "project_upsert",
+    "project_list",
+    "mail_send",
+    "mail_inbox",
+    "mail_read",
+    "mail_ack",
+    "channel_list",
+    "channel_send",
+    "channel_history",
+    "channel_fetch",
+];
+
+/// The group an API index entry belongs to. The group is a shelf, not a permission: `GET /api`
+/// carries every op, and the group only decides which short list a reader asks for first.
+pub(crate) fn group_of(tool: &str) -> &'static str {
+    if CORE_TOOLS.contains(&tool) {
+        return "core";
+    }
+    if tool.starts_with("pen_") || tool == "whois" || tool.starts_with("sudo") {
+        "identity"
+    } else if tool.starts_with("config") {
+        "config"
+    } else if tool.starts_with("claim") {
+        "claim"
+    } else if tool.starts_with("mail") {
+        "mail"
+    } else if tool.starts_with("channel") {
+        "channel"
+    } else {
+        // memory_dupes, merge, adopt, unowned, dangling, reembed, reparse, history_*.
+        "hygiene"
+    }
+}
+
 /// One tool exactly as `tools/list` presents it, for a surface that is not MCP.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCard {
@@ -1677,6 +1741,9 @@ pub struct MemoryServer {
     /// construction; every write it makes is stamped with that name instead of being refused as
     /// anonymous. HTTP transports ignore this — their headers decide.
     declared: Option<String>,
+    /// Which tools this instance advertises. One process serves both doors; the value is set once
+    /// at mount time and never changes.
+    surface: Surface,
 }
 
 /// What a miss means when the row belongs to the caller (hostile review of #194, round 1). Three
@@ -1719,7 +1786,16 @@ impl MemoryServer {
             cfg,
             encoder,
             declared: None,
+            surface: Surface::Full,
         }
+    }
+
+    /// Advertise a surface other than the full one. Called at mount time by [`http_router`]; the
+    /// session, auth and call path are unchanged, so a core door is the same server with a shorter
+    /// `tools/list`.
+    pub fn with_surface(mut self, surface: Surface) -> Self {
+        self.surface = surface;
+        self
     }
 
     /// ★ ONLY THE RECIPIENT READS ITS MAIL. `mail_inbox` takes a recipient as an argument, so without
@@ -4879,10 +4955,44 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
 
 #[tool_handler]
 impl ServerHandler for MemoryServer {
+    /// The surface split lives here and nowhere else. `#[tool_handler]` fills this method in only
+    /// when the impl does not define one, so this override is the whole mechanism: one server, two
+    /// advertised lists, one call path.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = Self::tool_router().list_all();
+        if self.surface == Surface::Core {
+            tools.retain(|tool| CORE_TOOLS.contains(&tool.name.as_ref()));
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
+        })
+    }
+
     fn get_info(&self) -> ServerConfig {
+        // The core door says what it is NOT carrying, and where to find it. A hint in the
+        // instructions costs one line here; a hidden tool with no signpost is an unfindable tool.
+        let instructions = if self.surface == Surface::Core {
+            format!(
+                "{INSTRUCTIONS}\n\nCORE SURFACE: this door advertises the hot path only. The rest \
+                 (hygiene, identity, admin, repair) is REST-only: GET /api for the map — each op's \
+                 group, method, path and hints; `GET /api/<group>` for one shelf; `?full=true` for \
+                 argument schemas. The expanded door is /mcp."
+            )
+        } else {
+            INSTRUCTIONS.to_string()
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(SERVER_NAME, crate::VERSION))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(instructions)
     }
 }
 
@@ -4981,13 +5091,29 @@ pub fn http_router(
     // (`None` disables reaping outright: never stuck, but a client that silently vanishes keeps
     // its slot until the process restarts.)
     const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-    let mut sessions = LocalSessionManager::default();
-    sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
-    let service_server = server.clone();
+    let mut full_sessions = LocalSessionManager::default();
+    full_sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
+    // The plain-HTTP reads reuse this clone, so the doors cannot drift.
+    let shared = server.clone();
+    let state_server = server.clone();
     let service: StreamableHttpService<MemoryServer, LocalSessionManager> =
-        StreamableHttpService::new(move || Ok(server.clone()), sessions.into(), config);
+        StreamableHttpService::new(
+            move || Ok(server.clone()),
+            full_sessions.into(),
+            config.clone(),
+        );
+    // The second door: the same server, the same session, a shorter advertised list. A client that
+    // can call REST points here; a client that cannot stays on `/mcp`.
+    let mut core_sessions = LocalSessionManager::default();
+    core_sessions.session_config.keep_alive = Some(SESSION_IDLE_TIMEOUT);
+    let core_service: StreamableHttpService<MemoryServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(shared.clone().with_surface(Surface::Core)),
+            core_sessions.into(),
+            config,
+        );
     // The plain-HTTP reads reuse this very session, so the two doors cannot drift.
-    let state = state.with_server(service_server);
+    let state = state.with_server(state_server);
     use crate::http_surface as surface;
     axum::Router::new()
         .route("/health", axum::routing::get(crate::http::health))
@@ -5125,6 +5251,12 @@ pub fn http_router(
         .fallback(surface::not_found)
         .method_not_allowed_fallback(surface::method_not_allowed)
         .nest_service("/mcp", service)
+        .nest_service("/mcp/core", core_service)
+        // The map of everything the core door does NOT carry. `/api` is the whole catalogue, one
+        // entry per tool (group, route, annotations, schema); `/api/{group}` is the same filtered.
+        // Read-only and content-free: it names the surface, never a memory.
+        .route("/api", axum::routing::get(surface::api_index))
+        .route("/api/{group}", axum::routing::get(surface::api_group))
         .with_state(state)
 }
 
@@ -5197,6 +5329,54 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_is_a_subset_of_every_tool_and_none_is_duplicated() {
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in CORE_TOOLS {
+            assert!(TOOLS.contains(tool), "core names an unknown tool: {tool}");
+            assert!(seen.insert(*tool), "core names a tool twice: {tool}");
+        }
+        // The split has to be a SPLIT: a core list equal to the whole surface saves nothing.
+        assert!(
+            CORE_TOOLS.len() < TOOLS.len() / 2,
+            "core is {} of {} — not a hot path",
+            CORE_TOOLS.len(),
+            TOOLS.len()
+        );
+    }
+
+    #[test]
+    fn the_core_surface_advertises_exactly_core() {
+        let full = MemoryServer::tool_router().list_all();
+        let mut core = full.clone();
+        core.retain(|tool| CORE_TOOLS.contains(&tool.name.as_ref()));
+        assert_eq!(core.len(), CORE_TOOLS.len());
+        for tool in &full {
+            let expected = CORE_TOOLS.contains(&tool.name.as_ref());
+            assert_eq!(
+                core.iter().any(|t| t.name == tool.name),
+                expected,
+                "{} is on the wrong side of the split",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_has_an_api_group() {
+        let groups: std::collections::BTreeSet<&str> =
+            TOOLS.iter().map(|tool| group_of(tool)).collect();
+        assert_eq!(
+            groups,
+            [
+                "channel", "claim", "config", "core", "hygiene", "identity", "mail"
+            ]
+            .into_iter()
+            .collect(),
+            "a new tool needs a group, and an empty group is a stale match arm"
+        );
+    }
 
     #[test]
     fn router_exposes_every_tool_with_annotations() {

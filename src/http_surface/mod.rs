@@ -21,11 +21,8 @@ use crate::mcp::{
     SearchParams, SemanticSearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
-use crate::store::{
-    self, encode,
-    links::{backlinks_to_wire_json, dangling_to_wire_json},
-    project, tags,
-};
+use crate::store::{self, encode, project, tags};
+use crate::wire::links::{backlinks_to_wire_json, dangling_to_wire_json};
 use rusqlite::OptionalExtension;
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials
@@ -554,11 +551,34 @@ fn refusal_response(json: bool, refusal: crate::identity::Refusal, absent: Statu
     }
 }
 
+/// ★ THE CALLER IS AN EXTRACTOR TOO (soma/ellmephant#231's invariant): a door may not be able to
+/// name a pen, decide a gate, or choose a status. Building a `Caller` used to be something every
+/// handler did for itself, from headers it fetched itself — twenty copies of
+/// `Caller::from_headers(&state.paths, &headers)`. Now the request is read ONCE, here, and a handler
+/// receives the answer, so the door has one way to ask who is speaking.
+///
+/// The extractor cannot fail: an unproven or forged claim is not an error at extraction time, it is
+/// a `Caller` whose `pen()` refuses. That is the distinction #232 exists to keep — reading is open,
+/// writing needs a pen — so the refusal belongs at the verb, not at the transport.
+impl axum::extract::FromRequestParts<HttpState> for crate::identity::Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &HttpState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        Ok(crate::identity::Caller::from_headers(
+            &state.paths,
+            &parts.headers,
+        ))
+    }
+}
+
 /// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
 /// because authority is always borrowed BY somebody.
 #[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as in `session`
-fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, Response> {
-    crate::identity::Caller::from_headers(paths, headers)
+fn proven_pen(caller: &crate::identity::Caller, json: bool) -> Result<String, Response> {
+    caller
         .pen_or("refused: this needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
         .map(ToString::to_string)
         .map_err(|r| refusal_response(json, r, StatusCode::UNAUTHORIZED))
@@ -575,8 +595,8 @@ fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> Result<String, R
 
 /// Who this request reads as. A proven pair decides; anything else — including a forged claim — is
 /// nobody, and nobody sees public rows only. Reads never fail for want of a pen.
-fn reader_from(headers: &HeaderMap, paths: &Paths) -> crate::store::audience::Reader {
-    crate::identity::Caller::from_headers(paths, headers).reader()
+fn reader_from(caller: &crate::identity::Caller) -> crate::store::audience::Reader {
+    caller.reader()
 }
 
 /// Build a `memory_search` request from the query string, so `GET /search` runs the MCP path.

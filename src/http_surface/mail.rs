@@ -64,11 +64,10 @@ pub async fn mail_send(
 /// The proven pen behind an HTTP request, or the refusal to send.
 #[allow(clippy::result_large_err)] // the refusal IS the axum response; boxing it would be taste, not safety.
 pub(super) fn mail_reader_identity(
-    headers: &HeaderMap,
+    caller: &crate::identity::Caller,
     json: bool,
-    paths: &Paths,
 ) -> Result<String, Response> {
-    crate::identity::Caller::from_headers(paths, headers)
+    caller
         .pen_or("refused: reading mail needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
         .map(ToString::to_string)
         .map_err(|r| refusal_response(json, r, StatusCode::FORBIDDEN))
@@ -85,6 +84,7 @@ async fn mail_guard(
     reader: &str,
     requested: &str,
     json: bool,
+    scope: crate::store::mail::BoxScope,
 ) -> Result<(), Response> {
     // A helper rather than a handler: no `&mut Parts`, so no extractor (#233).
     let Some(server) = state.server() else {
@@ -95,33 +95,24 @@ async fn mail_guard(
         ));
     };
     let (r, q) = (reader.to_string(), requested.to_string());
-    let allowed = server
+    // ★ THE SAME RULE AS MCP, including the GRANT (soma/ellmephant#235): this asked the `read`
+    // grant even when the verb was `ack`, so a pen holding only an ack grant was refused here and
+    // admitted there. The sentence comes from the store, so the two doors cannot drift again.
+    server
         .with_read(
             "mail_guard",
             crate::store::audience::Reader::pen(&r),
-            move |s| s.mail_may_read(&r, &q),
+            move |s| s.mail_may_open_box(&r, &q, scope),
         )
         .await
-        .map_err(|e| error(json, StatusCode::BAD_REQUEST, &e))?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(error(
-            json,
-            StatusCode::FORBIDDEN,
-            format!(
-                "refused: `{reader}` may not read `{requested}`'s mail — only the recipient, or a \
-                 live `read` grant, may"
-            ),
-        ))
-    }
+        .map_err(|e| error(json, error_status(&e), &e))
 }
 
 pub async fn mail_inbox(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-    headers: HeaderMap,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -133,11 +124,19 @@ pub async fn mail_inbox(
         .maybe("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_usize);
-    let reader = match mail_reader_identity(&headers, json, &state.paths) {
+    let reader = match mail_reader_identity(&caller, json) {
         Ok(name) => name,
         Err(r) => return r,
     };
-    if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
+    if let Err(r) = mail_guard(
+        &state,
+        &reader,
+        &recipient,
+        json,
+        crate::store::mail::BoxScope::Read,
+    )
+    .await
+    {
         return r;
     }
     let me = Some(reader.clone());
@@ -209,6 +208,7 @@ pub async fn mail_inbox(
 pub async fn mail_ack(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -227,13 +227,21 @@ pub async fn mail_ack(
             "`recipient` and `seq` are required",
         );
     };
-    let reader = match crate::identity::Caller::from_headers(&state.paths, &headers)
+    let reader = match caller
         .pen_or("refused: a cursor belongs to a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
         Ok(name) => name.to_string(),
         Err(r) => return refusal_response(json, r, StatusCode::FORBIDDEN),
     };
-    if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
+    if let Err(r) = mail_guard(
+        &state,
+        &reader,
+        &recipient,
+        json,
+        crate::store::mail::BoxScope::Ack,
+    )
+    .await
+    {
         return r;
     }
     match server
@@ -259,13 +267,13 @@ pub async fn mail_ack(
 pub async fn mail_read(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     axum::extract::Path(seq): axum::extract::Path<i64>,
     RawQuery(raw): RawQuery,
-    headers: HeaderMap,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let reader = match mail_reader_identity(&headers, json, &state.paths) {
+    let reader = match mail_reader_identity(&caller, json) {
         Ok(name) => name,
         Err(r) => return r,
     };
@@ -279,7 +287,15 @@ pub async fn mail_read(
     {
         Ok(Some(letter)) => {
             // The LETTER decides its box: the check is on the row, not on an argument.
-            if let Err(r) = mail_guard(&state, &reader, &letter.recipient, json).await {
+            if let Err(r) = mail_guard(
+                &state,
+                &reader,
+                &letter.recipient,
+                json,
+                crate::store::mail::BoxScope::Read,
+            )
+            .await
+            {
                 return r;
             }
             render(
@@ -330,6 +346,7 @@ pub async fn mail_prune(
 pub async fn mail_surrogate_grant(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -338,7 +355,7 @@ pub async fn mail_surrogate_grant(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers).pen_or(
+    let caller = match caller.pen_or(
         "refused: granting a name needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
     ) {
         Ok(name) => name.to_string(),
@@ -403,6 +420,7 @@ pub async fn mail_surrogate_grant(
 pub async fn mail_surrogate_revoke(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -411,9 +429,7 @@ pub async fn mail_surrogate_revoke(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers)
-        .pen_or("refused: revoking needs a proven pen")
-    {
+    let caller = match caller.pen_or("refused: revoking needs a proven pen") {
         Ok(name) => name.to_string(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -457,6 +473,7 @@ pub async fn mail_surrogate_revoke(
 pub async fn mail_surrogate_list(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -465,9 +482,7 @@ pub async fn mail_surrogate_list(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers)
-        .pen_or("refused: listing grants needs a proven pen")
-    {
+    let caller = match caller.pen_or("refused: listing grants needs a proven pen") {
         Ok(name) => name.to_string(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };

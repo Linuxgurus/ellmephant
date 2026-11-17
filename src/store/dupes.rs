@@ -591,54 +591,6 @@ fn load_rows(
     Ok(rows)
 }
 
-/// Positional wire for the pair list (mirrors the other list-shaped reads): a `cols` header and
-/// bare-array rows. `distance` is rounded to 4 decimals.
-pub fn to_wire_json(pairs: &[DupePair]) -> Result<String> {
-    let rows: Vec<serde_json::Value> = pairs
-        .iter()
-        .map(|p| {
-            serde_json::json!([
-                p.key_a,
-                p.title_a,
-                p.key_b,
-                p.title_b,
-                ((p.distance as f64) * 10_000.0).round() / 10_000.0,
-                p.class.as_str()
-            ])
-        })
-        .collect();
-    Ok(format!(
-        "{{\"cols\":[\"key_a\",\"title_a\",\"key_b\",\"title_b\",\"distance\",\"class\"],\
-         \"count\":{},\"pairs\":{}}}",
-        pairs.len(),
-        crate::wire::rows_array(&rows)
-    ))
-}
-
-/// Positional wire for [`MergePlan`]: the steps to take, and the pairs `--plan` refuses with the
-/// reason. Both tables are positional, like every other list-shaped read.
-pub fn plan_to_wire_json(plan: &MergePlan) -> Result<String> {
-    let steps: Vec<serde_json::Value> = plan
-        .steps
-        .iter()
-        .map(|e| serde_json::json!([e.keep, e.absorb, e.reason]))
-        .collect();
-    let refused: Vec<serde_json::Value> = plan
-        .refused
-        .iter()
-        .map(|r| serde_json::json!([r.key_a, r.key_b, r.class.as_str(), r.reason]))
-        .collect();
-    Ok(format!(
-        "{{\"cols\":[\"keep\",\"absorb\",\"reason\"],\"count\":{},\"plan\":{},\
-         \"refused_cols\":[\"key_a\",\"key_b\",\"class\",\"reason\"],\"refused_count\":{},\
-         \"refused\":{}}}",
-        plan.steps.len(),
-        crate::wire::rows_array(&steps),
-        plan.refused.len(),
-        crate::wire::rows_array(&refused)
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,7 +605,7 @@ mod tests {
             distance: 0.012_345,
             class: Class::Duplicate,
         }];
-        let wire = to_wire_json(&pairs).unwrap();
+        let wire = crate::wire::dupes::to_wire_json(&pairs).unwrap();
         assert!(wire.starts_with(
             "{\"cols\":[\"key_a\",\"title_a\",\"key_b\",\"title_b\",\"distance\",\"class\"]"
         ));
@@ -662,7 +614,11 @@ mod tests {
             wire.contains("[\"a\",\"A\",\"b\",\"B\",0.0123,\"duplicate\"]"),
             "{wire}"
         );
-        assert!(to_wire_json(&[]).unwrap().contains("\"pairs\":[]"));
+        assert!(
+            crate::wire::dupes::to_wire_json(&[])
+                .unwrap()
+                .contains("\"pairs\":[]")
+        );
     }
 
     #[test]
@@ -791,7 +747,7 @@ mod tests {
                 reason: "a dated series".into(),
             }],
         };
-        let wire = plan_to_wire_json(&plan).unwrap();
+        let wire = crate::wire::dupes::plan_to_wire_json(&plan).unwrap();
         assert!(wire.contains("\"count\":1"), "{wire}");
         assert!(
             wire.contains("[\"keeper\",\"loser\",\"more reads (9 vs 2 visits)\"]"),

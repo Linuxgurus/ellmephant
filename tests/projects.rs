@@ -857,7 +857,7 @@ fn project_view_wire_carries_bodies_in_a_sister_table() {
     let view = project::view(&conn, &key, project::Hydrate::Full)
         .unwrap()
         .unwrap();
-    let wire = project::view_to_wire_json(&view).unwrap();
+    let wire = ellmephant::wire::project::view_to_wire_json(&view).unwrap();
     let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
     assert_eq!(v["preload"]["cols"], serde_json::json!(["key", "title"]));
     assert_eq!(v["bodies"]["cols"], serde_json::json!(["key", "body"]));
@@ -870,7 +870,7 @@ fn project_view_wire_carries_bodies_in_a_sister_table() {
     let plain = project::view(&conn, &key, project::Hydrate::None)
         .unwrap()
         .unwrap();
-    let wire = project::view_to_wire_json(&plain).unwrap();
+    let wire = ellmephant::wire::project::view_to_wire_json(&plain).unwrap();
     assert!(
         !wire.contains("bodies"),
         "no sister table when nothing is hydrated: {wire}"
@@ -887,7 +887,7 @@ fn the_wire_shapes_are_positional_and_self_describing() {
     project::upsert(&conn, &project_fixture("chronos"), Some(&["a".to_string()])).unwrap();
 
     let list = project::list(&conn, &project::Filter::default()).unwrap();
-    let wire = project::list_to_wire_json(&list).unwrap();
+    let wire = ellmephant::wire::project::list_to_wire_json(&list).unwrap();
     let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
     assert_eq!(
         v["cols"],
@@ -908,7 +908,7 @@ fn the_wire_shapes_are_positional_and_self_describing() {
     let view = project::view(&conn, &key, project::Hydrate::None)
         .unwrap()
         .unwrap();
-    let wire = project::view_to_wire_json(&view).unwrap();
+    let wire = ellmephant::wire::project::view_to_wire_json(&view).unwrap();
     let v: serde_json::Value = serde_json::from_str(&wire).expect("valid json");
     assert_eq!(v["project"]["key"], serde_json::json!("chronos"));
     assert_eq!(v["preload"]["cols"], serde_json::json!(["key", "title"]));

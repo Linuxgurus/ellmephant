@@ -7,8 +7,8 @@
 use crate::mcp::context::{pen_name, reader_of};
 use crate::mcp::*;
 use crate::search::{Fields, Query, to_wire_json};
-use crate::store::links::backlinks_to_wire_json;
 use crate::store::{self};
+use crate::wire::links::backlinks_to_wire_json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 
@@ -434,7 +434,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             targets = crate::store::links::dangling_targets(&edges),
             "dangling edges"
         );
-        Ok(crate::store::links::dangling_to_wire_json(&edges))
+        Ok(crate::wire::links::dangling_to_wire_json(&edges))
     }
 
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
@@ -497,7 +497,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 max_distance,
                 "dupes plan"
             );
-            return store::dupes::plan_to_wire_json(&plan).map_err(|e| e.to_string());
+            return crate::wire::dupes::plan_to_wire_json(&plan).map_err(|e| e.to_string());
         }
         let pairs = self
             .with_read("memory_dupes", reader.clone(), move |s| {
@@ -510,7 +510,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             max_distance,
             "dupes"
         );
-        store::dupes::to_wire_json(&pairs).map_err(|e| e.to_string())
+        crate::wire::dupes::to_wire_json(&pairs).map_err(|e| e.to_string())
     }
 
     /// Recompute every vector and rebuild the derived index — the only path out of a model or

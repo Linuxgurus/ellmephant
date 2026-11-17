@@ -108,3 +108,36 @@ pub fn project_upsert(
     session.channel_gate(caller.as_str(), crate::store::channel::Class::Record)?;
     session.project_merge(patch)
 }
+
+/// Take a commons row for a pen — or hand it to another. `to` is the credited owner; `force` is the
+/// caller's own word that it means it.
+///
+/// ★ THE GATE WAS IN BOTH DOORS (#168 review): each placed `channel_gate(Class::Record)` inside its
+/// own store closure. They agreed, which is luck rather than design — the next verb that needed one
+/// would have copied whichever door its author happened to read.
+pub fn memory_adopt(
+    session: &Session,
+    caller: &Pen,
+    key: &str,
+    to: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    session.channel_gate(caller.as_str(), crate::store::channel::Class::Record)?;
+    match to {
+        // A different pen takes the row: `assign` owns the subtree/ancestor law.
+        Some(target) => session.assign(key, caller.as_str(), target, force),
+        // The caller takes it itself.
+        None => session.adopt(key, caller.as_str(), force),
+    }
+}
+
+/// Prune a channel's text (or every channel with a retention). `Acting`, not `Record`: destroying the
+/// text a lock exists to make you fetch first is the act the lock is about.
+pub fn channel_prune(
+    session: &Session,
+    caller: &Pen,
+    channel: Option<&str>,
+) -> Result<Vec<crate::store::channel::Pruned>> {
+    session.channel_gate(caller.as_str(), crate::store::channel::Class::Acting)?;
+    session.channel_prune(channel)
+}

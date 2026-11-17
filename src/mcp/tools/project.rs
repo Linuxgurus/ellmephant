@@ -84,7 +84,7 @@ impl MemoryServer {
             preload = view.preload.len(),
             "project read"
         );
-        project::view_to_wire_json(&view).map_err(|e| e.to_string())
+        crate::wire::project::view_to_wire_json(&view).map_err(|e| e.to_string())
     }
 
     /// List the projects: the cheap index (no `state`), with intersecting filters.
@@ -118,7 +118,7 @@ impl MemoryServer {
             })
             .await?;
         tracing::info!(tool = "project_list", projects = rows.len(), "projects");
-        project::list_to_wire_json(&rows).map_err(|e| e.to_string())
+        crate::wire::project::list_to_wire_json(&rows).map_err(|e| e.to_string())
     }
 
     /// Read one config item — a stored value with a written ACL.

@@ -6,21 +6,18 @@
 use super::*;
 
 /// Who is asking, if anyone proved it. Reads are open, so `None` is a legitimate answer.
-pub(super) fn proven(headers: &HeaderMap, paths: &Paths) -> Option<String> {
-    crate::identity::Caller::from_headers(paths, headers)
-        .proven()
-        .map(ToString::to_string)
+pub(super) fn proven(caller: &crate::identity::Caller) -> Option<String> {
+    caller.proven().map(ToString::to_string)
 }
 
 /// GET /channels — policy for every channel, plus this pen's unread counts and breach.
 pub async fn channel_list(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let pen = proven(&headers, &state.paths);
+    let pen = proven(&caller);
     let caller = pen.clone();
     let out = server
         .with_read(
@@ -72,17 +69,16 @@ pub async fn channel_list(
 
 /// GET /channels/{channel}/messages — the LOG, which moves no receipt.
 pub async fn channel_history(
-    State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
-    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review): the store filters private memories by audience and
     // a chat log has the same problem — an incident channel is not a public page.
-    if let Err(r) = proven_pen(&headers, json, &state.paths) {
+    if let Err(r) = proven_pen(&caller, json) {
         return r;
     }
     let since = params
@@ -121,13 +117,12 @@ pub async fn channel_history(
 
 /// GET /channels/breach — what, if anything, is stopping this pen from changing the record.
 pub async fn channel_breach(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let Some(pen) = proven(&headers, &state.paths) else {
+    let Some(pen) = proven(&caller) else {
         return render(
             StatusCode::OK,
             json,
@@ -167,6 +162,7 @@ pub async fn channel_breach(
 pub async fn channel_send(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -176,7 +172,7 @@ pub async fn channel_send(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -214,6 +210,7 @@ pub async fn channel_send(
 pub async fn channel_fetch(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -222,7 +219,7 @@ pub async fn channel_fetch(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -263,6 +260,7 @@ pub async fn channel_fetch(
 pub async fn channel_present(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -271,7 +269,7 @@ pub async fn channel_present(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -306,8 +304,9 @@ pub async fn channel_join(
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
+    caller: crate::identity::Caller,
 ) -> Response {
-    channel_membership(state, channel, headers, raw, true).await
+    channel_membership(caller, state, channel, headers, raw, true).await
 }
 
 /// POST /channels/{channel}/leave — leave; leaving `emergency` on the team is refused.
@@ -316,11 +315,13 @@ pub async fn channel_leave(
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
+    caller: crate::identity::Caller,
 ) -> Response {
-    channel_membership(state, channel, headers, raw, false).await
+    channel_membership(caller, state, channel, headers, raw, false).await
 }
 
 async fn channel_membership(
+    caller: crate::identity::Caller,
     state: HttpState,
     channel: String,
     headers: HeaderMap,
@@ -331,7 +332,7 @@ async fn channel_membership(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -367,14 +368,13 @@ async fn channel_membership(
 
 /// GET /channels/wait — block for new messages. A WAIT, not a LISTEN: no receipt moves.
 pub async fn channel_wait(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let Some(pen) = proven(&headers, &state.paths) else {
+    let Some(pen) = proven(&caller) else {
         return error(
             json,
             StatusCode::UNAUTHORIZED,
@@ -439,14 +439,13 @@ pub async fn channel_wait(
 
 /// GET /channels/{channel}/members — effective membership.
 pub async fn channel_members(
-    State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
-    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = proven_pen(&headers, json, &state.paths) {
+    if let Err(r) = proven_pen(&caller, json) {
         return r;
     }
     let key = channel.clone();
@@ -486,6 +485,7 @@ pub async fn channel_members(
 pub async fn channel_create(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -494,7 +494,7 @@ pub async fn channel_create(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -536,6 +536,7 @@ pub async fn channel_create(
 pub async fn channel_set_gate(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -545,7 +546,7 @@ pub async fn channel_set_gate(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -579,14 +580,13 @@ pub async fn channel_set_gate(
 
 /// GET /channels/{channel}/events — who made this channel dangerous, and when.
 pub async fn channel_events(
-    State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
-    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = proven_pen(&headers, json, &state.paths) {
+    if let Err(r) = proven_pen(&caller, json) {
         return r;
     }
     let key = channel.clone();
@@ -628,6 +628,7 @@ pub async fn channel_events(
 pub async fn channel_set_retention(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -637,7 +638,7 @@ pub async fn channel_set_retention(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let pen = match proven_pen(&headers, json, &state.paths) {
+    let pen = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -677,6 +678,7 @@ pub async fn channel_set_retention(
 pub async fn channel_prune(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -688,7 +690,7 @@ pub async fn channel_prune(
     // ★ THE PEN IS REQUIRED, AND THEN CONSULTED (#168 review): the gate lives on this door too.
     // The MCP tool gated `channel_prune` and this route did not, so a locked pen could destroy the
     // text it was locked out of knowing — the two doors disagreed exactly where it matters.
-    let caller = match proven_pen(&headers, json, &state.paths) {
+    let caller = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -700,10 +702,10 @@ pub async fn channel_prune(
         .get("channel")
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
+    let actor = crate::names::Pen::new(&caller).expect("proven pen");
     match server
         .with_store("channel_prune", move |s| {
-            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
-            s.channel_prune(only.as_deref())
+            crate::ops::channel_prune(s, &actor, only.as_deref())
         })
         .await
     {
@@ -724,6 +726,7 @@ pub async fn channel_prune(
 pub async fn channel_invite(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -733,7 +736,7 @@ pub async fn channel_invite(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let actor = match proven_pen(&headers, json, &state.paths) {
+    let actor = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };

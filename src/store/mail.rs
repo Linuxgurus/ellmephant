@@ -517,6 +517,50 @@ pub fn may_send_as(conn: &Connection, proven: &str, sender: &str) -> Result<()> 
     )))
 }
 
+/// Which grant a box operation needs. Two verbs, two grants — and the difference is real: a `read`
+/// grant lets a pen see a box, an `ack` grant lets it move that box's cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxScope {
+    /// Open the box and read its letters.
+    Read,
+    /// Advance the box's cursor.
+    Ack,
+}
+
+impl BoxScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoxScope::Read => "read",
+            BoxScope::Ack => "ack",
+        }
+    }
+}
+
+/// ★ THE BOX RULE, ANSWERED ONCE (soma/ellmephant#235). The two doors used to answer this
+/// separately and disagreed twice: the MCP sentence had been corrupted by a copy-edit ("or a live
+/// `{scope}` grant" with a run of blanks where a word had been cut), and HTTP checked the **read**
+/// grant for an **ack**, so a pen with an ack grant was refused by one door and admitted by the
+/// other. One sentence, one grant, both doors.
+pub fn may_open_box(
+    conn: &Connection,
+    reader: &str,
+    requested: &str,
+    scope: BoxScope,
+) -> Result<()> {
+    let allowed = match scope {
+        BoxScope::Read => may_read_box(conn, reader, requested)?,
+        BoxScope::Ack => may_ack_box(conn, reader, requested)?,
+    };
+    if allowed {
+        return Ok(());
+    }
+    let verb = scope.as_str();
+    Err(Error::Forbidden(format!(
+        "`{reader}` may not {verb} `{requested}`'s mail — only the recipient, or a live `{verb}` \
+         grant, may"
+    )))
+}
+
 /// May `reader` read `requested`'s box?
 pub fn may_read_box(conn: &Connection, reader: &str, requested: &str) -> Result<bool> {
     if reader.eq_ignore_ascii_case(requested) {

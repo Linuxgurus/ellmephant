@@ -751,6 +751,49 @@ fn cell(value: &serde_json::Value) -> String {
     }
 }
 
+/// The `GET /memory-health` prose: the five numbers, their context, and anything suppressed.
+fn health_text(h: &store::health::Health) -> String {
+    let pct = |v: Option<f64>| match v {
+        Some(n) => format!("{n:.2}%"),
+        None => "null".to_string(),
+    };
+    let mut out = format!("ellmephant memory health — scope: {}\n", h.scope);
+    for (label, value) in [
+        ("rows", h.rows.to_string()),
+        ("body_chars", h.body_chars.to_string()),
+        ("log_chars", h.log_chars.to_string()),
+        ("log_share", pct(h.log_share)),
+        ("dup_pairs", h.dup_pairs.to_string()),
+        (
+            "dup_min_distance",
+            match h.dup_pairs_min_distance {
+                Some(d) => format!("{d:.4}"),
+                None => "null".to_string(),
+            },
+        ),
+        ("woven", pct(h.woven)),
+        ("woven_inbound", pct(h.woven_inbound)),
+        ("woven_outbound", pct(h.woven_outbound)),
+        ("cold30", pct(h.cold30)),
+        ("cold30_population", h.cold30_population.to_string()),
+        ("tag_distinct", h.tag_distinct.to_string()),
+        ("tag_singletons", h.tag_singletons.to_string()),
+        ("rows_untagged", h.rows_untagged.to_string()),
+        ("edges", h.edges.to_string()),
+        ("edges_per_row", format!("{:.4}", h.edges_per_row)),
+        ("dangling", h.dangling.to_string()),
+    ] {
+        out.push_str(&format!("  {label:<18}{value}\n"));
+    }
+    for reason in &h.suppressed {
+        out.push_str(&format!("  suppressed        {reason}\n"));
+    }
+    out.push('\n');
+    out.push_str(h.scope_note);
+    out.push('\n');
+    out
+}
+
 /// The `GET /stats` prose: the headline counts, then the heads of the tag and usefulness lists.
 fn stats_text(s: &store::stats::Stats) -> String {
     let mut out = format!(

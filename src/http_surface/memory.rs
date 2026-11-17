@@ -356,7 +356,7 @@ pub async fn dupes(
             .await
         {
             Ok(plan) => {
-                let wire = store::dupes::plan_to_wire_json(&plan).unwrap_or_default();
+                let wire = crate::wire::dupes::plan_to_wire_json(&plan).unwrap_or_default();
                 render(
                     StatusCode::OK,
                     json,
@@ -374,7 +374,7 @@ pub async fn dupes(
         .await
     {
         Ok(pairs) => {
-            let wire = store::dupes::to_wire_json(&pairs).unwrap_or_default();
+            let wire = crate::wire::dupes::to_wire_json(&pairs).unwrap_or_default();
             render(
                 StatusCode::OK,
                 json,

@@ -21,11 +21,8 @@ use crate::mcp::{
     SearchParams, SemanticSearchParams, instructions, json_ok, tool_catalog,
 };
 use crate::search::MatchMode;
-use crate::store::{
-    self, encode,
-    links::{backlinks_to_wire_json, dangling_to_wire_json},
-    project, tags,
-};
+use crate::store::{self, encode, project, tags};
+use crate::wire::links::{backlinks_to_wire_json, dangling_to_wire_json};
 use rusqlite::OptionalExtension;
 
 /// The resolved authority of a request. Today one constant covers the store; per-area credentials

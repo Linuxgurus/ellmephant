@@ -5,6 +5,10 @@
 //! can scan. JSON treats the whitespace as insignificant, so the result is still valid and
 //! machine-parseable — it is layout, not structure.
 
+pub mod dupes;
+pub mod links;
+pub mod project;
+
 /// Serialize a positional table body: a JSON array of rows, **one row per line, no indent**.
 ///
 /// Empty yields `[]`; otherwise `[\n<row>,\n<row>\n]`. Each row is compact — a body's newlines

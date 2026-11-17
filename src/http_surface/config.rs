@@ -31,7 +31,7 @@ pub async fn projects(
         .await
     {
         Ok(rows) => {
-            let wire = project::list_to_wire_json(&rows).unwrap_or_default();
+            let wire = crate::wire::project::list_to_wire_json(&rows).unwrap_or_default();
             render(
                 StatusCode::OK,
                 json,
@@ -65,7 +65,7 @@ pub async fn project_get(
         .await
     {
         Ok(view) => {
-            let wire = project::view_to_wire_json(&view).unwrap_or_default();
+            let wire = crate::wire::project::view_to_wire_json(&view).unwrap_or_default();
             render(
                 StatusCode::OK,
                 json,

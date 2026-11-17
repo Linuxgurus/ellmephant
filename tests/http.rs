@@ -312,6 +312,9 @@ fn every_tool_has_a_route() {
 
 /// A router with a write token configured, so the auth gate is live.
 fn app_with_token(dir: &std::path::Path, token: &str) -> axum::Router {
+    // ★ A write needs a PROVEN pen (#231), so the suite writes as one: provision it here
+    // and attach it in `request`, rather than repeating two headers in every test.
+    suite_identity(dir);
     let watch = Arc::new(LockWatch::new());
     let state = HttpState::new(
         Paths::from_root(dir),
@@ -326,6 +329,9 @@ fn app_with_token(dir: &std::path::Path, token: &str) -> axum::Router {
 
 /// A router with NO write token configured, so the write routes are open (see `resolve`).
 fn app_open(dir: &std::path::Path) -> axum::Router {
+    // ★ Same pen as `app_with_token`: what differs between the two is the BEARER, not the
+    // identity (#231). A write still names its pen with no token configured.
+    suite_identity(dir);
     let watch = Arc::new(LockWatch::new());
     let state = HttpState::new(
         Paths::from_root(dir),
@@ -361,9 +367,20 @@ async fn request(
     content_type: Option<&str>,
     body: &str,
 ) -> (StatusCode, String, Option<String>) {
+    let write = method != Method::GET;
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(token) = token {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    // ★ THE SUITE WRITES AS ONE PEN (#231): a WRITE from this harness comes from `suite-writer`,
+    // provisioned by `app_with_token`. Reads keep their old semantics on purpose — attaching an
+    // identity to a GET would narrow what it sees, which is a different contract. A test that
+    // means to exercise an UNPROVEN or FORGED write builds its own request, as
+    // `an_http_write_requires_a_proven_pen` does.
+    if write {
+        builder = builder
+            .header("X-Stet-From", "suite-writer")
+            .header("X-Stet-Auth", "suite-secret");
     }
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -625,12 +642,18 @@ async fn writes_are_open_when_no_token_is_configured() {
     let dir = tempfile::tempdir().unwrap();
     let app = app_open(dir.path());
 
+    // ★ NO TOKEN IS NOT NO IDENTITY (#231): the bearer gate is open here, and a write still
+    // names its pen — those are two different doors.
+    suite_identity(dir.path());
+
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/memory")
+                .header("X-Stet-From", "suite-writer")
+                .header("X-Stet-Auth", "suite-secret")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"key":"open-note","title":"open","body":"written with no token"}"#,
@@ -1607,6 +1630,8 @@ async fn wait_true_reports_a_write_that_could_not_be_indexed() {
     // Built WITH the failing encoder: `Encoder::inject` sets a `OnceLock`, so it cannot be replaced
     // after the fact — a test that tried would silently keep the working one.
     let dir = tempfile::tempdir().unwrap();
+    // ★ A write needs a PROVEN pen (#231); these two build their own app, so provision one.
+    suite_identity(dir.path());
     let watch = Arc::new(LockWatch::new());
     let paths = Paths::from_root(dir.path());
     let cfg = Config::default();
@@ -1673,6 +1698,8 @@ async fn wait_true_holds_the_lock_and_health_names_the_holder() {
     }
 
     let dir = tempfile::tempdir().unwrap();
+    // ★ A write needs a PROVEN pen (#231); these two build their own app, so provision one.
+    suite_identity(dir.path());
     let watch = Arc::new(LockWatch::new());
     let paths = Paths::from_root(dir.path());
     let cfg = Config::default();
@@ -1742,10 +1769,15 @@ async fn history_is_reachable_by_address_after_the_row_is_gone() {
     // A change to the DOCUMENT earns a version (a tag or source write would not).
     seed(&app, "", "kept", "Kept", "second state").await;
 
-    let peer = mcp_peer(MemoryServer::with_watch(
-        Arc::new(Mutex::new(session(dir.path()))),
-        Arc::new(LockWatch::new()),
-    ))
+    // ★ The rows were written over HTTP by `suite-writer`, so the peer that deletes them is
+    // that pen: ownership is checked against the actor, not against the door (#231).
+    let peer = mcp_peer_as(
+        MemoryServer::with_watch(
+            Arc::new(Mutex::new(session(dir.path()))),
+            Arc::new(LockWatch::new()),
+        ),
+        "suite-writer",
+    )
     .await;
 
     // The list is METADATA: enough to choose an `n`, and no bodies.
@@ -2334,8 +2366,31 @@ async fn a_write_may_be_credited_to_a_finger_it_holds_a_lend_for() {
     assert_eq!(doc["owner_relation"], json!("ME"), "{got}");
 }
 
-/// The identity fixture for HTTP writes.
-///
+/// The pen the whole suite writes as: `app_with_token` and `app_open` provision it, and
+/// [`request`] names it on every WRITE. A test that means to exercise an unproven or forged
+/// write builds its own request instead (`an_http_write_requires_a_proven_pen`).
+fn suite_identity(dir: &std::path::Path) {
+    let paths = Paths::from_root(dir);
+    let conn = ellmephant::db::open(&paths).unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO pen (name, kind) VALUES ('suite-writer', 'self')",
+        [],
+    )
+    .unwrap();
+    if ellmephant::store::credential::verify(&conn, "suite-writer", "suite-secret")
+        .unwrap()
+        .is_none()
+    {
+        let hash = ellmephant::store::credential::digest("suite-secret");
+        conn.execute(
+            "INSERT OR REPLACE INTO pen_credential (pen_id, hash)
+             VALUES ((SELECT id FROM pen WHERE name = 'suite-writer'), ?1)",
+            [hash],
+        )
+        .unwrap();
+    }
+}
+
 /// ★ PROVISIONING, NOT ENV: two pens with credentials hashed into `pen_credential`. The old fixture
 /// set `ELLMEPHANT_IDENTITIES`, which was process-global and made parallel tests influence each
 /// other; a row belongs to one temp store, so these tests no longer share anything.
@@ -3240,11 +3295,19 @@ async fn an_http_write_requires_a_proven_pen() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "a proven write must still land: {status} {body}");
-    let owner: Option<String> = conn
-        .query_row("SELECT owner FROM memory WHERE key = 'written-by-someone'", [], |r| r.get(0))
+    // `owner` is a pen ID (an integer), not a name: ask for the NAME, because a
+    // type mismatch here reads as `None` and would have made this assertion pass for
+    // the wrong reason on a row that does have an owner.
+    let owner_name: Option<String> = conn
+        .query_row(
+            "SELECT p.name FROM memory m JOIN pen p ON p.id = m.owner WHERE m.key = 'written-by-someone'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(None);
-    assert!(
-        owner.is_some(),
-        "a proven write must land with an owner, not in the commons"
+    assert_eq!(
+        owner_name.as_deref(),
+        Some("http-as-tester"),
+        "a proven write must land owned by the pen that proved itself, not in the commons"
     );
 }

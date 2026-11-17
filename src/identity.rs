@@ -82,6 +82,138 @@ pub fn resolve(paths: &Paths, headers: &HeaderMap) -> Result<Option<String>, Den
     }
 }
 
+/// Why a write was refused an identity.
+///
+/// The two cases are deliberately one refusal at the call site: `Caller::pen()` fails on BOTH, so a
+/// door cannot accidentally treat "forged" and "absent" differently. They stay distinguishable in
+/// the message, because a caller that sent a bad proof and one that sent none need different fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// A name was claimed and could not be proved.
+    Denied(Denied),
+    /// Nothing was claimed. Carries the sentence the route wants: `mint` and `lend` name the verb.
+    Missing(String),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Denied(d) => d.fmt(f),
+            Refusal::Missing(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// ★ ONE CALLER, BUILT ONCE (soma/ellmephant#232). Every door used to carry its own ladder —
+/// `identity_of`, `reader_of`, `pen_name`, `proven_pen`, `reader_from`, `proven` — and the copies
+/// disagreed: on HTTP a write could proceed with no pen (`.ok().flatten()` collapsed *forged* and
+/// *missing* into `None`), while MCP refused both. The divergence was not in the store; it was in
+/// having six answers to one question.
+///
+/// So the question is asked once, here, and the answer is a value the doors pass around.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    /// The proven pen. `Some` is the only way to write.
+    proven: Option<crate::names::Pen>,
+    /// Why a claim failed, if one was made and refused.
+    denied: Option<Denied>,
+    /// A pen DECLARED by a transport with no request (stdio, in-process): as trusted as the process
+    /// that started it. Ignored on HTTP, where the headers decide.
+    declared: Option<crate::names::Pen>,
+    /// The BORROWED authority — `sudo` and `pen_lend` let a caller act as another pen, and the store
+    /// already keeps that beside the assertion as `acted_by`. Carried here now, so a Command credits
+    /// through one value instead of two positional `Option<&str>` (see #239).
+    via: Option<crate::names::Pen>,
+}
+
+impl Caller {
+    /// The one HTTP constructor: read the pair from the request headers.
+    pub fn from_headers(paths: &Paths, headers: &HeaderMap) -> Self {
+        match resolve(paths, headers) {
+            Ok(proven) => Caller {
+                proven: proven
+                    .as_deref()
+                    .and_then(|p| crate::names::Pen::new(p).ok()),
+                ..Caller::default()
+            },
+            Err(denied) => Caller {
+                denied: Some(denied),
+                ..Caller::default()
+            },
+        }
+    }
+
+    /// A transport with no request at all (stdio, in-process): it may declare its pen once.
+    pub fn transport(declared: Option<&str>) -> Self {
+        Caller {
+            declared: declared.and_then(|p| crate::names::Pen::new(p).ok()),
+            ..Caller::default()
+        }
+    }
+
+    /// Let a declaring transport name itself. HTTP transports never call this: their headers decide.
+    pub fn declare(mut self, declared: Option<&str>) -> Self {
+        self.declared = declared.and_then(|p| crate::names::Pen::new(p).ok());
+        self
+    }
+
+    /// The proven pen, or the declared one for a trusted transport — never a forged claim.
+    pub fn proven(&self) -> Option<&crate::names::Pen> {
+        self.proven.as_ref().or_else(|| {
+            if self.denied.is_none() {
+                self.declared.as_ref()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Why a claim was refused, if one was. Reads use it only to stay narrow.
+    pub fn denied(&self) -> Option<&Denied> {
+        self.denied.as_ref()
+    }
+
+    /// ★ THE WRITE GATE: a pen, or a refusal. Fails on BOTH *forged* and *missing* — the whole point
+    /// of the type, and the difference between this and `.ok().flatten()`.
+    pub fn pen(&self) -> Result<&crate::names::Pen, Refusal> {
+        self.pen_or(
+            "refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` \
+             (reads need neither). `whoami` reports what this connection is.",
+        )
+    }
+
+    /// [`Caller::pen`] with the route's own sentence for the missing case, so `mint` can say
+    /// "minting needs a proven pen" without a second ladder.
+    pub fn pen_or(&self, missing: &str) -> Result<&crate::names::Pen, Refusal> {
+        if let Some(denied) = &self.denied {
+            return Err(Refusal::Denied(denied.clone()));
+        }
+        self.proven()
+            .ok_or_else(|| Refusal::Missing(missing.to_string()))
+    }
+
+    /// Who this request reads as. Never an error: a read is open, it is just narrow.
+    pub fn reader(&self) -> crate::store::audience::Reader {
+        match self.proven() {
+            Some(name) => crate::store::audience::Reader::pen(name.as_str()),
+            None => crate::store::audience::Reader::anonymous(),
+        }
+    }
+
+    /// The pen this caller acts AS when one is lent or taken by `sudo`.
+    pub fn via(&self) -> Option<&crate::names::Pen> {
+        self.via.as_ref()
+    }
+
+    /// Record borrowed authority — the store stamps it as `acted_by`.
+    pub fn acting_as(mut self, pen: Option<&str>) -> Self {
+        self.via = pen.and_then(|p| crate::names::Pen::new(p).ok());
+        self
+    }
+}
+
 /// The identities allowed to take a LEASE, from `ELLMEPHANT_LEASERS` (comma-separated names).
 ///
 /// ★ UNSET MEANS OPEN. A lease is how the hands do ordinary work, so refusing every lease the
@@ -209,6 +341,37 @@ mod tests {
         assert_eq!(
             resolve(&paths, &headers(Some("James"), Some(&secret))),
             Err(Denied::Forged("James".into()))
+        );
+    }
+
+    /// ★ THE WHOLE POINT OF THE TYPE (soma/ellmephant#232): `pen()` fails on BOTH *missing* and
+    /// *forged*. The door that used `.ok().flatten()` treated them identically by mistake — it
+    /// turned both into `None` and then wrote.
+    #[test]
+    fn pen_refuses_both_a_missing_and_a_forged_claim() {
+        let (_dir, paths, secret) = store();
+
+        let absent = Caller::from_headers(&paths, &headers(None, None));
+        assert_eq!(absent.proven(), None);
+        assert!(matches!(absent.pen(), Err(Refusal::Missing(_))));
+        // A read by the same caller is still legal; it is just narrow.
+        assert_eq!(absent.reader().pen_name(), None);
+
+        let forged = Caller::from_headers(&paths, &headers(Some("James"), Some("wrong")));
+        assert!(matches!(
+            forged.pen(),
+            Err(Refusal::Denied(Denied::Forged(_)))
+        ));
+        assert_eq!(forged.reader().pen_name(), None);
+
+        let proved = Caller::from_headers(&paths, &headers(Some("James"), Some(&secret)));
+        assert_eq!(proved.pen().unwrap().as_str(), "James");
+        // ★ A DECLARATION MAY STAND IN ONLY WHEN NOTHING WAS CLAIMED — never over a refusal. That
+        // is the difference between a trusted transport and a forged header.
+        assert!(forged.declare(Some("James")).pen().is_err());
+        assert_eq!(
+            absent.declare(Some("James")).pen().unwrap().as_str(),
+            "James"
         );
     }
 }

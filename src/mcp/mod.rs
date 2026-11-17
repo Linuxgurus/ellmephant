@@ -1481,14 +1481,25 @@ pub struct ProjectListParams {
 /// `Ok(None)` means nothing was claimed — a stdio transport has no HTTP request, and a client that
 /// sends no headers has claimed nothing. `Err` means a name was claimed and could not be proved, and
 /// it is REFUSED rather than downgraded to `anonymous`: an unproven name is a lie with a signature.
-fn identity_of(
+/// The caller's identity, built once per tool call (soma/ellmephant#232).
+///
+/// A transport with no HTTP request (stdio, in-process) may declare its pen at construction: it is
+/// as trusted as the process that started it. An HTTP request's headers decide, and a FORGED claim
+/// is kept as a refusal rather than downgraded to `anonymous` — an unproven name is a lie with a
+/// signature.
+fn caller_of(
     ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    declared: Option<&str>,
     paths: &Paths,
-) -> Result<Option<String>, crate::identity::Denied> {
-    let Some(parts) = ctx.extensions.get::<axum::http::request::Parts>() else {
-        return Ok(None);
-    };
-    crate::identity::resolve(paths, &parts.headers)
+) -> crate::identity::Caller {
+    match ctx.extensions.get::<axum::http::request::Parts>() {
+        // Headers decide. A declaration stands in only when nothing was claimed at all — a forged
+        // claim is a refusal, never a fallback (that is the difference `Caller::proven` keeps).
+        Some(parts) => {
+            crate::identity::Caller::from_headers(paths, &parts.headers).declare(declared)
+        }
+        None => crate::identity::Caller::transport(declared),
+    }
 }
 
 /// Who this READ is for. A proven pen filters; a transport that declared its pen once is as trusted
@@ -1499,14 +1510,7 @@ fn reader_of(
     declared: Option<&str>,
     paths: &Paths,
 ) -> crate::store::audience::Reader {
-    match identity_of(ctx, paths) {
-        Ok(Some(name)) => crate::store::audience::Reader::pen(&name),
-        Ok(None) => match declared {
-            Some(name) => crate::store::audience::Reader::pen(name),
-            None => crate::store::audience::Reader::anonymous(),
-        },
-        Err(_) => crate::store::audience::Reader::anonymous(),
-    }
+    caller_of(ctx, declared, paths).reader()
 }
 
 /// ★ A WRITE REQUIRES A PEN. Reads are open to anyone; a write with NO proven identity is REFUSED,
@@ -1519,18 +1523,12 @@ fn pen_name(
     declared: Option<&str>,
     paths: &Paths,
 ) -> std::result::Result<String, String> {
-    match identity_of(ctx, paths) {
-        Ok(Some(name)) => Ok(name),
-        // ★ A TRANSPORT WITH NO REQUEST MAY DECLARE ITS PEN ONCE, at construction: a stdio or
-        // in-process server is started BY a process and is as trusted as that process. HTTP
-        // transports ignore this — their headers decide, and an unproven header is still refused.
-        Ok(None) => match declared {
-            Some(name) => Ok(name.to_string()),
-            None => Err("refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is."
-                .to_string()),
-        },
-        Err(forged) => Err(forged.to_string()),
-    }
+    caller_of(ctx, declared, paths)
+        .pen_or(
+            "refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is.",
+        )
+        .map(ToString::to_string)
+        .map_err(|r| r.to_string())
 }
 
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
@@ -2327,20 +2325,24 @@ impl MemoryServer {
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let body = match identity_of(&ctx, &self.paths) {
-            Ok(Some(name)) => serde_json::json!({ "asserted_by": name, "proven": true }),
-            Ok(None) => {
-                serde_json::json!({ "asserted_by": crate::identity::ANONYMOUS, "proven": false })
-            }
+        let caller = caller_of(&ctx, None, &self.paths);
+        let body = match caller.denied() {
+            None => match caller.proven() {
+                Some(name) => serde_json::json!({ "asserted_by": name.as_str(), "proven": true }),
+                None => serde_json::json!({
+                    "asserted_by": crate::identity::ANONYMOUS,
+                    "proven": false
+                }),
+            },
             // A claim that did not verify still deserves an answer: the caller learns the name it
             // sent is not the name it has, which is the whole confusion this tool exists to end.
-            Err(crate::identity::Denied::Forged(claimed)) => serde_json::json!({
+            Some(crate::identity::Denied::Forged(claimed)) => serde_json::json!({
                 "asserted_by": crate::identity::ANONYMOUS,
                 "proven": false,
                 "claimed": claimed,
                 "problem": "the X-Stet-Auth proof is missing or wrong",
             }),
-            Err(crate::identity::Denied::Unavailable(why)) => serde_json::json!({
+            Some(crate::identity::Denied::Unavailable(why)) => serde_json::json!({
                 "asserted_by": crate::identity::ANONYMOUS,
                 "proven": false,
                 "problem": format!("the credential store is unavailable: {why}"),
@@ -2633,27 +2635,25 @@ impl MemoryServer {
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
         let claimed = p.as_pen.clone();
-        let mut patch = p.into_patch();
+        let patch = p.into_patch();
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
         // no signature at all. `as` may only ever name a DESCENDANT of that proven pen.
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let credited = match claimed {
-            Some(name) if !name.eq_ignore_ascii_case(&caller) => Some(name),
-            _ => None,
+        let caller = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
+        let credit = match claimed {
+            Some(name) => Some(crate::names::Pen::new(&name).map_err(|e| e.to_string())?),
+            None => None,
         };
-        patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
         // ★ THE PROVEN PEN, KEPT SEPARATE FROM THE CREDITED ONE (soma/ellmephant#192): authority is a
         // conjunction — the pen that sent this must be permitted AND the pen taking the credit must be
-        // permitted, or `as:` becomes a way to spend one authority under another pen's name.
-        patch.acted_by = Some(caller.clone());
+        // permitted, or `as:` becomes a way to spend one authority under another pen's name. The
+        // stamping and the two gates live in `ops::memory_upsert`, so the HTTP door is the same law.
         let outcome = self
             .with_store("memory_upsert", move |s| {
-                s.channel_gate(&caller, crate::store::channel::Class::Record)?;
-                if let Some(as_pen) = &credited {
-                    s.may_act_as(&caller, as_pen)?;
-                }
-                s.memory_merge(&patch)
+                crate::ops::memory_upsert(s, &caller, crate::ops::Upsert { patch, credit })
             })
             .await?;
         tracing::info!(
@@ -2698,18 +2698,17 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone(); // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
             .with_store("memory_delete", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                if !s.rm(&rm_key, Some(&pen))? {
-                    return Ok(None);
-                }
-                Ok(Some(s.version_count(&rm_key)?))
+                crate::ops::memory_delete(s, &pen, &rm_key)
             })
             .await?
         {
@@ -2838,15 +2837,17 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AppendParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
         let key = p.key;
         let line = p.line;
         let force = p.force.unwrap_or(false);
         let log_key = key.clone();
         let out = self
             .with_store("memory_append", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.append(&key, &line, Some(&pen), force)
+                crate::ops::memory_append(s, &pen, &key, &line, force)
             })
             .await?;
         tracing::info!(
@@ -2877,15 +2878,17 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<FoldParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
             .with_store("memory_fold", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.fold_into(&from, &into, Some(&pen))
+                crate::ops::memory_fold(s, &pen, &from, &into)
             })
             .await?;
         tracing::info!(
@@ -2917,15 +2920,17 @@ impl MemoryServer {
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
         // A merge DESTROYS the source, so it is signed like any other write.
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
             .with_store("memory_merge", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.merge_into(&from, &into, Some(&pen))
+                crate::ops::memory_merge(s, &pen, &from, &into)
             })
             .await?;
         tracing::info!(
@@ -3563,12 +3568,14 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone(); // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.project_merge(&patch)
+                crate::ops::project_upsert(s, &pen, &patch)
             })
             .await?;
         tracing::info!(
@@ -4449,7 +4456,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let pen = identity_of(&ctx, &self.paths).ok().flatten();
+        let pen = caller_of(&ctx, None, &self.paths)
+            .proven()
+            .map(ToString::to_string);
         let caller = pen.clone();
         let out = self
             .with_read(
@@ -4625,7 +4634,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let pen = identity_of(&ctx, &self.paths).ok().flatten();
+        let pen = caller_of(&ctx, None, &self.paths)
+            .proven()
+            .map(ToString::to_string);
         if pen.is_none() {
             return Ok(serde_json::json!({ "breach": null, "proven": false }).to_string());
         }

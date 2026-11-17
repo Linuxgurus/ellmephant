@@ -327,25 +327,23 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let who = pen_name(ctx, self.declared.as_deref(), &self.paths)?;
         let (reader, box_name) = (who.clone(), requested.to_string());
-        let allowed = self
-            .with_read(
-                "mail_box_for",
-                reader_of(ctx, self.declared.as_deref(), &self.paths),
-                move |s| {
-                    if scope == "ack" {
-                        s.mail_may_ack(&reader, &box_name)
-                    } else {
-                        s.mail_may_read(&reader, &box_name)
-                    }
-                },
-            )
-            .await?;
-        if allowed {
-            return Ok(who);
-        }
-        Err(format!(
-            "refused: `{who}` may not {scope} `{requested}`'s mail — only the recipient, or a live              `{scope}` grant, may"
-        ))
+        // ★ ONE RULE, ONE SENTENCE (soma/ellmephant#235). This used to ask `mail_may_ack` or
+        // `mail_may_read` itself and then compose the refusal — in a string a copy-edit had left
+        // with a run of blanks where a word belonged. The rule and its sentence live in the store
+        // now, so HTTP cannot answer a different question.
+        let scope = if scope == "ack" {
+            crate::store::mail::BoxScope::Ack
+        } else {
+            crate::store::mail::BoxScope::Read
+        };
+        self.with_read(
+            "mail_box_for",
+            reader_of(ctx, self.declared.as_deref(), &self.paths),
+            move |s| s.mail_may_open_box(&reader, &box_name, scope),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(who)
     }
 
     /// Declare the pen for a transport with no HTTP request (stdio / in-process). Writes are then

@@ -85,6 +85,7 @@ async fn mail_guard(
     reader: &str,
     requested: &str,
     json: bool,
+    scope: crate::store::mail::BoxScope,
 ) -> Result<(), Response> {
     // A helper rather than a handler: no `&mut Parts`, so no extractor (#233).
     let Some(server) = state.server() else {
@@ -95,26 +96,17 @@ async fn mail_guard(
         ));
     };
     let (r, q) = (reader.to_string(), requested.to_string());
-    let allowed = server
+    // ★ THE SAME RULE AS MCP, including the GRANT (soma/ellmephant#235): this asked the `read`
+    // grant even when the verb was `ack`, so a pen holding only an ack grant was refused here and
+    // admitted there. The sentence comes from the store, so the two doors cannot drift again.
+    server
         .with_read(
             "mail_guard",
             crate::store::audience::Reader::pen(&r),
-            move |s| s.mail_may_read(&r, &q),
+            move |s| s.mail_may_open_box(&r, &q, scope),
         )
         .await
-        .map_err(|e| error(json, StatusCode::BAD_REQUEST, &e))?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(error(
-            json,
-            StatusCode::FORBIDDEN,
-            format!(
-                "refused: `{reader}` may not read `{requested}`'s mail — only the recipient, or a \
-                 live `read` grant, may"
-            ),
-        ))
-    }
+        .map_err(|e| error(json, error_status(&e), &e))
 }
 
 pub async fn mail_inbox(
@@ -137,7 +129,15 @@ pub async fn mail_inbox(
         Ok(name) => name,
         Err(r) => return r,
     };
-    if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
+    if let Err(r) = mail_guard(
+        &state,
+        &reader,
+        &recipient,
+        json,
+        crate::store::mail::BoxScope::Read,
+    )
+    .await
+    {
         return r;
     }
     let me = Some(reader.clone());
@@ -233,7 +233,15 @@ pub async fn mail_ack(
         Ok(name) => name.to_string(),
         Err(r) => return refusal_response(json, r, StatusCode::FORBIDDEN),
     };
-    if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
+    if let Err(r) = mail_guard(
+        &state,
+        &reader,
+        &recipient,
+        json,
+        crate::store::mail::BoxScope::Ack,
+    )
+    .await
+    {
         return r;
     }
     match server
@@ -279,7 +287,15 @@ pub async fn mail_read(
     {
         Ok(Some(letter)) => {
             // The LETTER decides its box: the check is on the row, not on an argument.
-            if let Err(r) = mail_guard(&state, &reader, &letter.recipient, json).await {
+            if let Err(r) = mail_guard(
+                &state,
+                &reader,
+                &letter.recipient,
+                json,
+                crate::store::mail::BoxScope::Read,
+            )
+            .await
+            {
                 return r;
             }
             render(

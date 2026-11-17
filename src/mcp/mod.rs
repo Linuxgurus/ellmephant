@@ -65,6 +65,7 @@ pub const TOOLS: &[&str] = &[
     "memory_dangling",
     "memory_upvote",
     "memory_stats",
+    "memory_health",
     "memory_dupes",
     "memory_reembed",
     "memory_reparse",
@@ -398,6 +399,7 @@ mod tests {
             "memory_get",
             "memory_backlinks",
             "memory_stats",
+            "memory_health",
             "memory_dupes",
         ] {
             assert_eq!(

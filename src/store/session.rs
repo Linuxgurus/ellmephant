@@ -744,6 +744,13 @@ impl Session {
         Ok(stats)
     }
 
+    /// The five-number health surface (`memory_health`), through THIS session's reader.
+    ///
+    /// Shape (a): no store total, and no `Reader::everything()` — the reader is the boundary.
+    pub fn health(&self) -> Result<store::health::Health> {
+        store::health::compute_seen(&self.conn, &self.reader)
+    }
+
     /// Queue every document that needs (re-)embedding, and rebuild the derived indexes that take no
     /// model — the `[[link]]` graph, and the `vec0` table when the width changed (P9).
     ///

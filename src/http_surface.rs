@@ -469,14 +469,43 @@ fn error_status(message: &str) -> StatusCode {
 
 /// The session shared with `/mcp`, or the 500 that means the router forgot to attach it.
 #[allow(clippy::result_large_err)] // the Err is a ready-to-return response
-fn session(state: &HttpState) -> Result<&MemoryServer, Response> {
-    state.server().ok_or_else(|| {
-        error(
-            false,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server not attached",
-        )
-    })
+/// ★ THE SESSION IS AN EXTRACTOR, NOT SIXTY-TWO PREAMBLES (soma/ellmephant#233).
+///
+/// Every handler in this file began with
+///
+/// ```ignore
+/// let server = match session(&state) { Ok(s) => s, Err(r) => return r };
+/// ```
+///
+/// which is the same sentence sixty-two times: "if the router forgot to attach the session, answer
+/// 500". It is a property of the request, so it belongs in the request's type. `Server` is a thin
+/// borrow of the `MemoryServer` — it derefs, so a handler's body is unchanged — and its rejection is
+/// the same 500 the preamble built.
+pub struct Server(MemoryServer);
+
+impl std::ops::Deref for Server {
+    type Target = MemoryServer;
+
+    fn deref(&self) -> &MemoryServer {
+        &self.0
+    }
+}
+
+impl axum::extract::FromRequestParts<HttpState> for Server {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &HttpState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        state.server().cloned().map(Server).ok_or_else(|| {
+            error(
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server not attached",
+            )
+        })
+    }
 }
 
 /// The decoded query string, as ordered pairs so a repeated key (`tag=a&tag=b`) survives — which
@@ -837,6 +866,7 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
 /// `POST /pen/lend` — lend this request's pen's authority down to a descendant (`pen_lend`).
 pub async fn pen_lend(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -864,10 +894,6 @@ pub async fn pen_lend(
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server
         .with_store("pen_lend", move |s| s.lend(&caller, &ask.pen, ask.secs))
@@ -939,6 +965,7 @@ fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> Result<String, R
 /// `POST /sudo` — borrow a pen's authority (`sudo`).
 pub async fn sudo(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -963,10 +990,6 @@ pub async fn sudo(
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server
         .with_store("sudo", move |s| s.sudo(&caller, &ask.powerful, ask.secs))
@@ -995,6 +1018,7 @@ pub async fn sudo(
 /// able to see its own clock, and an operator should be able to see everyone's.
 pub async fn sudo_sessions(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1004,10 +1028,6 @@ pub async fn sudo_sessions(
     }
     let params = Params::parse(raw.as_deref());
     let pen = params.get("pen").map(ToString::to_string);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("sudo_sessions", move |s| s.sudo_sessions(pen.as_deref()))
         .await
@@ -1036,6 +1056,7 @@ pub async fn sudo_sessions(
 /// `POST /sudo/pass` — pass a session down (`sudo_pass`).
 pub async fn sudo_pass(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -1062,10 +1083,6 @@ pub async fn sudo_pass(
         Ok(a) => a,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
     };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("sudo_pass", move |s| {
             s.sudo_pass(&caller, &ask.powerful, &ask.pen, ask.secs)
@@ -1091,6 +1108,7 @@ pub async fn sudo_pass(
 /// `POST /sudo/release` — end a session and its chain (`sudo_release`).
 pub async fn sudo_release(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -1115,10 +1133,6 @@ pub async fn sudo_release(
         Ok(a) => a,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
     };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("sudo_release", move |s| {
             s.sudo_release(&caller, &ask.powerful)
@@ -1138,6 +1152,7 @@ pub async fn sudo_release(
 /// `POST /pen/mint` — create a pen under this request's pen (`pen_mint`).
 pub async fn pen_mint(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -1166,10 +1181,6 @@ pub async fn pen_mint(
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server
         .with_store("pen_mint", move |s| s.mint(&caller, &ask.name, &ask.kind))
@@ -1200,6 +1211,7 @@ pub async fn pen_mint(
 /// `POST /pen/rotate` — replace a credential, returning the new secret once (`pen_rotate`).
 pub async fn pen_rotate(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -1233,10 +1245,6 @@ pub async fn pen_rotate(
         }
     };
     let target = ask.pen.unwrap_or_else(|| caller.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let for_store = target.clone();
     match server
         .with_store("pen_rotate", move |s| {
@@ -1260,6 +1268,7 @@ pub async fn pen_rotate(
 /// `GET /whois/{pen}` — one pen and what it is to this request's pen (`whois`).
 pub async fn whois(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     Path(pen): Path<String>,
     RawQuery(raw): RawQuery,
@@ -1269,10 +1278,6 @@ pub async fn whois(
         .proven()
         .map(ToString::to_string)
         .unwrap_or_else(|| crate::identity::ANONYMOUS.to_string());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read("whois", reader_from(&headers, &state.paths), move |s| {
             s.whois(&viewer, &pen)
@@ -1363,6 +1368,7 @@ fn reader_from(headers: &HeaderMap, paths: &Paths) -> crate::store::audience::Re
 /// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1370,10 +1376,6 @@ pub async fn stats(
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tags = params.flag("tags");
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read("memory_stats", reader, move |s| s.stats(with_tags))
         .await
@@ -1392,6 +1394,7 @@ pub async fn stats(
 /// one write a read may make, because a counter is not data (HTTP.md invariant 1).
 pub async fn memory_get(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
@@ -1402,10 +1405,6 @@ pub async fn memory_get(
     let version = match params.parse_as::<i64>("version") {
         Ok(v) => v,
         Err(msg) => return error(json, StatusCode::BAD_REQUEST, msg),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     // `?version=N` reads a PAST state: by address, so the live row need not exist, and counting no
     // visit — `visits` measures the memory, not a state the memory held.
@@ -1475,6 +1474,7 @@ pub async fn memory_get(
 /// `GET /unowned` — the rows nobody owns, and why (`memory_unowned`).
 pub async fn unowned(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1485,10 +1485,6 @@ pub async fn unowned(
         .map(|v| v.unwrap_or(50))
         .unwrap_or(50)
         .clamp(1, 500);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read(
             "memory_unowned",
@@ -1522,16 +1518,13 @@ pub async fn unowned(
 /// `GET /memory/{key}/backlinks` — incoming `[[…]]` edges (`memory_backlinks`).
 pub async fn backlinks(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let reader = reader_from(&headers, &state.paths);
     let json = Params::parse(raw.as_deref()).json();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read("memory_backlinks", reader, move |s| s.backlinks(&key))
         .await
@@ -1552,15 +1545,12 @@ pub async fn backlinks(
 /// `GET /dangling` — every broken `[[…]]` edge, one row per referrer (`memory_dangling`).
 pub async fn dangling(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     let reader = reader_from(&headers, &state.paths);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read("memory_dangling", reader, |s| s.dangling())
         .await
@@ -1585,6 +1575,7 @@ pub async fn dangling(
 /// the memory still existed would be wrong for exactly the caller who needs it most.
 pub async fn history(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1596,10 +1587,6 @@ pub async fn history(
         Err(msg) => return error(json, StatusCode::BAD_REQUEST, msg),
     };
     let orphans_only = params.flag("orphans_only");
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match params.maybe("key") {
         Some(key) => {
             let lookup = key.to_string();
@@ -1656,6 +1643,7 @@ pub async fn history(
 /// `GET /search` — the same query surface as `memory_search`, same bytes.
 pub async fn search(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1665,10 +1653,6 @@ pub async fn search(
     let search = match search_params(&params) {
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server.run_search(search, reader).await {
         Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
@@ -1680,6 +1664,7 @@ pub async fn search(
 /// `deleted=true` for the graveyard. Same body as the tool, by construction.
 pub async fn semantic_search(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1722,10 +1707,6 @@ pub async fn semantic_search(
         max_distance: params.maybe("max_distance").and_then(|v| v.parse().ok()),
         fields,
     };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server.run_semantic(p, reader).await {
         Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
         Err(e) => error(json, error_status(&e), e),
@@ -1737,6 +1718,7 @@ pub async fn semantic_search(
 /// for every other pair.
 pub async fn dupes(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1750,10 +1732,6 @@ pub async fn dupes(
     let limit = match params.parse_as::<usize>("limit") {
         Ok(v) => v.unwrap_or(DUPES_LIMIT),
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     if params.flag("plan") {
         return match server
@@ -1796,6 +1774,7 @@ pub async fn dupes(
 /// `GET /projects` — the project index (`project_list`), same bytes.
 pub async fn projects(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1812,10 +1791,6 @@ pub async fn projects(
         owner: params.all("owner"),
         pattern: params.maybe("pattern").map(ToString::to_string),
         mode,
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server
         .with_read("project_list", reader, move |s| s.project_list(&filter))
@@ -1837,6 +1812,7 @@ pub async fn projects(
 /// `GET /project/{key}` — one project with its ordered preload (`project_get`).
 pub async fn project_get(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
@@ -1847,10 +1823,6 @@ pub async fn project_get(
     let hydrate = match project::Hydrate::parse(params.get("hydrate").unwrap_or("none")) {
         Ok(h) => h,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server
         .with_read("project_get", reader, move |s| {
@@ -1874,16 +1846,13 @@ pub async fn project_get(
 /// `GET /config/{key}` — one config item (`config_get`); `null` when absent or not addressed to you.
 pub async fn config_get(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let reader = reader_from(&headers, &state.paths);
     let json = Params::parse(raw.as_deref()).json();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read("config_get", reader, move |s| s.config_get(&key))
         .await
@@ -1905,6 +1874,7 @@ pub async fn config_get(
 /// `GET /config` — every item this connection may read (`config_list`), with an optional `prefix`.
 pub async fn config_list(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -1912,10 +1882,6 @@ pub async fn config_list(
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let prefix = params.maybe("prefix").map(ToString::to_string);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read("config_list", reader, move |s| {
             s.config_list(prefix.as_deref())
@@ -1939,6 +1905,7 @@ pub async fn config_list(
 /// `POST /config/{key}` — change a value (`config_set`); JSON body `{value, source?}`.
 pub async fn config_set(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
@@ -1967,10 +1934,6 @@ pub async fn config_set(
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
     let log_key = key.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("config_set", move |s| {
             s.config_set(&who, &key, &value, source.as_deref())
@@ -1994,6 +1957,7 @@ pub async fn config_set(
 /// `POST /config` — create an item or rewrite its ACL (`config_define`); JSON body of the tool's args.
 pub async fn config_define(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -2033,10 +1997,6 @@ pub async fn config_define(
         Err(r) => return r,
     };
     let log_key = key.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("config_define", move |s| {
             s.config_define(&who, &key, &value, &set_audience, &read_audience, &source)
@@ -2060,6 +2020,7 @@ pub async fn config_define(
 /// `POST /claim` — take or renew an atomic lease (`claim_acquire`); JSON body of the tool's args.
 pub async fn claim_acquire(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
@@ -2083,10 +2044,6 @@ pub async fn claim_acquire(
         None => return error(json, StatusCode::BAD_REQUEST, "missing `owner`"),
     };
     let ttl = doc.get("ttl_seconds").and_then(|v| v.as_i64());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("claim_acquire", move |s| {
             s.claim_acquire(&name, &owner, ttl)
@@ -2126,6 +2083,7 @@ pub async fn claim_acquire(
 /// `POST /claim/{key}/release` — drop your own lease (`claim_release`). `owner` from body or query.
 pub async fn claim_release(
     State(state): State<HttpState>,
+    server: Server,
     Path(name): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -2149,10 +2107,6 @@ pub async fn claim_release(
         .or_else(|| params.maybe("owner").map(ToString::to_string));
     let Some(owner) = owner else {
         return error(json, StatusCode::BAD_REQUEST, "missing `owner`");
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     // ★ THE HTTP SURFACE HAS NO PEN, ONLY A STORE-WIDE TOKEN, so it cannot check ancestry. It keeps
     // the owner check and says so: an ancestor release is an MCP act, where the caller is proven.
@@ -2188,14 +2142,14 @@ pub async fn claim_release(
 }
 
 /// `GET /claim` — every claim, live or expired (`claim_list`).
-pub async fn claims(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn claims(
+    State(_state): State<HttpState>,
+    server: Server,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let name = params.maybe("name").map(ToString::to_string);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read(
             "claim_list",
@@ -2235,6 +2189,7 @@ pub async fn claims(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> 
 /// `POST /memory` — store one memory (`memory_upsert`); text front-matter or JSON.
 pub async fn upsert(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
@@ -2276,10 +2231,6 @@ pub async fn upsert(
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e.to_string()),
     };
     let cmd = crate::ops::Upsert { patch, credit };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("memory_upsert", move |s| {
             crate::ops::memory_upsert(s, &caller, cmd)
@@ -2349,16 +2300,13 @@ pub async fn upsert(
 /// `DELETE /memory/{key}` — remove one memory (`memory_delete`).
 pub async fn memory_delete(
     State(state): State<HttpState>,
+    server: Server,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -2403,6 +2351,7 @@ pub async fn memory_delete(
 /// `GET /history/search?q=<words>` — exact words over every PAST state (`memory_history_search`).
 pub async fn history_search(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -2417,10 +2366,6 @@ pub async fn history_search(
         .clamp(1, 200);
     // Reads need no bearer beyond the door's own, like every other GET on this surface.
     let scope = match authorize(&state, &headers, true) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -2467,6 +2412,7 @@ pub async fn history_search(
 /// both shapes, and a LIVE key is refused: its history is the only copy of what it said.
 pub async fn history_erase(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -2486,10 +2432,6 @@ pub async fn history_erase(
             "this destroys text and nothing can restore it: pass confirm=true",
         );
     }
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match (ask_key, ask_orphans) {
         (Some(key), false) => {
             let lookup = key.clone();
@@ -2548,6 +2490,7 @@ pub async fn history_erase(
 /// `POST /memory/{key}/upvote` — mark one memory useful (`memory_upvote`).
 pub async fn upvote(
     State(state): State<HttpState>,
+    server: Server,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -2581,13 +2524,9 @@ pub async fn upvote(
         None => vec![key.clone()],
     };
     let named = keys.join(", ");
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
     // errors nor the JSON can drift apart.
-    match crate::mcp::upvote_sweep(server, reader_from(&headers, &state.paths), keys).await {
+    match crate::mcp::upvote_sweep(&server, reader_from(&headers, &state.paths), keys).await {
         Ok(payload) => {
             tracing::info!(area = scope.area, keys = %named, "upvoted over http");
             render(StatusCode::OK, json, payload, format!("upvoted {named}"))
@@ -2605,6 +2544,7 @@ pub async fn upvote(
 /// entire point of the verb.
 pub async fn append(
     State(state): State<HttpState>,
+    server: Server,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -2636,10 +2576,6 @@ pub async fn append(
                 );
             }
         },
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
         Ok(name) => name.clone(),
@@ -2673,6 +2609,7 @@ pub async fn append(
 /// `POST /memory/{key}/merge?into=` — integrate one memory into another and delete it (`memory_merge`).
 pub async fn merge(
     State(state): State<HttpState>,
+    server: Server,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -2720,10 +2657,6 @@ pub async fn merge(
             }
         },
     };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let from = key.clone();
     let target = into.clone();
     // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
@@ -2761,6 +2694,7 @@ pub async fn merge(
 /// caller can send the MCP tool's arguments unchanged.
 pub async fn fold(
     State(state): State<HttpState>,
+    server: Server,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -2805,10 +2739,6 @@ pub async fn fold(
             }
         },
     };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let from = key.clone();
     let target = into.clone();
     // A fold changes the record, so it takes the same channel gate a merge does; it does NOT take
@@ -2852,6 +2782,7 @@ pub async fn fold(
 /// an owned row needs `force=true` AND the caller to be an ancestor of its owner.
 pub async fn adopt(
     State(state): State<HttpState>,
+    server: Server,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -2877,10 +2808,6 @@ pub async fn adopt(
     {
         Ok(pen) => pen.to_string(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     let adopting = key.clone();
     let owner = pen.clone();
@@ -2915,6 +2842,7 @@ pub async fn adopt(
 /// Model-free and seconds long, which is the whole point: the alternative was a full re-embed.
 pub async fn reparse(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -2925,10 +2853,6 @@ pub async fn reparse(
     };
     let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
         Err(r) => return r,
     };
     match server
@@ -2973,6 +2897,7 @@ pub async fn reparse(
 /// returns, so it is one of the cheapest.
 pub async fn reembed(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -2983,10 +2908,6 @@ pub async fn reembed(
     };
     let caller = match proven_pen(&headers, json, &state.paths) {
         Ok(p) => p,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
         Err(r) => return r,
     };
     match server
@@ -3027,6 +2948,7 @@ pub async fn reembed(
 /// `POST /project` — create or replace a project (`project_upsert`); JSON or text front-matter.
 pub async fn project_upsert(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
@@ -3054,10 +2976,6 @@ pub async fn project_upsert(
     let proven = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
     };
     match server
         .with_store("project_upsert", move |s| {
@@ -3872,6 +3790,7 @@ fn boot_json(view: &BootView, tools: Option<&[BootTool]>) -> serde_json::Value {
 /// `POST /mail` — write one letter (`mail_send`). JSON body; nothing is delivered.
 pub async fn mail_send(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
@@ -3899,10 +3818,6 @@ pub async fn mail_send(
     let subject = field("subject").unwrap_or_default();
     let encoding = field("encoding").unwrap_or_else(|| "text".to_string());
     let to = recipient.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("mail_send", move |s| {
             s.mail_send(&sender, &sender, &recipient, &subject, &letter, &encoding)
@@ -3953,7 +3868,14 @@ async fn mail_guard(
     requested: &str,
     json: bool,
 ) -> Result<(), Response> {
-    let server = session(state)?;
+    // A helper rather than a handler: no `&mut Parts`, so no extractor (#233).
+    let Some(server) = state.server() else {
+        return Err(error(
+            json,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server not attached",
+        ));
+    };
     let (r, q) = (reader.to_string(), requested.to_string());
     let allowed = server
         .with_read(
@@ -3979,6 +3901,7 @@ async fn mail_guard(
 
 pub async fn mail_inbox(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -3999,10 +3922,6 @@ pub async fn mail_inbox(
     if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
         return r;
     }
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let me = Some(reader.clone());
     match server
         .with_read(
@@ -4071,6 +3990,7 @@ pub async fn mail_inbox(
 /// to move without a proven pen, and guessing one would hand someone else's cursor to whoever asked.
 pub async fn mail_ack(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -4098,10 +4018,6 @@ pub async fn mail_ack(
     if let Err(r) = mail_guard(&state, &reader, &recipient, json).await {
         return r;
     }
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("mail_ack", move |s| {
             s.mail_advance(&reader, &recipient, seq)
@@ -4124,6 +4040,7 @@ pub async fn mail_ack(
 /// `GET /mail/{seq}` — one letter, body included (`mail_read`).
 pub async fn mail_read(
     State(state): State<HttpState>,
+    server: Server,
     axum::extract::Path(seq): axum::extract::Path<i64>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -4132,10 +4049,6 @@ pub async fn mail_read(
     let json = params.json();
     let reader = match mail_reader_identity(&headers, json, &state.paths) {
         Ok(name) => name,
-        Err(r) => return r,
-    };
-    let server = match session(&state) {
-        Ok(s) => s,
         Err(r) => return r,
     };
     match server
@@ -4166,6 +4079,7 @@ pub async fn mail_read(
 /// `POST /mail/prune?keep_days=7` — drop letters nobody ever read (`mail_prune`).
 pub async fn mail_prune(
     State(state): State<HttpState>,
+    server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -4178,10 +4092,6 @@ pub async fn mail_prune(
         .maybe("keep_days")
         .and_then(|v| v.parse().ok())
         .unwrap_or(14_i64);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("mail_prune", move |s| s.mail_prune(keep_days))
         .await
@@ -4201,6 +4111,7 @@ pub async fn mail_prune(
 /// `POST /mail/surrogate/grant` — lend your OWN name for mail.
 pub async fn mail_surrogate_grant(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -4244,10 +4155,6 @@ pub async fn mail_surrogate_grant(
             ),
         );
     }
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let scopes = ask.scopes.unwrap_or_else(|| "send".to_string());
     match server
         .with_store("mail_surrogate_grant", move |s| {
@@ -4277,6 +4184,7 @@ pub async fn mail_surrogate_grant(
 /// `POST /mail/surrogate/revoke` — take a lent name back.
 pub async fn mail_surrogate_revoke(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -4311,10 +4219,6 @@ pub async fn mail_surrogate_revoke(
             format!("refused: `{caller}` may revoke its OWN grants only"),
         );
     }
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("mail_surrogate_revoke", move |s| {
             s.mail_revoke(&ask.grantor, &ask.surrogate)
@@ -4334,6 +4238,7 @@ pub async fn mail_surrogate_revoke(
 /// `GET /mail/surrogate` — every grant this pen holds, live or not.
 pub async fn mail_surrogate_list(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -4352,10 +4257,6 @@ pub async fn mail_surrogate_list(
         .maybe("surrogate")
         .map(ToString::to_string)
         .unwrap_or(caller);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read(
             "mail_surrogate_list",
@@ -4396,16 +4297,13 @@ fn proven(headers: &HeaderMap, paths: &Paths) -> Option<String> {
 /// GET /channels — policy for every channel, plus this pen's unread counts and breach.
 pub async fn channel_list(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
     let pen = proven(&headers, &state.paths);
     let caller = pen.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let out = server
         .with_read(
             "channel_list",
@@ -4457,6 +4355,7 @@ pub async fn channel_list(
 /// GET /channels/{channel}/messages — the LOG, which moves no receipt.
 pub async fn channel_history(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -4476,10 +4375,6 @@ pub async fn channel_history(
         .maybe("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(50);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let key = channel.clone();
     match server
         .with_read(
@@ -4509,6 +4404,7 @@ pub async fn channel_history(
 /// GET /channels/breach — what, if anything, is stopping this pen from changing the record.
 pub async fn channel_breach(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -4522,10 +4418,6 @@ pub async fn channel_breach(
         );
     };
     let who = pen.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read(
             "channel_breach",
@@ -4556,6 +4448,7 @@ pub async fn channel_breach(
 /// POST /channels/{channel}/messages — say one thing.
 pub async fn channel_send(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -4583,10 +4476,6 @@ pub async fn channel_send(
     };
     let reply_to = doc.get("reply_to").and_then(|v| v.as_i64());
     let (who, chan) = (pen.clone(), channel.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_send", move |s| {
             s.channel_send(&who, &chan, &text, reply_to)
@@ -4606,6 +4495,7 @@ pub async fn channel_send(
 /// POST /channels/fetch — LISTEN: take the unread messages and mark them fetched.
 pub async fn channel_fetch(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -4628,10 +4518,6 @@ pub async fn channel_fetch(
         .map(ToString::to_string);
     let limit = doc.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
     let who = pen.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_fetch", move |s| {
             s.channel_fetch(&who, channel.as_deref(), limit)
@@ -4658,6 +4544,7 @@ pub async fn channel_fetch(
 /// POST /channels/present — a turn boundary offered this pen its inbox.
 pub async fn channel_present(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -4679,10 +4566,6 @@ pub async fn channel_present(
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
     let who = pen.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_present", move |s| {
             s.channel_present(&who, boundary.as_deref())
@@ -4735,9 +4618,14 @@ async fn channel_membership(
         Err(r) => return r,
     };
     let (who, chan) = (pen.clone(), channel.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
+    // The one remaining hand-written session guard: this helper takes the state by value, so it has
+    // no `&mut Parts` for the `Server` extractor. Every handler uses the extractor instead (#233).
+    let Some(server) = state.server() else {
+        return error(
+            json,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server not attached",
+        );
     };
     let out = if join {
         server
@@ -4762,6 +4650,7 @@ async fn channel_membership(
 /// GET /channels/wait — block for new messages. A WAIT, not a LISTEN: no receipt moves.
 pub async fn channel_wait(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -4779,10 +4668,6 @@ pub async fn channel_wait(
         None => {
             // No cursor = "from now", not the whole backlog.
             let who = pen.clone();
-            let server = match session(&state) {
-                Ok(s) => s,
-                Err(r) => return r,
-            };
             match server
                 .with_read(
                     "channel_wait",
@@ -4804,10 +4689,6 @@ pub async fn channel_wait(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
     loop {
         let who = pen.clone();
-        let server = match session(&state) {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
         let rows = match server
             .with_read(
                 "channel_wait",
@@ -4841,6 +4722,7 @@ pub async fn channel_wait(
 /// GET /channels/{channel}/members — effective membership.
 pub async fn channel_members(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -4850,10 +4732,6 @@ pub async fn channel_members(
         return r;
     }
     let key = channel.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read(
             "channel_members",
@@ -4889,6 +4767,7 @@ pub async fn channel_members(
 /// POST /channels — create one. A gated channel needs `estate` or `james` (the store says so).
 pub async fn channel_create(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -4916,10 +4795,6 @@ pub async fn channel_create(
     let members = field("members").unwrap_or_else(|| "open".to_string());
     let gate = field("gate").unwrap_or_else(|| "none".to_string());
     let (who, key, title2) = (pen.clone(), channel.clone(), title.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_create", move |s| {
             s.channel_create(&who, &key, &title2, &members, &gate)
@@ -4942,6 +4817,7 @@ pub async fn channel_create(
 /// POST /channels/{channel}/gate — change a gate; the change is a row.
 pub async fn channel_set_gate(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -4967,10 +4843,6 @@ pub async fn channel_set_gate(
         return error(json, StatusCode::BAD_REQUEST, "`gate` is required");
     };
     let (who, chan) = (pen.clone(), channel.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_set_gate", move |s| {
             s.channel_set_gate(&who, &chan, &gate)
@@ -4990,6 +4862,7 @@ pub async fn channel_set_gate(
 /// GET /channels/{channel}/events — who made this channel dangerous, and when.
 pub async fn channel_events(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -4999,10 +4872,6 @@ pub async fn channel_events(
         return r;
     }
     let key = channel.clone();
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_read(
             "channel_events",
@@ -5040,6 +4909,7 @@ pub async fn channel_events(
 /// POST /channels/{channel}/retention — how long the text is kept. Keeper-only, recorded.
 pub async fn channel_set_retention(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -5061,10 +4931,6 @@ pub async fn channel_set_retention(
         return error(json, StatusCode::BAD_REQUEST, "`keep_secs` is required");
     };
     let (who, chan) = (pen.clone(), channel.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_set_retention", move |s| {
             s.channel_set_retention(&who, &chan, keep)
@@ -5092,6 +4958,7 @@ pub async fn channel_set_retention(
 /// POST /channels/prune — expire the text past retention. Receipts stay.
 pub async fn channel_prune(
     State(state): State<HttpState>,
+    server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -5115,10 +4982,6 @@ pub async fn channel_prune(
         .get("channel")
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_prune", move |s| {
             s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
@@ -5142,6 +5005,7 @@ pub async fn channel_prune(
 /// POST /channels/{channel}/invite — put another pen in. Keeper-only: an invitation has an inviter.
 pub async fn channel_invite(
     State(state): State<HttpState>,
+    server: Server,
     Path(channel): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
@@ -5167,10 +5031,6 @@ pub async fn channel_invite(
         return error(json, StatusCode::BAD_REQUEST, "`pen` is required");
     };
     let (who, chan, target) = (actor.clone(), channel.clone(), guest.clone());
-    let server = match session(&state) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     match server
         .with_store("channel_invite", move |s| {
             s.channel_invite(&who, &target, &chan)

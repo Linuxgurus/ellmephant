@@ -912,8 +912,22 @@ fn denied_response(json: bool, denied: crate::identity::Denied, forged: StatusCo
     error(json, code, denied.to_string())
 }
 
-/// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
-/// because authority is always borrowed BY somebody.
+/// The proven pen of a request, or the 401 that says what to send — every WRITE needs one, and so
+/// does every sudo route, because authority is always borrowed BY somebody.
+///
+/// ★ THIS FUNCTION ALREADY EXISTED AND SIX WRITE HANDLERS DID NOT USE IT (#231).
+///
+/// `identity::resolve` has three outcomes — a proven pen, `Ok(None)` for a request that claimed
+/// nothing, `Err(Forged)` for a name that was claimed and could not be proved. Six write handlers
+/// (`upsert`, `memory_delete`, `append`, `merge`, `fold`, `project_upsert`) wrote
+/// `resolve(..).ok().flatten()` instead, which collapses the last two into `None`, and then
+/// consulted the gate only `if let Some(caller)`. An unidentified writer was therefore treated as
+/// an acceptable author: `asserted_by` was stamped `"anonymous"`, `owner` stayed NULL, the row
+/// landed in the COMMONS where any pen may rewrite it (#119) — and the caller was answered
+/// `200 stored`. A forged pair bought exactly what a missing pair bought.
+///
+/// The MCP door has refused both cases since #109 (`pen_name`). A write needs a pen; reads stay
+/// open and simply narrow to public rows. There is one function for that, and this is it.
 #[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as in `session`
 fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, Response> {
     match crate::identity::resolve(paths, headers) {
@@ -2275,43 +2289,38 @@ pub async fn upsert(
     // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
     // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
     // names the pen, and only a PROVEN one is stamped (#109).
-    let proven = crate::identity::resolve(&state.paths, &headers)
-        .ok()
-        .flatten();
-    // ★ A SILENTLY IGNORED ARGUMENT IS A LIE ABOUT WHAT HAPPENED (found reviewing #126): with no
-    // proven pen there is nobody to check the claim against, so `as` would be dropped and the write
-    // attributed to nobody while the caller believed the finger was credited.
-    if as_pen.is_some() && proven.is_none() {
-        return error(
-            json,
-            StatusCode::UNAUTHORIZED,
-            "refused: crediting a descendant needs a PROVEN pen — send `X-Stet-From` and `X-Stet-Auth`",
-        );
-    }
-    let credited = match (&as_pen, &proven) {
-        (Some(claimed), Some(caller)) if !claimed.eq_ignore_ascii_case(caller) => {
-            Some(claimed.clone())
-        }
+    //
+    // ★ AND `.ok().flatten()` WAS THE SAME BUG ONE LAYER DOWN (#231): it turned a FORGED pair and NO
+    // pair at all into `None`, so this handler wrote rows nobody was answerable for and answered
+    // `200 stored`. `proven_pen` refuses both, and it already existed — these six handlers simply did not
+    let proven = match proven_pen(&headers, json, &state.paths) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    // ★ A SILENTLY IGNORED ARGUMENT IS A LIE ABOUT WHAT HAPPENED (found reviewing #126): `as` names
+    // a pen to CREDIT, and it is only meaningful when that pen is not the writer. `proven_pen` has
+    // already established there is a proven writer, so the old "needs a PROVEN pen" refusal is now
+    // unreachable by construction rather than by a check.
+    let credited = match &as_pen {
+        Some(claimed) if !claimed.eq_ignore_ascii_case(&proven) => Some(claimed.clone()),
         _ => None,
     };
-    patch.asserted_by = credited.clone().or_else(|| proven.clone());
+    patch.asserted_by = Some(credited.clone().unwrap_or_else(|| proven.clone()));
     // ★ THE ACTOR IS THE PROVEN PEN ON EVERY DOOR (soma/ellmephant#192): without this an update over
     // HTTP would have to take its authority from the credited name.
-    patch.acted_by = proven.clone();
+    patch.acted_by = Some(proven.clone());
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
         .with_store("memory_upsert", move |s| {
-            if let Some(caller) = &proven {
-                s.channel_gate(caller, crate::store::channel::Class::Record)?;
-            }
+            s.channel_gate(&proven, crate::store::channel::Class::Record)?;
             // ★ A credit needs a LIVE LEND, exactly as on the MCP door: `as` is not a rename of the
             // writer, it is a claim that this pen may act for that one, and parentage alone is not
             // enough to make it true.
-            if let (Some(as_pen), Some(caller)) = (&credited, &proven) {
-                s.may_act_as(caller, as_pen)?;
+            if let Some(as_pen) = &credited {
+                s.may_act_as(&proven, as_pen)?;
             }
             s.memory_merge(&patch)
         })
@@ -2394,18 +2403,18 @@ pub async fn memory_delete(
         Err(r) => return r,
     };
     // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
-    // nobody to name in the ledger, and `store::delete` will refuse it on a row somebody owns.
-    let pen = crate::identity::resolve(&state.paths, &headers)
-        .ok()
-        .flatten();
+    // nobody to name in the ledger, and `store::delete` will refuse it on a row somebody owns — so
+    // an unproven removal was not "harmless", it was a refusal one layer down with a `200` above it.
+    let pen = match proven_pen(&headers, json, &state.paths) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
-            if let Some(caller) = &pen {
-                s.channel_gate(caller, crate::store::channel::Class::Record)?;
-            }
+            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
 
-            if !s.rm(&lookup, pen.as_deref())? {
+            if !s.rm(&lookup, Some(pen.as_str()))? {
                 return Ok(None);
             }
             Ok(Some(s.version_count(&lookup)?))
@@ -2678,17 +2687,17 @@ pub async fn append(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let pen = crate::identity::resolve(&state.paths, &headers)
-        .ok()
-        .flatten();
+    // ★ An append is a WRITE: it needs a pen, exactly as `upsert` does (#231).
+    let pen = match proven_pen(&headers, json, &state.paths) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let force = params.flag("force");
     let target = key.clone();
     match server
         .with_store("memory_append", move |s| {
-            if let Some(caller) = &pen {
-                s.channel_gate(caller, crate::store::channel::Class::Record)?;
-            }
-            s.append(&target, &line, pen.as_deref(), force)
+            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+            s.append(&target, &line, Some(pen.as_str()), force)
         })
         .await
     {
@@ -2766,16 +2775,16 @@ pub async fn merge(
     let from = key.clone();
     let target = into.clone();
     // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
-    let pen = crate::identity::resolve(&state.paths, &headers)
-        .ok()
-        .flatten();
+    // ★ And an unproven caller must not be told `merged` for a source it was never allowed to
+    // destroy (#231) — the store's own rule is checked against an actor, so there has to be one.
+    let pen = match proven_pen(&headers, json, &state.paths) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     match server
         .with_store("memory_merge", move |s| {
-            if let Some(caller) = &pen {
-                s.channel_gate(caller, crate::store::channel::Class::Record)?;
-            }
-
-            s.merge_into(&from, &target, pen.as_deref())
+            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+            s.merge_into(&from, &target, Some(pen.as_str()))
         })
         .await
     {
@@ -2857,16 +2866,17 @@ pub async fn fold(
     // the source's write authority, which is the whole point. It DOES require a proven pen: the
     // store refuses a fold with no actor (an append nobody is named for), so an unproven caller gets
     // a 403 from `fold_into` rather than a ledger row with a NULL actor.
-    let pen = crate::identity::resolve(&state.paths, &headers)
-        .ok()
-        .flatten();
+    // ★ The comment above says the store refuses a fold with no actor, so an unproven caller got a
+    // 403 from `fold_into` — a refusal produced deep inside, after the door had already said yes to
+    // the request. `proven_pen` refuses at the door, where the reason is legible (#231).
+    let pen = match proven_pen(&headers, json, &state.paths) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     match server
         .with_store("memory_fold", move |s| {
-            if let Some(caller) = &pen {
-                s.channel_gate(caller, crate::store::channel::Class::Record)?;
-            }
-
-            s.fold_into(&from, &target, pen.as_deref())
+            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
+            s.fold_into(&from, &target, Some(pen.as_str()))
         })
         .await
     {
@@ -3098,20 +3108,20 @@ pub async fn project_upsert(
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
-    // The pen the identity pair proves, if any: a project write may still be anonymous (the row
-    // records it), but a gate can only bite a pen that has one.
-    let proven = crate::identity::resolve(&state.paths, &headers)
-        .ok()
-        .flatten();
+    // ★ A project write is a WRITE (#231). The old comment here said "may still be anonymous (the
+    // row records it)" — but the row records `anonymous`, which is exactly the stamp that leaves
+    // `owner` NULL and the row rewritable by any pen. Same law as `upsert`, one helper.
+    let proven = match proven_pen(&headers, json, &state.paths) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
         .with_store("project_upsert", move |s| {
-            if let Some(caller) = &proven {
-                s.channel_gate(caller, crate::store::channel::Class::Record)?;
-            }
+            s.channel_gate(&proven, crate::store::channel::Class::Record)?;
             s.project_merge(&patch)
         })
         .await

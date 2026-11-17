@@ -3157,3 +3157,94 @@ async fn api_index_names_the_rest_of_the_surface() {
     let (status, _, _) = get(&app, "/api/nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ─── The door contract (#231) ────────────────────────────────────────────────────────────────
+/// An HTTP write must require a PROVEN pen, and the two unproven cases must be
+/// indistinguishable: a forged pair and no pair at all.
+///
+/// Why this exists as a test rather than a comment: six handlers reached the store with
+/// `identity::resolve(..).ok().flatten()`, which turns `Err(Forged)` and `Ok(None)` into the same
+/// `None`, and then consulted the channel gate only `if let Some(caller)`. So a request carrying
+/// the bearer and NO identity headers created a row with `asserted_by = "anonymous"` and
+/// `owner = NULL` — a commons row any pen may rewrite (#119) — and was answered `200 stored`.
+/// The MCP door has refused both since #109. Nothing caught the HTTP door because no test drove
+/// it with a missing identity; every write test supplied a valid one.
+#[tokio::test]
+async fn an_http_write_requires_a_proven_pen() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_token(dir.path(), "tok");
+    let paths = Paths::from_root(dir.path());
+    identity_fixture(&paths);
+
+    let post = |headers: Vec<(&'static str, &'static str)>, key: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/memory")
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                req = req.header(name, value);
+            }
+            let res = app
+                .oneshot(
+                    req.body(Body::from(
+                        json!({ "key": key, "title": "a title", "body": "a body" }).to_string(),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+    };
+
+    // 1. No identity claimed at all.
+    let (status, body) = post(vec![], "written-by-nobody").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a write with no identity must be refused, not stored: {status} {body}"
+    );
+
+    // 2. A name claimed and not proved.
+    let (status, body) = post(
+        vec![("X-Stet-From", "http-as-tester"), ("X-Stet-Auth", "wrong-secret")],
+        "written-by-a-liar",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a write with a FORGED identity must be refused, not stored: {status} {body}"
+    );
+
+    // 3. Neither attempt may leave a row behind — the refusal is the whole point, and a row with
+    //    `owner` NULL is exactly what #119 makes rewritable by anyone.
+    let conn = ellmephant::db::open(&paths).unwrap();
+    for key in ["written-by-nobody", "written-by-a-liar"] {
+        let found: Option<String> = conn
+            .query_row("SELECT key FROM memory WHERE key = ?1", [key], |r| r.get(0))
+            .ok();
+        assert_eq!(found, None, "a refused write must not create a row: {key}");
+    }
+
+    // 4. And a PROVEN pair still writes, so this is about identity and not about writes being shut.
+    let (status, body) = post(
+        vec![("X-Stet-From", "http-as-tester"), ("X-Stet-Auth", "as-secret-1")],
+        "written-by-someone",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a proven write must still land: {status} {body}");
+    let owner: Option<String> = conn
+        .query_row("SELECT owner FROM memory WHERE key = 'written-by-someone'", [], |r| r.get(0))
+        .unwrap_or(None);
+    assert!(
+        owner.is_some(),
+        "a proven write must land with an owner, not in the commons"
+    );
+}

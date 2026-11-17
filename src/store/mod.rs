@@ -15,6 +15,7 @@ pub mod mail;
 pub mod maintain;
 pub mod project;
 pub mod relation;
+mod rules;
 pub mod shape;
 pub mod slug;
 pub mod snapshot;
@@ -863,178 +864,40 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         ..Default::default()
     };
     let key = resolve_key(conn, &probe)?;
-    // ★ THE DOOR THAT STOPS THE TAP (soma/ellmephant#217). A body whose SHAPE is a run record is
-    // refused, and the refusal names the verb and the arguments it inferred. `force: true` writes it
-    // anyway: an agent that read the refusal may still be right.
-    if let Some(hint) = patch
-        .body
-        .as_deref()
-        .filter(|_| !patch.force)
-        .and_then(|body| shape::record_hint(body, &key))
-    {
-        return Err(Error::Invalid(shape::refusal(&hint, &key)));
-    }
-    // ★ TWO INSTRUCTIONS THAT CONTRADICT EACH OTHER ARE REFUSED, NOT RESOLVED SILENTLY
-    // (soma/ellmephant#189 D5). `private` derives an audience from the proven pen; an explicit
-    // `audience` names others. Asked for both, this used to keep the `audience` and drop `private`
-    // without a word — and when that audience did not include the author, the row became invisible to
-    // the pen that wrote it. A caller must not have to guess which of its two sentences was obeyed.
-    // ★ ONLY `private: true` CONTRADICTS AN AUDIENCE (hostile review of #194, round 2). `private: false`
-    // says "not private", and ANY explicit audience satisfies that — refusing the pair rejected a
-    // request that was not contradictory, and every client that always sends `private: false` with an
-    // audience would have broken. The contradiction is a claim of exclusivity alongside a list.
-    if patch.private == Some(true) && patch.audience.is_some() {
-        return Err(Error::Invalid(
-            "`private: true` and `audience` contradict each other: private addresses the row to the \
-             writing pen ALONE, audience names other pens. Pass one. To address several pens INCLUDING \
-             yourself, use `audience: \"pen:<you>,pen:<other>\"` and no `private`; `private: false` \
-             needs no audience, and any audience satisfies it."
-                .into(),
-        ));
-    }
+    // ★ THE RULES ARE DATA, AND THE ORDER IS THE CONTRACT (soma/ellmephant#238). What used to be six
+    // guards inline is now two named lists split by WHAT A RULE READS: `RULES_PRE` sees only the
+    // incoming patch and runs before anyone decides whether the caller may write; `RULES_POST` reads
+    // the existing row and runs after. A rule on the wrong side of the boundary turns a refusal into
+    // a read (#192), and `src/store/rules.rs` says so on each one.
     let existing = get(conn, &key)?;
-    // A `protected` row (or a write that would make one) needs a live lease on its own key.
     let was_tags = existing
         .as_ref()
         .map(|m| m.tags.clone())
         .unwrap_or_default();
-    // ★ WHO IS WRITING, ONCE (adversarial review of #192). `acted_by` is the proven pen; `asserted_by`
-    // is the credited one. Authority, the boundary guard and the write all have to agree about which
-    // pen is acting, or a hand crediting its finger gets judged as the finger for some checks and as
-    // the hand for others.
-    // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): the guards below must judge the pen that
-    // acts. Falling back to `asserted_by` is how a write gets authorised as the name it credits.
-    // ★ `private` AND `as:` CONTRADICT EACH OTHER (hostile review of #195, round 3). `private: true`
-    // addresses the row to the pen that ACTS; `as:` credits a different pen. Both cannot be true, and
-    // the failure was ugly rather than refused: with the audience on the actor, the CREDITED pen could
-    // no longer read words it was credited for, so the D1 rule refused the write with a message about
-    // invisibility — a true sentence that names the wrong cause. Refuse the combination instead.
-    match (
-        patch.private,
-        patch.asserted_by.as_deref(),
-        patch.acted_by.as_deref(),
-    ) {
-        (Some(true), Some(credited), Some(actor)) if !credited.eq_ignore_ascii_case(actor) => {
-            return Err(Error::Invalid(
-                "`private: true` addresses the row to the pen that ACTS, and `as:` credits a \
-                 different pen — they contradict each other. Pass an explicit `audience` (e.g. \
-                 `pen:<you>,pen:<them>`) if the row is for both, or drop one of them."
-                    .into(),
-            ));
-        }
-        _ => {}
-    }
+    // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): every rule and the write itself must judge
+    // the pen that acts. Falling back to `asserted_by` is how a write gets authorised as the name it
+    // credits, and how a hand crediting its finger is judged as the finger for some checks and as the
+    // hand for others.
     let writer = patch.acted_by.as_deref();
-    // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
-    // `guard_audience` produce different sentences for different states, so running them first let a
-    // pen that may not write the row learn that it exists and is not public — a read disguised as a
-    // refusal. A refusal must not be a read; the same rule as the CAS ordering.
+    let ctx = rules::WriteCtx {
+        conn,
+        patch,
+        key: &key,
+        existing: existing.as_ref(),
+        was_tags: &was_tags,
+        writer,
+    };
+    rules::run(rules::RULES_PRE, &ctx)?;
+    // ★ AUTHORISE BEFORE THE ROW-READING RULES (adversarial review of #192). Their sentences describe
+    // row state, so running one first lets a pen that may not write the row learn that it exists and
+    // is not public. A refusal must not be a read; the same rule as the CAS ordering. This is the
+    // BOUNDARY, not a rule: it sits between the lists because it is the one thing that must not move.
     if existing.is_some() {
         may_write(conn, &key, writer)?;
     }
-    guard_protected(conn, &key, &was_tags, patch, writer)?;
-    // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
-    // could not read. Without this, `private` would be a lock whose key hangs beside the door.
-    guard_audience(conn, existing.as_ref(), patch, writer)?;
+    rules::run(rules::RULES_POST, &ctx)?;
 
-    let (mem, created) = match existing {
-        Some(old) => {
-            let title = patch.title.clone().unwrap_or_else(|| old.title.clone());
-            let body = patch.body.clone().unwrap_or_else(|| old.body.clone());
-            if title.trim().is_empty() {
-                return Err(Error::Invalid(
-                    "`title` cannot be empty; omit it to leave the stored title alone".into(),
-                ));
-            }
-            if body.trim().is_empty() {
-                return Err(Error::Invalid(
-                    "`body` cannot be empty; omit it to leave the stored body alone".into(),
-                ));
-            }
-            let source = match &patch.source {
-                Some(s) => (!s.trim().is_empty()).then(|| s.clone()),
-                None => old.source.clone(),
-            };
-            (
-                Memory {
-                    key: key.clone(),
-                    title,
-                    body,
-                    tags: patch.tags.clone().unwrap_or_else(|| old.tags.clone()),
-                    source,
-                    // ★ AUTHORSHIP IS WRITE-ONCE (#107). A patch is a write, not a claim about who
-                    // asserted the document: the stored author is carried through untouched, and the
-                    // writer names itself in `edited_by` — so re-filing a row cannot launder
-                    // its provenance, and the move is visible without a version.
-                    asserted_by: old.asserted_by.clone(),
-                    // ★ THE WRITER, NOT THE CREDIT (Stet, review of #192): a parent writing as its
-                    // child must be recorded as the parent, or the laundering survives in the audit trail
-                    // after being blocked at the gate.
-                    // ★ AN UNKNOWN WRITER IS HONEST; A CREDITED WRITER IS A GUESS (Stet's review of
-                    // #192). Falling back to `asserted_by` here would record the pen being CREDITED as
-                    // the pen that wrote — the exact defect the `edited_by`-from-`acted_by` fix exists
-                    // to prevent, surviving in the one branch that kept a fallback.
-                    edited_by: patch.acted_by.clone().or_else(|| old.edited_by.clone()),
-                    origin: patch.origin.clone().or_else(|| old.origin.clone()),
-                    audience: match (&patch.audience, patch.private) {
-                        // An explicit audience is a SHARE (it names others), so it is checked against
-                        // the registry; `private` is derived from the proven pen and cannot.
-                        (Some(spec), _) => audience::validated(conn, spec)?,
-                        // ★ `private` NAMES THE PEN THAT ACTS, NOT THE PEN IT CREDITS (hostile review of
-                        // #195, round 2). This read `asserted_by` — the credit — so a hand crediting its
-                        // finger made the row private to the FINGER, and a legacy row with an
-                        // `anonymous` author could be made private to a pen that does not exist. The
-                        // proven pen is the one making the row private; the credit is a name.
-                        (None, Some(p)) => audience::for_write(
-                            p,
-                            patch
-                                .acted_by
-                                .as_deref()
-                                .or(patch.asserted_by.as_deref())
-                                .or(old.asserted_by.as_deref()),
-                        )?,
-                        (None, None) => old.audience.clone(),
-                    },
-                    ..Default::default()
-                },
-                false,
-            )
-        }
-        None => {
-            let title = patch.title.clone().unwrap_or_default();
-            let body = patch.body.clone().unwrap_or_default();
-            if title.trim().is_empty() || body.trim().is_empty() {
-                return Err(Error::Invalid(
-                    "a new memory needs both a `title` and a `body`; an existing key can be patched \
-                     field by field"
-                        .into(),
-                ));
-            }
-            (
-                Memory {
-                    key: key.clone(),
-                    title,
-                    body,
-                    tags: patch.tags.clone().unwrap_or_default(),
-                    source: patch.source.clone().filter(|s| !s.trim().is_empty()),
-                    asserted_by: patch.asserted_by.clone(),
-                    edited_by: patch.acted_by.clone().or_else(|| patch.asserted_by.clone()),
-                    origin: patch.origin.clone().filter(|s| !s.trim().is_empty()),
-                    audience: match &patch.audience {
-                        Some(spec) => audience::validated(conn, spec)?,
-                        None => audience::for_write(
-                            patch.private == Some(true),
-                            // ★ The same correction on the CREATE path: the pen making the row private
-                            // is the one that acts; the credit is a name and may be a finger.
-                            patch.acted_by.as_deref().or(patch.asserted_by.as_deref()),
-                        )?,
-                    },
-                    ..Default::default()
-                },
-                true,
-            )
-        }
-    };
+    let (mem, created) = document(&ctx)?;
 
     let (_id, key, queued, conflict) = add_impl(
         conn,
@@ -1057,6 +920,98 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         queued,
         conflict,
     })
+}
+
+/// ★ ONE DOCUMENT BUILDER (soma/ellmephant#238). The create and update branches used to duplicate
+/// every decision in `merge` — tags, source, origin, audience derivation, and the `asserted_by` /
+/// `edited_by` pair — and three of the bugs in this file's history (#190, #192, #195) were each a fix
+/// to one branch that missed the other. Stated once, the two answers cannot drift.
+///
+/// The rules that are shared are stated once here as well: authorship is write-once (#107), and the
+/// pen RECORDED as writer is the one that acts, never the name it credits.
+fn document(ctx: &rules::WriteCtx<'_>) -> Result<(Memory, bool)> {
+    let old = ctx.existing;
+    let patch = ctx.patch;
+    let title = patch
+        .title
+        .clone()
+        .or_else(|| old.map(|o| o.title.clone()))
+        .unwrap_or_default();
+    let body = patch
+        .body
+        .clone()
+        .or_else(|| old.map(|o| o.body.clone()))
+        .unwrap_or_default();
+    let tags = patch
+        .tags
+        .clone()
+        .or_else(|| old.map(|o| o.tags.clone()))
+        .unwrap_or_default();
+    // A `source` of `Some("")` clears it on both paths; an absent one keeps the stored value.
+    let source = match &patch.source {
+        Some(s) => (!s.trim().is_empty()).then(|| s.clone()),
+        None => old.and_then(|o| o.source.clone()),
+    };
+    // `origin` keeps the subtlety the two branches disagreed about: a whitespace-only origin was
+    // dropped on a create but stored on an update. Preserved rather than "tidied", because changing it
+    // would rewrite rows nobody asked about — and if it should be one rule, that is a decision with a
+    // test, not a side effect of this refactor.
+    let origin = match (&patch.origin, old) {
+        (None, old) => old.and_then(|o| o.origin.clone()),
+        (Some(s), None) => (!s.trim().is_empty()).then(|| s.clone()),
+        (Some(s), Some(_)) => Some(s.clone()),
+    };
+    // ★ AUTHORSHIP IS WRITE-ONCE (#107). A patch is a write, not a claim about who asserted the
+    // document: the stored author is carried through untouched, so re-filing a row cannot launder its
+    // provenance and the move is visible in `edited_by` without a version.
+    let asserted_by = match old {
+        Some(o) => o.asserted_by.clone(),
+        None => patch.asserted_by.clone(),
+    };
+    // ★ THE WRITER, NOT THE CREDIT (Stet, review of #192). A parent writing as its child must be
+    // recorded as the parent, or the laundering survives in the audit trail after being blocked at the
+    // gate. ★ AN UNKNOWN WRITER IS HONEST; A CREDITED WRITER IS A GUESS: falling back to
+    // `asserted_by` on an update would record the pen being credited as the pen that wrote.
+    let edited_by = patch.acted_by.clone().or_else(|| match old {
+        Some(o) => o.edited_by.clone(),
+        None => patch.asserted_by.clone(),
+    });
+    let audience = match &patch.audience {
+        // An explicit audience is a SHARE (it names others), so it is checked against the registry;
+        // `private` is derived from the proven pen and cannot be.
+        Some(spec) => audience::validated(ctx.conn, spec)?,
+        None => match (patch.private, old) {
+            // Re-asserting nothing leaves the boundary where it was.
+            (None, Some(o)) => o.audience.clone(),
+            // ★ `private` NAMES THE PEN THAT ACTS, NOT THE PEN IT CREDITS (hostile review of #195,
+            // round 2). This read `asserted_by` — the credit — so a hand crediting its finger made the
+            // row private to the FINGER, and a legacy row with an `anonymous` author could be made
+            // private to a pen that does not exist.
+            (private, _) => audience::for_write(
+                private == Some(true),
+                patch
+                    .acted_by
+                    .as_deref()
+                    .or(patch.asserted_by.as_deref())
+                    .or(old.and_then(|o| o.asserted_by.as_deref())),
+            )?,
+        },
+    };
+    Ok((
+        Memory {
+            key: ctx.key.to_string(),
+            title,
+            body,
+            tags,
+            source,
+            asserted_by,
+            edited_by,
+            origin,
+            audience,
+            ..Default::default()
+        },
+        old.is_none(),
+    ))
 }
 
 /// A write resolved *outside* the transaction: the key, and the existing document it will upsert.

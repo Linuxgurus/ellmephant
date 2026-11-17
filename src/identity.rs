@@ -116,16 +116,16 @@ impl std::error::Error for Refusal {}
 #[derive(Debug, Clone, Default)]
 pub struct Caller {
     /// The proven pen. `Some` is the only way to write.
-    proven: Option<String>,
+    proven: Option<crate::names::Pen>,
     /// Why a claim failed, if one was made and refused.
     denied: Option<Denied>,
     /// A pen DECLARED by a transport with no request (stdio, in-process): as trusted as the process
     /// that started it. Ignored on HTTP, where the headers decide.
-    declared: Option<String>,
+    declared: Option<crate::names::Pen>,
     /// The BORROWED authority — `sudo` and `pen_lend` let a caller act as another pen, and the store
     /// already keeps that beside the assertion as `acted_by`. Carried here now, so a Command credits
     /// through one value instead of two positional `Option<&str>` (see #239).
-    via: Option<String>,
+    via: Option<crate::names::Pen>,
 }
 
 impl Caller {
@@ -133,7 +133,9 @@ impl Caller {
     pub fn from_headers(paths: &Paths, headers: &HeaderMap) -> Self {
         match resolve(paths, headers) {
             Ok(proven) => Caller {
-                proven,
+                proven: proven
+                    .as_deref()
+                    .and_then(|p| crate::names::Pen::new(p).ok()),
                 ..Caller::default()
             },
             Err(denied) => Caller {
@@ -146,22 +148,22 @@ impl Caller {
     /// A transport with no request at all (stdio, in-process): it may declare its pen once.
     pub fn transport(declared: Option<&str>) -> Self {
         Caller {
-            declared: declared.map(str::to_string),
+            declared: declared.and_then(|p| crate::names::Pen::new(p).ok()),
             ..Caller::default()
         }
     }
 
     /// Let a declaring transport name itself. HTTP transports never call this: their headers decide.
     pub fn declare(mut self, declared: Option<&str>) -> Self {
-        self.declared = declared.map(str::to_string);
+        self.declared = declared.and_then(|p| crate::names::Pen::new(p).ok());
         self
     }
 
     /// The proven pen, or the declared one for a trusted transport — never a forged claim.
-    pub fn proven(&self) -> Option<&str> {
-        self.proven.as_deref().or_else(|| {
+    pub fn proven(&self) -> Option<&crate::names::Pen> {
+        self.proven.as_ref().or_else(|| {
             if self.denied.is_none() {
-                self.declared.as_deref()
+                self.declared.as_ref()
             } else {
                 None
             }
@@ -175,7 +177,7 @@ impl Caller {
 
     /// ★ THE WRITE GATE: a pen, or a refusal. Fails on BOTH *forged* and *missing* — the whole point
     /// of the type, and the difference between this and `.ok().flatten()`.
-    pub fn pen(&self) -> Result<&str, Refusal> {
+    pub fn pen(&self) -> Result<&crate::names::Pen, Refusal> {
         self.pen_or(
             "refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` \
              (reads need neither). `whoami` reports what this connection is.",
@@ -184,7 +186,7 @@ impl Caller {
 
     /// [`Caller::pen`] with the route's own sentence for the missing case, so `mint` can say
     /// "minting needs a proven pen" without a second ladder.
-    pub fn pen_or(&self, missing: &str) -> Result<&str, Refusal> {
+    pub fn pen_or(&self, missing: &str) -> Result<&crate::names::Pen, Refusal> {
         if let Some(denied) = &self.denied {
             return Err(Refusal::Denied(denied.clone()));
         }
@@ -195,19 +197,19 @@ impl Caller {
     /// Who this request reads as. Never an error: a read is open, it is just narrow.
     pub fn reader(&self) -> crate::store::audience::Reader {
         match self.proven() {
-            Some(name) => crate::store::audience::Reader::pen(name),
+            Some(name) => crate::store::audience::Reader::pen(name.as_str()),
             None => crate::store::audience::Reader::anonymous(),
         }
     }
 
     /// The pen this caller acts AS when one is lent or taken by `sudo`.
-    pub fn via(&self) -> Option<&str> {
-        self.via.as_deref()
+    pub fn via(&self) -> Option<&crate::names::Pen> {
+        self.via.as_ref()
     }
 
     /// Record borrowed authority — the store stamps it as `acted_by`.
     pub fn acting_as(mut self, pen: Option<&str>) -> Self {
-        self.via = pen.map(str::to_string);
+        self.via = pen.and_then(|p| crate::names::Pen::new(p).ok());
         self
     }
 }
@@ -363,10 +365,13 @@ mod tests {
         assert_eq!(forged.reader().pen_name(), None);
 
         let proved = Caller::from_headers(&paths, &headers(Some("James"), Some(&secret)));
-        assert_eq!(proved.pen().unwrap(), "James");
+        assert_eq!(proved.pen().unwrap().as_str(), "James");
         // ★ A DECLARATION MAY STAND IN ONLY WHEN NOTHING WAS CLAIMED — never over a refusal. That
         // is the difference between a trusted transport and a forged header.
-        assert_eq!(forged.declare(Some("James")).pen().is_err(), true);
-        assert_eq!(absent.declare(Some("James")).pen().unwrap(), "James");
+        assert!(forged.declare(Some("James")).pen().is_err());
+        assert_eq!(
+            absent.declare(Some("James")).pen().unwrap().as_str(),
+            "James"
+        );
     }
 }

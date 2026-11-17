@@ -649,7 +649,7 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
                         .split(',')
                         .map(str::trim)
                         .filter(|t| !t.is_empty())
-                        .map(str::to_string)
+                        .map(ToString::to_string)
                         .collect(),
                 );
             }
@@ -923,7 +923,7 @@ fn refusal_response(json: bool, refusal: crate::identity::Refusal, absent: Statu
 fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, Response> {
     crate::identity::Caller::from_headers(paths, headers)
         .pen_or("refused: this needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
-        .map(str::to_string)
+        .map(ToString::to_string)
         .map_err(|r| refusal_response(json, r, StatusCode::UNAUTHORIZED))
 }
 
@@ -932,7 +932,7 @@ fn proven_pen(headers: &HeaderMap, json: bool, paths: &Paths) -> Result<String, 
 fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> Result<String, Response> {
     doc.get(name)
         .and_then(|v| v.as_str())
-        .map(str::to_string)
+        .map(ToString::to_string)
         .ok_or_else(|| error(json, StatusCode::BAD_REQUEST, format!("missing `{name}`")))
 }
 
@@ -1003,7 +1003,7 @@ pub async fn sudo_sessions(
         return r;
     }
     let params = Params::parse(raw.as_deref());
-    let pen = params.get("pen").map(str::to_string);
+    let pen = params.get("pen").map(ToString::to_string);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -1267,7 +1267,7 @@ pub async fn whois(
     let json = Params::parse(raw.as_deref()).json();
     let viewer = crate::identity::Caller::from_headers(&state.paths, &headers)
         .proven()
-        .map(str::to_string)
+        .map(ToString::to_string)
         .unwrap_or_else(|| crate::identity::ANONYMOUS.to_string());
     let server = match session(&state) {
         Ok(s) => s,
@@ -1317,7 +1317,7 @@ pub async fn whoami(State(state): State<HttpState>, headers: HeaderMap) -> Respo
             Some(name) => {
                 let text = format!("{name} (proven)\n");
                 (
-                    serde_json::json!({ "asserted_by": name, "proven": true }),
+                    serde_json::json!({ "asserted_by": name.as_str(), "proven": true }),
                     text,
                 )
             }
@@ -1715,8 +1715,8 @@ pub async fn semantic_search(
         None => None,
     };
     let p = SemanticSearchParams {
-        query: params.maybe("q").map(str::to_string),
-        doc_type: params.maybe("type").map(str::to_string),
+        query: params.maybe("q").map(ToString::to_string),
+        doc_type: params.maybe("type").map(ToString::to_string),
         deleted,
         k: params.maybe("k").and_then(|v| v.parse().ok()),
         max_distance: params.maybe("max_distance").and_then(|v| v.parse().ok()),
@@ -1807,10 +1807,10 @@ pub async fn projects(
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
     let filter = project::Filter {
-        status: params.maybe("status").map(str::to_string),
+        status: params.maybe("status").map(ToString::to_string),
         tags: params.all("tag"),
         owner: params.all("owner"),
-        pattern: params.maybe("pattern").map(str::to_string),
+        pattern: params.maybe("pattern").map(ToString::to_string),
         mode,
     };
     let server = match session(&state) {
@@ -1911,7 +1911,7 @@ pub async fn config_list(
     let reader = reader_from(&headers, &state.paths);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let prefix = params.maybe("prefix").map(str::to_string);
+    let prefix = params.maybe("prefix").map(ToString::to_string);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -1965,7 +1965,7 @@ pub async fn config_set(
     let source = doc
         .get("source")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(ToString::to_string);
     let log_key = key.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -2145,8 +2145,8 @@ pub async fn claim_release(
         .as_ref()
         .and_then(|v| v.get("owner"))
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| params.maybe("owner").map(str::to_string));
+        .map(ToString::to_string)
+        .or_else(|| params.maybe("owner").map(ToString::to_string));
     let Some(owner) = owner else {
         return error(json, StatusCode::BAD_REQUEST, "missing `owner`");
     };
@@ -2191,7 +2191,7 @@ pub async fn claim_release(
 pub async fn claims(State(state): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let name = params.maybe("name").map(str::to_string);
+    let name = params.maybe("name").map(ToString::to_string);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -2257,7 +2257,7 @@ pub async fn upsert(
     } else {
         memory_patch_text(&String::from_utf8_lossy(&bytes))
     };
-    let (mut patch, as_pen) = match patch {
+    let (patch, as_pen) = match patch {
         Ok(p) => p,
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
@@ -2268,31 +2268,21 @@ pub async fn upsert(
     // ★ ONE CALLER, AND A WRITE WITHOUT ONE IS REFUSED (soma/ellmephant#231) — including a FORGED
     // claim, which `.ok().flatten()` used to collapse into "nobody" and then write as the commons.
     let caller = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
-        Ok(name) => name.to_string(),
+        Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
-    let credited = match &as_pen {
-        Some(claimed) if !claimed.eq_ignore_ascii_case(&caller) => Some(claimed.clone()),
-        _ => None,
+    let credit = match as_pen.as_deref().map(crate::names::Pen::new).transpose() {
+        Ok(credit) => credit,
+        Err(e) => return error(json, StatusCode::BAD_REQUEST, e.to_string()),
     };
-    patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
-    // ★ THE ACTOR IS THE PROVEN PEN ON EVERY DOOR (soma/ellmephant#192): without this an update over
-    // HTTP would have to take its authority from the credited name.
-    patch.acted_by = Some(caller.clone());
+    let cmd = crate::ops::Upsert { patch, credit };
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
     };
     match server
         .with_store("memory_upsert", move |s| {
-            s.channel_gate(&caller, crate::store::channel::Class::Record)?;
-            // ★ A credit needs a LIVE LEND, exactly as on the MCP door: `as` is not a rename of the
-            // writer, it is a claim that this pen may act for that one, and parentage alone is not
-            // enough to make it true.
-            if let Some(as_pen) = &credited {
-                s.may_act_as(&caller, as_pen)?;
-            }
-            s.memory_merge(&patch)
+            crate::ops::memory_upsert(s, &caller, cmd)
         })
         .await
     {
@@ -2375,17 +2365,13 @@ pub async fn memory_delete(
     // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
     // nobody to name in the ledger — and since #231 it is REFUSED, not passed as `None`.
     let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
-        Ok(name) => name.to_string(),
+        Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
     let lookup = key.clone();
     match server
         .with_store("memory_delete", move |s| {
-            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-            if !s.rm(&lookup, Some(&pen))? {
-                return Ok(None);
-            }
-            Ok(Some(s.version_count(&lookup)?))
+            crate::ops::memory_delete(s, &pen, &lookup)
         })
         .await
     {
@@ -2421,7 +2407,7 @@ pub async fn history_search(
     headers: HeaderMap,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
-    let Some(phrase) = params.get("q").map(str::to_string) else {
+    let Some(phrase) = params.get("q").map(ToString::to_string) else {
         return error(true, StatusCode::BAD_REQUEST, "need `q` (words to find)");
     };
     let limit = params
@@ -2485,7 +2471,7 @@ pub async fn history_erase(
     headers: HeaderMap,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
-    let ask_key = params.get("key").map(str::to_string);
+    let ask_key = params.get("key").map(ToString::to_string);
     let ask_orphans = matches!(params.get("orphans"), Some("true") | Some("1"));
     let ask_confirm = matches!(params.get("confirm"), Some("true") | Some("1"));
     let json = true;
@@ -2656,15 +2642,14 @@ pub async fn append(
         Err(r) => return r,
     };
     let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
-        Ok(name) => name.to_string(),
+        Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
     let force = params.flag("force");
     let target = key.clone();
     match server
         .with_store("memory_append", move |s| {
-            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-            s.append(&target, &line, Some(&pen), force)
+            crate::ops::memory_append(s, &pen, &target, &line, force)
         })
         .await
     {
@@ -2743,13 +2728,12 @@ pub async fn merge(
     let target = into.clone();
     // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
     let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
-        Ok(name) => name.to_string(),
+        Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
     match server
         .with_store("memory_merge", move |s| {
-            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-            s.merge_into(&from, &target, Some(&pen))
+            crate::ops::memory_merge(s, &pen, &from, &target)
         })
         .await
     {
@@ -2832,13 +2816,12 @@ pub async fn fold(
     // store refuses a fold with no actor (an append nobody is named for), so since #231 the door
     // refuses first rather than letting an unproven caller reach `fold_into`.
     let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
-        Ok(name) => name.to_string(),
+        Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
     match server
         .with_store("memory_fold", move |s| {
-            s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-            s.fold_into(&from, &target, Some(&pen))
+            crate::ops::memory_fold(s, &pen, &from, &target)
         })
         .await
     {
@@ -3069,7 +3052,7 @@ pub async fn project_upsert(
     // The pen the identity pair proves. A project write is a write: since #231 it needs one, the
     // same as on the MCP door, so the channel gate can bite and the row records who stored it.
     let proven = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
-        Ok(name) => name.to_string(),
+        Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
     let server = match session(&state) {
@@ -3078,8 +3061,7 @@ pub async fn project_upsert(
     };
     match server
         .with_store("project_upsert", move |s| {
-            s.channel_gate(&proven, crate::store::channel::Class::Record)?;
-            s.project_merge(&patch)
+            crate::ops::project_upsert(s, &proven, &patch)
         })
         .await
     {
@@ -3135,8 +3117,8 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
     let mut tags = p.all("tag");
     tags.extend(p.all("tags"));
     Ok(SearchParams {
-        query: p.maybe("q").map(str::to_string),
-        pattern: p.maybe("pattern").map(str::to_string),
+        query: p.maybe("q").map(ToString::to_string),
+        pattern: p.maybe("pattern").map(ToString::to_string),
         mode: Some(match_mode_param(p.maybe("mode"))?),
         k: p.parse_as::<usize>("k")?,
         max_distance: p.parse_as::<f32>("max_distance")?,
@@ -3150,19 +3132,19 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         tags,
         min_chars: p.parse_as::<usize>("min_chars")?,
         max_chars: p.parse_as::<usize>("max_chars")?,
-        created_after: p.maybe("created_after").map(str::to_string),
-        created_before: p.maybe("created_before").map(str::to_string),
-        updated_after: p.maybe("updated_after").map(str::to_string),
-        updated_before: p.maybe("updated_before").map(str::to_string),
+        created_after: p.maybe("created_after").map(ToString::to_string),
+        created_before: p.maybe("created_before").map(ToString::to_string),
+        updated_after: p.maybe("updated_after").map(ToString::to_string),
+        updated_before: p.maybe("updated_before").map(ToString::to_string),
         // ★ THE SAME PREDICATES ON BOTH DOORS (soma/ellmephant#114): a filter reachable from one
         // door and not the other is a search that answers differently depending on how it was asked.
-        key: p.maybe("key").map(str::to_string),
+        key: p.maybe("key").map(ToString::to_string),
         key_prefix: p
             .maybe("key_prefix")
             .map(|v| bool_param(v, "key_prefix"))
             .transpose()?,
-        title: p.maybe("title").map(str::to_string),
-        status: p.maybe("status").map(str::to_string),
+        title: p.maybe("title").map(ToString::to_string),
+        status: p.maybe("status").map(ToString::to_string),
         fields,
     })
 }
@@ -3904,7 +3886,7 @@ pub async fn mail_send(
         Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
-    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(ToString::to_string);
     let (Some(sender), Some(recipient), Some(letter)) =
         (field("sender"), field("recipient"), field("body"))
     else {
@@ -3955,7 +3937,7 @@ fn mail_reader_identity(
 ) -> Result<String, Response> {
     crate::identity::Caller::from_headers(paths, headers)
         .pen_or("refused: reading mail needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
-        .map(str::to_string)
+        .map(ToString::to_string)
         .map_err(|r| refusal_response(json, r, StatusCode::FORBIDDEN))
 }
 
@@ -4002,7 +3984,7 @@ pub async fn mail_inbox(
 ) -> Response {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let Some(recipient) = params.maybe("recipient").map(str::to_string) else {
+    let Some(recipient) = params.maybe("recipient").map(ToString::to_string) else {
         return error(json, StatusCode::BAD_REQUEST, "`recipient` is required");
     };
     let explicit = params.maybe("since").and_then(|v| v.parse::<i64>().ok());
@@ -4098,7 +4080,7 @@ pub async fn mail_ack(
         return r;
     }
     let (Some(recipient), Some(seq)) = (
-        params.maybe("recipient").map(str::to_string),
+        params.maybe("recipient").map(ToString::to_string),
         params.maybe("seq").and_then(|v| v.parse::<i64>().ok()),
     ) else {
         return error(
@@ -4368,7 +4350,7 @@ pub async fn mail_surrogate_list(
     };
     let subject = params
         .maybe("surrogate")
-        .map(str::to_string)
+        .map(ToString::to_string)
         .unwrap_or(caller);
     let server = match session(&state) {
         Ok(s) => s,
@@ -4408,7 +4390,7 @@ pub async fn mail_surrogate_list(
 fn proven(headers: &HeaderMap, paths: &Paths) -> Option<String> {
     crate::identity::Caller::from_headers(paths, headers)
         .proven()
-        .map(str::to_string)
+        .map(ToString::to_string)
 }
 
 /// GET /channels — policy for every channel, plus this pen's unread counts and breach.
@@ -4592,7 +4574,11 @@ pub async fn channel_send(
         Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
         Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
     };
-    let Some(text) = doc.get("body").and_then(|v| v.as_str()).map(str::to_string) else {
+    let Some(text) = doc
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+    else {
         return error(json, StatusCode::BAD_REQUEST, "`body` is required");
     };
     let reply_to = doc.get("reply_to").and_then(|v| v.as_i64());
@@ -4639,7 +4625,7 @@ pub async fn channel_fetch(
     let channel = doc
         .get("channel")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(ToString::to_string);
     let limit = doc.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
     let who = pen.clone();
     let server = match session(&state) {
@@ -4691,7 +4677,7 @@ pub async fn channel_present(
     let boundary = doc
         .get("boundary")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(ToString::to_string);
     let who = pen.clone();
     let server = match session(&state) {
         Ok(s) => s,
@@ -4919,7 +4905,7 @@ pub async fn channel_create(
         Ok(Some(v)) => v,
         _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
     };
-    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(ToString::to_string);
     let (Some(channel), Some(title)) = (field("channel"), field("title")) else {
         return error(
             json,
@@ -4973,7 +4959,11 @@ pub async fn channel_set_gate(
         Ok(Some(v)) => v,
         _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
     };
-    let Some(gate) = doc.get("gate").and_then(|v| v.as_str()).map(str::to_string) else {
+    let Some(gate) = doc
+        .get("gate")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+    else {
         return error(json, StatusCode::BAD_REQUEST, "`gate` is required");
     };
     let (who, chan) = (pen.clone(), channel.clone());
@@ -5124,7 +5114,7 @@ pub async fn channel_prune(
     let only = doc
         .get("channel")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(ToString::to_string);
     let server = match session(&state) {
         Ok(s) => s,
         Err(r) => return r,
@@ -5169,7 +5159,11 @@ pub async fn channel_invite(
         Ok(Some(v)) => v,
         _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
     };
-    let Some(guest) = doc.get("pen").and_then(|v| v.as_str()).map(str::to_string) else {
+    let Some(guest) = doc
+        .get("pen")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+    else {
         return error(json, StatusCode::BAD_REQUEST, "`pen` is required");
     };
     let (who, chan, target) = (actor.clone(), channel.clone(), guest.clone());

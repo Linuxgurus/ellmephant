@@ -17,6 +17,8 @@ pub mod identity;
 pub mod index;
 pub mod mcp;
 pub mod model;
+pub mod names;
+pub mod ops;
 pub mod search;
 pub mod store;
 pub mod wire;

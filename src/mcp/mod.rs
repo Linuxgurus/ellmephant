@@ -1527,7 +1527,7 @@ fn pen_name(
         .pen_or(
             "refused: a write requires a proven identity — send `X-Stet-From` and `X-Stet-Auth` (reads need neither). `whoami` reports what this connection is.",
         )
-        .map(str::to_string)
+        .map(ToString::to_string)
         .map_err(|r| r.to_string())
 }
 
@@ -2328,7 +2328,7 @@ impl MemoryServer {
         let caller = caller_of(&ctx, None, &self.paths);
         let body = match caller.denied() {
             None => match caller.proven() {
-                Some(name) => serde_json::json!({ "asserted_by": name, "proven": true }),
+                Some(name) => serde_json::json!({ "asserted_by": name.as_str(), "proven": true }),
                 None => serde_json::json!({
                     "asserted_by": crate::identity::ANONYMOUS,
                     "proven": false
@@ -2635,27 +2635,25 @@ impl MemoryServer {
         Parameters(p): Parameters<UpsertParams>,
     ) -> std::result::Result<String, String> {
         let claimed = p.as_pen.clone();
-        let mut patch = p.into_patch();
+        let patch = p.into_patch();
         // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
         // rather than silently becoming `anonymous`, because a lie with a signature is worse than
         // no signature at all. `as` may only ever name a DESCENDANT of that proven pen.
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let credited = match claimed {
-            Some(name) if !name.eq_ignore_ascii_case(&caller) => Some(name),
-            _ => None,
+        let caller = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
+        let credit = match claimed {
+            Some(name) => Some(crate::names::Pen::new(&name).map_err(|e| e.to_string())?),
+            None => None,
         };
-        patch.asserted_by = Some(credited.clone().unwrap_or_else(|| caller.clone()));
         // ★ THE PROVEN PEN, KEPT SEPARATE FROM THE CREDITED ONE (soma/ellmephant#192): authority is a
         // conjunction — the pen that sent this must be permitted AND the pen taking the credit must be
-        // permitted, or `as:` becomes a way to spend one authority under another pen's name.
-        patch.acted_by = Some(caller.clone());
+        // permitted, or `as:` becomes a way to spend one authority under another pen's name. The
+        // stamping and the two gates live in `ops::memory_upsert`, so the HTTP door is the same law.
         let outcome = self
             .with_store("memory_upsert", move |s| {
-                s.channel_gate(&caller, crate::store::channel::Class::Record)?;
-                if let Some(as_pen) = &credited {
-                    s.may_act_as(&caller, as_pen)?;
-                }
-                s.memory_merge(&patch)
+                crate::ops::memory_upsert(s, &caller, crate::ops::Upsert { patch, credit })
             })
             .await?;
         tracing::info!(
@@ -2700,18 +2698,17 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone(); // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
             .with_store("memory_delete", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                if !s.rm(&rm_key, Some(&pen))? {
-                    return Ok(None);
-                }
-                Ok(Some(s.version_count(&rm_key)?))
+                crate::ops::memory_delete(s, &pen, &rm_key)
             })
             .await?
         {
@@ -2840,15 +2837,17 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AppendParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
         let key = p.key;
         let line = p.line;
         let force = p.force.unwrap_or(false);
         let log_key = key.clone();
         let out = self
             .with_store("memory_append", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.append(&key, &line, Some(&pen), force)
+                crate::ops::memory_append(s, &pen, &key, &line, force)
             })
             .await?;
         tracing::info!(
@@ -2879,15 +2878,17 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<FoldParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
             .with_store("memory_fold", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.fold_into(&from, &into, Some(&pen))
+                crate::ops::memory_fold(s, &pen, &from, &into)
             })
             .await?;
         tracing::info!(
@@ -2919,15 +2920,17 @@ impl MemoryServer {
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
         // A merge DESTROYS the source, so it is signed like any other write.
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
             .with_store("memory_merge", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.merge_into(&from, &into, Some(&pen))
+                crate::ops::memory_merge(s, &pen, &from, &into)
             })
             .await?;
         tracing::info!(
@@ -3565,12 +3568,14 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone(); // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Record)?;
-                s.project_merge(&patch)
+                crate::ops::project_upsert(s, &pen, &patch)
             })
             .await?;
         tracing::info!(
@@ -4453,7 +4458,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     ) -> std::result::Result<String, String> {
         let pen = caller_of(&ctx, None, &self.paths)
             .proven()
-            .map(str::to_string);
+            .map(ToString::to_string);
         let caller = pen.clone();
         let out = self
             .with_read(
@@ -4631,7 +4636,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     ) -> std::result::Result<String, String> {
         let pen = caller_of(&ctx, None, &self.paths)
             .proven()
-            .map(str::to_string);
+            .map(ToString::to_string);
         if pen.is_none() {
             return Ok(serde_json::json!({ "breach": null, "proven": false }).to_string());
         }

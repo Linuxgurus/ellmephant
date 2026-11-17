@@ -4,11 +4,11 @@
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use ellmephant::cli::session::Session;
 use ellmephant::config::{Config, Paths};
 use ellmephant::embed::HashEmbedder;
 use ellmephant::mcp::{MemoryServer, http_router};
 use ellmephant::model::Spec;
+use ellmephant::store::session::Session;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::{Peer, RoleClient, ServiceExt};
 use tower::ServiceExt as _;

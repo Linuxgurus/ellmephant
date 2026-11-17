@@ -17,7 +17,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ellmephant::cli::session::Session;
 use ellmephant::config::Config;
 use ellmephant::db;
 use ellmephant::embed::Embedder;
@@ -26,6 +25,7 @@ use ellmephant::http::LockWatch;
 use ellmephant::mcp::MemoryServer;
 use ellmephant::model::Spec;
 use ellmephant::store::Patch;
+use ellmephant::store::session::Session;
 
 /// The fake embedder's width, and what the config has to echo (see the tests' `Config`).
 const DIM: usize = 8;

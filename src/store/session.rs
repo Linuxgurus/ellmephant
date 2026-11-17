@@ -73,7 +73,7 @@ impl Encoder {
                 );
                 let started = std::time::Instant::now();
                 let loaded: Box<dyn Embedder> =
-                    Box::new(super::embed::load_embedder(&self.spec, &self.cfg)?);
+                    Box::new(crate::embed::load_embedder(&self.spec, &self.cfg)?);
                 // Losing a race is fine: whoever set it first loaded the same weights.
                 let _ = self.inner.set(loaded);
                 tracing::info!(

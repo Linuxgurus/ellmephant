@@ -81,15 +81,19 @@ index; search embeds a phrase and takes the KNN of the whole store; `Session` is
 core; the CLI and the MCP server are two faces on top of it. Everything above `memory.db` can be
 deleted and rebuilt.
 
-Five layers, one crate:
+Eight layers, one crate — and the two the refactor added are the point: a door may parse, call one
+verb and render, but it may not decide who may write, which gate applies, or how a row is shaped. That
+law lives in `ops` (above the store) and in `store::rules` (inside it), once, for both doors:
 
 | Layer | Module | Responsibility |
 |---|---|---|
 | Storage | `db`, `migrations/` | open SQLite, pragmas, schema, `meta` kv |
-| Write path | `store`, `embed`, `index/vec`, `store::encode` | upsert a row: key, one hash, tags, links, and a queued document |
+| Write path | `store`, `store::rules`, `embed`, `index/vec`, `store::encode` | upsert a row: key, tags, links, and a queued document — through two ordered rule lists |
 | Structures | `store::project` | projects: identity, the ordered preload (membership is a tag) |
 | Read path | `search`, `index/vec` | one semantic phrase → KNN over the document vectors |
-| Interfaces | `cli`, `mcp` | MCP server (HTTP default, stdio option); `doctor` + `model` for operations |
+| Law (one verb, one definition) | `ops` | the gates a write must pass — credit, `channel_gate`, the store call — once, for both doors |
+| Interfaces (the doors) | `mcp`, `http_surface`, `wire` | MCP server (HTTP default, stdio option); the REST surface; the wire shapes. Each door extracts → calls → renders, and holds no law |
+| Operations | `cli` | `doctor` + `model` on the one shared core; `store::session` is the façade both doors share |
 | Tooling | `model`, `bench` | weights cache, latency + golden-eval measurements |
 
 ## Storage model
@@ -110,12 +114,15 @@ Everything else is **derived** from those rows and can be rebuilt at any time:
 - `memory_vec` — `sqlite-vec` `vec0` KNN index over the document embeddings.
 - `memory_link` — the `[[key]]` link graph, forward edges and backlinks.
 
-A `meta` table mirrors `dim` / `model` / `instruction` for drift detection at startup, and the
-per-row `encode_hash` decides when a row needs re-embedding (any change to the key, tags, title or
-body changes the document; a queued-but-unencoded row holds the `encode_pending` sentinel, which never
-matches a real hash). Ids are local; `key` is the stable identity (upsert target and link
-target). Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate
-`reembed`, not an implicit migration.
+A `meta` table mirrors `dim` / `model` / `instruction` for drift detection at startup. **No truth row
+carries encoding state** (★ NO HASH, 2026-10-21): the old per-row `encode_hash` was a stamp describing
+a *derived* index, and it produced two silent no-ops — a reset queue that drained embedding nothing,
+and a hash claiming "indexed" over a torn index. `encode_queue` now holds the rendered text and its own
+settle guard, and "is this a document change?" is answered by comparing the stored title/body, which
+is the question an embed actually depends on. `encode_pending` in `stats` is a COUNT over that queue,
+not a column on a row. Ids are local; `key` is the stable identity (upsert target and link target).
+Dimensions are frozen at `CREATE`; changing the embedder's width is a deliberate `reembed`, not an
+implicit migration.
 
 Inside a structure, a relation earns its own table only when its invariant is cross-row: `contains`
 has one (a memory has one home, *anywhere* — a column cannot see other rows), `preload` does not
@@ -152,7 +159,13 @@ must satisfy every one given). The phrase is embedded (with the query-side instr
 and the KNN of the whole store is taken, capped by `max_distance` and truncated to `k`;
 **with no phrase it is a pure filter** over the store (every matching row, key order, uncapped).
 Filters apply *before* the `k` cap, so a result shorter than `k` means the distance ceiling cut
-it, not `k`. There is no regex/key leg — `key`/`tags` are part of the embedded document.
+it, not `k`.
+
+There **is** a lexical leg, and it is opt-in: `pattern` matches `key`/`title`/`body` as a substring
+(`mode: "literal"`, the default) or a regular expression (`mode: "regex"`), and it intersects with
+`query` and the structured filters. The legs are reported separately in the payload (`semantic` and
+`lexical`, each in its own order — distance and BM25 respectively) so a caller can tell which leg
+answered; `hits` stays as the fused view.
 
 ```jsonc
 // `memory_search` parameters. Every one is optional but the query — or omit the query entirely
@@ -224,15 +237,22 @@ The golden file is JSONL, one object per line: `{"query": "…", "expect": ["key
 src/
 ├── main.rs            clap dispatch
 ├── lib.rs             module tree
-├── config.rs          paths + config.toml merge       error.rs    thiserror types
+├── config.rs          paths + config.toml merge     error.rs   thiserror types
+├── identity.rs        who is speaking: the one `Caller`, and why a write needs a proven pen
+├── names.rs           `Pen` and `Key` as types (the two transpositions that are destructive when wrong)
+├── ops.rs             the LAW for the verbs that had drifted: credit, gate, act — once per verb
+├── wire/              the MCP wire shapes (`rows_array`, and every `*_to_wire_json`)
+├── http.rs            HttpState, the lock watch, health counters
+├── http_surface/      the REST door, one module per route family
 ├── model/             weights cache: resolve, fetch, verify
 ├── db/                open, pragmas, migrate(), meta key/value
-├── embed/             Embedder trait, qwen3, tokenize, projection
-├── store/             add/get + projects + derived indexes (slug, tags, links) + maintain (reembed)
+├── embed/             Embedder trait, qwen3, tokenize, projection, the encoder loader
+├── store/             rows: add/get, projects, derived indexes (slug, tags, links, shape),
+│                      the ordered write rules, and `session` (the façade both doors share)
 ├── index/             the vec0 (KNN) document-vector table
 ├── search/            the semantic phrase search over the store
-├── cli/               doctor, model, session (the MCP server is the interface)
-├── mcp/               MCP server (HTTP default; stdio option)
+├── cli/               doctor, model (operations only — the doors are the interface)
+├── mcp/               MCP server (HTTP default; stdio option), params, transport, tools/ by group
 └── bench/             timings, golden eval (recall@k + MRR), sweeps
 migrations/            NNNN_*.sql, embedded with include_str!
 tests/                 integration tests + tests/golden/{memories,queries.jsonl}

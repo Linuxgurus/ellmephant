@@ -1140,6 +1140,17 @@ impl Session {
         mail::revoke(&self.conn, grantor, surrogate)
     }
 
+    /// ★ THE BOX RULE, with its refusal (soma/ellmephant#235): the doors call this instead of
+    /// asking the two primitives and writing their own sentence.
+    pub fn mail_may_open_box(
+        &self,
+        reader: &str,
+        requested: &str,
+        scope: mail::BoxScope,
+    ) -> Result<()> {
+        mail::may_open_box(&self.conn, reader, requested, scope)
+    }
+
     /// May this pen read that box? (own box, or a live `read` grant)
     pub fn mail_may_read(&self, reader: &str, requested: &str) -> Result<bool> {
         mail::may_read_box(&self.conn, reader, requested)

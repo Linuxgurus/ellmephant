@@ -523,12 +523,12 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPruneParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // a prune writes; anonymous is read-only
+        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // a prune writes; anonymous is read-only
+        let pen = crate::names::Pen::new(&who).map_err(|e| e.to_string())?;
         let only = p.channel;
         let rows = self
             .with_store("channel_prune", move |s| {
-                s.channel_gate(&pen, crate::store::channel::Class::Acting)?;
-                s.channel_prune(only.as_deref())
+                crate::ops::channel_prune(s, &pen, only.as_deref())
             })
             .await?;
         let total: usize = rows.iter().map(|r| r.emptied).sum();

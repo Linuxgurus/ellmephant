@@ -250,19 +250,6 @@ pub fn dangling_targets(edges: &[DanglingEdge]) -> usize {
     targets.len()
 }
 
-/// Positional wire form for both doors: `cols` names the fields once, rows are bare arrays.
-pub fn dangling_to_wire_json(edges: &[DanglingEdge]) -> String {
-    let rows: Vec<serde_json::Value> = edges
-        .iter()
-        .map(|e| serde_json::json!([e.from_key, e.to_key, e.to_type.as_str()]))
-        .collect();
-    format!(
-        "{{\"cols\":[\"from\",\"to\",\"to_type\"],\"targets\":{},\"dangling\":{}}}",
-        dangling_targets(edges),
-        crate::wire::rows_array(&rows)
-    )
-}
-
 /// `(to_key, to_type, from_key)` for every unresolved edge, ordered by target then referrer.
 fn dangling_rows(conn: &Connection) -> Result<Vec<(String, Kind, String)>> {
     let mut stmt = conn.prepare(
@@ -789,21 +776,6 @@ pub fn backlinks_seen(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Serialize a [`Backlink`] slice for the MCP wire: a top-level `cols` header names the fields
-/// and `backlinks` are positional rows, so field names appear once rather than on every row
-/// (mirrors [`crate::search::to_wire_json`]). The keyed serde form stays for scripts. Each row
-/// sits on its own line (see [`crate::wire::rows_array`]) so a raw result is scannable.
-pub fn backlinks_to_wire_json(rows: &[Backlink]) -> Result<String> {
-    let backlinks: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|b| serde_json::json!([b.key, b.title]))
-        .collect();
-    Ok(format!(
-        "{{\"cols\":[\"key\",\"title\"],\"backlinks\":{}}}",
-        crate::wire::rows_array(&backlinks)
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,7 +865,7 @@ mod tests {
                 title: "B".into(),
             },
         ];
-        let wire = backlinks_to_wire_json(&rows).unwrap();
+        let wire = crate::wire::links::backlinks_to_wire_json(&rows).unwrap();
         let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
         assert_eq!(v["cols"], serde_json::json!(["key", "title"]));
         assert_eq!(v["backlinks"][0], serde_json::json!(["a", "A"]));

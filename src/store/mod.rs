@@ -16,6 +16,7 @@ pub mod maintain;
 pub mod project;
 pub mod relation;
 mod rules;
+pub mod session;
 pub mod shape;
 pub mod slug;
 pub mod snapshot;

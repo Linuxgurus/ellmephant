@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
-use ellmephant::cli::session::Session;
 use ellmephant::config::{Config, Paths};
 use ellmephant::embed::HashEmbedder;
 use ellmephant::http::{HttpState, LockWatch};
 use ellmephant::mcp::{MemoryServer, http_router};
 use ellmephant::model::Spec;
+use ellmephant::store::session::Session;
 use rmcp::model::CallToolRequestParams;
 use rmcp::{Peer, RoleClient, ServiceExt};
 use tower::ServiceExt as _;

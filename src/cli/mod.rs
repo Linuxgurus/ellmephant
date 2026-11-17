@@ -4,11 +4,9 @@
 //! MCP is the read/write path, and anything that is not MCP is better served by the API.
 
 pub mod doctor;
-pub mod embed;
 pub mod format;
 pub mod model;
 mod pen;
-pub mod session;
 
 use std::path::PathBuf;
 

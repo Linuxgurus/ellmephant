@@ -29,8 +29,8 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
-use crate::cli::session::Session;
 use crate::config::{Config, Paths};
+use crate::store::session::Session;
 // NOTE: do *not* import `crate::error::Result` here — `#[tool_handler]` expands to code that
 // uses the unqualified `Result` from `rmcp`, and our single-parameter alias would shadow it.
 use crate::error::Error;
@@ -1740,7 +1740,7 @@ pub struct MemoryServer {
     /// it is precisely the stall this split removes.
     paths: crate::config::Paths,
     cfg: crate::config::Config,
-    encoder: Arc<super::cli::session::Encoder>,
+    encoder: Arc<super::store::session::Encoder>,
     /// ★ A DECLARED PEN, for transports that carry no HTTP request (stdio, in-process). A server
     /// started BY a process is as trusted as that process, so it may say who it is once, at
     /// construction; every write it makes is stamped with that name instead of being refused as
@@ -2026,7 +2026,7 @@ fn lock(session: &Arc<Mutex<Session>>) -> crate::error::Result<std::sync::MutexG
 fn pass(
     session: &Arc<Mutex<Session>>,
     watch: &crate::http::LockWatch,
-    encoder: &super::cli::session::Encoder,
+    encoder: &super::store::session::Encoder,
     idle: &rusqlite::Connection,
     skipped: &mut std::collections::HashMap<String, std::time::Instant>,
 ) -> crate::error::Result<bool> {

@@ -7,9 +7,9 @@
 //! ★ THE ORDER IS PART OF THE LAW, not an accident of writing: borrow the acting pen, then stamp
 //! authorship, then gate, then act. A gate that runs after the store has written is not a gate.
 
-use crate::cli::session::Session;
 use crate::error::Result;
 use crate::names::Pen;
+use crate::store::session::Session;
 use crate::store::{MergeOutcome, Patch};
 
 /// One upsert, as a value: the patch and the pen it CREDITS (if it credits a descendant rather than

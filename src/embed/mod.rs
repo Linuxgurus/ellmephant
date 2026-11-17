@@ -120,6 +120,21 @@ impl Embedder for HashEmbedder {
     }
 }
 
+/// ★ THE ONE PLACE THE WEIGHTS DIRECTORY AND THE `Embedder` MEET (PLAN §6 P3).
+///
+/// It used to live in `cli::embed`, which was fine while only the CLI session built an encoder — but
+/// the session façade is `store::session` now (soma/ellmephant#50), and a store module reaching into
+/// `cli` for its encoder would have made the layering say the opposite of what the move means.
+pub(crate) fn load_embedder(
+    spec: &crate::model::Spec,
+    cfg: &crate::config::Config,
+) -> Result<qwen3::Qwen3Embedder> {
+    let fetcher = crate::model::fetch::UreqFetcher::from_env();
+    let dir = crate::model::ensure(spec, &fetcher)?;
+    let opts = qwen3::Options::new(cfg.dim, &cfg.device, &cfg.precision, &cfg.instruction);
+    qwen3::Qwen3Embedder::load(&dir, &opts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

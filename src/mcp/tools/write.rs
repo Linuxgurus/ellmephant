@@ -355,19 +355,18 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AdoptParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let pen = crate::names::Pen::new(&who).map_err(|e| e.to_string())?;
         let key = p.key;
         let force = p.force.unwrap_or(false);
-        let owner = p.to.unwrap_or_else(|| pen.clone());
+        let owner = p.to.unwrap_or_else(|| who.clone());
         let adopting = key.clone();
-        let actor = pen.clone();
         let target = owner.clone();
         self.with_store("memory_adopt", move |s| {
-            s.channel_gate(&actor, crate::store::channel::Class::Record)?;
-            s.assign(&adopting, &actor, &target, force)
+            crate::ops::memory_adopt(s, &pen, &adopting, Some(&target), force)
         })
         .await?;
-        tracing::info!(tool = "memory_adopt", key = %key, actor = %pen, owner = %owner, force, "ownership assigned");
+        tracing::info!(tool = "memory_adopt", key = %key, actor = %who, owner = %owner, force, "ownership assigned");
         Ok(json_ok(serde_json::json!({
             "status": "adopted",
             "key": key,

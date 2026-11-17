@@ -702,10 +702,10 @@ pub async fn channel_prune(
         .get("channel")
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
+    let actor = crate::names::Pen::new(&caller).expect("proven pen");
     match server
         .with_store("channel_prune", move |s| {
-            s.channel_gate(&caller, crate::store::channel::Class::Acting)?;
-            s.channel_prune(only.as_deref())
+            crate::ops::channel_prune(s, &actor, only.as_deref())
         })
         .await
     {

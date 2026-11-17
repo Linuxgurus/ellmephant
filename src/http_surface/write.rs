@@ -630,16 +630,16 @@ pub async fn adopt(
         .and_then(|v| v.as_bool())
         .unwrap_or_else(|| matches!(params.get("force"), Some("true") | Some("1")));
     let pen = match caller.pen_or("adopt needs a proven identity (X-Stet-From + X-Stet-Auth)") {
-        Ok(pen) => pen.to_string(),
+        Ok(pen) => pen.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
     let adopting = key.clone();
-    let owner = pen.clone();
     let actor = pen.clone();
     match server
         .with_store("memory_adopt", move |s| {
-            s.channel_gate(&actor, crate::store::channel::Class::Record)?;
-            s.adopt(&adopting, &owner, force)
+            // The REST route adopts for the CALLER; `to` is the MCP tool's extra, and passing it
+            // here would change `adopt` into `assign` — a different rule for the same verb.
+            crate::ops::memory_adopt(s, &actor, &adopting, None, force)
         })
         .await
     {
@@ -651,7 +651,7 @@ pub async fn adopt(
                 serde_json::json!({
                     "status": "adopted",
                     "key": key,
-                    "owner": pen,
+                    "owner": pen.as_str(),
                 })
                 .to_string(),
                 format!("adopted {key} as {pen}"),

@@ -8,6 +8,13 @@
 pub mod dupes;
 pub mod links;
 pub mod project;
+pub mod search;
+
+/// Round a distance to 4 decimals for the wire: enough to rank, and it avoids the long
+/// `f32`→`f64` widening tail that `json!` would otherwise print (`0.41999998…`).
+pub fn wire_distance(d: f32) -> f64 {
+    ((d as f64) * 10_000.0).round() / 10_000.0
+}
 
 /// Serialize a positional table body: a JSON array of rows, **one row per line, no indent**.
 ///

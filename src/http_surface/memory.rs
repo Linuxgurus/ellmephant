@@ -12,13 +12,13 @@ pub async fn memory_get(
     caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let version = match params.parse_as::<i64>("version") {
         Ok(v) => v,
-        Err(msg) => return error(json, StatusCode::BAD_REQUEST, msg),
+        Err(msg) => return Err(ApiError::bad(json, msg)),
     };
     // `?version=N` reads a PAST state: by address, so the live row need not exist, and counting no
     // visit — `visits` measures the memory, not a state the memory held.
@@ -29,26 +29,23 @@ pub async fn memory_get(
             .await
         {
             Ok(Some(past)) => {
-                let mut value = serde_json::to_value(&past).unwrap_or(serde_json::Value::Null);
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("version".to_string(), serde_json::json!(n));
-                    obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
-                }
                 // A PAST state is read by address: its owner rides inside `content`, and a walk is
                 // for a pen that still answers, so no relation is printed here.
-                render(
+                present(
                     StatusCode::OK,
                     json,
-                    value.to_string(),
-                    memory_text(&past, None),
+                    &MemoryCard {
+                        mem: &past,
+                        relation: None,
+                        version: Some(n),
+                    },
                 )
             }
-            Ok(None) => error(
+            Ok(None) => Err(ApiError::not_found(
                 json,
-                StatusCode::NOT_FOUND,
                 format!("no such version: {key} {n}"),
-            ),
-            Err(e) => error(json, error_status(&e), e),
+            )),
+            Err(e) => Err(ApiError::store(json, e)),
         };
     }
     let lookup = key.clone();
@@ -67,21 +64,17 @@ pub async fn memory_get(
             if let Some(seen) = server.bump_visit(&key) {
                 mem.visits = seen;
             }
-            let mut value = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
-                if let Some(walk) = &relation {
-                    obj.insert("owner_relation".to_string(), serde_json::json!(walk));
-                }
-            }
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                value.to_string(),
-                memory_text(&mem, relation.as_deref()),
+                &MemoryCard {
+                    mem: &mem,
+                    relation: relation.as_deref(),
+                    version: None,
+                },
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -90,7 +83,7 @@ pub async fn unowned(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let limit = params
@@ -104,25 +97,28 @@ pub async fn unowned(
         })
         .await
     {
-        Ok(rows) => {
-            let mut out = String::new();
-            for r in &rows {
-                out.push_str(&format!(
-                    "  {}  {:<12} {:<10} {}\n",
-                    r.key, r.why, r.asserted_by, r.created
-                ));
-            }
-            if rows.is_empty() {
-                out.push_str("  (no ownerless rows)\n");
-            }
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::to_string(&rows).unwrap_or_default(),
-                out,
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                rows,
+                |rows| serde_json::to_string(rows).unwrap_or_default(),
+                |rows| {
+                    let mut out = String::new();
+                    for r in rows {
+                        out.push_str(&format!(
+                            "  {}  {:<12} {:<10} {}\n",
+                            r.key, r.why, r.asserted_by, r.created
+                        ));
+                    }
+                    if rows.is_empty() {
+                        out.push_str("  (no ownerless rows)\n");
+                    }
+                    out
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -132,7 +128,7 @@ pub async fn backlinks(
     caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let json = Params::parse(raw.as_deref()).json();
     match server
@@ -141,14 +137,9 @@ pub async fn backlinks(
     {
         Ok(rows) => {
             let wire = backlinks_to_wire_json(&rows).unwrap_or_default();
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("backlinks", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("backlinks", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -157,7 +148,7 @@ pub async fn dangling(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let reader = reader_from(&caller);
     match server
@@ -166,14 +157,9 @@ pub async fn dangling(
     {
         Ok(rows) => {
             let wire = dangling_to_wire_json(&rows);
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("dangling", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("dangling", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -186,13 +172,13 @@ pub async fn history(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let cap = match params.parse_as::<u32>("limit") {
         Ok(v) => v.unwrap_or(HISTORY_LIMIT as u32) as usize,
-        Err(msg) => return error(json, StatusCode::BAD_REQUEST, msg),
+        Err(msg) => return Err(ApiError::bad(json, msg)),
     };
     let orphans_only = params.flag("orphans_only");
     match params.maybe("key") {
@@ -212,14 +198,9 @@ pub async fn history(
                         "versions": rows.into_iter().take(cap).collect::<Vec<_>>(),
                     })
                     .to_string();
-                    render(
-                        StatusCode::OK,
-                        json,
-                        wire.clone(),
-                        list_text("versions", &wire),
-                    )
+                    present(StatusCode::OK, json, &Table::new("versions", wire))
                 }
-                Err(e) => error(json, error_status(&e), e),
+                Err(e) => Err(ApiError::store(json, e)),
             }
         }
         // No key: the INDEX. Nothing else lists keys that are gone, so this is how an orphan is found.
@@ -236,14 +217,9 @@ pub async fn history(
                     "keys": rows.into_iter().take(cap).collect::<Vec<_>>(),
                 })
                 .to_string();
-                render(
-                    StatusCode::OK,
-                    json,
-                    wire.clone(),
-                    list_text("history", &wire),
-                )
+                present(StatusCode::OK, json, &Table::new("history", wire))
             }
-            Err(e) => error(json, error_status(&e), e),
+            Err(e) => Err(ApiError::store(json, e)),
         },
     }
 }
@@ -253,17 +229,17 @@ pub async fn search(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let search = match search_params(&params) {
         Ok(p) => p,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     match server.run_search(search, reader).await {
-        Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
-        Err(e) => error(json, error_status(&e), e),
+        Ok(wire) => present(StatusCode::OK, json, &Table::new("hits", wire)),
+        Err(e) => Err(ApiError::new(json, status_of_message(&e), e)),
     }
 }
 
@@ -273,7 +249,7 @@ pub async fn semantic_search(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -287,11 +263,7 @@ pub async fn semantic_search(
             match field_param(name) {
                 Some(f) => fields.push(f),
                 None => {
-                    return error(
-                        json,
-                        StatusCode::BAD_REQUEST,
-                        format!("bad `fields`: {name}"),
-                    );
+                    return Err(ApiError::bad(json, format!("bad `fields`: {name}")));
                 }
             }
         }
@@ -301,7 +273,7 @@ pub async fn semantic_search(
     let deleted = match params.maybe("deleted") {
         Some(v) => match bool_param(v, "deleted") {
             Ok(b) => Some(b),
-            Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+            Err(e) => return Err(ApiError::bad(json, e)),
         },
         None => None,
     };
@@ -314,8 +286,8 @@ pub async fn semantic_search(
         fields,
     };
     match server.run_semantic(p, reader).await {
-        Ok(wire) => render(StatusCode::OK, json, wire.clone(), list_text("hits", &wire)),
-        Err(e) => error(json, error_status(&e), e),
+        Ok(wire) => present(StatusCode::OK, json, &Table::new("hits", wire)),
+        Err(e) => Err(ApiError::new(json, status_of_message(&e), e)),
     }
 }
 
@@ -326,17 +298,17 @@ pub async fn dupes(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let max_distance = match params.parse_as::<f32>("max_distance") {
         Ok(v) => v.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let limit = match params.parse_as::<usize>("limit") {
         Ok(v) => v.unwrap_or(DUPES_LIMIT),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     if params.flag("plan") {
         return match server
@@ -347,14 +319,9 @@ pub async fn dupes(
         {
             Ok(plan) => {
                 let wire = crate::wire::dupes::plan_to_wire_json(&plan).unwrap_or_default();
-                render(
-                    StatusCode::OK,
-                    json,
-                    wire.clone(),
-                    list_text("merge plan", &wire),
-                )
+                present(StatusCode::OK, json, &Table::new("merge plan", wire))
             }
-            Err(e) => error(json, error_status(&e), e),
+            Err(e) => Err(ApiError::store(json, e)),
         };
     }
     match server
@@ -365,13 +332,8 @@ pub async fn dupes(
     {
         Ok(pairs) => {
             let wire = crate::wire::dupes::to_wire_json(&pairs).unwrap_or_default();
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("dupes", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("dupes", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }

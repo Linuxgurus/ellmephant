@@ -12,24 +12,21 @@ pub async fn claim_acquire(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Ok(None) => return Err(ApiError::bad(json, "a JSON body is required")),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let name = match doc.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
-        None => return error(json, StatusCode::BAD_REQUEST, "missing `name`"),
+        None => return Err(ApiError::bad(json, "missing `name`")),
     };
     let owner = match doc.get("owner").and_then(|v| v.as_str()) {
         Some(o) => o.to_string(),
-        None => return error(json, StatusCode::BAD_REQUEST, "missing `owner`"),
+        None => return Err(ApiError::bad(json, "missing `owner`")),
     };
     let ttl = doc.get("ttl_seconds").and_then(|v| v.as_i64());
     match server
@@ -46,25 +43,29 @@ pub async fn claim_acquire(
                 won = out.won,
                 "claim over http"
             );
-            let text = if out.won {
-                format!(
-                    "claimed `{}` for {} until {}",
-                    out.claim.name, out.claim.owner, out.claim.expires_at
-                )
-            } else {
-                format!(
-                    "refused: `{}` held by {} until {}",
-                    out.claim.name, out.claim.owner, out.claim.expires_at
-                )
-            };
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&out).unwrap_or_default(),
-                text,
+                &report(
+                    out,
+                    |out| serde_json::to_string(out).unwrap_or_default(),
+                    |out| {
+                        if out.won {
+                            format!(
+                                "claimed `{}` for {} until {}",
+                                out.claim.name, out.claim.owner, out.claim.expires_at
+                            )
+                        } else {
+                            format!(
+                                "refused: `{}` held by {} until {}",
+                                out.claim.name, out.claim.owner, out.claim.expires_at
+                            )
+                        }
+                    },
+                ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -76,16 +77,13 @@ pub async fn claim_release(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(v) => v,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let owner = doc
         .as_ref()
@@ -94,7 +92,11 @@ pub async fn claim_release(
         .map(ToString::to_string)
         .or_else(|| params.maybe("owner").map(ToString::to_string));
     let Some(owner) = owner else {
-        return error(json, StatusCode::BAD_REQUEST, "missing `owner`");
+        return Err(ApiError::new(
+            json,
+            StatusCode::BAD_REQUEST,
+            "missing `owner`",
+        ));
     };
     // ★ THE HTTP SURFACE HAS NO PEN, ONLY A STORE-WIDE TOKEN, so it cannot check ancestry. It keeps
     // the owner check and says so: an ancestor release is an MCP act, where the caller is proven.
@@ -110,22 +112,28 @@ pub async fn claim_release(
                 released = out.released,
                 "claim release over http"
             );
-            let text = if out.released {
-                "released".to_string()
-            } else {
-                match &out.claim {
-                    Some(c) => format!("refused: held by {} until {}", c.owner, c.expires_at),
-                    None => "refused: no such claim".to_string(),
-                }
-            };
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&out).unwrap_or_default(),
-                text,
+                &report(
+                    out,
+                    |out| serde_json::to_string(out).unwrap_or_default(),
+                    |out| {
+                        if out.released {
+                            "released".to_string()
+                        } else {
+                            match &out.claim {
+                                Some(c) => {
+                                    format!("refused: held by {} until {}", c.owner, c.expires_at)
+                                }
+                                None => "refused: no such claim".to_string(),
+                            }
+                        }
+                    },
+                ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -134,7 +142,7 @@ pub async fn claims(
     State(_state): State<HttpState>,
     server: Server,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let name = params.maybe("name").map(ToString::to_string);
@@ -146,30 +154,35 @@ pub async fn claims(
         )
         .await
     {
-        Ok(rows) => {
-            let text = if rows.is_empty() {
-                "no claims".to_string()
-            } else {
-                rows.iter()
-                    .map(|c| {
-                        format!(
-                            "{} {} held by {} (until {})",
-                            if c.live { "live" } else { "expired" },
-                            c.name,
-                            c.owner,
-                            c.expires_at
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::to_string(&serde_json::json!({ "claims": rows })).unwrap_or_default(),
-                text,
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                rows,
+                |rows| {
+                    serde_json::to_string(&serde_json::json!({ "claims": rows }))
+                        .unwrap_or_default()
+                },
+                |rows| {
+                    if rows.is_empty() {
+                        "no claims".to_string()
+                    } else {
+                        rows.iter()
+                            .map(|c| {
+                                format!(
+                                    "{} {} held by {} (until {})",
+                                    if c.live { "live" } else { "expired" },
+                                    c.name,
+                                    c.owner,
+                                    c.expires_at
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }

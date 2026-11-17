@@ -6,17 +6,20 @@
 use super::*;
 
 /// The router fallback: our own 404, so a gateway never substitutes an empty body.
-pub async fn not_found(uri: axum::http::Uri) -> Response {
-    error(
+pub async fn not_found(uri: axum::http::Uri) -> ApiResult<Response> {
+    Err(ApiError::not_found(
         false,
-        StatusCode::NOT_FOUND,
         format!("not found: {}", uri.path()),
-    )
+    ))
 }
 
 /// The 405 for a known path, wrong method — again our own body, not the gateway's.
-pub async fn method_not_allowed() -> Response {
-    error(false, StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+pub async fn method_not_allowed() -> ApiResult<Response> {
+    Err(ApiError::new(
+        false,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed",
+    ))
 }
 
 /// One op in the API index. Deliberately lean by default: a caller reads this to LEARN the surface,
@@ -95,39 +98,40 @@ pub(super) fn api_doc(group: Option<&str>, full: bool) -> Option<serde_json::Val
 }
 
 /// `GET /api` — the map of the surface the core MCP does not carry.
-pub async fn api_index(RawQuery(raw): RawQuery) -> Response {
+pub async fn api_index(RawQuery(raw): RawQuery) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let full = params.flag("full");
     match api_doc(None, full) {
-        Some(doc) => render(
+        Some(doc) => present(
             StatusCode::OK,
             params.json(),
-            json_ok(doc),
-            format!("{} ops; add ?full=true for schemas\n", ROUTES.len()),
+            &report(
+                doc,
+                |doc| json_ok(doc.clone()),
+                |_| format!("{} ops; add ?full=true for schemas\n", ROUTES.len()),
+            ),
         ),
-        None => error(
-            params.json(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the API index is empty",
-        ),
+        None => Err(ApiError::internal(params.json(), "the API index is empty")),
     }
 }
 
 /// `GET /api/{group}` — one shelf of the same index.
-pub async fn api_group(Path(group): Path<String>, RawQuery(raw): RawQuery) -> Response {
+pub async fn api_group(Path(group): Path<String>, RawQuery(raw): RawQuery) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let full = params.flag("full");
     match api_doc(Some(&group), full) {
-        Some(doc) => render(
+        Some(doc) => present(
             StatusCode::OK,
             params.json(),
-            json_ok(doc),
-            format!("group {group}; add ?full=true for schemas\n"),
+            &report(
+                (doc, group),
+                |(doc, _)| json_ok(doc.clone()),
+                |(_, group)| format!("group {group}; add ?full=true for schemas\n"),
+            ),
         ),
-        None => error(
+        None => Err(ApiError::not_found(
             params.json(),
-            StatusCode::NOT_FOUND,
             format!("no group {group:?}: try /api"),
-        ),
+        )),
     }
 }

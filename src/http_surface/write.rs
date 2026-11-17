@@ -13,19 +13,16 @@ pub async fn upsert(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     // `?wait=true`: settle this document before answering, so the caller can search the moment it has
     // a reply. Opt-in, because it is the one path that holds the store lock across the model call.
     let wait = matches!(params.get("wait"), Some("true") | Some("1"));
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let patch = if is_json_content(&headers) {
         memory_patch_json(&bytes)
@@ -34,7 +31,7 @@ pub async fn upsert(
     };
     let (patch, as_pen) = match patch {
         Ok(p) => p,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     // ★ THE COMMENT ABOVE WAS TRUE AND THE CODE WAS NOT: the parsers return `asserted_by: None` and
     // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
@@ -42,13 +39,13 @@ pub async fn upsert(
     // names the pen, and only a PROVEN one is stamped (#109).
     // ★ ONE CALLER, AND A WRITE WITHOUT ONE IS REFUSED (soma/ellmephant#231) — including a FORGED
     // claim, which `.ok().flatten()` used to collapse into "nobody" and then write as the commons.
-    let caller = match caller.pen() {
-        Ok(name) => name.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
-    };
+    let caller = caller
+        .pen()
+        .map_err(|r| refusal_response(json, r, StatusCode::UNAUTHORIZED))?
+        .clone();
     let credit = match as_pen.as_deref().map(crate::names::Pen::new).transpose() {
         Ok(credit) => credit,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let cmd = crate::ops::Upsert { patch, credit };
     match server
@@ -72,15 +69,22 @@ pub async fn upsert(
                     version = current,
                     "compare-and-swap write refused over http"
                 );
-                return render(
+                return present(
                     StatusCode::CONFLICT,
                     json,
-                    json_ok(serde_json::json!({
-                        "status": "conflict",
-                        "key": key,
-                        "current_version": current,
-                    })),
-                    format!("conflict: {key} is at version {current}; nothing written"),
+                    &report(
+                        (key, current),
+                        |(key, current)| {
+                            json_ok(serde_json::json!({
+                                "status": "conflict",
+                                "key": key,
+                                "current_version": current,
+                            }))
+                        },
+                        |(key, current)| {
+                            format!("conflict: {key} is at version {current}; nothing written")
+                        },
+                    ),
                 );
             }
             let key = out.key.clone();
@@ -98,22 +102,29 @@ pub async fn upsert(
                         // The WRITE stands: the queue is derived state, so the row is safe and the
                         // worker will come back to it. Say so rather than claim a guarantee we missed.
                         tracing::warn!(key = %out.key, error = %err, "?wait=true could not index");
-                        result["encode_error"] = serde_json::json!(err);
+                        result["encode_error"] = serde_json::json!(err.to_string());
                         false
                     }
                 });
                 result["indexed"] = serde_json::json!(indexed);
             }
             tracing::info!(area = scope.area, key = %key, "memory stored over http");
-            let text = match indexed {
-                Some(indexed) => {
-                    format!("stored {key} (queued={}, indexed={indexed})", out.queued)
-                }
-                None => format!("stored {key} (queued={})", out.queued),
-            };
-            render(StatusCode::OK, json, json_ok(result), text)
+            present(
+                StatusCode::OK,
+                json,
+                &report(
+                    (result, key, out.queued, indexed),
+                    |(result, _, _, _)| json_ok(result.clone()),
+                    |(_, key, queued, indexed)| match indexed {
+                        Some(indexed) => {
+                            format!("stored {key} (queued={queued}, indexed={indexed})")
+                        }
+                        None => format!("stored {key} (queued={queued})"),
+                    },
+                ),
+            )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -125,17 +136,14 @@ pub async fn memory_delete(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
     // nobody to name in the ledger — and since #231 it is REFUSED, not passed as `None`.
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let lookup = key.clone();
     match server
@@ -146,26 +154,29 @@ pub async fn memory_delete(
     {
         Ok(Some(remaining)) => {
             tracing::info!(area = scope.area, key = %key, versions = remaining, "memory removed over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                json_ok(serde_json::json!({
-                    "status": "removed",
-                    "key": key,
-                    // The newest of these is the state it was deleted in (the delete snapshots it).
-                    "versions_remaining": remaining,
-                })),
-                format!(
-                    "deleted {key} ({remaining} version(s) remain, the newest being the state it had)"
+                &report(
+                    (key, remaining),
+                    |(key, remaining)| {
+                        json_ok(serde_json::json!({
+                            "status": "removed",
+                            "key": key,
+                            // The newest of these is the state it was deleted in (the delete snapshots it).
+                            "versions_remaining": remaining,
+                        }))
+                    },
+                    |(key, remaining)| {
+                        format!(
+                            "deleted {key} ({remaining} version(s) remain, the newest being the state it had)"
+                        )
+                    },
                 ),
             )
         }
-        Ok(None) => error(
-            json,
-            StatusCode::NOT_FOUND,
-            format!("no such memory: {key}"),
-        ),
-        Err(e) => error(json, error_status(&e), e),
+        Ok(None) => Err(ApiError::not_found(json, format!("no such memory: {key}"))),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -175,10 +186,14 @@ pub async fn history_search(
     server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let Some(phrase) = params.get("q").map(ToString::to_string) else {
-        return error(true, StatusCode::BAD_REQUEST, "need `q` (words to find)");
+        return Err(ApiError::new(
+            true,
+            StatusCode::BAD_REQUEST,
+            "need `q` (words to find)",
+        ));
     };
     let limit = params
         .get("k")
@@ -186,10 +201,7 @@ pub async fn history_search(
         .unwrap_or(10)
         .clamp(1, 200);
     // Reads need no bearer beyond the door's own, like every other GET on this surface.
-    let scope = match authorize(&state, &headers, true) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, true)?;
     match server
         .with_store("memory_history_search", move |s| {
             s.history_search(&phrase, limit)
@@ -215,14 +227,17 @@ pub async fn history_search(
                 hits = rows.len(),
                 "history searched over http"
             );
-            render(
+            present(
                 StatusCode::OK,
                 true,
-                json_ok(serde_json::json!({ "hits": rows })),
-                format!("{} past state(s) matched", rows.len()),
+                &report(
+                    rows,
+                    |rows| json_ok(serde_json::json!({ "hits": rows })),
+                    |rows| format!("{} past state(s) matched", rows.len()),
+                ),
             )
         }
-        Err(e) => error(true, error_status(&e), e),
+        Err(e) => Err(ApiError::store(true, e)),
     }
 }
 
@@ -236,22 +251,18 @@ pub async fn history_erase(
     server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let ask_key = params.get("key").map(ToString::to_string);
     let ask_orphans = matches!(params.get("orphans"), Some("true") | Some("1"));
     let ask_confirm = matches!(params.get("confirm"), Some("true") | Some("1"));
     let json = true;
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     if !ask_confirm {
-        return error(
+        return Err(ApiError::bad(
             json,
-            StatusCode::BAD_REQUEST,
             "this destroys text and nothing can restore it: pass confirm=true",
-        );
+        ));
     }
     match (ask_key, ask_orphans) {
         (Some(key), false) => {
@@ -262,18 +273,23 @@ pub async fn history_erase(
             {
                 Ok(n) => {
                     tracing::info!(area = scope.area, key = %key, versions = n, "history erased over http");
-                    render(
+                    present(
                         StatusCode::OK,
                         json,
-                        json_ok(serde_json::json!({
-                            "status": "erased",
-                            "key": key,
-                            "versions_erased": n,
-                        })),
-                        format!("erased {n} version(s) of {key}"),
+                        &report(
+                            (key, n),
+                            |(key, n)| {
+                                json_ok(serde_json::json!({
+                                    "status": "erased",
+                                    "key": key,
+                                    "versions_erased": n,
+                                }))
+                            },
+                            |(key, n)| format!("erased {n} version(s) of {key}"),
+                        ),
                     )
                 }
-                Err(e) => error(json, error_status(&e), e),
+                Err(e) => Err(ApiError::store(json, e)),
             }
         }
         (None, true) => match server
@@ -287,24 +303,30 @@ pub async fn history_erase(
                     versions,
                     "orphan history erased over http"
                 );
-                render(
+                present(
                     StatusCode::OK,
                     json,
-                    json_ok(serde_json::json!({
-                        "status": "erased",
-                        "orphan_keys": keys,
-                        "versions_erased": versions,
-                    })),
-                    format!("erased {versions} version(s) of {keys} deleted key(s)"),
+                    &report(
+                        (keys, versions),
+                        |(keys, versions)| {
+                            json_ok(serde_json::json!({
+                                "status": "erased",
+                                "orphan_keys": keys,
+                                "versions_erased": versions,
+                            }))
+                        },
+                        |(keys, versions)| {
+                            format!("erased {versions} version(s) of {keys} deleted key(s)")
+                        },
+                    ),
                 )
             }
-            Err(e) => error(json, error_status(&e), e),
+            Err(e) => Err(ApiError::store(json, e)),
         },
-        _ => error(
+        _ => Err(ApiError::bad(
             json,
-            StatusCode::BAD_REQUEST,
             "pass exactly one of key=<slug> or orphans=true",
-        ),
+        )),
     }
 }
 
@@ -317,18 +339,15 @@ pub async fn upvote(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     // MCP's `memory_upvote` takes `{"keys": [...]}` — a BATCH, and that is what a caller who knows the
     // tool will send. Accept it; the path key is the one-key shorthand. A body that names other keys
     // must never be ignored, and this route used to upvote the PATH key and silently drop the body.
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     // ★ ONE KEY OR MANY (#mem): the tool takes either shape, so the route must too — a client that
     // sends `{"keys":"one"}` is asking the same question as `{"keys":["one"]}`.
@@ -336,11 +355,10 @@ pub async fn upvote(
         Some(value) => match serde_json::from_value::<crate::mcp::OneOrMany>(value.clone()) {
             Ok(parsed) => parsed.into_vec(),
             Err(_) => {
-                return error(
+                return Err(ApiError::bad(
                     json,
-                    StatusCode::BAD_REQUEST,
                     format!("bad `keys`: {value} (a string or an array of strings expected)"),
-                );
+                ));
             }
         },
         None => vec![key.clone()],
@@ -351,11 +369,19 @@ pub async fn upvote(
     match crate::mcp::upvote_sweep(&server, reader_from(&caller), keys).await {
         Ok(payload) => {
             tracing::info!(area = scope.area, keys = %named, "upvoted over http");
-            render(StatusCode::OK, json, payload, format!("upvoted {named}"))
+            present(
+                StatusCode::OK,
+                json,
+                &report(
+                    (payload, named),
+                    |(payload, _)| payload.clone(),
+                    |(_, named)| format!("upvoted {named}"),
+                ),
+            )
         }
         Err(message) => {
-            let status = error_status(&message);
-            error(json, status, message)
+            let status = status_of_message(&message);
+            Err(ApiError::new(json, status, message))
         }
     }
 }
@@ -372,16 +398,13 @@ pub async fn append(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let line = match body
         .as_ref()
@@ -392,17 +415,16 @@ pub async fn append(
         None => match params.maybe("line") {
             Some(line) => line.to_string(),
             None => {
-                return error(
+                return Err(ApiError::bad(
                     json,
-                    StatusCode::BAD_REQUEST,
                     "missing `line`: send a JSON body {\"line\": \"...\"}, or `?line=...`",
-                );
+                ));
             }
         },
     };
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let force = params.flag("force");
     let target = key.clone();
@@ -414,18 +436,23 @@ pub async fn append(
     {
         Ok(out) => {
             tracing::info!(area = scope.area, key = %key, appended = out.appended, "appended over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&out).unwrap_or_default(),
-                if out.appended {
-                    format!("appended one line to {key}")
-                } else {
-                    format!("{key} already carries that line — nothing written")
-                },
+                &report(
+                    (out, key),
+                    |(out, _)| serde_json::to_string(out).unwrap_or_default(),
+                    |(out, key)| {
+                        if out.appended {
+                            format!("appended one line to {key}")
+                        } else {
+                            format!("{key} already carries that line — nothing written")
+                        }
+                    },
+                ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -438,19 +465,16 @@ pub async fn merge(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     // The MCP tool takes `{"from", "into"}`; accept it, so a caller can send the tool's own arguments
     // unchanged. The path names `from` here, so a body `from` must AGREE with it rather than quietly
     // win. `?into=` stays for a caller that only has a URL.
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     if let Some(given) = body
         .as_ref()
@@ -458,11 +482,10 @@ pub async fn merge(
         .and_then(|f| f.as_str())
         && given != key
     {
-        return error(
+        return Err(ApiError::bad(
             json,
-            StatusCode::BAD_REQUEST,
             format!("body `from` is `{given}` but the path names `{key}`"),
-        );
+        ));
     }
     let into = match body
         .as_ref()
@@ -473,11 +496,10 @@ pub async fn merge(
         None => match params.maybe("into") {
             Some(into) => into.to_string(),
             None => {
-                return error(
+                return Err(ApiError::bad(
                     json,
-                    StatusCode::BAD_REQUEST,
                     "missing `into`: send `?into=<key>`, or a JSON body {\"into\": \"<key>\"}",
-                );
+                ));
             }
         },
     };
@@ -486,7 +508,7 @@ pub async fn merge(
     // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     match server
         .with_store("memory_merge", move |s| {
@@ -496,18 +518,23 @@ pub async fn merge(
     {
         Ok(out) => {
             tracing::info!(area = scope.area, from = %key, into = %into, "merged over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&out).unwrap_or_default(),
-                format!(
-                    "merged {key} -> {into} ({} line(s) integrated, {} refs repointed)",
-                    out.integrated.len(),
-                    out.bodies
+                &report(
+                    (out, key, into),
+                    |(out, _, _)| serde_json::to_string(out).unwrap_or_default(),
+                    |(out, key, into)| {
+                        format!(
+                            "merged {key} -> {into} ({} line(s) integrated, {} refs repointed)",
+                            out.integrated.len(),
+                            out.bodies
+                        )
+                    },
                 ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -524,16 +551,13 @@ pub async fn fold(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     if let Some(given) = body
         .as_ref()
@@ -541,11 +565,10 @@ pub async fn fold(
         .and_then(|f| f.as_str())
         && given != key
     {
-        return error(
+        return Err(ApiError::bad(
             json,
-            StatusCode::BAD_REQUEST,
             format!("body `from` is `{given}` but the path names `{key}`"),
-        );
+        ));
     }
     let into = match body
         .as_ref()
@@ -556,11 +579,10 @@ pub async fn fold(
         None => match params.maybe("into") {
             Some(into) => into.to_string(),
             None => {
-                return error(
+                return Err(ApiError::bad(
                     json,
-                    StatusCode::BAD_REQUEST,
                     "missing `into`: send `?into=<key>`, or a JSON body {\"into\": \"<key>\"}",
-                );
+                ));
             }
         },
     };
@@ -572,7 +594,7 @@ pub async fn fold(
     // refuses first rather than letting an unproven caller reach `fold_into`.
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     match server
         .with_store("memory_fold", move |s| {
@@ -582,22 +604,27 @@ pub async fn fold(
     {
         Ok(out) => {
             tracing::info!(area = scope.area, from = %key, into = %into, changed = out.changed, "folded over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&out).unwrap_or_default(),
-                format!(
-                    "folded {key} into {into} ({} line(s) appended{})",
-                    out.integrated.len(),
-                    if out.changed {
-                        ""
-                    } else {
-                        "; nothing was missing"
-                    }
+                &report(
+                    (out, key, into),
+                    |(out, _, _)| serde_json::to_string(out).unwrap_or_default(),
+                    |(out, key, into)| {
+                        format!(
+                            "folded {key} into {into} ({} line(s) appended{})",
+                            out.integrated.len(),
+                            if out.changed {
+                                ""
+                            } else {
+                                "; nothing was missing"
+                            }
+                        )
+                    },
                 ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -613,16 +640,13 @@ pub async fn adopt(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let force = body
         .as_ref()
@@ -631,7 +655,7 @@ pub async fn adopt(
         .unwrap_or_else(|| matches!(params.get("force"), Some("true") | Some("1")));
     let pen = match caller.pen_or("adopt needs a proven identity (X-Stet-From + X-Stet-Auth)") {
         Ok(pen) => pen.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let adopting = key.clone();
     let actor = pen.clone();
@@ -645,19 +669,24 @@ pub async fn adopt(
     {
         Ok(()) => {
             tracing::info!(area = scope.area, key = %key, owner = %pen, "adopted over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::json!({
-                    "status": "adopted",
-                    "key": key,
-                    "owner": pen.as_str(),
-                })
-                .to_string(),
-                format!("adopted {key} as {pen}"),
+                &report(
+                    (key, pen),
+                    |(key, pen)| {
+                        serde_json::json!({
+                            "status": "adopted",
+                            "key": key,
+                            "owner": pen.as_str(),
+                        })
+                        .to_string()
+                    },
+                    |(key, pen)| format!("adopted {key} as {pen}"),
+                ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -670,16 +699,10 @@ pub async fn reparse(
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let caller = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
+    let caller = proven_pen(&caller, json)?;
     match server
         .with_store("memory_reparse", move |s| {
             // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): identity is what makes the call
@@ -697,21 +720,28 @@ pub async fn reparse(
                 edges = report.edges,
                 "re-parsed the link graph over http"
             );
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                json_ok(serde_json::json!({
-                    "status": "reparsed",
-                    "rows": report.rows,
-                    "edges": report.edges,
-                })),
-                format!(
-                    "re-parsed {} document(s); the graph now holds {} edge(s)",
-                    report.rows, report.edges
+                &super::report(
+                    report,
+                    |report| {
+                        json_ok(serde_json::json!({
+                            "status": "reparsed",
+                            "rows": report.rows,
+                            "edges": report.edges,
+                        }))
+                    },
+                    |report| {
+                        format!(
+                            "re-parsed {} document(s); the graph now holds {} edge(s)",
+                            report.rows, report.edges
+                        )
+                    },
                 ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -726,16 +756,10 @@ pub async fn reembed(
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let caller = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
+    let caller = proven_pen(&caller, json)?;
     match server
         .with_store("memory_reembed", move |s| {
             // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): same rule as `reparse` above — a
@@ -751,23 +775,30 @@ pub async fn reembed(
                 queued = report.queued,
                 "queued a re-embed over http"
             );
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                json_ok(serde_json::json!({
-                    "status": "queued",
-                    "queued": report.queued,
-                    "dim": report.dim,
-                    "rebuilt": report.rebuilt,
-                    "model": report.model,
-                })),
-                format!(
-                    "queued {} document(s) for re-embedding ({} rebuilt)",
-                    report.queued, report.rebuilt
+                &super::report(
+                    report,
+                    |report| {
+                        json_ok(serde_json::json!({
+                            "status": "queued",
+                            "queued": report.queued,
+                            "dim": report.dim,
+                            "rebuilt": report.rebuilt,
+                            "model": report.model,
+                        }))
+                    },
+                    |report| {
+                        format!(
+                            "queued {} document(s) for re-embedding ({} rebuilt)",
+                            report.queued, report.rebuilt
+                        )
+                    },
                 ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -779,15 +810,12 @@ pub async fn project_upsert(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let patch = if is_json_content(&headers) {
         project_patch_json(&bytes)
@@ -796,13 +824,13 @@ pub async fn project_upsert(
     };
     let patch = match patch {
         Ok(p) => p,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     // The pen the identity pair proves. A project write is a write: since #231 it needs one, the
     // same as on the MCP door, so the channel gate can bite and the row records who stored it.
     let proven = match caller.pen() {
         Ok(name) => name.clone(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     match server
         .with_store("project_upsert", move |s| {
@@ -812,20 +840,27 @@ pub async fn project_upsert(
     {
         Ok(out) => {
             tracing::info!(area = scope.area, key = %out.key, "project stored over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                json_ok(serde_json::json!({
-                    "status": if out.created { "created" } else { "updated" },
-                    "key": out.key,
-                })),
-                format!(
-                    "stored project {} ({})",
-                    out.key,
-                    if out.created { "created" } else { "updated" }
+                &report(
+                    out,
+                    |out| {
+                        json_ok(serde_json::json!({
+                            "status": if out.created { "created" } else { "updated" },
+                            "key": out.key,
+                        }))
+                    },
+                    |out| {
+                        format!(
+                            "stored project {} ({})",
+                            out.key,
+                            if out.created { "created" } else { "updated" }
+                        )
+                    },
                 ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }

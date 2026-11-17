@@ -10,13 +10,13 @@ pub async fn projects(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mode = match mode_param(params.maybe("mode")) {
         Ok(m) => m,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let filter = project::Filter {
         status: params.maybe("status").map(ToString::to_string),
@@ -31,14 +31,9 @@ pub async fn projects(
     {
         Ok(rows) => {
             let wire = crate::wire::project::list_to_wire_json(&rows).unwrap_or_default();
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("projects", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("projects", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -48,13 +43,13 @@ pub async fn project_get(
     caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let hydrate = match project::Hydrate::parse(params.get("hydrate").unwrap_or("none")) {
         Ok(h) => h,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     match server
         .with_read("project_get", reader, move |s| {
@@ -64,14 +59,9 @@ pub async fn project_get(
     {
         Ok(view) => {
             let wire = crate::wire::project::view_to_wire_json(&view).unwrap_or_default();
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("project", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("project", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -81,7 +71,7 @@ pub async fn config_get(
     caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let json = Params::parse(raw.as_deref()).json();
     match server
@@ -91,14 +81,9 @@ pub async fn config_get(
         Ok(item) => {
             let wire = serde_json::to_value(&item).unwrap_or(serde_json::Value::Null);
             let text = wire.to_string();
-            render(
-                StatusCode::OK,
-                json,
-                text.clone(),
-                list_text("config", &text),
-            )
+            present(StatusCode::OK, json, &Table::new("config", text))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -107,7 +92,7 @@ pub async fn config_list(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -121,14 +106,9 @@ pub async fn config_list(
         Ok(items) => {
             let wire = serde_json::json!({ "config": items });
             let text = wire.to_string();
-            render(
-                StatusCode::OK,
-                json,
-                text.clone(),
-                list_text("config", &text),
-            )
+            present(StatusCode::OK, json, &Table::new("config", text))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -141,24 +121,18 @@ pub async fn config_set(
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let who = match proven_pen(&caller, json) {
-        Ok(w) => w,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
+    let who = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Ok(None) => return Err(ApiError::bad(json, "a JSON body is required")),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let value = match doc.get("value").and_then(|v| v.as_str()) {
         Some(v) => v.to_string(),
-        None => return error(json, StatusCode::BAD_REQUEST, "missing `value`"),
+        None => return Err(ApiError::bad(json, "missing `value`")),
     };
     let source = doc
         .get("source")
@@ -174,14 +148,9 @@ pub async fn config_set(
         Ok(item) => {
             tracing::info!(area = scope.area, key = %log_key, "config written over http");
             let wire = serde_json::to_string(&item).unwrap_or_default();
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("config", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("config", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -193,41 +162,20 @@ pub async fn config_define(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let who = match proven_pen(&caller, json) {
-        Ok(w) => w,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
+    let who = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Ok(None) => return Err(ApiError::bad(json, "a JSON body is required")),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
-    let key = match body_str(&doc, "key", json) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let value = match body_str(&doc, "value", json) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let set_audience = match body_str(&doc, "set_audience", json) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let read_audience = match body_str(&doc, "read_audience", json) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let source = match body_str(&doc, "source", json) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let key = body_str(&doc, "key", json)?;
+    let value = body_str(&doc, "value", json)?;
+    let set_audience = body_str(&doc, "set_audience", json)?;
+    let read_audience = body_str(&doc, "read_audience", json)?;
+    let source = body_str(&doc, "source", json)?;
     let log_key = key.clone();
     match server
         .with_store("config_define", move |s| {
@@ -238,13 +186,8 @@ pub async fn config_define(
         Ok(item) => {
             tracing::info!(area = scope.area, key = %log_key, "config defined over http");
             let wire = serde_json::to_string(&item).unwrap_or_default();
-            render(
-                StatusCode::OK,
-                json,
-                wire.clone(),
-                list_text("config", &wire),
-            )
+            present(StatusCode::OK, json, &Table::new("config", wire))
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }

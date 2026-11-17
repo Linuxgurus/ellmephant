@@ -464,6 +464,28 @@ pub async fn whoami(caller: crate::identity::Caller) -> Response {
     render(StatusCode::OK, true, doc.to_string(), text)
 }
 
+/// `GET /memory-health` — the five-number health surface (`memory_health`), visible-scoped.
+pub async fn memory_health(
+    server: Server,
+    caller: crate::identity::Caller,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = Params::parse(raw.as_deref());
+    let json = params.json();
+    match server
+        .with_read("memory_health", reader_from(&caller), |s| s.health())
+        .await
+    {
+        Ok(health) => render(
+            StatusCode::OK,
+            json,
+            serde_json::to_string(&health).unwrap_or_default(),
+            health_text(&health),
+        ),
+        Err(e) => error(json, error_status(&e), e),
+    }
+}
+
 /// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(
     server: Server,

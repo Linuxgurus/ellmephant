@@ -16,10 +16,22 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::{Peer, RoleClient, ServiceExt};
 use tower::ServiceExt as _;
 
+/// The pen every WRITE in this file proves with, and its secret.
+///
+/// Since #231 a write with no proven pen is refused on both doors, so a fixture that wrote
+/// `anonymous` was silently testing a state the service no longer allows. The secret is fixed (and
+/// hashed with the store's own `digest`) so a helper can attach the pair without threading it
+/// through every call — the file is the fixture, exactly as `tests/credential.rs` does it.
+const TEST_PEN: &str = "tester";
+const TEST_SECRET: &str = "test-secret-proves-nothing";
+const TEST_FROM: &str = "X-Stet-From";
+const TEST_AUTH: &str = "X-Stet-Auth";
+
 /// An open, offline session backed by the fake embedder (mirrors `tests/mcp.rs`).
 fn session(dir: &std::path::Path) -> Session {
     let paths = Paths::from_root(dir);
     paths.ensure().expect("create store root");
+    provision_write_identity(&paths);
     // The config is the WRITE path's view of the vector space — a write has no embedder to ask — so it
     // has to agree with the fake injected below. Disagree, and `encode_hash` describes a different space
     // than the stored vectors do, which makes every later write look like a document change.
@@ -33,6 +45,24 @@ fn session(dir: &std::path::Path) -> Session {
     Session::open(paths, cfg, spec)
         .expect("open store")
         .with_embedder(Box::new(HashEmbedder::new(DIM)))
+}
+
+/// Give the store a pen that can prove itself: `tester`, hanging from the root `estate` (a
+/// parentless pen cannot hold a credential).
+fn provision_write_identity(paths: &Paths) {
+    let conn = ellmephant::db::open(paths).expect("open");
+    conn.execute(
+        "INSERT OR IGNORE INTO pen (name, kind, parent_id)
+         VALUES (?1, 'self', (SELECT id FROM pen WHERE name = 'estate'))",
+        [TEST_PEN],
+    )
+    .expect("seed pen");
+    conn.execute(
+        "INSERT OR REPLACE INTO pen_credential (pen_id, hash, issued_by)
+         SELECT id, ?2, NULL FROM pen WHERE name = ?1",
+        rusqlite::params![TEST_PEN, ellmephant::store::credential::digest(TEST_SECRET)],
+    )
+    .expect("seed credential");
 }
 
 /// A router over a server and a health state that share one witness.
@@ -361,7 +391,19 @@ async fn request(
     content_type: Option<&str>,
     body: &str,
 ) -> (StatusCode, String, Option<String>) {
+    let is_write = matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
     let mut builder = Request::builder().method(method).uri(uri);
+    // Every WRITE in this file is made by a PROVEN pen (#231): a write with no identity is refused
+    // on both doors now, so the fixture proves `tester`. Reads are left alone — they are open, and
+    // several tests here are about what an anonymous reader may see.
+    if is_write {
+        builder = builder
+            .header(TEST_FROM, TEST_PEN)
+            .header(TEST_AUTH, TEST_SECRET);
+    }
     if let Some(token) = token {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
@@ -632,6 +674,10 @@ async fn writes_are_open_when_no_token_is_configured() {
                 .method(Method::POST)
                 .uri("/memory")
                 .header(header::CONTENT_TYPE, "application/json")
+                // The door's bearer is absent on purpose (no token is configured); the IDENTITY is
+                // not, because since #231 a write with no proven pen is refused on both doors.
+                .header(TEST_FROM, TEST_PEN)
+                .header(TEST_AUTH, TEST_SECRET)
                 .body(Body::from(
                     r#"{"key":"open-note","title":"open","body":"written with no token"}"#,
                 ))
@@ -1611,6 +1657,7 @@ async fn wait_true_reports_a_write_that_could_not_be_indexed() {
     let paths = Paths::from_root(dir.path());
     let cfg = Config::default();
     let spec = Spec::from_config(&cfg, &paths);
+    provision_write_identity(&paths);
     let session = Session::open(paths.clone(), cfg.clone(), spec)
         .expect("open store")
         .with_embedder(Box::new(Broken));
@@ -1677,6 +1724,7 @@ async fn wait_true_holds_the_lock_and_health_names_the_holder() {
     let paths = Paths::from_root(dir.path());
     let cfg = Config::default();
     let spec = Spec::from_config(&cfg, &paths);
+    provision_write_identity(&paths);
     let session = Session::open(paths.clone(), cfg.clone(), spec)
         .expect("open store")
         .with_embedder(Box::new(Slow));

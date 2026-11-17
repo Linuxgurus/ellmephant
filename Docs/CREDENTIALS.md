@@ -101,3 +101,27 @@ These are seeds into tables, not the authority itself, and are unaffected by thi
 - `ELLMEPHANT_PEN_TREE` → `pen.parent_id` (a seed only; the table wins on disagreement)
 - `ELLMEPHANT_LEASERS` → **still env-only.** It gates who may take a lease; the natural next step is
   a column or capability table, not part of this change.
+
+## A write requires a proven pen, on both doors
+
+Until #231 the two adapters answered "who is writing" separately, and disagreed. On HTTP a write
+with **no** proof, or with a **forged** one, was treated as `anonymous` — `owner NULL`, which since
+#119 means any pen may rewrite the row — and `channel_gate` was skipped, because the gate only runs
+`if let Some(caller)`. The MCP door refused both. The same store, two answers.
+
+Now there is one `identity::Caller` per request, and `Caller::pen()` fails on **both** cases:
+
+| what the caller sent | HTTP | MCP |
+| --- | --- | --- |
+| the pair, and it verifies | write, stamped with the proven pen | same |
+| no `X-Stet-From`/`X-Stet-Auth` | **refused** (401) | **refused** |
+| a name whose proof is missing or wrong | **refused** (401) | **refused** |
+
+The two cases stay *distinguishable in the message* — a caller who sent a bad proof and one who
+sent none need different fixes — but they are one refusal at the gate, because collapsing them is
+what created the bug. Reads are unchanged: no proof means an anonymous reader, and anonymous reads
+are open (narrow, not refused).
+
+`tests/authority_contract.rs` is the regression: for every write verb, on both doors, `{no proof,
+forged, valid}` must produce the same outcome. It is behaviour-level on purpose — the file split in
+#50 can move the code underneath without invalidating it.

@@ -137,6 +137,7 @@ pub fn http_router(
         .route("/sudo/sessions", axum::routing::get(surface::sudo_sessions))
         .route("/bootstrap", axum::routing::get(surface::bootstrap))
         .route("/stats", axum::routing::get(surface::stats))
+        .route("/memory-health", axum::routing::get(surface::memory_health))
         .route("/dangling", axum::routing::get(surface::dangling))
         .route(
             "/history",

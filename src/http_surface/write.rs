@@ -9,6 +9,7 @@ use super::*;
 pub async fn upsert(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
@@ -41,7 +42,7 @@ pub async fn upsert(
     // names the pen, and only a PROVEN one is stamped (#109).
     // ★ ONE CALLER, AND A WRITE WITHOUT ONE IS REFUSED (soma/ellmephant#231) — including a FORGED
     // claim, which `.ok().flatten()` used to collapse into "nobody" and then write as the commons.
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
+    let caller = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -120,6 +121,7 @@ pub async fn upsert(
 pub async fn memory_delete(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -131,7 +133,7 @@ pub async fn memory_delete(
     };
     // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
     // nobody to name in the ledger — and since #231 it is REFUSED, not passed as `None`.
-    let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
+    let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -310,6 +312,7 @@ pub async fn history_erase(
 pub async fn upvote(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -345,7 +348,7 @@ pub async fn upvote(
     let named = keys.join(", ");
     // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
     // errors nor the JSON can drift apart.
-    match crate::mcp::upvote_sweep(&server, reader_from(&headers, &state.paths), keys).await {
+    match crate::mcp::upvote_sweep(&server, reader_from(&caller), keys).await {
         Ok(payload) => {
             tracing::info!(area = scope.area, keys = %named, "upvoted over http");
             render(StatusCode::OK, json, payload, format!("upvoted {named}"))
@@ -364,6 +367,7 @@ pub async fn upvote(
 pub async fn append(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -396,7 +400,7 @@ pub async fn append(
             }
         },
     };
-    let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
+    let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -429,6 +433,7 @@ pub async fn append(
 pub async fn merge(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -479,7 +484,7 @@ pub async fn merge(
     let from = key.clone();
     let target = into.clone();
     // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
-    let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
+    let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -514,6 +519,7 @@ pub async fn merge(
 pub async fn fold(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -564,7 +570,7 @@ pub async fn fold(
     // the source's write authority, which is the whole point. It DOES require a proven pen: the
     // store refuses a fold with no actor (an append nobody is named for), so since #231 the door
     // refuses first rather than letting an unproven caller reach `fold_into`.
-    let pen = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
+    let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -602,6 +608,7 @@ pub async fn fold(
 pub async fn adopt(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -622,9 +629,7 @@ pub async fn adopt(
         .and_then(|b| b.get("force"))
         .and_then(|v| v.as_bool())
         .unwrap_or_else(|| matches!(params.get("force"), Some("true") | Some("1")));
-    let pen = match crate::identity::Caller::from_headers(&state.paths, &headers)
-        .pen_or("adopt needs a proven identity (X-Stet-From + X-Stet-Auth)")
-    {
+    let pen = match caller.pen_or("adopt needs a proven identity (X-Stet-From + X-Stet-Auth)") {
         Ok(pen) => pen.to_string(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };
@@ -662,6 +667,7 @@ pub async fn adopt(
 pub async fn reparse(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -670,7 +676,7 @@ pub async fn reparse(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match proven_pen(&headers, json, &state.paths) {
+    let caller = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -717,6 +723,7 @@ pub async fn reparse(
 pub async fn reembed(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -725,7 +732,7 @@ pub async fn reembed(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match proven_pen(&headers, json, &state.paths) {
+    let caller = match proven_pen(&caller, json) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -768,6 +775,7 @@ pub async fn reembed(
 pub async fn project_upsert(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
@@ -792,7 +800,7 @@ pub async fn project_upsert(
     };
     // The pen the identity pair proves. A project write is a write: since #231 it needs one, the
     // same as on the MCP door, so the channel gate can bite and the row records who stored it.
-    let proven = match crate::identity::Caller::from_headers(&state.paths, &headers).pen() {
+    let proven = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
     };

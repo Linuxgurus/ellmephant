@@ -9,6 +9,7 @@ use super::*;
 pub async fn pen_lend(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -18,7 +19,7 @@ pub async fn pen_lend(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers)
+    let caller = match caller
         .pen_or("refused: lending needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
         Ok(name) => name.to_string(),
@@ -67,6 +68,7 @@ pub async fn pen_lend(
 pub async fn sudo(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -75,7 +77,7 @@ pub async fn sudo(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match proven_pen(&headers, json, &state.paths) {
+    let caller = match proven_pen(&caller, json) {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -158,6 +160,7 @@ pub async fn sudo_sessions(
 pub async fn sudo_pass(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -166,7 +169,7 @@ pub async fn sudo_pass(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match proven_pen(&headers, json, &state.paths) {
+    let caller = match proven_pen(&caller, json) {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -210,6 +213,7 @@ pub async fn sudo_pass(
 pub async fn sudo_release(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -218,7 +222,7 @@ pub async fn sudo_release(
     if let Err(r) = authorize(&state, &headers, json) {
         return r;
     }
-    let caller = match proven_pen(&headers, json, &state.paths) {
+    let caller = match proven_pen(&caller, json) {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -254,6 +258,7 @@ pub async fn sudo_release(
 pub async fn pen_mint(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -264,7 +269,7 @@ pub async fn pen_mint(
         Err(r) => return r,
     };
     // A mint is a WRITE: the caller is the parent, and an unproven caller is nobody.
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers)
+    let caller = match caller
         .pen_or("refused: minting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
         Ok(name) => name.to_string(),
@@ -313,6 +318,7 @@ pub async fn pen_mint(
 pub async fn pen_rotate(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -322,7 +328,7 @@ pub async fn pen_rotate(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let caller = match crate::identity::Caller::from_headers(&state.paths, &headers).pen_or(
+    let caller = match caller.pen_or(
         "refused: rotating a credential needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
     ) {
         Ok(name) => name.to_string(),
@@ -368,19 +374,18 @@ pub async fn pen_rotate(
 
 /// `GET /whois/{pen}` — one pen and what it is to this request's pen (`whois`).
 pub async fn whois(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     Path(pen): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let viewer = crate::identity::Caller::from_headers(&state.paths, &headers)
+    let viewer = caller
         .proven()
         .map(ToString::to_string)
         .unwrap_or_else(|| crate::identity::ANONYMOUS.to_string());
     match server
-        .with_read("whois", reader_from(&headers, &state.paths), move |s| {
+        .with_read("whois", reader_from(&caller), move |s| {
             s.whois(&viewer, &pen)
         })
         .await
@@ -416,8 +421,7 @@ pub async fn whois(
 /// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
 /// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
 /// same question the model asks instead of guessing from a remembered flag.
-pub async fn whoami(State(state): State<HttpState>, headers: HeaderMap) -> Response {
-    let caller = crate::identity::Caller::from_headers(&state.paths, &headers);
+pub async fn whoami(caller: crate::identity::Caller) -> Response {
     let (doc, text) = match caller.denied() {
         None => match caller.proven() {
             Some(name) => {
@@ -462,12 +466,11 @@ pub async fn whoami(State(state): State<HttpState>, headers: HeaderMap) -> Respo
 
 /// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tags = params.flag("tags");

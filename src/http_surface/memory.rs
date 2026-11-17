@@ -8,13 +8,12 @@ use super::*;
 /// `GET /memory/{key}` — one memory whole. Counts a `visits` read, exactly as `memory_get` does: the
 /// one write a read may make, because a counter is not data (HTTP.md invariant 1).
 pub async fn memory_get(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let version = match params.parse_as::<i64>("version") {
@@ -88,9 +87,8 @@ pub async fn memory_get(
 
 /// `GET /unowned` — the rows nobody owns, and why (`memory_unowned`).
 pub async fn unowned(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = Params::parse(raw.as_deref());
@@ -101,11 +99,9 @@ pub async fn unowned(
         .unwrap_or(50)
         .clamp(1, 500);
     match server
-        .with_read(
-            "memory_unowned",
-            reader_from(&headers, &state.paths),
-            move |s| s.unowned(limit),
-        )
+        .with_read("memory_unowned", reader_from(&caller), move |s| {
+            s.unowned(limit)
+        })
         .await
     {
         Ok(rows) => {
@@ -132,13 +128,12 @@ pub async fn unowned(
 
 /// `GET /memory/{key}/backlinks` — incoming `[[…]]` edges (`memory_backlinks`).
 pub async fn backlinks(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let json = Params::parse(raw.as_deref()).json();
     match server
         .with_read("memory_backlinks", reader, move |s| s.backlinks(&key))
@@ -159,13 +154,12 @@ pub async fn backlinks(
 
 /// `GET /dangling` — every broken `[[…]]` edge, one row per referrer (`memory_dangling`).
 pub async fn dangling(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let json = Params::parse(raw.as_deref()).json();
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     match server
         .with_read("memory_dangling", reader, |s| s.dangling())
         .await
@@ -189,12 +183,11 @@ pub async fn dangling(
 /// for — an orphan, whose row is gone — has no `/memory/{key}` to hang from, and a path that implied
 /// the memory still existed would be wrong for exactly the caller who needs it most.
 pub async fn history(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let cap = match params.parse_as::<u32>("limit") {
@@ -257,12 +250,11 @@ pub async fn history(
 
 /// `GET /search` — the same query surface as `memory_search`, same bytes.
 pub async fn search(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let search = match search_params(&params) {
@@ -278,12 +270,11 @@ pub async fn search(
 /// `GET /semantic` — the store-wide search (`semantic_search`): an optional `type`, and
 /// `deleted=true` for the graveyard. Same body as the tool, by construction.
 pub async fn semantic_search(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mut fields = Vec::new();
@@ -332,12 +323,11 @@ pub async fn semantic_search(
 /// answers the merge plan instead: one keeper/absorb step per duplicate CLUSTER, and a named refusal
 /// for every other pair.
 pub async fn dupes(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let max_distance = match params.parse_as::<f32>("max_distance") {

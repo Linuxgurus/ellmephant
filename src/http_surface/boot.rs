@@ -190,10 +190,10 @@ pub(super) fn boot_tag(pen: Option<&str>) -> Option<String> {
 /// spend tokens on rather than receive by default.
 pub async fn bootstrap(
     State(state): State<HttpState>,
-    headers: HeaderMap,
     RawQuery(raw): RawQuery,
+    caller: crate::identity::Caller,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tools = params.flag("tools");

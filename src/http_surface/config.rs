@@ -7,12 +7,11 @@ use super::*;
 
 /// `GET /projects` — the project index (`project_list`), same bytes.
 pub async fn projects(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let mode = match mode_param(params.maybe("mode")) {
@@ -45,13 +44,12 @@ pub async fn projects(
 
 /// `GET /project/{key}` — one project with its ordered preload (`project_get`).
 pub async fn project_get(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let hydrate = match project::Hydrate::parse(params.get("hydrate").unwrap_or("none")) {
@@ -79,13 +77,12 @@ pub async fn project_get(
 
 /// `GET /config/{key}` — one config item (`config_get`); `null` when absent or not addressed to you.
 pub async fn config_get(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let json = Params::parse(raw.as_deref()).json();
     match server
         .with_read("config_get", reader, move |s| s.config_get(&key))
@@ -107,12 +104,11 @@ pub async fn config_get(
 
 /// `GET /config` — every item this connection may read (`config_list`), with an optional `prefix`.
 pub async fn config_list(
-    State(state): State<HttpState>,
     server: Server,
-    headers: HeaderMap,
+    caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let reader = reader_from(&headers, &state.paths);
+    let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let prefix = params.maybe("prefix").map(ToString::to_string);
@@ -140,6 +136,7 @@ pub async fn config_list(
 pub async fn config_set(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     Path(key): Path<String>,
     RawQuery(raw): RawQuery,
@@ -150,7 +147,7 @@ pub async fn config_set(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let who = match proven_pen(&headers, json, &state.paths) {
+    let who = match proven_pen(&caller, json) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -192,6 +189,7 @@ pub async fn config_set(
 pub async fn config_define(
     State(state): State<HttpState>,
     server: Server,
+    caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
@@ -201,7 +199,7 @@ pub async fn config_define(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let who = match proven_pen(&headers, json, &state.paths) {
+    let who = match proven_pen(&caller, json) {
         Ok(w) => w,
         Err(r) => return r,
     };

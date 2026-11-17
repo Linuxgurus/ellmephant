@@ -15,6 +15,7 @@ pub mod mail;
 pub mod maintain;
 pub mod project;
 pub mod relation;
+mod rules;
 pub mod shape;
 pub mod slug;
 pub mod snapshot;
@@ -863,94 +864,43 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         ..Default::default()
     };
     let key = resolve_key(conn, &probe)?;
-    // ★ THE DOOR THAT STOPS THE TAP (soma/ellmephant#217). A body whose SHAPE is a run record is
-    // refused, and the refusal names the verb and the arguments it inferred. `force: true` writes it
-    // anyway: an agent that read the refusal may still be right.
-    if let Some(hint) = patch
-        .body
-        .as_deref()
-        .filter(|_| !patch.force)
-        .and_then(|body| shape::record_hint(body, &key))
-    {
-        return Err(Error::Invalid(shape::refusal(&hint, &key)));
-    }
-    // ★ TWO INSTRUCTIONS THAT CONTRADICT EACH OTHER ARE REFUSED, NOT RESOLVED SILENTLY
-    // (soma/ellmephant#189 D5). `private` derives an audience from the proven pen; an explicit
-    // `audience` names others. Asked for both, this used to keep the `audience` and drop `private`
-    // without a word — and when that audience did not include the author, the row became invisible to
-    // the pen that wrote it. A caller must not have to guess which of its two sentences was obeyed.
-    // ★ ONLY `private: true` CONTRADICTS AN AUDIENCE (hostile review of #194, round 2). `private: false`
-    // says "not private", and ANY explicit audience satisfies that — refusing the pair rejected a
-    // request that was not contradictory, and every client that always sends `private: false` with an
-    // audience would have broken. The contradiction is a claim of exclusivity alongside a list.
-    if patch.private == Some(true) && patch.audience.is_some() {
-        return Err(Error::Invalid(
-            "`private: true` and `audience` contradict each other: private addresses the row to the \
-             writing pen ALONE, audience names other pens. Pass one. To address several pens INCLUDING \
-             yourself, use `audience: \"pen:<you>,pen:<other>\"` and no `private`; `private: false` \
-             needs no audience, and any audience satisfies it."
-                .into(),
-        ));
-    }
+    // ★ THE RULES ARE DATA, AND THE ORDER IS THE CONTRACT (soma/ellmephant#238). What used to be six
+    // guards inline is now two named lists split by WHAT A RULE READS: `RULES_PRE` sees only the
+    // incoming patch and runs before anyone decides whether the caller may write; `RULES_POST` reads
+    // the existing row and runs after. A rule on the wrong side of the boundary turns a refusal into
+    // a read (#192), and `src/store/rules.rs` says so on each one.
     let existing = get(conn, &key)?;
-    // A `protected` row (or a write that would make one) needs a live lease on its own key.
     let was_tags = existing
         .as_ref()
         .map(|m| m.tags.clone())
         .unwrap_or_default();
-    // ★ WHO IS WRITING, ONCE (adversarial review of #192). `acted_by` is the proven pen; `asserted_by`
-    // is the credited one. Authority, the boundary guard and the write all have to agree about which
-    // pen is acting, or a hand crediting its finger gets judged as the finger for some checks and as
-    // the hand for others.
-    // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): the guards below must judge the pen that
-    // acts. Falling back to `asserted_by` is how a write gets authorised as the name it credits.
-    // ★ `private` AND `as:` CONTRADICT EACH OTHER (hostile review of #195, round 3). `private: true`
-    // addresses the row to the pen that ACTS; `as:` credits a different pen. Both cannot be true, and
-    // the failure was ugly rather than refused: with the audience on the actor, the CREDITED pen could
-    // no longer read words it was credited for, so the D1 rule refused the write with a message about
-    // invisibility — a true sentence that names the wrong cause. Refuse the combination instead.
-    match (
-        patch.private,
-        patch.asserted_by.as_deref(),
-        patch.acted_by.as_deref(),
-    ) {
-        (Some(true), Some(credited), Some(actor)) if !credited.eq_ignore_ascii_case(actor) => {
-            return Err(Error::Invalid(
-                "`private: true` addresses the row to the pen that ACTS, and `as:` credits a \
-                 different pen — they contradict each other. Pass an explicit `audience` (e.g. \
-                 `pen:<you>,pen:<them>`) if the row is for both, or drop one of them."
-                    .into(),
-            ));
-        }
-        _ => {}
-    }
+    // ★ THE ACTOR, NEVER THE CREDIT (soma/ellmephant#192): every rule and the write itself must judge
+    // the pen that acts. Falling back to `asserted_by` is how a write gets authorised as the name it
+    // credits, and how a hand crediting its finger is judged as the finger for some checks and as the
+    // hand for others.
     let writer = patch.acted_by.as_deref();
-    // ★ AUTHORISE BEFORE THE GUARDS (adversarial review of #192). `guard_protected` and
-    // `guard_audience` produce different sentences for different states, so running them first let a
-    // pen that may not write the row learn that it exists and is not public — a read disguised as a
-    // refusal. A refusal must not be a read; the same rule as the CAS ordering.
+    let ctx = rules::WriteCtx {
+        conn,
+        patch,
+        key: &key,
+        existing: existing.as_ref(),
+        was_tags: &was_tags,
+        writer,
+    };
+    rules::run(rules::RULES_PRE, &ctx)?;
+    // ★ AUTHORISE BEFORE THE ROW-READING RULES (adversarial review of #192). Their sentences describe
+    // row state, so running one first lets a pen that may not write the row learn that it exists and
+    // is not public. A refusal must not be a read; the same rule as the CAS ordering. This is the
+    // BOUNDARY, not a rule: it sits between the lists because it is the one thing that must not move.
     if existing.is_some() {
         may_write(conn, &key, writer)?;
     }
-    guard_protected(conn, &key, &was_tags, patch, writer)?;
-    // An audience belongs to the pen that set it: a caller may not publish, or privatise, a row it
-    // could not read. Without this, `private` would be a lock whose key hangs beside the door.
-    guard_audience(conn, existing.as_ref(), patch, writer)?;
+    rules::run(rules::RULES_POST, &ctx)?;
 
     let (mem, created) = match existing {
         Some(old) => {
             let title = patch.title.clone().unwrap_or_else(|| old.title.clone());
             let body = patch.body.clone().unwrap_or_else(|| old.body.clone());
-            if title.trim().is_empty() {
-                return Err(Error::Invalid(
-                    "`title` cannot be empty; omit it to leave the stored title alone".into(),
-                ));
-            }
-            if body.trim().is_empty() {
-                return Err(Error::Invalid(
-                    "`body` cannot be empty; omit it to leave the stored body alone".into(),
-                ));
-            }
             let source = match &patch.source {
                 Some(s) => (!s.trim().is_empty()).then(|| s.clone()),
                 None => old.source.clone(),
@@ -1001,15 +951,10 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
             )
         }
         None => {
+            // The emptiness check lives in `rules::RULES_POST`'s `field` rule now: one place, so a
+            // create and an update cannot disagree about what "empty" means.
             let title = patch.title.clone().unwrap_or_default();
             let body = patch.body.clone().unwrap_or_default();
-            if title.trim().is_empty() || body.trim().is_empty() {
-                return Err(Error::Invalid(
-                    "a new memory needs both a `title` and a `body`; an existing key can be patched \
-                     field by field"
-                        .into(),
-                ));
-            }
             (
                 Memory {
                     key: key.clone(),

@@ -84,6 +84,45 @@ fn authority_is_checked_before_the_protected_guard() {
     );
 }
 
+/// ★ THE REFUSAL CANNOT DESCRIBE THE ROW (Stet's property, #238): given a caller who may not write,
+/// the response must not change with the row's state — otherwise the sentence is an existence probe
+/// in prose, however carefully the check itself is ordered. The SAME key is refused twice: once as a
+/// plain row, then as a PROTECTED row with a live lease held by someone else. The two sentences must
+/// be byte-identical, which is what "authorise before the row-reading rules" buys and what merely
+/// seeing a 403 does not prove.
+#[test]
+fn the_authority_refusal_does_not_change_with_the_row_state() {
+    let (_dir, paths, _embedder) = fixture();
+
+    let patch = Patch {
+        key: Some("owned".into()),
+        body: Some("an observer's words".into()),
+        acted_by: Some("observer".into()),
+        asserted_by: Some("observer".into()),
+        ..Default::default()
+    };
+    let plain = write(&paths, patch.clone()).expect_err("observer may not write james's row");
+
+    {
+        // Make the same row PROTECTED and lease it to its owner: now a second refusal (no lease for
+        // the observer) is available to any guard that runs before the authority check.
+        let conn = db::open(&paths).expect("open");
+        conn.execute(
+            "UPDATE memory SET tags = ?1 WHERE key = 'owned'",
+            [store::tags::encode(&[store::PROTECTED.to_string()])],
+        )
+        .expect("protect the row");
+        store::claim::acquire(&conn, "owned", "james", Some(600)).expect("james holds the lease");
+    }
+
+    let protected = write(&paths, patch).expect_err("observer may not write james's row");
+    assert_eq!(
+        plain, protected,
+        "the refusal changed with the row's PROTECTED/leased state — the authority check is not \
+         before the row-reading rules, and the refusal has become a read"
+    );
+}
+
 /// ★ A patch-only refusal is a measurement of the PATCH, so the row's existence cannot change it.
 #[test]
 fn a_patch_only_refusal_is_identical_for_an_existing_and_a_missing_key() {

@@ -95,19 +95,51 @@ fn identity_is_built_in_one_place_per_door() {
 }
 
 #[test]
-fn store_does_not_render_the_wire() {
-    for (path, text) in sources(&root().join("src/store")) {
-        assert!(
-            !text.contains("fn to_wire_json")
-                && !text.contains("fn dangling_to_wire_json")
-                && !text.contains("fn backlinks_to_wire_json")
-                && !text.contains("fn plan_to_wire_json")
-                && !text.contains("fn list_to_wire_json")
-                && !text.contains("fn view_to_wire_json"),
-            "{} defines a wire renderer — `store::` knows rows, `wire::` knows the wire (#236)",
-            path.display()
-        );
+fn no_layer_but_the_wire_renders_the_wire() {
+    // `store::` and `search::` answer questions; `wire::` lays the answer out (soma/ellmephant#236).
+    // `search::to_wire_json` was the hold-out: it leaned on `Fields::row`, which was an argument for
+    // moving `Fields`, not for leaving a `cols` table inside the search layer.
+    for dir in ["src/store", "src/search"] {
+        for (path, text) in sources(&root().join(dir)) {
+            let code = code_only(&text);
+            assert!(
+                !code.contains("fn to_wire_json")
+                    && !code.contains("fn dangling_to_wire_json")
+                    && !code.contains("fn backlinks_to_wire_json")
+                    && !code.contains("fn plan_to_wire_json")
+                    && !code.contains("fn list_to_wire_json")
+                    && !code.contains("fn view_to_wire_json"),
+                "{} defines a wire renderer — `store::`/`search::` know rows, `wire::` knows the \
+                 wire (#236)",
+                path.display()
+            );
+        }
     }
+}
+
+/// One outcome, one body, two renderings (soma/ellmephant#236). A handler that calls `render`
+/// directly has quietly gone back to deciding its JSON and text separately, which is the drift the
+/// Presenter exists to make impossible. `render` is therefore called in exactly one place.
+#[test]
+fn handlers_present_rather_than_render() {
+    let mut calls = Vec::new();
+    for (path, text) in sources(&root().join("src/http_surface")) {
+        for line in code_only(&text).lines() {
+            if line.contains("render(") && !line.contains("fn render(") {
+                calls.push(path.display().to_string());
+            }
+        }
+    }
+    assert_eq!(
+        calls,
+        vec![
+            root()
+                .join("src/http_surface/present.rs")
+                .display()
+                .to_string()
+        ],
+        "`render` is called outside the Presenter; route the verb through `present(...)` instead"
+    );
 }
 
 /// The epic's line goal, as a ceiling rather than a wish: 5,000-line doors grew back once already,

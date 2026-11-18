@@ -11,6 +11,7 @@ use ellmephant::db;
 use ellmephant::embed::HashEmbedder;
 use ellmephant::search::{self, Field, Fields, Hit, MatchMode, Neighbor, Query};
 use ellmephant::store::Memory;
+use ellmephant::wire::search::to_wire_json;
 use rusqlite::Connection;
 
 const DIM: usize = 64;
@@ -278,7 +279,7 @@ fn wire_json_is_positional_with_a_cols_header() {
     // Every field requested: the full column shape, in canonical order. `score` joined the list with
     // the two-leg report (2026-11-11): it is the lexical leg's number, beside the semantic distance.
     let all = Fields::selection(Field::ALL);
-    let wire = search::to_wire_json(&bundle, &all).expect("wire");
+    let wire = to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["cols"],
@@ -318,7 +319,7 @@ fn wire_json_defaults_to_key_only() {
         search: None,
     };
     // Nothing asked for: a hit is just its key — the lean default (SPEC §10).
-    let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
+    let wire = to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(v["cols"], serde_json::json!(["key", "via"]));
     assert_eq!(v["hits"][0], serde_json::json!(["k", "semantic"]));
@@ -364,7 +365,7 @@ fn wire_json_emits_a_neighbors_table_when_expanded() {
         }],
         search: None,
     };
-    let wire = search::to_wire_json(&bundle, &Fields::key_only()).expect("wire");
+    let wire = to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(
         v["neighbors"]["cols"],

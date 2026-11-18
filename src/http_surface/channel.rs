@@ -15,7 +15,7 @@ pub async fn channel_list(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let pen = proven(&caller);
     let caller = pen.clone();
@@ -38,32 +38,37 @@ pub async fn channel_list(
         )
         .await;
     match out {
-        Ok((channels, unread, breach)) => {
-            let text = channels
-                .iter()
-                .map(|c| {
-                    let n = unread
+        Ok((channels, unread, breach)) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                (channels, unread, breach, pen),
+                |(channels, unread, breach, listener)| {
+                    serde_json::json!({
+                        "channels": channels,
+                        "unread": unread,
+                        "breach": breach,
+                        "listener": listener,
+                    })
+                    .to_string()
+                },
+                |(channels, unread, _, _)| {
+                    let text = channels
                         .iter()
-                        .find(|u| u.channel == c.key)
-                        .map_or(0, |u| u.count);
-                    format!("#{} ({}) gate={} unread={n}", c.key, c.title, c.gate)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({
-                    "channels": channels,
-                    "unread": unread,
-                    "breach": breach,
-                    "listener": pen,
-                })
-                .to_string(),
-                format!("{text}\n"),
-            )
-        }
-        Err(e) => error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+                        .map(|c| {
+                            let n = unread
+                                .iter()
+                                .find(|u| u.channel == c.key)
+                                .map_or(0, |u| u.count);
+                            format!("#{} ({}) gate={} unread={n}", c.key, c.title, c.gate)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{text}\n")
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::internal(json, e)),
     }
 }
 
@@ -73,14 +78,12 @@ pub async fn channel_history(
     caller: crate::identity::Caller,
     Path(channel): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review): the store filters private memories by audience and
     // a chat log has the same problem — an incident channel is not a public page.
-    if let Err(r) = proven_pen(&caller, json) {
-        return r;
-    }
+    proven_pen(&caller, json)?;
     let since = params
         .maybe("since")
         .and_then(|v| v.parse::<i64>().ok())
@@ -98,20 +101,25 @@ pub async fn channel_history(
         )
         .await
     {
-        Ok(rows) => {
-            let text = rows
-                .iter()
-                .map(|m| format!("{} {}: {}", m.seq, m.pen, m.body))
-                .collect::<Vec<_>>()
-                .join("\n");
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({ "channel": channel, "messages": rows }).to_string(),
-                format!("{text}\n"),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                (channel, rows),
+                |(channel, rows)| {
+                    serde_json::json!({ "channel": channel, "messages": rows }).to_string()
+                },
+                |(_, rows)| {
+                    let text = rows
+                        .iter()
+                        .map(|m| format!("{} {}: {}", m.seq, m.pen, m.body))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{text}\n")
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -120,14 +128,17 @@ pub async fn channel_breach(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let Some(pen) = proven(&caller) else {
-        return render(
+        return present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "breach": null, "proven": false }).to_string(),
-            "none (pen not proven)\n".to_string(),
+            &report(
+                (),
+                |()| serde_json::json!({ "breach": null, "proven": false }).to_string(),
+                |()| "none (pen not proven)\n".to_string(),
+            ),
         );
     };
     let who = pen.clone();
@@ -139,22 +150,22 @@ pub async fn channel_breach(
         )
         .await
     {
-        Ok(found) => {
-            let text = match &found {
-                Some(b) => format!(
-                    "#{} seq {} offered {} time(s), {}s ago (gate {})\n",
-                    b.channel, b.seq, b.misses, b.age_secs, b.gate
-                ),
-                None => "none\n".to_string(),
-            };
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({ "breach": found, "proven": true }).to_string(),
-                text,
-            )
-        }
-        Err(e) => error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+        Ok(found) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                found,
+                |found| serde_json::json!({ "breach": found, "proven": true }).to_string(),
+                |found| match found {
+                    Some(b) => format!(
+                        "#{} seq {} offered {} time(s), {}s ago (gate {})\n",
+                        b.channel, b.seq, b.misses, b.age_secs, b.gate
+                    ),
+                    None => "none\n".to_string(),
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::internal(json, e)),
     }
 }
 
@@ -167,26 +178,25 @@ pub async fn channel_send(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Ok(None) => return Err(ApiError::bad(json, "a JSON body is required")),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let Some(text) = doc
         .get("body")
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
     else {
-        return error(json, StatusCode::BAD_REQUEST, "`body` is required");
+        return Err(ApiError::new(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`body` is required",
+        ));
     };
     let reply_to = doc.get("reply_to").and_then(|v| v.as_i64());
     let (who, chan) = (pen.clone(), channel.clone());
@@ -196,13 +206,12 @@ pub async fn channel_send(
         })
         .await
     {
-        Ok(msg) => render(
+        Ok(msg) => present(
             StatusCode::OK,
             json,
-            serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into()),
-            format!("sent #{} seq {}\n", msg.channel, msg.seq),
+            &viewed(&msg, |m| format!("sent #{} seq {}\n", m.channel, m.seq)),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -214,15 +223,10 @@ pub async fn channel_fetch(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
         _ => serde_json::json!({}),
@@ -239,20 +243,23 @@ pub async fn channel_fetch(
         })
         .await
     {
-        Ok(rows) => {
-            let text = rows
-                .iter()
-                .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
-                .collect::<Vec<_>>()
-                .join("\n");
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({ "fetched": rows.len(), "messages": rows }).to_string(),
-                format!("{text}\n"),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                rows,
+                |rows| serde_json::json!({ "fetched": rows.len(), "messages": rows }).to_string(),
+                |rows| {
+                    let text = rows
+                        .iter()
+                        .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{text}\n")
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -264,15 +271,10 @@ pub async fn channel_present(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
         _ => serde_json::json!({}),
@@ -288,13 +290,16 @@ pub async fn channel_present(
         })
         .await
     {
-        Ok(marked) => render(
+        Ok(marked) => present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "pen": pen, "marked": marked }).to_string(),
-            format!("presented for {pen} ({marked} unread marked)\n"),
+            &report(
+                (pen, marked),
+                |(pen, marked)| serde_json::json!({ "pen": pen, "marked": marked }).to_string(),
+                |(pen, marked)| format!("presented for {pen} ({marked} unread marked)\n"),
+            ),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -305,7 +310,7 @@ pub async fn channel_join(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     caller: crate::identity::Caller,
-) -> Response {
+) -> ApiResult<Response> {
     channel_membership(caller, state, channel, headers, raw, true).await
 }
 
@@ -316,7 +321,7 @@ pub async fn channel_leave(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     caller: crate::identity::Caller,
-) -> Response {
+) -> ApiResult<Response> {
     channel_membership(caller, state, channel, headers, raw, false).await
 }
 
@@ -327,24 +332,15 @@ async fn channel_membership(
     headers: HeaderMap,
     raw: Option<String>,
     join: bool,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let (who, chan) = (pen.clone(), channel.clone());
     // The one remaining hand-written session guard: this helper takes the state by value, so it has
     // no `&mut Parts` for the `Server` extractor. Every handler uses the extractor instead (#233).
     let Some(server) = state.server() else {
-        return error(
-            json,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server not attached",
-        );
+        return Err(ApiError::internal(json, "server not attached"));
     };
     let out = if join {
         server
@@ -356,13 +352,21 @@ async fn channel_membership(
             .await
     };
     match out {
-        Ok(()) => render(
+        Ok(()) => present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "pen": pen, "channel": channel, "member": join }).to_string(),
-            format!("{} #{channel}\n", if join { "joined" } else { "left" }),
+            &report(
+                (pen, channel, join),
+                |(pen, channel, join)| {
+                    serde_json::json!({ "pen": pen, "channel": channel, "member": join })
+                        .to_string()
+                },
+                |(_, channel, join)| {
+                    format!("{} #{channel}\n", if *join { "joined" } else { "left" })
+                },
+            ),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -371,15 +375,15 @@ pub async fn channel_wait(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let Some(pen) = proven(&caller) else {
-        return error(
+        return Err(ApiError::new(
             json,
             StatusCode::UNAUTHORIZED,
             "refused: waiting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
-        );
+        ));
     };
     let after = match params.maybe("after").and_then(|v| v.parse::<i64>().ok()) {
         Some(after) => after,
@@ -395,7 +399,7 @@ pub async fn channel_wait(
                 .await
             {
                 Ok(head) => head,
-                Err(e) => return error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+                Err(e) => return Err(ApiError::internal(json, e)),
             }
         }
     };
@@ -416,21 +420,28 @@ pub async fn channel_wait(
             .await
         {
             Ok(rows) => rows,
-            Err(e) => return error(json, StatusCode::INTERNAL_SERVER_ERROR, e),
+            Err(e) => return Err(ApiError::internal(json, e)),
         };
         if !rows.is_empty() || std::time::Instant::now() >= deadline {
-            let text = rows
-                .iter()
-                .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
-                .collect::<Vec<_>>()
-                .join("\n");
             let truncated = rows.len() >= 200;
-            return render(
+            return present(
                 StatusCode::OK,
                 json,
-                serde_json::json!({ "after": after, "messages": rows, "truncated": truncated })
-                    .to_string(),
-                format!("{text}\n"),
+                &report(
+                    (after, rows, truncated),
+                    |(after, rows, truncated)| {
+                        serde_json::json!({ "after": after, "messages": rows, "truncated": truncated })
+                            .to_string()
+                    },
+                    |(_, rows, _)| {
+                        let text = rows
+                            .iter()
+                            .map(|m| format!("#{} {}: {}", m.channel, m.pen, m.body))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("{text}\n")
+                    },
+                ),
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -443,11 +454,9 @@ pub async fn channel_members(
     caller: crate::identity::Caller,
     Path(channel): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = proven_pen(&caller, json) {
-        return r;
-    }
+    proven_pen(&caller, json)?;
     let key = channel.clone();
     match server
         .with_read(
@@ -457,27 +466,32 @@ pub async fn channel_members(
         )
         .await
     {
-        Ok(rows) => {
-            let text = rows
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{} {}{}",
-                        m.pen,
-                        m.state,
-                        if m.explicit { " (explicit)" } else { "" }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({ "channel": channel, "members": rows }).to_string(),
-                format!("{text}\n"),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                (channel, rows),
+                |(channel, rows)| {
+                    serde_json::json!({ "channel": channel, "members": rows }).to_string()
+                },
+                |(_, rows)| {
+                    let text = rows
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{} {}{}",
+                                m.pen,
+                                m.state,
+                                if m.explicit { " (explicit)" } else { "" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{text}\n")
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -489,26 +503,17 @@ pub async fn channel_create(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        _ => return Err(ApiError::bad(json, "a JSON body is required")),
     };
     let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(ToString::to_string);
     let (Some(channel), Some(title)) = (field("channel"), field("title")) else {
-        return error(
-            json,
-            StatusCode::BAD_REQUEST,
-            "`channel` and `title` are required",
-        );
+        return Err(ApiError::bad(json, "`channel` and `title` are required"));
     };
     let members = field("members").unwrap_or_else(|| "open".to_string());
     let gate = field("gate").unwrap_or_else(|| "none".to_string());
@@ -519,16 +524,17 @@ pub async fn channel_create(
         })
         .await
     {
-        Ok(row) => render(
+        Ok(row) => present(
             StatusCode::OK,
             json,
-            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
-            format!(
-                "created #{} (members {}, gate {})\n",
-                row.key, row.members, row.gate
-            ),
+            &viewed(&row, |row| {
+                format!(
+                    "created #{} (members {}, gate {})\n",
+                    row.key, row.members, row.gate
+                )
+            }),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -541,25 +547,24 @@ pub async fn channel_set_gate(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        _ => return Err(ApiError::bad(json, "a JSON body is required")),
     };
     let Some(gate) = doc
         .get("gate")
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
     else {
-        return error(json, StatusCode::BAD_REQUEST, "`gate` is required");
+        return Err(ApiError::new(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`gate` is required",
+        ));
     };
     let (who, chan) = (pen.clone(), channel.clone());
     match server
@@ -568,13 +573,14 @@ pub async fn channel_set_gate(
         })
         .await
     {
-        Ok(row) => render(
+        Ok(row) => present(
             StatusCode::OK,
             json,
-            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
-            format!("#{} gate is now {}\n", row.key, row.gate),
+            &viewed(&row, |row| {
+                format!("#{} gate is now {}\n", row.key, row.gate)
+            }),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -584,11 +590,9 @@ pub async fn channel_events(
     caller: crate::identity::Caller,
     Path(channel): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = proven_pen(&caller, json) {
-        return r;
-    }
+    proven_pen(&caller, json)?;
     let key = channel.clone();
     match server
         .with_read(
@@ -598,29 +602,34 @@ pub async fn channel_events(
         )
         .await
     {
-        Ok(rows) => {
-            let text = rows
-                .iter()
-                .map(|e| {
-                    format!(
-                        "{} {} {} {} -> {}",
-                        e.at,
-                        e.pen.clone().unwrap_or_else(|| "-".into()),
-                        e.action,
-                        e.was.clone().unwrap_or_else(|| "-".into()),
-                        e.now.clone().unwrap_or_else(|| "-".into())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({ "channel": channel, "events": rows }).to_string(),
-                format!("{text}\n"),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                (channel, rows),
+                |(channel, rows)| {
+                    serde_json::json!({ "channel": channel, "events": rows }).to_string()
+                },
+                |(_, rows)| {
+                    let text = rows
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{} {} {} {} -> {}",
+                                e.at,
+                                e.pen.clone().unwrap_or_else(|| "-".into()),
+                                e.action,
+                                e.was.clone().unwrap_or_else(|| "-".into()),
+                                e.now.clone().unwrap_or_else(|| "-".into())
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{text}\n")
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -633,21 +642,20 @@ pub async fn channel_set_retention(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let pen = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let pen = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        _ => return Err(ApiError::bad(json, "a JSON body is required")),
     };
     let Some(keep) = doc.get("keep_secs").and_then(|v| v.as_i64()) else {
-        return error(json, StatusCode::BAD_REQUEST, "`keep_secs` is required");
+        return Err(ApiError::new(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`keep_secs` is required",
+        ));
     };
     let (who, chan) = (pen.clone(), channel.clone());
     match server
@@ -656,21 +664,22 @@ pub async fn channel_set_retention(
         })
         .await
     {
-        Ok(row) => render(
+        Ok(row) => present(
             StatusCode::OK,
             json,
-            serde_json::to_string(&row).unwrap_or_else(|_| "{}".into()),
-            format!(
-                "#{} keeps {}\n",
-                row.key,
-                if row.keep_secs == 0 {
-                    "forever".into()
-                } else {
-                    format!("{}s", row.keep_secs)
-                }
-            ),
+            &viewed(&row, |row| {
+                format!(
+                    "#{} keeps {}\n",
+                    row.key,
+                    if row.keep_secs == 0 {
+                        "forever".into()
+                    } else {
+                        format!("{}s", row.keep_secs)
+                    }
+                )
+            }),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -682,18 +691,13 @@ pub async fn channel_prune(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     // ★ THE PEN IS REQUIRED, AND THEN CONSULTED (#168 review): the gate lives on this door too.
     // The MCP tool gated `channel_prune` and this route did not, so a locked pen could destroy the
     // text it was locked out of knowing — the two doors disagreed exactly where it matters.
-    let caller = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let caller = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
         _ => serde_json::json!({}),
@@ -709,16 +713,22 @@ pub async fn channel_prune(
         })
         .await
     {
-        Ok(rows) => {
-            let total: usize = rows.iter().map(|r| r.emptied).sum();
-            render(
-                StatusCode::OK,
-                json,
-                serde_json::json!({ "pruned": rows, "emptied": total }).to_string(),
-                format!("emptied {total} message body(s)\n"),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                rows,
+                |rows| {
+                    let total: usize = rows.iter().map(|r| r.emptied).sum();
+                    serde_json::json!({ "pruned": rows, "emptied": total }).to_string()
+                },
+                |rows| {
+                    let total: usize = rows.iter().map(|r| r.emptied).sum();
+                    format!("emptied {total} message body(s)\n")
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -731,25 +741,24 @@ pub async fn channel_invite(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let actor = match proven_pen(&caller, json) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let actor = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        _ => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
+        _ => return Err(ApiError::bad(json, "a JSON body is required")),
     };
     let Some(guest) = doc
         .get("pen")
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
     else {
-        return error(json, StatusCode::BAD_REQUEST, "`pen` is required");
+        return Err(ApiError::new(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`pen` is required",
+        ));
     };
     let (who, chan, target) = (actor.clone(), channel.clone(), guest.clone());
     match server
@@ -758,12 +767,18 @@ pub async fn channel_invite(
         })
         .await
     {
-        Ok(()) => render(
+        Ok(()) => present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "channel": channel, "pen": guest, "member": true, "invited_by": actor }).to_string(),
-            format!("invited {guest} to #{channel}\n"),
+            &report(
+                (channel, guest, actor),
+                |(channel, guest, actor)| {
+                    serde_json::json!({ "channel": channel, "pen": guest, "member": true, "invited_by": actor })
+                        .to_string()
+                },
+                |(channel, guest, _)| format!("invited {guest} to #{channel}\n"),
+            ),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }

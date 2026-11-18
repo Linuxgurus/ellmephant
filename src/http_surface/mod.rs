@@ -10,7 +10,7 @@
 
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 
 use crate::config::Paths;
@@ -71,70 +71,34 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 ///
 /// With no `ELLMEPHANT_WRITE_TOKEN` configured there is nothing to check and nothing to hand a
 /// caller, so the door is open — see [`resolve`]. Configure the token and this becomes a gate.
-#[allow(clippy::result_large_err)] // the Err is a ready-to-return response, not a value to carry
-fn authorize(state: &HttpState, headers: &HeaderMap, json: bool) -> Result<Scope, Response> {
-    resolve(bearer(headers), state.write_token()).ok_or_else(|| unauthorized(json))
-}
-
-/// The 401: `WWW-Authenticate: Bearer`, and **nothing more** — a `resource_metadata` challenge is
-/// what makes a client invent an OAuth flow.
-fn unauthorized(json: bool) -> Response {
-    let mut response = error(json, StatusCode::UNAUTHORIZED, "unauthorized");
-    response
-        .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    response
+fn authorize(state: &HttpState, headers: &HeaderMap, json: bool) -> ApiResult<Scope> {
+    resolve(bearer(headers), state.write_token()).ok_or_else(|| ApiError::unauthorized(json))
 }
 
 /// A text or JSON body with an explicit content type.
-fn render(status: StatusCode, json: bool, json_body: String, text_body: String) -> Response {
+///
+/// Returns an [`ApiResult`] rather than a bare `Response` so a handler's success and refusal are the
+/// same type: the caller writes `render(...)` at the tail and `return Err(...)` for a refusal, and
+/// the signature is one shape everywhere (soma/ellmephant#233).
+fn render(
+    status: StatusCode,
+    json: bool,
+    json_body: String,
+    text_body: String,
+) -> ApiResult<Response> {
     let (content_type, body) = if json {
         ("application/json", json_body)
     } else {
         ("text/plain; charset=utf-8", text_body)
     };
-    Response::builder()
+    Ok(Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(body))
-        .expect("http response")
-}
-
-/// An error body: one line of prose, or `{"error","status"}` under `?format=json`.
-fn error(json: bool, status: StatusCode, message: impl AsRef<str>) -> Response {
-    let message = message.as_ref();
-    if json {
-        let body = serde_json::json!({ "error": message, "status": status.as_u16() }).to_string();
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .expect("http error")
-    } else {
-        render(status, false, String::new(), message.to_string())
-    }
-}
-
-/// 404 for a store error that names a missing row; 413 for a body past the store's cap; 503 for a
-/// derived index that is not there; 400 otherwise (a malformed request).
-fn error_status(message: &str) -> StatusCode {
-    if message.starts_with("forbidden:") {
-        StatusCode::FORBIDDEN
-    } else if message.starts_with("no such memory:") || message.starts_with("no such project:") {
-        StatusCode::NOT_FOUND
-    } else if message.starts_with("body too long:") {
-        // The request is well formed and the caller is welcome; it is simply too big to hold.
-        StatusCode::PAYLOAD_TOO_LARGE
-    } else if message.starts_with("index unavailable:") {
-        // Not the caller's fault and not permanent: the derived index needs rebuilding.
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::BAD_REQUEST
-    }
+        .expect("http response"))
 }
 
 /// The session shared with `/mcp`, or the 500 that means the router forgot to attach it.
-#[allow(clippy::result_large_err)] // the Err is a ready-to-return response
 /// ★ THE SESSION IS AN EXTRACTOR, NOT SIXTY-TWO PREAMBLES (soma/ellmephant#233).
 ///
 /// Every handler in this file began with
@@ -158,19 +122,17 @@ impl std::ops::Deref for Server {
 }
 
 impl axum::extract::FromRequestParts<HttpState> for Server {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
         state: &HttpState,
     ) -> std::result::Result<Self, Self::Rejection> {
-        state.server().cloned().map(Server).ok_or_else(|| {
-            error(
-                false,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server not attached",
-            )
-        })
+        state
+            .server()
+            .cloned()
+            .map(Server)
+            .ok_or_else(|| ApiError::internal(false, "server not attached"))
     }
 }
 
@@ -533,21 +495,21 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
 /// because a store that cannot be read is not a caller who lied. This is where it reaches the
 /// client — 503 for the store, the route's own refusal code for a bad proof. Rotating secrets
 /// because a database blinked is the failure this prevents.
-fn denied_response(json: bool, denied: crate::identity::Denied, forged: StatusCode) -> Response {
+fn denied_response(json: bool, denied: crate::identity::Denied, forged: StatusCode) -> ApiError {
     let code = match denied {
         crate::identity::Denied::Forged(_) => forged,
         crate::identity::Denied::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
-    error(json, code, denied.to_string())
+    ApiError::new(json, code, denied)
 }
 
 /// A [`Caller`](crate::identity::Caller) refusal as a response: the denial keeps its own code split
 /// (503 for an unreadable store, the route's code for a bad proof), and an absent pen gets the
 /// route's sentence. One mapper, so no door invents a fourth answer.
-fn refusal_response(json: bool, refusal: crate::identity::Refusal, absent: StatusCode) -> Response {
+fn refusal_response(json: bool, refusal: crate::identity::Refusal, absent: StatusCode) -> ApiError {
     match refusal {
         crate::identity::Refusal::Denied(denied) => denied_response(json, denied, absent),
-        crate::identity::Refusal::Missing(why) => error(json, absent, why),
+        crate::identity::Refusal::Missing(why) => ApiError::new(json, absent, why),
     }
 }
 
@@ -576,8 +538,7 @@ impl axum::extract::FromRequestParts<HttpState> for crate::identity::Caller {
 
 /// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
 /// because authority is always borrowed BY somebody.
-#[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as in `session`
-fn proven_pen(caller: &crate::identity::Caller, json: bool) -> Result<String, Response> {
+fn proven_pen(caller: &crate::identity::Caller, json: bool) -> ApiResult<String> {
     caller
         .pen_or("refused: this needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
         .map(ToString::to_string)
@@ -585,12 +546,11 @@ fn proven_pen(caller: &crate::identity::Caller, json: bool) -> Result<String, Re
 }
 
 /// One required string field of a JSON body, or the 400 that names what is missing.
-#[allow(clippy::result_large_err)] // the Err is a ready-to-return response, as elsewhere here
-fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> Result<String, Response> {
+fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> ApiResult<String> {
     doc.get(name)
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
-        .ok_or_else(|| error(json, StatusCode::BAD_REQUEST, format!("missing `{name}`")))
+        .ok_or_else(|| ApiError::bad(json, format!("missing `{name}`")))
 }
 
 /// Who this request reads as. A proven pair decides; anything else — including a forged claim — is
@@ -692,199 +652,6 @@ fn field_param(name: &str) -> Option<FieldParam> {
         "score" => Some(FieldParam::Score),
         _ => None,
     }
-}
-
-/// Render a positional `cols`/rows wire body as a header line and one line per row.
-fn list_text(label: &str, wire: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(wire) else {
-        return wire.to_string();
-    };
-    match first_table(&value) {
-        Some(rows) => {
-            let mut out = format!("{label} — {} row(s)\n", rows.len());
-            for row in rows {
-                let cells: Vec<String> = row
-                    .as_array()
-                    .map(|cells| cells.iter().map(cell).collect())
-                    .unwrap_or_default();
-                out.push_str("  ");
-                out.push_str(&cells.join("  "));
-                out.push('\n');
-            }
-            out
-        }
-        None => wire.to_string(),
-    }
-}
-
-/// The first array-of-arrays under an object that also carries a `cols` header (searching nested
-/// tables like `project_get`'s `preload`).
-fn first_table(value: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
-    let obj = value.as_object()?;
-    if obj.contains_key("cols") {
-        for (key, v) in obj {
-            if key == "cols" {
-                continue;
-            }
-            if let Some(rows) = v.as_array()
-                && rows.iter().all(|r| r.is_array())
-            {
-                return Some(rows.clone());
-            }
-        }
-    }
-    for v in obj.values() {
-        if let Some(rows) = first_table(v) {
-            return Some(rows);
-        }
-    }
-    None
-}
-
-/// One wire cell as plain text (strings unquoted, arrays comma-joined).
-fn cell(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(items) => items.iter().map(cell).collect::<Vec<_>>().join(","),
-        serde_json::Value::Null => "-".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// The `GET /memory-health` prose: the five numbers, their context, and anything suppressed.
-fn health_text(h: &store::health::Health) -> String {
-    let pct = |v: Option<f64>| match v {
-        Some(n) => format!("{n:.2}%"),
-        None => "null".to_string(),
-    };
-    let mut out = format!("ellmephant memory health — scope: {}\n", h.scope);
-    for (label, value) in [
-        ("rows", h.rows.to_string()),
-        ("body_chars", h.body_chars.to_string()),
-        ("log_chars", h.log_chars.to_string()),
-        ("log_share", pct(h.log_share)),
-        (
-            "dup_pairs",
-            match h.dup_pairs {
-                Some(n) => n.to_string(),
-                None => "null".to_string(),
-            },
-        ),
-        (
-            "dup_min_distance",
-            match h.dup_pairs_min_distance {
-                Some(d) => format!("{d:.4}"),
-                None => "null".to_string(),
-            },
-        ),
-        ("woven", pct(h.woven)),
-        ("woven_inbound", pct(h.woven_inbound)),
-        ("woven_outbound", pct(h.woven_outbound)),
-        ("cold30", pct(h.cold30)),
-        ("cold30_population", h.cold30_population.to_string()),
-        ("tag_distinct", h.tag_distinct.to_string()),
-        ("tag_singletons", h.tag_singletons.to_string()),
-        ("rows_untagged", h.rows_untagged.to_string()),
-        ("edges", h.edges.to_string()),
-        (
-            "edges_per_row",
-            match h.edges_per_row {
-                Some(v) => format!("{v:.4}"),
-                None => "null".to_string(),
-            },
-        ),
-        ("dangling", h.dangling.to_string()),
-    ] {
-        out.push_str(&format!("  {label:<18}{value}\n"));
-    }
-    for reason in &h.suppressed {
-        out.push_str(&format!("  suppressed        {reason}\n"));
-    }
-    out.push('\n');
-    out.push_str(h.scope_note);
-    out.push('\n');
-    out
-}
-
-/// The `GET /stats` prose: the headline counts, then the heads of the tag and usefulness lists.
-fn stats_text(s: &store::stats::Stats) -> String {
-    let mut out = format!(
-        "ellmephant store — {} memories, {} bytes on disk\n",
-        s.memories, s.db_bytes
-    );
-    for (label, value) in [
-        ("body chars", s.body_chars.to_string()),
-        ("distinct tags", s.distinct_tags.to_string()),
-        ("tagged", format!("{}/{}", s.tagged, s.memories)),
-        ("link edges", s.edges.to_string()),
-        ("orphans", s.orphans.to_string()),
-        ("dangling", s.dangling.to_string()),
-        // Two numbers, because they are two facts that share one value (owner NULL).
-        ("commons", s.commons.to_string()),
-        (
-            "unattributed",
-            match s.unattributed {
-                0 => "0".to_string(),
-                n => format!(
-                    "{n} (no currently existing pen wrote these — no owner, no author; claim them)"
-                ),
-            },
-        ),
-        ("visits", s.visits_total.to_string()),
-        ("useful", s.useful_total.to_string()),
-        (
-            "versions",
-            format!(
-                "{} row(s), {} bytes, {} of a deleted key",
-                s.versions, s.version_bytes, s.version_orphans
-            ),
-        ),
-        (
-            "encode queue",
-            match s.encode_oldest_s {
-                Some(age) => format!(
-                    "{} pending (oldest {}s), {} failed",
-                    s.encode_pending, age, s.encode_failed
-                ),
-                None => format!("{} pending, {} failed", s.encode_pending, s.encode_failed),
-            },
-        ),
-    ] {
-        out.push_str(&format!("  {label:<14}{value}\n"));
-    }
-    for (tag, count) in &s.top_tags {
-        out.push_str(&format!("  top tag       {tag} ({count})\n"));
-    }
-    for (key, count) in &s.top_useful {
-        out.push_str(&format!("  useful        {key} ({count})\n"));
-    }
-    out
-}
-
-/// The `GET /memory/{key}` prose: the header fields, then the body.
-fn memory_text(mem: &store::Memory, relation: Option<&str>) -> String {
-    let mut out = format!("{}\n", mem.key);
-    out.push_str(&format!("  {:<8}{}\n", "title", mem.title));
-    // Who answers for it, and what they are to the reader: a name is an address, and the walk is the
-    // rest of the sentence.
-    if let Some(owner) = &mem.owner {
-        match relation {
-            Some(walk) => out.push_str(&format!("  {:<8}{owner}  {walk}\n", "owner")),
-            None => out.push_str(&format!("  {:<8}{owner}\n", "owner")),
-        }
-    }
-    out.push_str(&format!("  {:<8}{}\n", "tags", mem.tags.join(", ")));
-    if let Some(source) = &mem.source {
-        out.push_str(&format!("  {:<8}{source}\n", "source"));
-    }
-    out.push_str(&format!(
-        "  {:<8}{} visits, {} useful\n",
-        "usage", mem.visits, mem.times_useful
-    ));
-    out.push_str("---\n");
-    out.push_str(&mem.body);
-    out.push('\n');
-    out
 }
 
 /// The ceiling the default boot is held under, in bytes — public because the suite asserts it
@@ -995,3 +762,8 @@ mod api;
 pub use api::*;
 mod routes;
 pub use routes::*;
+mod reply;
+pub use reply::*;
+mod present;
+use present::stats_text;
+pub use present::*;

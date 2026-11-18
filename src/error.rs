@@ -76,6 +76,21 @@ pub enum Error {
     /// A capability this build does not carry (e.g. the encoder behind a disabled feature).
     #[error("{0}")]
     Unsupported(&'static str),
+
+    /// The store's own machinery failed: a poisoned lock, or a task that did not join. It is not the
+    /// caller's mistake, so it must not be flattened into the same 400 as a malformed argument.
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// ★ THE TOOL BOUNDARY IS PROSE (soma/ellmephant#231/#233): an MCP tool answers `Result<_, String>`
+/// because that is what the protocol carries, and `?` uses this conversion. The HTTP door keeps the
+/// typed error (`ApiError::store`) so its status comes from the VARIANT, and the MCP door turns the
+/// same error into a sentence at its edge — one fact, two renderings, no second diagnosis.
+impl From<Error> for String {
+    fn from(error: Error) -> Self {
+        error.to_string()
+    }
 }
 
 /// Crate-wide result alias.

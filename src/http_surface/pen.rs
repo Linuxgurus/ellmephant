@@ -13,21 +13,18 @@ pub async fn pen_lend(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let caller = match caller
         .pen_or("refused: lending needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -36,7 +33,7 @@ pub async fn pen_lend(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     match server
         .with_store("pen_lend", move |s| s.lend(&caller, &ask.pen, ask.secs))
@@ -49,18 +46,15 @@ pub async fn pen_lend(
                 powerful = %session.powerful,
                 "authority lent down over http"
             );
-            let value = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
-            render(
+            present(
                 StatusCode::CREATED,
                 json,
-                value.to_string(),
-                format!(
-                    "lent {} -> {} until {}\n",
-                    session.powerful, session.weak, session.expires_at
-                ),
+                &viewed(&session, |s| {
+                    format!("lent {} -> {} until {}\n", s.powerful, s.weak, s.expires_at)
+                }),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -72,18 +66,13 @@ pub async fn sudo(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let caller = match proven_pen(&caller, json) {
-        Ok(c) => c,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let caller = proven_pen(&caller, json)?;
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -92,25 +81,23 @@ pub async fn sudo(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     match server
         .with_store("sudo", move |s| s.sudo(&caller, &ask.powerful, ask.secs))
         .await
     {
-        Ok(session) => {
-            let value = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
-            render(
-                StatusCode::CREATED,
-                json,
-                value.to_string(),
+        Ok(session) => present(
+            StatusCode::CREATED,
+            json,
+            &viewed(&session, |s| {
                 format!(
                     "borrowed {} as {} until {}\n",
-                    session.powerful, session.weak, session.expires_at
-                ),
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
+                    s.powerful, s.weak, s.expires_at
+                )
+            }),
+        ),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -124,35 +111,43 @@ pub async fn sudo_sessions(
     server: Server,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     let params = Params::parse(raw.as_deref());
     let pen = params.get("pen").map(ToString::to_string);
     match server
         .with_store("sudo_sessions", move |s| s.sudo_sessions(pen.as_deref()))
         .await
     {
-        Ok(sessions) => {
-            let value = serde_json::to_value(&sessions).unwrap_or(serde_json::Value::Null);
-            let text = if sessions.is_empty() {
-                "no live sessions\n".to_string()
-            } else {
-                sessions
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{} holds {} ({}) until {}\n",
-                            s.weak, s.powerful, s.source, s.expires_at
-                        )
-                    })
-                    .collect()
-            };
-            render(StatusCode::OK, json, value.to_string(), text)
-        }
-        Err(e) => error(json, error_status(&e), e),
+        Ok(sessions) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                sessions,
+                |sessions| {
+                    serde_json::to_value(sessions)
+                        .unwrap_or(serde_json::Value::Null)
+                        .to_string()
+                },
+                |sessions| {
+                    if sessions.is_empty() {
+                        "no live sessions\n".to_string()
+                    } else {
+                        sessions
+                            .iter()
+                            .map(|s| {
+                                format!(
+                                    "{} holds {} ({}) until {}\n",
+                                    s.weak, s.powerful, s.source, s.expires_at
+                                )
+                            })
+                            .collect()
+                    }
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -164,18 +159,13 @@ pub async fn sudo_pass(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let caller = match proven_pen(&caller, json) {
-        Ok(c) => c,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let caller = proven_pen(&caller, json)?;
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -185,7 +175,7 @@ pub async fn sudo_pass(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     match server
         .with_store("sudo_pass", move |s| {
@@ -193,19 +183,17 @@ pub async fn sudo_pass(
         })
         .await
     {
-        Ok(session) => {
-            let value = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
-            render(
-                StatusCode::CREATED,
-                json,
-                value.to_string(),
+        Ok(session) => present(
+            StatusCode::CREATED,
+            json,
+            &viewed(&session, |s| {
                 format!(
                     "passed {} to {} until {}\n",
-                    session.powerful, session.weak, session.expires_at
-                ),
-            )
-        }
-        Err(e) => error(json, error_status(&e), e),
+                    s.powerful, s.weak, s.expires_at
+                )
+            }),
+        ),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -217,18 +205,13 @@ pub async fn sudo_release(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
-    let caller = match proven_pen(&caller, json) {
-        Ok(c) => c,
-        Err(r) => return r,
-    };
+    authorize(&state, &headers, json)?;
+    let caller = proven_pen(&caller, json)?;
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -236,7 +219,7 @@ pub async fn sudo_release(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     match server
         .with_store("sudo_release", move |s| {
@@ -244,13 +227,18 @@ pub async fn sudo_release(
         })
         .await
     {
-        Ok(killed) => render(
+        Ok(killed) => present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "status": "released", "sessions": killed }).to_string(),
-            format!("released: {killed} session(s)\n"),
+            &report(
+                killed,
+                |killed| {
+                    serde_json::json!({ "status": "released", "sessions": killed }).to_string()
+                },
+                |killed| format!("released: {killed} session(s)\n"),
+            ),
         ),
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -262,22 +250,19 @@ pub async fn pen_mint(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     // A mint is a WRITE: the caller is the parent, and an unproven caller is nobody.
     let caller = match caller
         .pen_or("refused: minting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -286,7 +271,7 @@ pub async fn pen_mint(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     match server
         .with_store("pen_mint", move |s| s.mint(&caller, &ask.name, &ask.kind))
@@ -299,18 +284,18 @@ pub async fn pen_mint(
                 parent = %minted.parent,
                 "pen minted over http"
             );
-            let value = serde_json::to_value(&minted).unwrap_or(serde_json::Value::Null);
-            render(
+            present(
                 StatusCode::CREATED,
                 json,
-                value.to_string(),
-                format!(
-                    "minted {} ({}) under {}\nsecret (shown once): {}\n",
-                    minted.name, minted.kind, minted.parent, minted.secret
-                ),
+                &viewed(&minted, |m| {
+                    format!(
+                        "minted {} ({}) under {}\nsecret (shown once): {}\n",
+                        m.name, m.kind, m.parent, m.secret
+                    )
+                }),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -322,21 +307,18 @@ pub async fn pen_rotate(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let caller = match caller.pen_or(
         "refused: rotating a credential needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
     ) {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -348,7 +330,7 @@ pub async fn pen_rotate(
     } else {
         match serde_json::from_slice(&bytes) {
             Ok(a) => a,
-            Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+            Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
         }
     };
     let target = ask.pen.unwrap_or_else(|| caller.clone());
@@ -361,14 +343,21 @@ pub async fn pen_rotate(
     {
         Ok(secret) => {
             tracing::info!(area = scope.area, pen = %target, "credential rotated over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::json!({ "pen": target, "secret": secret }).to_string(),
-                format!("rotated {target}; new secret (shown once): {secret}\n"),
+                &report(
+                    (target, secret),
+                    |(target, secret)| {
+                        serde_json::json!({ "pen": target, "secret": secret }).to_string()
+                    },
+                    |(target, secret)| {
+                        format!("rotated {target}; new secret (shown once): {secret}\n")
+                    },
+                ),
             )
         }
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -378,7 +367,7 @@ pub async fn whois(
     caller: crate::identity::Caller,
     Path(pen): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let viewer = caller
         .proven()
@@ -390,38 +379,48 @@ pub async fn whois(
         })
         .await
     {
-        Ok(facts) => {
-            let value = serde_json::to_value(&facts).unwrap_or(serde_json::Value::Null);
-            let text = format!(
-                "{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{} row(s)\n  {:<10}{}\n",
-                facts.name,
-                "kind",
-                facts.kind,
-                "parent",
-                facts.parent.as_deref().unwrap_or("(root)"),
-                "created",
-                facts.created,
-                "state",
-                facts
-                    .ceased
-                    .as_deref()
-                    .map(|c| format!("retired {c}"))
-                    .unwrap_or_else(|| "live".to_string()),
-                "owns",
-                facts.owns,
-                "relation",
-                facts.relation.as_deref().unwrap_or("(no common root)"),
-            );
-            render(StatusCode::OK, json, value.to_string(), text)
-        }
-        Err(e) => error(json, error_status(&e), e),
+        Ok(facts) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                facts,
+                |facts| {
+                    serde_json::to_value(facts)
+                        .unwrap_or(serde_json::Value::Null)
+                        .to_string()
+                },
+                |facts| {
+                    format!(
+                        "{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{}\n  {:<10}{} row(s)\n  {:<10}{}\n",
+                        facts.name,
+                        "kind",
+                        facts.kind,
+                        "parent",
+                        facts.parent.as_deref().unwrap_or("(root)"),
+                        "created",
+                        facts.created,
+                        "state",
+                        facts
+                            .ceased
+                            .as_deref()
+                            .map(|c| format!("retired {c}"))
+                            .unwrap_or_else(|| "live".to_string()),
+                        "owns",
+                        facts.owns,
+                        "relation",
+                        facts.relation.as_deref().unwrap_or("(no common root)"),
+                    )
+                },
+            ),
+        ),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
 /// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
 /// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
 /// same question the model asks instead of guessing from a remembered flag.
-pub async fn whoami(caller: crate::identity::Caller) -> Response {
+pub async fn whoami(caller: crate::identity::Caller) -> ApiResult<Response> {
     let (doc, text) = match caller.denied() {
         None => match caller.proven() {
             Some(name) => {
@@ -441,11 +440,11 @@ pub async fn whoami(caller: crate::identity::Caller) -> Response {
         // `whoami` is for; Unavailable is a 503, because "anonymous" would be a guess presented as a
         // fact.
         Some(crate::identity::Denied::Unavailable(why)) => {
-            return error(
+            return Err(ApiError::new(
                 true,
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("authentication is unavailable: {why}"),
-            );
+            ));
         }
         Some(crate::identity::Denied::Forged(claimed)) => {
             let mut doc = serde_json::json!({
@@ -461,7 +460,15 @@ pub async fn whoami(caller: crate::identity::Caller) -> Response {
             (doc, text)
         }
     };
-    render(StatusCode::OK, true, doc.to_string(), text)
+    present(
+        StatusCode::OK,
+        true,
+        &report(
+            (doc, text),
+            |(doc, _)| doc.to_string(),
+            |(_, text)| text.clone(),
+        ),
+    )
 }
 
 /// `GET /memory-health` — the five-number health surface (`memory_health`), visible-scoped.
@@ -469,20 +476,15 @@ pub async fn memory_health(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     match server
         .with_read("memory_health", reader_from(&caller), |s| s.health())
         .await
     {
-        Ok(health) => render(
-            StatusCode::OK,
-            json,
-            serde_json::to_string(&health).unwrap_or_default(),
-            health_text(&health),
-        ),
-        Err(e) => error(json, error_status(&e), e),
+        Ok(health) => present(StatusCode::OK, json, &viewed(&health, health_text)),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -491,7 +493,7 @@ pub async fn stats(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -500,12 +502,7 @@ pub async fn stats(
         .with_read("memory_stats", reader, move |s| s.stats(with_tags))
         .await
     {
-        Ok(stats) => render(
-            StatusCode::OK,
-            json,
-            serde_json::to_string(&stats).unwrap_or_default(),
-            stats_text(&stats),
-        ),
-        Err(e) => error(json, error_status(&e), e),
+        Ok(stats) => present(StatusCode::OK, json, &viewed(&stats, stats_text)),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }

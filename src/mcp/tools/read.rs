@@ -6,7 +6,7 @@
 
 use crate::mcp::context::{pen_name, reader_of};
 use crate::mcp::*;
-use crate::search::{Fields, Query, to_wire_json};
+use crate::search::{Fields, Query};
 use crate::store::{self};
 use crate::wire::links::backlinks_to_wire_json;
 use rmcp::handler::server::wrapper::Parameters;
@@ -227,7 +227,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 s.search(&q)
             })
             .await?;
-        let json = to_wire_json(&bundle, &fields).map_err(|e| e.to_string())?;
+        let json =
+            crate::wire::search::to_wire_json(&bundle, &fields).map_err(|e| e.to_string())?;
         log_search(
             log_query.as_deref(),
             expand,
@@ -285,7 +286,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             .await
         {
             Ok(found) => found,
-            Err(e) => return Err(self.explain_miss(&key, e, reader.clone()).await),
+            Err(e) => {
+                return Err(self.explain_miss(&key, e.to_string(), reader.clone()).await);
+            }
         };
         // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
         // write holds the store this visit simply goes uncounted — which is nothing, next to a read

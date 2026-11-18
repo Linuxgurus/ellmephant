@@ -133,11 +133,7 @@ impl MemoryServer {
     /// `tool` labels the call in logs: a success is a `debug!` with its latency, a store
     /// error a `warn!`, and a panic/join failure an `error!`. That is the one place every
     /// tool failure surfaces, so `docker logs` never loses it to a client-side error string.
-    pub(crate) async fn with_store<T, F>(
-        &self,
-        tool: &'static str,
-        f: F,
-    ) -> std::result::Result<T, String>
+    pub(crate) async fn with_store<T, F>(&self, tool: &'static str, f: F) -> crate::error::Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Session) -> crate::error::Result<T> + Send + 'static,
@@ -150,7 +146,7 @@ impl MemoryServer {
             let wait = std::time::Instant::now();
             let mut guard = session
                 .lock()
-                .map_err(|_| "memory store lock poisoned".to_string())?;
+                .map_err(|_| crate::error::Error::Internal("memory store lock poisoned".into()))?;
             tracing::debug!(
                 tool,
                 wait_ms = wait.elapsed().as_millis() as u64,
@@ -158,7 +154,7 @@ impl MemoryServer {
             );
             // Witness the holder for exactly as long as the lock is held.
             let _held = watch.held(tool);
-            f(&mut guard).map_err(|e| e.to_string())
+            f(&mut guard)
         })
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -172,7 +168,8 @@ impl MemoryServer {
                 Err(err)
             }
             Err(join) => {
-                let err = format!("memory store task failed: {join}");
+                let err =
+                    crate::error::Error::Internal(format!("memory store task failed: {join}"));
                 tracing::error!(tool, elapsed_ms, error = %err, "tool task failed");
                 Err(err)
             }
@@ -196,7 +193,7 @@ impl MemoryServer {
         tool: &'static str,
         reader: crate::store::audience::Reader,
         f: F,
-    ) -> std::result::Result<T, String>
+    ) -> crate::error::Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Session) -> crate::error::Result<T> + Send + 'static,
@@ -206,9 +203,8 @@ impl MemoryServer {
         let encoder = Arc::clone(&self.encoder);
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || {
-            let session =
-                Session::read_only_as(&paths, cfg, encoder, reader).map_err(|e| e.to_string())?;
-            f(&session).map_err(|e| e.to_string())
+            let session = Session::read_only_as(&paths, cfg, encoder, reader)?;
+            f(&session)
         })
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -222,7 +218,7 @@ impl MemoryServer {
                 Err(err)
             }
             Err(join) => {
-                let err = format!("memory read task failed: {join}");
+                let err = crate::error::Error::Internal(format!("memory read task failed: {join}"));
                 tracing::error!(tool, elapsed_ms, error = %err, "read task failed");
                 Err(err)
             }
@@ -510,7 +506,7 @@ impl MemoryServer {
     ///
     /// The worker's job, run on the caller's thread and under the caller's lock — which is the whole
     /// difference, and the reason this exists in exactly one place. See `ENCODE-WORKER.md`.
-    pub async fn encode_now(&self, key: &str) -> std::result::Result<bool, String> {
+    pub async fn encode_now(&self, key: &str) -> crate::error::Result<bool> {
         let key = key.to_string();
         self.with_store("memory_encode_now", move |s| s.encode_document(&key))
             .await

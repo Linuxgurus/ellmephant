@@ -154,7 +154,7 @@ fn the_five_numbers_match_the_fixture() {
 
     assert_eq!(h.edges, 1);
     assert_eq!(h.dangling, 0);
-    assert!((h.edges_per_row - 1.0 / rows as f64).abs() < 1e-9);
+    assert!((h.edges_per_row.expect("rows > 0") - 1.0 / rows as f64).abs() < 1e-9);
     assert!(h.suppressed.is_empty(), "{:?}", h.suppressed);
 }
 
@@ -245,6 +245,143 @@ fn a_second_pens_private_row_does_not_move_the_callers_numbers() {
 }
 
 #[test]
+fn a_visible_row_linking_to_a_private_target_is_not_woven() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    conn.execute(
+        "INSERT INTO pen (name, kind) VALUES ('stet', 'self'), ('james', 'self')",
+        [],
+    )
+    .expect("seed pens");
+
+    // James' private row exists first, so the visible row's link resolves to a real row only james
+    // can read. Stet sees the source, never the target.
+    store::merge(
+        &conn,
+        &store::Patch {
+            key: Some("james-private".into()),
+            title: Some("james only".into()),
+            body: Some("private target body".into()),
+            private: Some(true),
+            acted_by: Some("james".into()),
+            asserted_by: Some("james".into()),
+            ..Default::default()
+        },
+    )
+    .expect("private target");
+    common::settle(&conn, &embedder);
+
+    add(
+        &conn,
+        &embedder,
+        &memory("public-src", "see [[james-private]]", &[]),
+    );
+    add(
+        &conn,
+        &embedder,
+        &memory("public-other", "unrelated body", &[]),
+    );
+
+    let before = health::compute_seen(&conn, &Reader::pen("stet")).expect("health before");
+    assert_eq!(
+        before.rows, 2,
+        "the target is private, so only the two public rows are visible"
+    );
+    assert_eq!(before.edges, 1, "the visible source names a target");
+    assert_eq!(
+        before.woven,
+        Some(0.0),
+        "an edge whose target stet cannot see is not woven: {before:?}"
+    );
+    assert_eq!(before.woven_outbound, Some(0.0), "{before:?}");
+    assert_eq!(before.woven_inbound, Some(0.0), "{before:?}");
+
+    // The owner rewrites its private row; the visible source still names the same key. Stet's whole
+    // Health must not move.
+    store::merge(
+        &conn,
+        &store::Patch {
+            key: Some("james-private".into()),
+            title: Some("james only, rewritten".into()),
+            body: Some("a different private target body".into()),
+            private: Some(true),
+            acted_by: Some("james".into()),
+            asserted_by: Some("james".into()),
+            ..Default::default()
+        },
+    )
+    .expect("private rewrite");
+    common::settle(&conn, &embedder);
+
+    let after = health::compute_seen(&conn, &Reader::pen("stet")).expect("health after");
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap(),
+        "a private target must not move a single number, in either direction"
+    );
+}
+
+#[test]
+fn an_empty_store_suppresses_every_ratio() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+
+    let h = health::compute_seen(&conn, &Reader::pen("stet")).expect("health");
+    assert_eq!(h.rows, 0);
+    assert!(h.log_share.is_none(), "{h:?}");
+    assert!(h.woven.is_none(), "{h:?}");
+    assert!(h.woven_inbound.is_none(), "{h:?}");
+    assert!(h.woven_outbound.is_none(), "{h:?}");
+    assert!(h.dup_pairs_min_distance.is_none(), "{h:?}");
+    assert!(
+        h.edges_per_row.is_none(),
+        "an empty ratio is null, not 0: {h:?}"
+    );
+    assert!(h.cold30.is_none(), "{h:?}");
+    for name in [
+        "log_share:",
+        "woven:",
+        "dup_pairs_min_distance:",
+        "edges_per_row:",
+        "cold30:",
+    ] {
+        assert!(
+            h.suppressed.iter().any(|reason| reason.starts_with(name)),
+            "suppressed must name `{name}`: {:?}",
+            h.suppressed
+        );
+    }
+    let wire = serde_json::to_value(&h).unwrap();
+    assert!(wire["edges_per_row"].is_null(), "{wire}");
+}
+
+#[test]
+fn a_store_with_no_duplicates_suppresses_the_min_distance() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    add(&conn, &embedder, &memory("one", "first distinct body", &[]));
+    add(
+        &conn,
+        &embedder,
+        &memory("two", "second distinct body", &[]),
+    );
+
+    let h = health::compute_seen(&conn, &Reader::everything()).expect("health");
+    assert_eq!(h.rows, 2);
+    assert_eq!(h.dup_pairs, 0);
+    assert!(h.dup_pairs_min_distance.is_none(), "{h:?}");
+    assert!(
+        h.suppressed
+            .iter()
+            .any(|reason| reason.starts_with("dup_pairs_min_distance:")),
+        "{:?}",
+        h.suppressed
+    );
+}
+
+#[test]
 fn log_share_uses_exactly_the_eight_prefixes_and_carries_its_definition() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
@@ -268,12 +405,25 @@ fn log_share_uses_exactly_the_eight_prefixes_and_carries_its_definition() {
         &embedder,
         &memory("alert-row", &"y".repeat(100), &[]),
     );
+    // `LIKE` would have accepted this; `GLOB` must not: the definition says "begins with `alerts-`".
+    // `add` slugifies keys to lower case, so write the raw upper-case key directly to exercise the
+    // predicate rather than the slugifier.
+    let upper_id = add(
+        &conn,
+        &embedder,
+        &memory("case-variant", &"u".repeat(100), &[]),
+    );
+    conn.execute(
+        "UPDATE memory SET key = 'ALERTS-upper' WHERE id = ?1",
+        [upper_id],
+    )
+    .expect("raw upper-case key");
     add(&conn, &embedder, &memory("notes", &"z".repeat(50), &[]));
 
     let h = health::compute_seen(&conn, &Reader::everything()).expect("health");
     assert_eq!(h.log_chars, 80, "eight rows x ten characters");
-    assert_eq!(h.body_chars, 80 + 100 + 100 + 50);
-    assert!((h.log_share.unwrap() - (80.0 / 330.0 * 100.0)).abs() < 1e-9);
+    assert_eq!(h.body_chars, 80 + 100 + 100 + 100 + 50);
+    assert!((h.log_share.unwrap() - (80.0 / 430.0 * 100.0)).abs() < 1e-9);
     assert_eq!(
         LOG_CLASS_PREFIXES,
         &[

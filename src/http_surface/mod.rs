@@ -780,7 +780,13 @@ fn health_text(h: &store::health::Health) -> String {
         ("tag_singletons", h.tag_singletons.to_string()),
         ("rows_untagged", h.rows_untagged.to_string()),
         ("edges", h.edges.to_string()),
-        ("edges_per_row", format!("{:.4}", h.edges_per_row)),
+        (
+            "edges_per_row",
+            match h.edges_per_row {
+                Some(v) => format!("{v:.4}"),
+                None => "null".to_string(),
+            },
+        ),
         ("dangling", h.dangling.to_string()),
     ] {
         out.push_str(&format!("  {label:<18}{value}\n"));

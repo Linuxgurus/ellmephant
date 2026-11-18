@@ -45,13 +45,14 @@ pub const BODY_CHARS_DEFINITION: &str = "body_chars is the sum of `length(body)`
 
 /// `log_share` definition. The eight prefixes are repeated here on purpose, and a test keeps this
 /// string and [`LOG_CLASS_PREFIXES`] in step.
-pub const LOG_SHARE_DEFINITION: &str = "log_share is `log_chars / body_chars` over VISIBLE rows, as a percentage; `log_chars` sums the bodies of rows whose key begins with one of eight operational-log prefixes: alerts-, hygiene-, recess-, maintenance-, pr-watch-, dispatch-, offsite-, cluster-watch-.";
+pub const LOG_SHARE_DEFINITION: &str = "log_share is `log_chars / body_chars` over VISIBLE rows, as a percentage; `log_chars` sums the bodies of rows whose key begins, case-sensitively, with one of eight operational-log prefixes: alerts-, hygiene-, recess-, maintenance-, pr-watch-, dispatch-, offsite-, cluster-watch-.";
 
-/// `dup_pairs` definition. The class filter is the point: candidate pairs are not duplicates.
-pub const DUP_PAIRS_DEFINITION: &str = "dup_pairs counts VISIBLE pairs at or below the default cosine distance (0.05) whose `memory_dupes` class is `duplicate`; series, artifact and distinct pairs are excluded. dup_pairs_min_distance is the smallest distance among those duplicate pairs, or null when there are none.";
+/// `dup_pairs` definition. The class filter is the point: candidate pairs are not duplicates. The
+/// neighbour cap is named because it bounds what the number can mean: this is not an all-pairs count.
+pub const DUP_PAIRS_DEFINITION: &str = "dup_pairs counts VISIBLE pairs at or below the default cosine distance (0.05) whose `memory_dupes` class is `duplicate`; series, artifact and distinct pairs are excluded. Candidate pairs come from each row's 3 nearest neighbours (memory_dupes' NEIGHBOURS cap, k = 4 including self), not from an all-pairs search, so a mutual cluster of five or more near-identical rows can be undercounted. dup_pairs_min_distance is the smallest distance among those duplicate pairs, or null when there are none.";
 
 /// `woven` definition. Three numbers, one definition, and the direction named.
-pub const WOVEN_DEFINITION: &str = "woven is the percentage of VISIBLE rows with at least one `memory_link` edge in EITHER direction, where an edge counts only when both ends are visible; woven_inbound counts rows named as a memory target (`to_type = 'memory'`), woven_outbound counts rows that name any target. A row with both counts once in `woven`.";
+pub const WOVEN_DEFINITION: &str = "woven is the percentage of VISIBLE rows with at least one `memory_link` edge in EITHER direction, where an edge counts only when both ends are visible; woven_inbound counts rows named as a memory target (`to_type = 'memory'`), woven_outbound counts rows that name a visible memory target (`to_type = 'memory'`). A row with both counts once in `woven`.";
 
 /// `cold30` definition. The store has `visits` (a lifetime count), not a last-visit timestamp, so
 /// "cold" can only mean never read.
@@ -78,8 +79,9 @@ pub struct Health {
 
     /// Visible pairs whose class is `duplicate`.
     pub dup_pairs: i64,
-    /// Smallest distance among those pairs; `None` when there are none.
-    pub dup_pairs_min_distance: Option<f32>,
+    /// Smallest distance among those pairs, in the same 4dp form as `memory_dupes`; `None` when
+    /// there are none.
+    pub dup_pairs_min_distance: Option<f64>,
     /// What `dup_pairs` counted.
     pub dup_pairs_definition: &'static str,
 
@@ -106,10 +108,10 @@ pub struct Health {
     /// Visible rows carrying no tag.
     pub rows_untagged: i64,
 
-    /// Visible memory-target edges.
+    /// Memory-target edges named by visible rows (source-scoped, as in `memory_stats`).
     pub edges: i64,
-    /// `edges / rows` (0.0 for an empty visible store).
-    pub edges_per_row: f64,
+    /// `edges / rows`; `None` when there are no visible rows (an empty ratio is not zero).
+    pub edges_per_row: Option<f64>,
     /// Visible broken `[[…]]` targets.
     pub dangling: i64,
 
@@ -137,16 +139,17 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
     let s = stats::compute_seen(conn, reader)?;
     let (pred, pred_binds) = reader.sql();
 
-    // log_chars: the same eight prefixes the issue fixed. `LIKE` is the predicate named there, and
-    // each pattern is a bound parameter so the prefix list stays one constant.
+    // log_chars: the same eight prefixes the issue fixed. `GLOB`, not `LIKE`: `LIKE` is ASCII
+    // case-insensitive in SQLite, so `ALERTS-x` would have counted as `alerts-x`; `GLOB` is literal.
+    // Each pattern is a bound parameter so the prefix list stays one constant.
     let log_clause = LOG_CLASS_PREFIXES
         .iter()
-        .map(|_| "key LIKE ?")
+        .map(|_| "key GLOB ?")
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut log_binds = pred_binds.clone();
     for prefix in LOG_CLASS_PREFIXES {
-        log_binds.push(format!("{prefix}%"));
+        log_binds.push(format!("{prefix}*"));
     }
     let log_chars = count(
         conn,
@@ -174,24 +177,36 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
         ),
         &inbound_binds,
     )?;
+    // The outbound half is both-ends too: naming a target key is not an edge this reader can
+    // follow unless the target is a visible memory row. This keeps `woven` exactly the union of
+    // the two direction numbers instead of letting an invisible target raise it.
+    let mut outbound_binds = pred_binds.clone();
+    outbound_binds.extend(pred_binds.iter().cloned());
     let woven_outbound = count(
         conn,
         &format!(
             "SELECT count(*) FROM memory m WHERE ({pred}) \
-                AND m.id IN (SELECT from_id FROM memory_link)"
+                AND m.id IN (SELECT l.from_id FROM memory_link l \
+                              WHERE l.to_type = 'memory' \
+                                AND l.to_key IN (SELECT t.key FROM memory t WHERE {pred}))"
         ),
-        &pred_binds,
+        &outbound_binds,
     )?;
+    let mut woven_binds = pred_binds.clone();
+    woven_binds.extend(pred_binds.iter().cloned());
+    woven_binds.extend(pred_binds.iter().cloned());
     let woven = count(
         conn,
         &format!(
             "SELECT count(*) FROM memory m WHERE ({pred}) AND (\
-                m.id IN (SELECT from_id FROM memory_link) \
+                m.id IN (SELECT l.from_id FROM memory_link l \
+                          WHERE l.to_type = 'memory' \
+                            AND l.to_key IN (SELECT t.key FROM memory t WHERE {pred})) \
                 OR m.key IN (SELECT l.to_key FROM memory_link l \
                               WHERE l.to_type = 'memory' \
                                 AND l.from_id IN (SELECT id FROM memory WHERE {pred})))"
         ),
-        &inbound_binds,
+        &woven_binds,
     )?;
 
     // Cold30: rows older than 30 days that have never been read. The population is reported even
@@ -224,13 +239,19 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
     let dup_pairs_min_distance = duplicate_pairs
         .iter()
         .map(|pair| pair.distance)
-        .min_by(|a, b| a.total_cmp(b));
+        .min_by(|a, b| a.total_cmp(b))
+        .map(crate::wire::wire_distance);
 
     let log_share = percent(log_chars, s.body_chars);
     let woven = percent(woven, s.memories);
     let woven_inbound = percent(woven_inbound, s.memories);
     let woven_outbound = percent(woven_outbound, s.memories);
     let cold30 = percent(cold30_count, cold30_population);
+    let edges_per_row = if s.memories > 0 {
+        Some(s.edges as f64 / s.memories as f64)
+    } else {
+        None
+    };
 
     let mut suppressed = Vec::new();
     if cold30.is_none() {
@@ -255,6 +276,10 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
                 .to_string(),
         );
     }
+    if edges_per_row.is_none() {
+        suppressed
+            .push("edges_per_row: no visible rows — the ratio has no denominator".to_string());
+    }
 
     Ok(Health {
         scope: SCOPE,
@@ -278,11 +303,7 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
         tag_singletons: s.singleton_tags,
         rows_untagged: s.untagged,
         edges: s.edges,
-        edges_per_row: if s.memories > 0 {
-            s.edges as f64 / s.memories as f64
-        } else {
-            0.0
-        },
+        edges_per_row,
         dangling: s.dangling,
         suppressed,
     })
@@ -321,5 +342,11 @@ mod tests {
         assert_eq!(percent(1, 0), None);
         assert_eq!(percent(0, 4), Some(0.0));
         assert_eq!(percent(1, 4), Some(25.0));
+    }
+
+    #[test]
+    fn the_dup_pairs_definition_names_the_neighbour_cap() {
+        assert!(DUP_PAIRS_DEFINITION.contains("3 nearest neighbours"));
+        assert!(DUP_PAIRS_DEFINITION.contains("not from an all-pairs search"));
     }
 }

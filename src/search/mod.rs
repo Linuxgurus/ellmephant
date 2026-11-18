@@ -49,6 +49,7 @@ use crate::error::{Error, Result};
 use crate::index;
 use crate::store::audience;
 use crate::store::{self, Memory};
+use crate::wire::wire_distance;
 
 /// A candidate row: its id and, when the phrase was semantic, its cosine distance.
 type Candidate = (i64, Option<f32>);
@@ -409,12 +410,6 @@ pub fn to_wire_json(bundle: &Bundle, fields: &Fields) -> Result<String> {
     }
     out.push('}');
     Ok(out)
-}
-
-/// Round a distance to 4 decimals for the wire: enough to rank, and it avoids the long
-/// `f32`→`f64` widening tail that `json!` would otherwise print (`0.41999998…`).
-fn wire_distance(d: f32) -> f64 {
-    ((d as f64) * 10_000.0).round() / 10_000.0
 }
 
 /// Run a query. `embedder` is required when a phrase is given, ignored otherwise.

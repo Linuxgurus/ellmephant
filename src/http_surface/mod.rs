@@ -763,7 +763,13 @@ fn health_text(h: &store::health::Health) -> String {
         ("body_chars", h.body_chars.to_string()),
         ("log_chars", h.log_chars.to_string()),
         ("log_share", pct(h.log_share)),
-        ("dup_pairs", h.dup_pairs.to_string()),
+        (
+            "dup_pairs",
+            match h.dup_pairs {
+                Some(n) => n.to_string(),
+                None => "null".to_string(),
+            },
+        ),
         (
             "dup_min_distance",
             match h.dup_pairs_min_distance {

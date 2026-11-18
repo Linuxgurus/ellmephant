@@ -10,15 +10,18 @@
 //! `0`, when the 30d+ population is empty: `0` would say "nothing is cold", which is a different
 //! claim from "nothing is measurable".
 //!
-//! Everything is a cheap aggregate except the duplicate-pair count, which reuses the existing
-//! `memory_dupes` finder (vectors, no bodies embedded); no bodies are loaded into the response.
+//! Every number here is a cheap aggregate. The duplicate-pair count is deliberately NOT computed in
+//! this call: `memory_dupes` is the finder that returns it, and running it inside the aggregate costs
+//! one KNN query per visible row (measured 19.7 s on a 1922-row store, 99.5% of the call). So
+//! `dup_pairs` is `null` with a `suppressed` line naming `memory_dupes`, never a silent `0` — the
+//! same doctrine as `cold30`: an uncomputed number is not a zero.
 
 use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::error::Result;
 use crate::store::audience::Reader;
-use crate::store::{dupes, stats};
+use crate::store::stats;
 
 /// The response's scope marker: these numbers describe the caller's visible rows, not the store.
 pub const SCOPE: &str = "visible";
@@ -47,9 +50,10 @@ pub const BODY_CHARS_DEFINITION: &str = "body_chars is the sum of `length(body)`
 /// string and [`LOG_CLASS_PREFIXES`] in step.
 pub const LOG_SHARE_DEFINITION: &str = "log_share is `log_chars / body_chars` over VISIBLE rows, as a percentage; `log_chars` sums the bodies of rows whose key begins, case-sensitively, with one of eight operational-log prefixes: alerts-, hygiene-, recess-, maintenance-, pr-watch-, dispatch-, offsite-, cluster-watch-.";
 
-/// `dup_pairs` definition. The class filter is the point: candidate pairs are not duplicates. The
-/// neighbour cap is named because it bounds what the number can mean: this is not an all-pairs count.
-pub const DUP_PAIRS_DEFINITION: &str = "dup_pairs counts VISIBLE pairs at or below the default cosine distance (0.05) whose `memory_dupes` class is `duplicate`; series, artifact and distinct pairs are excluded. Candidate pairs come from each row's 3 nearest neighbours (memory_dupes' NEIGHBOURS cap, k = 4 including self), not from an all-pairs search, so a mutual cluster of five or more near-identical rows can be undercounted. dup_pairs_min_distance is the smallest distance among those duplicate pairs, or null when there are none.";
+/// `dup_pairs` definition. It describes what `memory_dupes` counts, because that finder — not this
+/// aggregate — returns the number. The neighbour cap is named because it bounds what the number can
+/// mean: this is not an all-pairs count.
+pub const DUP_PAIRS_DEFINITION: &str = "dup_pairs is what `memory_dupes` counts, not a number this call computes: VISIBLE pairs at or below the default cosine distance (0.05) whose `memory_dupes` class is `duplicate`; series, artifact and distinct pairs are excluded. Candidate pairs come from each row's 3 nearest neighbours (memory_dupes' NEIGHBOURS cap, k = 4 including self), not from an all-pairs search, so a mutual cluster of five or more near-identical rows can be undercounted. dup_pairs_min_distance is the smallest distance among those duplicate pairs, or null when there are none.";
 
 /// `woven` definition. Three numbers, one definition, and the direction named.
 pub const WOVEN_DEFINITION: &str = "woven is the percentage of VISIBLE rows with at least one `memory_link` edge in EITHER direction, where an edge counts only when both ends are visible; woven_inbound counts rows named as a memory target (`to_type = 'memory'`), woven_outbound counts rows that name a visible memory target (`to_type = 'memory'`). A row with both counts once in `woven`.";
@@ -77,12 +81,13 @@ pub struct Health {
     /// The predicate `log_share` used, always in the response.
     pub log_share_definition: &'static str,
 
-    /// Visible pairs whose class is `duplicate`.
-    pub dup_pairs: i64,
-    /// Smallest distance among those pairs, in the same 4dp form as `memory_dupes`; `None` when
-    /// there are none.
+    /// Visible pairs whose class is `duplicate`, as `memory_dupes` counts them; `None` here because
+    /// this aggregate does not run that finder (the `suppressed` line names it).
+    pub dup_pairs: Option<i64>,
+    /// Smallest distance among those pairs, in the same 4dp form as `memory_dupes`; `None` here for
+    /// the same reason, and `None` from `memory_dupes` when there are no duplicate pairs.
     pub dup_pairs_min_distance: Option<f64>,
-    /// What `dup_pairs` counted.
+    /// What `memory_dupes` counts for `dup_pairs`.
     pub dup_pairs_definition: &'static str,
 
     /// Percentage of visible rows with a link edge in either direction.
@@ -228,19 +233,13 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
         None => None,
     };
 
-    // Duplicate pairs: the existing finder, visible-scoped, with the default ceiling. Only the
-    // `duplicate` class is a duplicate; a `series` with identical bodies is not (#219).
-    let pairs = dupes::find_seen(conn, reader, dupes::DEFAULT_MAX_DISTANCE, usize::MAX)?;
-    let duplicate_pairs: Vec<&dupes::DupePair> = pairs
-        .iter()
-        .filter(|pair| pair.class == dupes::Class::Duplicate)
-        .collect();
-    let dup_pairs = duplicate_pairs.len() as i64;
-    let dup_pairs_min_distance = duplicate_pairs
-        .iter()
-        .map(|pair| pair.distance)
-        .min_by(|a, b| a.total_cmp(b))
-        .map(crate::wire::wire_distance);
+    // Duplicate pairs are NOT computed here. `dupes::find_seen` costs one `vec::knn` query per
+    // visible row plus `load_rows` materialising every body (measured 19,658 ms of a 19,624 ms
+    // call on a 1922-row snapshot — the shape, not the constant). The aggregate reports `null` and
+    // names `memory_dupes` as the exact finder; it must never print `0`, which would assert "no
+    // duplicates" from a count that was never taken.
+    let dup_pairs: Option<i64> = None;
+    let dup_pairs_min_distance: Option<f64> = None;
 
     let log_share = percent(log_chars, s.body_chars);
     let woven = percent(woven, s.memories);
@@ -270,9 +269,9 @@ pub fn compute_seen(conn: &Connection, reader: &Reader) -> Result<Health> {
     if woven.is_none() {
         suppressed.push("woven: no visible rows — the share has no denominator".to_string());
     }
-    if dup_pairs_min_distance.is_none() {
+    if dup_pairs.is_none() {
         suppressed.push(
-            "dup_pairs_min_distance: no duplicate pairs within the default distance (not applicable)"
+            "dup_pairs: not computed in this call — the pair count is the `memory_dupes` finder (class `duplicate` only, NEIGHBOURS = 3 cap), which returns the pairs and their distances; `dup_pairs_min_distance` is not computed here either. Call `memory_dupes` for that number, and do not read this null as 0."
                 .to_string(),
         );
     }

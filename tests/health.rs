@@ -138,8 +138,17 @@ fn the_five_numbers_match_the_fixture() {
     approx(h.log_share, log_chars as f64 / total_chars as f64 * 100.0);
     assert_eq!(h.log_share_definition, LOG_SHARE_DEFINITION);
 
-    assert_eq!(h.dup_pairs, 1);
-    assert_eq!(h.dup_pairs_min_distance, Some(0.0));
+    // The duplicate finder is budgeted out of the aggregate: null + a `suppressed` line that names
+    // the exact finder, never a silent 0.
+    assert_eq!(h.dup_pairs, None);
+    assert_eq!(h.dup_pairs_min_distance, None);
+    assert!(
+        h.suppressed
+            .iter()
+            .any(|reason| reason.starts_with("dup_pairs:") && reason.contains("memory_dupes")),
+        "suppressed must name `memory_dupes` as the finder: {:?}",
+        h.suppressed
+    );
     approx(h.woven, 2.0 / rows as f64 * 100.0);
     approx(h.woven_inbound, 1.0 / rows as f64 * 100.0);
     approx(h.woven_outbound, 1.0 / rows as f64 * 100.0);
@@ -155,7 +164,13 @@ fn the_five_numbers_match_the_fixture() {
     assert_eq!(h.edges, 1);
     assert_eq!(h.dangling, 0);
     assert!((h.edges_per_row.expect("rows > 0") - 1.0 / rows as f64).abs() < 1e-9);
-    assert!(h.suppressed.is_empty(), "{:?}", h.suppressed);
+    assert!(
+        h.suppressed
+            .iter()
+            .any(|reason| reason.starts_with("dup_pairs:") && reason.contains("memory_dupes")),
+        "{:?}",
+        h.suppressed
+    );
 }
 
 #[test]
@@ -342,7 +357,7 @@ fn an_empty_store_suppresses_every_ratio() {
     for name in [
         "log_share:",
         "woven:",
-        "dup_pairs_min_distance:",
+        "dup_pairs:",
         "edges_per_row:",
         "cold30:",
     ] {
@@ -354,10 +369,11 @@ fn an_empty_store_suppresses_every_ratio() {
     }
     let wire = serde_json::to_value(&h).unwrap();
     assert!(wire["edges_per_row"].is_null(), "{wire}");
+    assert!(wire["dup_pairs"].is_null(), "{wire}");
 }
 
 #[test]
-fn a_store_with_no_duplicates_suppresses_the_min_distance() {
+fn a_store_with_no_duplicates_still_reports_dup_pairs_as_null() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -370,12 +386,13 @@ fn a_store_with_no_duplicates_suppresses_the_min_distance() {
 
     let h = health::compute_seen(&conn, &Reader::everything()).expect("health");
     assert_eq!(h.rows, 2);
-    assert_eq!(h.dup_pairs, 0);
+    // Even a store that HAS no duplicates must not print 0: the finder did not run.
+    assert_eq!(h.dup_pairs, None, "{h:?}");
     assert!(h.dup_pairs_min_distance.is_none(), "{h:?}");
     assert!(
         h.suppressed
             .iter()
-            .any(|reason| reason.starts_with("dup_pairs_min_distance:")),
+            .any(|reason| reason.starts_with("dup_pairs:") && reason.contains("memory_dupes")),
         "{:?}",
         h.suppressed
     );

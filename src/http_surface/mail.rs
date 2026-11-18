@@ -12,26 +12,22 @@ pub async fn mail_send(
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    let scope = match authorize(&state, &headers, json) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    let scope = authorize(&state, &headers, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
-        Ok(None) => return error(json, StatusCode::BAD_REQUEST, "a JSON body is required"),
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Ok(None) => return Err(ApiError::bad(json, "a JSON body is required")),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(ToString::to_string);
     let (Some(sender), Some(recipient), Some(letter)) =
         (field("sender"), field("recipient"), field("body"))
     else {
-        return error(
+        return Err(ApiError::bad(
             json,
-            StatusCode::BAD_REQUEST,
             "`sender`, `recipient` and `body` are required",
-        );
+        ));
     };
     let subject = field("subject").unwrap_or_default();
     let encoding = field("encoding").unwrap_or_else(|| "text".to_string());
@@ -44,14 +40,17 @@ pub async fn mail_send(
     {
         Ok(out) => {
             tracing::info!(area = scope.area, seq = out.seq, to = %to, "letter over http");
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&out).unwrap_or_default(),
-                format!("letter {} written to `{to}`", out.seq),
+                &report(
+                    (out, to),
+                    |(out, _)| serde_json::to_string(out).unwrap_or_default(),
+                    |(out, to)| format!("letter {} written to `{to}`", out.seq),
+                ),
             )
         }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -66,7 +65,7 @@ pub async fn mail_send(
 pub(super) fn mail_reader_identity(
     caller: &crate::identity::Caller,
     json: bool,
-) -> Result<String, Response> {
+) -> ApiResult<String> {
     caller
         .pen_or("refused: reading mail needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
         .map(ToString::to_string)
@@ -85,14 +84,10 @@ async fn mail_guard(
     requested: &str,
     json: bool,
     scope: crate::store::mail::BoxScope,
-) -> Result<(), Response> {
+) -> ApiResult<()> {
     // A helper rather than a handler: no `&mut Parts`, so no extractor (#233).
     let Some(server) = state.server() else {
-        return Err(error(
-            json,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server not attached",
-        ));
+        return Err(ApiError::internal(json, "server not attached"));
     };
     let (r, q) = (reader.to_string(), requested.to_string());
     // ★ THE SAME RULE AS MCP, including the GRANT (soma/ellmephant#235): this asked the `read`
@@ -105,7 +100,7 @@ async fn mail_guard(
             move |s| s.mail_may_open_box(&r, &q, scope),
         )
         .await
-        .map_err(|e| error(json, error_status(&e), &e))
+        .map_err(|e| ApiError::store(json, e))
 }
 
 pub async fn mail_inbox(
@@ -113,32 +108,30 @@ pub async fn mail_inbox(
     server: Server,
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let Some(recipient) = params.maybe("recipient").map(ToString::to_string) else {
-        return error(json, StatusCode::BAD_REQUEST, "`recipient` is required");
+        return Err(ApiError::new(
+            json,
+            StatusCode::BAD_REQUEST,
+            "`recipient` is required",
+        ));
     };
     let explicit = params.maybe("since").and_then(|v| v.parse::<i64>().ok());
     let limit = params
         .maybe("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_usize);
-    let reader = match mail_reader_identity(&caller, json) {
-        Ok(name) => name,
-        Err(r) => return r,
-    };
-    if let Err(r) = mail_guard(
+    let reader = mail_reader_identity(&caller, json)?;
+    mail_guard(
         &state,
         &reader,
         &recipient,
         json,
         crate::store::mail::BoxScope::Read,
     )
-    .await
-    {
-        return r;
-    }
+    .await?;
     let me = Some(reader.clone());
     match server
         .with_read(
@@ -164,40 +157,46 @@ pub async fn mail_inbox(
         Ok((rows, head, stored, since)) => {
             let page_top = rows.iter().map(|r| r.seq).max();
             let cursor = stored.as_ref().map(|c| c.seq).unwrap_or(0);
-            let text = if rows.is_empty() {
-                format!("no mail after {since}")
-            } else {
-                rows.iter()
-                    .map(|r| {
-                        format!(
-                            "{} {} {} ({} · {} bytes)",
-                            r.seq, r.at, r.sender, r.subject, r.bytes
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            render(
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::json!({
-                    "reader": stored
-                        .as_ref()
-                        .map(|c| c.reader.clone())
-                        .unwrap_or_else(|| reader.clone()),
-                    "cursor": cursor,
-                    "head": head,
-                    "unread": (head - cursor).max(0),
-                    "letters": rows,
-                    "page_top": page_top,
-                    "max_seq": page_top.unwrap_or(since),
-                    "newest_available": head,
-                })
-                .to_string(),
-                text,
+                &report(
+                    (stored, cursor, head, rows, page_top, since, reader),
+                    |(stored, cursor, head, rows, page_top, since, reader)| {
+                        serde_json::json!({
+                            "reader": stored
+                                .as_ref()
+                                .map(|c| c.reader.clone())
+                                .unwrap_or_else(|| reader.clone()),
+                            "cursor": cursor,
+                            "head": head,
+                            "unread": (head - cursor).max(0),
+                            "letters": rows,
+                            "page_top": page_top,
+                            "max_seq": page_top.unwrap_or(*since),
+                            "newest_available": head,
+                        })
+                        .to_string()
+                    },
+                    |(_, _, _, rows, _, since, _)| {
+                        if rows.is_empty() {
+                            format!("no mail after {since}")
+                        } else {
+                            rows.iter()
+                                .map(|r| {
+                                    format!(
+                                        "{} {} {} ({} · {} bytes)",
+                                        r.seq, r.at, r.sender, r.subject, r.bytes
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    },
+                ),
             )
         }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -211,55 +210,47 @@ pub async fn mail_ack(
     caller: crate::identity::Caller,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     let (Some(recipient), Some(seq)) = (
         params.maybe("recipient").map(ToString::to_string),
         params.maybe("seq").and_then(|v| v.parse::<i64>().ok()),
     ) else {
-        return error(
-            json,
-            StatusCode::BAD_REQUEST,
-            "`recipient` and `seq` are required",
-        );
+        return Err(ApiError::bad(json, "`recipient` and `seq` are required"));
     };
     let reader = match caller
         .pen_or("refused: a cursor belongs to a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::FORBIDDEN),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::FORBIDDEN)),
     };
-    if let Err(r) = mail_guard(
+    mail_guard(
         &state,
         &reader,
         &recipient,
         json,
         crate::store::mail::BoxScope::Ack,
     )
-    .await
-    {
-        return r;
-    }
+    .await?;
     match server
         .with_store("mail_ack", move |s| {
             s.mail_advance(&reader, &recipient, seq)
         })
         .await
     {
-        Ok(cursor) => render(
+        Ok(cursor) => present(
             StatusCode::OK,
             json,
-            serde_json::to_string(&cursor).unwrap_or_default(),
-            format!(
-                "cursor moved to {} (+{}), {} unread",
-                cursor.seq, cursor.moved, cursor.unread
-            ),
+            &viewed(&cursor, |cursor| {
+                format!(
+                    "cursor moved to {} (+{}), {} unread",
+                    cursor.seq, cursor.moved, cursor.unread
+                )
+            }),
         ),
-        Err(e) => error(json, error_status(&e), e),
+        Err(e) => Err(ApiError::store(json, e)),
     }
 }
 
@@ -270,13 +261,10 @@ pub async fn mail_read(
     caller: crate::identity::Caller,
     axum::extract::Path(seq): axum::extract::Path<i64>,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    let reader = match mail_reader_identity(&caller, json) {
-        Ok(name) => name,
-        Err(r) => return r,
-    };
+    let reader = mail_reader_identity(&caller, json)?;
     match server
         .with_read(
             "mail_read",
@@ -287,26 +275,26 @@ pub async fn mail_read(
     {
         Ok(Some(letter)) => {
             // The LETTER decides its box: the check is on the row, not on an argument.
-            if let Err(r) = mail_guard(
+            mail_guard(
                 &state,
                 &reader,
                 &letter.recipient,
                 json,
                 crate::store::mail::BoxScope::Read,
             )
-            .await
-            {
-                return r;
-            }
-            render(
+            .await?;
+            present(
                 StatusCode::OK,
                 json,
-                serde_json::to_string(&letter).unwrap_or_default(),
-                letter.body.clone(),
+                &report(
+                    letter,
+                    |letter| serde_json::to_string(letter).unwrap_or_default(),
+                    |letter| letter.body.clone(),
+                ),
             )
         }
-        Ok(None) => error(json, StatusCode::NOT_FOUND, "no such letter"),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Ok(None) => Err(ApiError::not_found(json, "no such letter")),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -316,12 +304,10 @@ pub async fn mail_prune(
     server: Server,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     let keep_days = params
         .maybe("keep_days")
         .and_then(|v| v.parse().ok())
@@ -330,13 +316,18 @@ pub async fn mail_prune(
         .with_store("mail_prune", move |s| s.mail_prune(keep_days))
         .await
     {
-        Ok(removed) => render(
+        Ok(removed) => present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "removed": removed }).to_string(),
-            format!("pruned {removed} letter(s) older than {keep_days}d"),
+            &report(
+                (removed, keep_days),
+                |(removed, _)| serde_json::json!({ "removed": removed }).to_string(),
+                |(removed, keep_days)| {
+                    format!("pruned {removed} letter(s) older than {keep_days}d")
+                },
+            ),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => Err(ApiError::bad(json, e)),
     }
 }
 
@@ -350,20 +341,18 @@ pub async fn mail_surrogate_grant(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     let caller = match caller.pen_or(
         "refused: granting a name needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`",
     ) {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -378,17 +367,17 @@ pub async fn mail_surrogate_grant(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     if !caller.eq_ignore_ascii_case(ask.grantor.trim()) {
-        return error(
+        return Err(ApiError::new(
             json,
             StatusCode::FORBIDDEN,
             format!(
                 "refused: `{caller}` may grant its OWN name only; `{}` must grant itself",
                 ask.grantor
             ),
-        );
+        ));
     }
     let scopes = ask.scopes.unwrap_or_else(|| "send".to_string());
     match server
@@ -403,16 +392,20 @@ pub async fn mail_surrogate_grant(
         })
         .await
     {
-        Ok(grant) => {
-            let value = serde_json::to_value(&grant).unwrap_or(serde_json::Value::Null);
-            render(
-                StatusCode::CREATED,
-                json,
-                value.to_string(),
-                "granted\n".to_string(),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
+        Ok(grant) => present(
+            StatusCode::CREATED,
+            json,
+            &report(
+                grant,
+                |grant| {
+                    serde_json::to_value(grant)
+                        .unwrap_or(serde_json::Value::Null)
+                        .to_string()
+                },
+                |_| "granted\n".to_string(),
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, &e)),
     }
 }
 
@@ -424,18 +417,16 @@ pub async fn mail_surrogate_revoke(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Body,
-) -> Response {
+) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     let caller = match caller.pen_or("refused: revoking needs a proven pen") {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let bytes = match body_bytes(body).await {
         Ok(b) => b,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, e),
+        Err(e) => return Err(ApiError::bad(json, e)),
     };
     #[derive(serde::Deserialize)]
     struct Ask {
@@ -444,14 +435,14 @@ pub async fn mail_surrogate_revoke(
     }
     let ask: Ask = match serde_json::from_slice(&bytes) {
         Ok(a) => a,
-        Err(e) => return error(json, StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
+        Err(e) => return Err(ApiError::bad(json, format!("bad JSON: {e}"))),
     };
     if !caller.eq_ignore_ascii_case(ask.grantor.trim()) {
-        return error(
+        return Err(ApiError::new(
             json,
             StatusCode::FORBIDDEN,
             format!("refused: `{caller}` may revoke its OWN grants only"),
-        );
+        ));
     }
     match server
         .with_store("mail_surrogate_revoke", move |s| {
@@ -459,13 +450,16 @@ pub async fn mail_surrogate_revoke(
         })
         .await
     {
-        Ok(n) => render(
+        Ok(n) => present(
             StatusCode::OK,
             json,
-            serde_json::json!({ "revoked": n }).to_string(),
-            format!("revoked {n}\n"),
+            &report(
+                n,
+                |n| serde_json::json!({ "revoked": n }).to_string(),
+                |n| format!("revoked {n}\n"),
+            ),
         ),
-        Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
+        Err(e) => Err(ApiError::bad(json, &e)),
     }
 }
 
@@ -476,15 +470,13 @@ pub async fn mail_surrogate_list(
     caller: crate::identity::Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Response {
+) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    if let Err(r) = authorize(&state, &headers, json) {
-        return r;
-    }
+    authorize(&state, &headers, json)?;
     let caller = match caller.pen_or("refused: listing grants needs a proven pen") {
         Ok(name) => name.to_string(),
-        Err(r) => return refusal_response(json, r, StatusCode::UNAUTHORIZED),
+        Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
     };
     let subject = params
         .maybe("surrogate")
@@ -498,16 +490,20 @@ pub async fn mail_surrogate_list(
         )
         .await
     {
-        Ok(rows) => {
-            let value = serde_json::to_value(&rows).unwrap_or(serde_json::Value::Null);
-            render(
-                StatusCode::OK,
-                json,
-                value.to_string(),
-                format!("{}\n", rows.len()),
-            )
-        }
-        Err(e) => error(json, StatusCode::BAD_REQUEST, &e),
+        Ok(rows) => present(
+            StatusCode::OK,
+            json,
+            &report(
+                rows,
+                |rows| {
+                    serde_json::to_value(rows)
+                        .unwrap_or(serde_json::Value::Null)
+                        .to_string()
+                },
+                |rows| format!("{}\n", rows.len()),
+            ),
+        ),
+        Err(e) => Err(ApiError::bad(json, &e)),
     }
 }
 

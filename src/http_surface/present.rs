@@ -1,0 +1,264 @@
+//! The presenter: one outcome, ONE body, two renderings (soma/ellmephant#236).
+//!
+//! A rendered verb used to build its JSON and its text in two independent code paths in the same
+//! function, so adding a field could update one and forget the other (`channel_send`'s text said
+//! `sent #{} seq {}` while its JSON named the same facts differently). [`Present`] makes the pair a
+//! property of one value: an implementation must answer both questions, side by side, and
+//! [`present`] is the only thing that turns the pair into a response.
+//!
+//! The table renderer is the same idea already at work in the MCP wire: a `cols` header governs the
+//! rows, so the text view is a projection of the JSON body rather than a second report of the data.
+
+use super::*;
+
+/// One outcome, rendered both ways. Implementations live beside the verb they render.
+pub trait Present {
+    /// The JSON body, already serialized (so a row-per-line table stays byte-identical).
+    fn json(&self) -> String;
+    /// The plain-text body a curl caller reads.
+    fn text(&self) -> String;
+}
+
+/// Render a presenter at a status.
+pub fn present<T: Present>(status: StatusCode, json: bool, value: &T) -> ApiResult<Response> {
+    render(status, json, value.json(), value.text())
+}
+
+/// One memory as the door shows it: the stored row plus the two facts only the READER can add —
+/// the walk to the owner, and the read nudge. The JSON and the prose both read this value.
+pub struct MemoryCard<'a> {
+    pub mem: &'a store::Memory,
+    pub relation: Option<&'a str>,
+    pub version: Option<i64>,
+}
+
+impl Present for MemoryCard<'_> {
+    fn json(&self) -> String {
+        let mut value = serde_json::to_value(self.mem).unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(n) = self.version {
+                obj.insert("version".to_string(), serde_json::json!(n));
+            }
+            obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
+            if let Some(walk) = self.relation {
+                obj.insert("owner_relation".to_string(), serde_json::json!(walk));
+            }
+        }
+        value.to_string()
+    }
+
+    fn text(&self) -> String {
+        memory_text(self.mem, self.relation)
+    }
+}
+
+/// A positional `cols`/rows wire body: the JSON body is the wire itself, and the text is a
+/// projection of it, so the two can never disagree about the rows.
+pub struct Table {
+    label: String,
+    wire: String,
+}
+
+impl Table {
+    pub fn new(label: impl Into<String>, wire: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            wire: wire.into(),
+        }
+    }
+}
+
+impl Present for Table {
+    fn json(&self) -> String {
+        self.wire.clone()
+    }
+
+    fn text(&self) -> String {
+        list_text(&self.label, &self.wire)
+    }
+}
+
+/// A domain value and the text renderer registered for it. The JSON comes from `serde`, so a field
+/// added to the value appears in both bodies or in neither.
+pub struct Viewed<'a, T> {
+    value: &'a T,
+    text: fn(&T) -> String,
+}
+
+/// Present `value` with `text` as its plain-text rendering.
+pub fn viewed<'a, T: serde::Serialize>(value: &'a T, text: fn(&T) -> String) -> Viewed<'a, T> {
+    Viewed { value, text }
+}
+
+impl<T: serde::Serialize> Present for Viewed<'_, T> {
+    fn json(&self) -> String {
+        serde_json::to_string(self.value).unwrap_or_else(|_| "{}".into())
+    }
+
+    fn text(&self) -> String {
+        (self.text)(self.value)
+    }
+}
+
+/// A verb whose wire shape is assembled by hand (`json!`) rather than serialized from one struct.
+///
+/// Both renderers are functions OF THE SAME VALUE, so a field added to the outcome cannot reach one
+/// body and miss the other: the compiler hands both closures the identical tuple/struct.
+pub struct Report<T> {
+    value: T,
+    json: fn(&T) -> String,
+    text: fn(&T) -> String,
+}
+
+/// Present `value` through the two renderers registered for its shape.
+pub fn report<T>(value: T, json: fn(&T) -> String, text: fn(&T) -> String) -> Report<T> {
+    Report { value, json, text }
+}
+
+impl<T> Present for Report<T> {
+    fn json(&self) -> String {
+        (self.json)(&self.value)
+    }
+
+    fn text(&self) -> String {
+        (self.text)(&self.value)
+    }
+}
+
+/// Render a positional `cols`/rows wire body as a header line and one line per row.
+pub(super) fn list_text(label: &str, wire: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(wire) else {
+        return wire.to_string();
+    };
+    match first_table(&value) {
+        Some(rows) => {
+            let mut out = format!("{label} — {} row(s)\n", rows.len());
+            for row in rows {
+                let cells: Vec<String> = row
+                    .as_array()
+                    .map(|cells| cells.iter().map(cell).collect())
+                    .unwrap_or_default();
+                out.push_str("  ");
+                out.push_str(&cells.join("  "));
+                out.push('\n');
+            }
+            out
+        }
+        None => wire.to_string(),
+    }
+}
+
+/// The first array-of-arrays under an object that also carries a `cols` header (searching nested
+/// tables like `project_get`'s `preload`).
+pub(super) fn first_table(value: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    let obj = value.as_object()?;
+    if obj.contains_key("cols") {
+        for (key, v) in obj {
+            if key == "cols" {
+                continue;
+            }
+            if let Some(rows) = v.as_array()
+                && rows.iter().all(|r| r.is_array())
+            {
+                return Some(rows.clone());
+            }
+        }
+    }
+    for v in obj.values() {
+        if let Some(rows) = first_table(v) {
+            return Some(rows);
+        }
+    }
+    None
+}
+
+/// One wire cell as plain text (strings unquoted, arrays comma-joined).
+pub(super) fn cell(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items.iter().map(cell).collect::<Vec<_>>().join(","),
+        serde_json::Value::Null => "-".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The `GET /stats` prose: the headline counts, then the heads of the tag and usefulness lists.
+pub(super) fn stats_text(s: &store::stats::Stats) -> String {
+    let mut out = format!(
+        "ellmephant store — {} memories, {} bytes on disk\n",
+        s.memories, s.db_bytes
+    );
+    for (label, value) in [
+        ("body chars", s.body_chars.to_string()),
+        ("distinct tags", s.distinct_tags.to_string()),
+        ("tagged", format!("{}/{}", s.tagged, s.memories)),
+        ("link edges", s.edges.to_string()),
+        ("orphans", s.orphans.to_string()),
+        ("dangling", s.dangling.to_string()),
+        // Two numbers, because they are two facts that share one value (owner NULL).
+        ("commons", s.commons.to_string()),
+        (
+            "unattributed",
+            match s.unattributed {
+                0 => "0".to_string(),
+                n => format!(
+                    "{n} (no currently existing pen wrote these — no owner, no author; claim them)"
+                ),
+            },
+        ),
+        ("visits", s.visits_total.to_string()),
+        ("useful", s.useful_total.to_string()),
+        (
+            "versions",
+            format!(
+                "{} row(s), {} bytes, {} of a deleted key",
+                s.versions, s.version_bytes, s.version_orphans
+            ),
+        ),
+        (
+            "encode queue",
+            match s.encode_oldest_s {
+                Some(age) => format!(
+                    "{} pending (oldest {}s), {} failed",
+                    s.encode_pending, age, s.encode_failed
+                ),
+                None => format!("{} pending, {} failed", s.encode_pending, s.encode_failed),
+            },
+        ),
+    ] {
+        out.push_str(&format!("  {label:<14}{value}\n"));
+    }
+    for (tag, count) in &s.top_tags {
+        out.push_str(&format!("  top tag       {tag} ({count})\n"));
+    }
+    for (key, count) in &s.top_useful {
+        out.push_str(&format!("  useful        {key} ({count})\n"));
+    }
+    out
+}
+
+/// The `GET /memory/{key}` prose: the header fields, then the body.
+pub(super) fn memory_text(mem: &store::Memory, relation: Option<&str>) -> String {
+    let mut out = format!("{}\n", mem.key);
+    out.push_str(&format!("  {:<8}{}\n", "title", mem.title));
+    // Who answers for it, and what they are to the reader: a name is an address, and the walk is the
+    // rest of the sentence.
+    if let Some(owner) = &mem.owner {
+        match relation {
+            Some(walk) => out.push_str(&format!("  {:<8}{owner}  {walk}\n", "owner")),
+            None => out.push_str(&format!("  {:<8}{owner}\n", "owner")),
+        }
+    }
+    out.push_str(&format!("  {:<8}{}\n", "tags", mem.tags.join(", ")));
+    if let Some(source) = &mem.source {
+        out.push_str(&format!("  {:<8}{source}\n", "source"));
+    }
+    out.push_str(&format!(
+        "  {:<8}{} visits, {} useful\n",
+        "usage", mem.visits, mem.times_useful
+    ));
+    out.push_str("---\n");
+    out.push_str(&mem.body);
+    out.push('\n');
+    out
+}

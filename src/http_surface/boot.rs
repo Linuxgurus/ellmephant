@@ -192,7 +192,7 @@ pub async fn bootstrap(
     State(state): State<HttpState>,
     RawQuery(raw): RawQuery,
     caller: crate::identity::Caller,
-) -> Response {
+) -> ApiResult<Response> {
     let reader = reader_from(&caller);
     let params = Params::parse(raw.as_deref());
     let json = params.json();
@@ -206,11 +206,14 @@ pub async fn bootstrap(
     .await
     .unwrap_or_default();
     let tools = with_tools.then(boot_tools);
-    render(
+    present(
         StatusCode::OK,
         json,
-        boot_json(&view, tools.as_deref()).to_string(),
-        boot_text(&view, tools.as_deref()),
+        &report(
+            (view, tools),
+            |(view, tools)| boot_json(view, tools.as_deref()).to_string(),
+            |(view, tools)| boot_text(view, tools.as_deref()),
+        ),
     )
 }
 

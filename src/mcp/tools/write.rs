@@ -4,7 +4,6 @@
 //! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
 //! into the one table the handler dispatches through.
 
-use crate::mcp::context::{caller_of, pen_name};
 use crate::mcp::*;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
@@ -30,13 +29,6 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let claimed = p.as_pen.clone();
         let patch = p.into_patch();
-        // The name travels on the CONNECTION, not the payload: a forged claim refuses the write
-        // rather than silently becoming `anonymous`, because a lie with a signature is worse than
-        // no signature at all. `as` may only ever name a DESCENDANT of that proven pen.
-        let caller = caller_of(&ctx, self.declared.as_deref(), &self.paths)
-            .pen()
-            .map_err(|r| r.to_string())?
-            .clone();
         let credit = match claimed {
             Some(name) => Some(crate::names::Pen::new(&name).map_err(|e| e.to_string())?),
             None => None,
@@ -46,8 +38,8 @@ impl MemoryServer {
         // permitted, or `as:` becomes a way to spend one authority under another pen's name. The
         // stamping and the two gates live in `ops::memory_upsert`, so the HTTP door is the same law.
         let outcome = self
-            .with_store("memory_upsert", move |s| {
-                crate::ops::memory_upsert(s, &caller, crate::ops::Upsert { patch, credit })
+            .write_outcome("memory_upsert", &ctx, move |s, caller| {
+                crate::ops::memory_upsert(s, caller, crate::ops::Upsert { patch, credit })
             })
             .await?;
         tracing::info!(
@@ -92,17 +84,13 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
-            .pen()
-            .map_err(|r| r.to_string())?
-            .clone(); // writes are signed; anonymous is read-only
         let key = p.key;
         let rm_key = key.clone();
         // The receipt says what the delete did NOT remove. History outlives the row by design, and a
         // delete that stays silent about that reads as "gone" when it means "not findable as current".
         if let Some(remaining) = self
-            .with_store("memory_delete", move |s| {
-                crate::ops::memory_delete(s, &pen, &rm_key)
+            .write_outcome("memory_delete", &ctx, move |s, pen| {
+                crate::ops::memory_delete(s, pen, &rm_key)
             })
             .await?
         {
@@ -137,11 +125,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<HistorySearchParams>,
     ) -> std::result::Result<String, String> {
-        let _pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let limit = p.k.unwrap_or(10).clamp(1, 200);
+        let query = p.query;
+        // A pen is REQUIRED even though this reads: history is every state a row has held, including
+        // states its current audience would not show. The connection is the writer's for the same
+        // reason — a past state is not in the live index.
         let hits = self
-            .with_store("memory_history_search", move |s| {
-                s.history_search(&p.query, limit)
+            .write_outcome("memory_history_search", &ctx, move |s, _pen| {
+                s.history_search(&query, limit)
             })
             .await?;
         let rows: Vec<serde_json::Value> = hits
@@ -182,11 +173,10 @@ impl MemoryServer {
                 "this destroys text and nothing can restore it: pass `confirm: true`".to_string(),
             );
         }
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         match (p.key, p.orphans.unwrap_or(false)) {
             (Some(key), false) => {
                 let done = self
-                    .with_store("memory_history_erase", move |s| {
+                    .write_outcome("memory_history_erase", &ctx, move |s, _pen| {
                         s.erase_history(&key).map(|n| (key.clone(), n))
                     })
                     .await?;
@@ -197,8 +187,11 @@ impl MemoryServer {
                 })))
             }
             (None, true) => {
-                let (keys, versions) = self
-                    .with_store("memory_history_erase", move |s| s.erase_orphan_history())
+                let (keys, versions, pen) = self
+                    .write_outcome("memory_history_erase", &ctx, move |s, pen| {
+                        s.erase_orphan_history()
+                            .map(|(k, v)| (k, v, pen.as_str().to_string()))
+                    })
                     .await?;
                 tracing::info!(tool = "memory_history_erase", keys, versions, pen = %pen, "orphan history erased");
                 Ok(json_ok(serde_json::json!({
@@ -231,17 +224,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AppendParams>,
     ) -> std::result::Result<String, String> {
-        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
-            .pen()
-            .map_err(|r| r.to_string())?
-            .clone();
+
         let key = p.key;
         let line = p.line;
         let force = p.force.unwrap_or(false);
         let log_key = key.clone();
         let out = self
-            .with_store("memory_append", move |s| {
-                crate::ops::memory_append(s, &pen, &key, &line, force)
+            .write_outcome("memory_append", &ctx, move |s, pen| {
+                crate::ops::memory_append(s, pen, &key, &line, force)
             })
             .await?;
         tracing::info!(
@@ -251,7 +241,7 @@ impl MemoryServer {
             version = ?out.version,
             "memory appended"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// Fold one memory's lines into another without deleting the source — the append-only,
@@ -272,17 +262,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<FoldParams>,
     ) -> std::result::Result<String, String> {
-        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
-            .pen()
-            .map_err(|r| r.to_string())?
-            .clone();
+
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
-            .with_store("memory_fold", move |s| {
-                crate::ops::memory_fold(s, &pen, &from, &into)
+            .write_outcome("memory_fold", &ctx, move |s, pen| {
+                crate::ops::memory_fold(s, pen, &from, &into)
             })
             .await?;
         tracing::info!(
@@ -293,7 +280,7 @@ impl MemoryServer {
             changed = out.changed,
             "memory folded"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// Integrate one memory into another and delete it — the safe way to merge.
@@ -314,17 +301,14 @@ impl MemoryServer {
         Parameters(p): Parameters<MergeParams>,
     ) -> std::result::Result<String, String> {
         // A merge DESTROYS the source, so it is signed like any other write.
-        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
-            .pen()
-            .map_err(|r| r.to_string())?
-            .clone();
+
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();
         let log_into = into.clone();
         let out = self
-            .with_store("memory_merge", move |s| {
-                crate::ops::memory_merge(s, &pen, &from, &into)
+            .write_outcome("memory_merge", &ctx, move |s, pen| {
+                crate::ops::memory_merge(s, pen, &from, &into)
             })
             .await?;
         tracing::info!(
@@ -335,7 +319,7 @@ impl MemoryServer {
             preloads = out.preloads,
             "memories merged"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// Take responsibility for a memory — responsibility, not authorship.
@@ -355,21 +339,20 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AdoptParams>,
     ) -> std::result::Result<String, String> {
-        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let pen = crate::names::Pen::new(&who).map_err(|e| e.to_string())?;
         let key = p.key;
         let force = p.force.unwrap_or(false);
-        let owner = p.to.unwrap_or_else(|| who.clone());
-        let adopting = key.clone();
-        let target = owner.clone();
-        self.with_store("memory_adopt", move |s| {
-            crate::ops::memory_adopt(s, &pen, &adopting, Some(&target), force)
-        })
-        .await?;
-        tracing::info!(tool = "memory_adopt", key = %key, actor = %who, owner = %owner, force, "ownership assigned");
+        let to = p.to;
+        let (log_key, owner) = self
+            .write_outcome("memory_adopt", &ctx, move |s, pen| {
+                let owner = to.unwrap_or_else(|| pen.as_str().to_string());
+                crate::ops::memory_adopt(s, pen, &key, Some(&owner), force)?;
+                Ok((key, owner))
+            })
+            .await?;
+        tracing::info!(tool = "memory_adopt", key = %log_key, owner = %owner, force, "ownership assigned");
         Ok(json_ok(serde_json::json!({
             "status": "adopted",
-            "key": key,
+            "key": log_key,
             "owner": owner,
         })))
     }

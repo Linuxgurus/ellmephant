@@ -37,77 +37,89 @@ use crate::model;
 use crate::search::{Bundle, Field, MatchMode};
 use crate::store::{self, project};
 
-/// Names of the tools this server exposes.
-pub const TOOLS: &[&str] = &[
-    "whoami",
-    "memory_unowned",
-    "whois",
-    "pen_mint",
-    "pen_rotate",
-    "pen_lend",
-    "sudo",
-    "sudo_pass",
-    "sudo_release",
-    "sudo_sessions",
-    "memory_upsert",
-    "memory_append",
-    "memory_delete",
-    "memory_history_erase",
-    "memory_history_search",
-    "memory_merge",
-    "memory_fold",
-    "memory_adopt",
-    "memory_search",
-    "semantic_search",
-    "memory_get",
-    "memory_history",
-    "memory_backlinks",
-    "memory_dangling",
-    "memory_upvote",
-    "memory_stats",
-    "memory_health",
-    "memory_dupes",
-    "memory_reembed",
-    "memory_reparse",
-    "project_upsert",
-    "project_get",
-    "project_list",
-    "config_get",
-    "config_set",
-    "config_define",
-    "config_list",
-    "claim_acquire",
-    "claim_release",
-    "claim_list",
-    "mail_send",
-    "mail_inbox",
-    "mail_read",
-    "mail_ack",
-    "mail_prune",
-    "channel_list",
-    "channel_send",
-    "channel_history",
-    "channel_fetch",
-    "channel_present",
-    "channel_invite",
-    "channel_breach",
-    "channel_join",
-    "channel_leave",
-    "channel_wait",
-    "channel_members",
-    "channel_create",
-    "channel_set_gate",
-    "channel_events",
-    "channel_set_retention",
-    "channel_prune",
-    "mail_surrogate_grant",
-    "mail_surrogate_revoke",
-    "mail_surrogate_list",
-];
+/// ONE TOOL TABLE (soma/ellmephant#231, #237).
+///
+/// The names used to live in four places — `TOOLS`, `CORE_TOOLS`, `Surface` and `group_of` — kept in
+/// agreement by a test whose whole job was to catch them disagreeing. That test was the smell: four
+/// lists of one fact. This is the fact. Everything else is a view of it.
+///
+/// `group` is a SHELF, not a permission: `GET /api` uses it to decide which short list a reader asks
+/// for first, and every op is reachable regardless.
+pub struct ToolSpec {
+    /// The name in `tools/list`, and the name the REST route is derived from.
+    pub name: &'static str,
+    /// The API index shelf: `core`, `identity`, `config`, `claim`, `mail`, `channel`, `hygiene`.
+    pub group: &'static str,
+    /// Whether the hot-path door (`/mcp/core`) advertises it.
+    pub core: bool,
+}
 
-/// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
-/// `initialize` cannot disagree about who is answering.
-pub(crate) const SERVER_NAME: &str = "ellmephant";
+pub const TOOLS: &[ToolSpec] = &[
+    ToolSpec { name: "whoami", group: "core", core: true },
+    ToolSpec { name: "memory_unowned", group: "hygiene", core: false },
+    ToolSpec { name: "whois", group: "identity", core: false },
+    ToolSpec { name: "pen_mint", group: "identity", core: false },
+    ToolSpec { name: "pen_rotate", group: "identity", core: false },
+    ToolSpec { name: "pen_lend", group: "identity", core: false },
+    ToolSpec { name: "sudo", group: "identity", core: false },
+    ToolSpec { name: "sudo_pass", group: "identity", core: false },
+    ToolSpec { name: "sudo_release", group: "identity", core: false },
+    ToolSpec { name: "sudo_sessions", group: "identity", core: false },
+    ToolSpec { name: "memory_upsert", group: "core", core: true },
+    ToolSpec { name: "memory_append", group: "hygiene", core: false },
+    ToolSpec { name: "memory_delete", group: "core", core: true },
+    ToolSpec { name: "memory_history_erase", group: "hygiene", core: false },
+    ToolSpec { name: "memory_history_search", group: "hygiene", core: false },
+    ToolSpec { name: "memory_merge", group: "hygiene", core: false },
+    ToolSpec { name: "memory_fold", group: "hygiene", core: false },
+    ToolSpec { name: "memory_adopt", group: "hygiene", core: false },
+    ToolSpec { name: "memory_search", group: "core", core: true },
+    ToolSpec { name: "semantic_search", group: "hygiene", core: false },
+    ToolSpec { name: "memory_get", group: "core", core: true },
+    ToolSpec { name: "memory_history", group: "core", core: true },
+    ToolSpec { name: "memory_backlinks", group: "core", core: true },
+    ToolSpec { name: "memory_dangling", group: "hygiene", core: false },
+    ToolSpec { name: "memory_upvote", group: "core", core: true },
+    ToolSpec { name: "memory_stats", group: "core", core: true },
+    ToolSpec { name: "memory_health", group: "hygiene", core: false },
+    ToolSpec { name: "memory_dupes", group: "hygiene", core: false },
+    ToolSpec { name: "memory_reembed", group: "hygiene", core: false },
+    ToolSpec { name: "memory_reparse", group: "hygiene", core: false },
+    ToolSpec { name: "project_upsert", group: "core", core: true },
+    ToolSpec { name: "project_get", group: "core", core: true },
+    ToolSpec { name: "project_list", group: "core", core: true },
+    ToolSpec { name: "config_get", group: "config", core: false },
+    ToolSpec { name: "config_set", group: "config", core: false },
+    ToolSpec { name: "config_define", group: "config", core: false },
+    ToolSpec { name: "config_list", group: "config", core: false },
+    ToolSpec { name: "claim_acquire", group: "claim", core: false },
+    ToolSpec { name: "claim_release", group: "claim", core: false },
+    ToolSpec { name: "claim_list", group: "claim", core: false },
+    ToolSpec { name: "mail_send", group: "core", core: true },
+    ToolSpec { name: "mail_inbox", group: "core", core: true },
+    ToolSpec { name: "mail_read", group: "core", core: true },
+    ToolSpec { name: "mail_ack", group: "core", core: true },
+    ToolSpec { name: "mail_prune", group: "mail", core: false },
+    ToolSpec { name: "channel_list", group: "core", core: true },
+    ToolSpec { name: "channel_send", group: "core", core: true },
+    ToolSpec { name: "channel_history", group: "core", core: true },
+    ToolSpec { name: "channel_fetch", group: "core", core: true },
+    ToolSpec { name: "channel_present", group: "channel", core: false },
+    ToolSpec { name: "channel_invite", group: "channel", core: false },
+    ToolSpec { name: "channel_breach", group: "channel", core: false },
+    ToolSpec { name: "channel_join", group: "channel", core: false },
+    ToolSpec { name: "channel_leave", group: "channel", core: false },
+    ToolSpec { name: "channel_wait", group: "channel", core: false },
+    ToolSpec { name: "channel_members", group: "channel", core: false },
+    ToolSpec { name: "channel_create", group: "channel", core: false },
+    ToolSpec { name: "channel_set_gate", group: "channel", core: false },
+    ToolSpec { name: "channel_events", group: "channel", core: false },
+    ToolSpec { name: "channel_set_retention", group: "channel", core: false },
+    ToolSpec { name: "channel_prune", group: "channel", core: false },
+    ToolSpec { name: "mail_surrogate_grant", group: "mail", core: false },
+    ToolSpec { name: "mail_surrogate_revoke", group: "mail", core: false },
+    ToolSpec { name: "mail_surrogate_list", group: "mail", core: false },
+];
 
 /// Which tools an MCP door ADVERTISES.
 ///
@@ -124,7 +136,8 @@ pub enum Surface {
     Core,
 }
 
-/// The tools `/mcp/core` advertises. Everything else is reachable over REST and indexed at `GET /api`.
+/// The tools `/mcp/core` advertises — a VIEW of [`TOOLS`], never a second list. Everything else is
+/// reachable over REST and indexed at `GET /api`.
 ///
 /// Chosen by frequency, not by power: these are the calls a turn makes without thinking. Hygiene,
 /// identity, admin and repair are rare and live on the expanded door and the API.
@@ -135,50 +148,32 @@ pub enum Surface {
 /// `memory_fold` are edits whose correctness depends on a `memory_get` first, so the turn reads
 /// before it writes; `channel_wait` blocks the turn for up to 25 seconds. Add one only with a
 /// measurement of how often it is called, never because it reads like the others.
-pub const CORE_TOOLS: &[&str] = &[
-    "whoami",
-    "memory_search",
-    "memory_get",
-    "memory_upsert",
-    "memory_delete",
-    "memory_stats",
-    "memory_backlinks",
-    "memory_history",
-    "memory_upvote",
-    "project_get",
-    "project_upsert",
-    "project_list",
-    "mail_send",
-    "mail_inbox",
-    "mail_read",
-    "mail_ack",
-    "channel_list",
-    "channel_send",
-    "channel_history",
-    "channel_fetch",
-];
 
-/// The group an API index entry belongs to. The group is a shelf, not a permission: `GET /api`
-/// carries every op, and the group only decides which short list a reader asks for first.
-pub(crate) fn group_of(tool: &str) -> &'static str {
-    if CORE_TOOLS.contains(&tool) {
-        return "core";
-    }
-    if tool.starts_with("pen_") || tool == "whois" || tool.starts_with("sudo") {
-        "identity"
-    } else if tool.starts_with("config") {
-        "config"
-    } else if tool.starts_with("claim") {
-        "claim"
-    } else if tool.starts_with("mail") {
-        "mail"
-    } else if tool.starts_with("channel") {
-        "channel"
-    } else {
-        // memory_dupes, merge, adopt, unowned, dangling, reembed, reparse, history_*.
-        "hygiene"
-    }
+pub fn core_count() -> usize {
+    TOOLS.iter().filter(|t| t.core).count()
 }
+
+/// Whether the hot-path door advertises `name`. Unknown names are not core: an unlisted tool is a
+/// bug caught by the composition test, and guessing here would hide it.
+pub fn is_core(name: &str) -> bool {
+    TOOLS.iter().any(|t| t.core && t.name == name)
+}
+
+/// The row for one tool, or `None` when the name is not in the table.
+pub fn spec(name: &str) -> Option<&'static ToolSpec> {
+    TOOLS.iter().find(|t| t.name == name)
+}
+
+/// The group an API index entry belongs to, read from the table. A name the table does not carry
+/// falls back to `hygiene` — the same answer the old prefix match gave for `memory_*` — so a tool
+/// added without its row still appears somewhere rather than vanishing from the index.
+pub(crate) fn group_of(tool: &str) -> &'static str {
+    spec(tool).map(|t| t.group).unwrap_or("hygiene")
+}
+
+/// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
+/// `initialize` cannot disagree about who is answering.
+pub(crate) const SERVER_NAME: &str = "ellmephant";
 
 /// One tool exactly as `tools/list` presents it, for a surface that is not MCP.
 #[derive(Debug, Clone)]
@@ -274,7 +269,7 @@ impl ServerHandler for MemoryServer {
     ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         let mut tools = Self::tool_router().list_all();
         if self.surface == Surface::Core {
-            tools.retain(|tool| CORE_TOOLS.contains(&tool.name.as_ref()));
+            tools.retain(|tool| is_core(tool.name.as_ref()));
         }
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
@@ -312,17 +307,21 @@ mod tests {
     #[test]
     fn core_is_a_subset_of_every_tool_and_none_is_duplicated() {
         let mut seen = std::collections::BTreeSet::new();
-        for tool in CORE_TOOLS {
-            assert!(TOOLS.contains(tool), "core names an unknown tool: {tool}");
-            assert!(seen.insert(*tool), "core names a tool twice: {tool}");
+        for tool in TOOLS.iter().filter(|t| t.core) {
+            assert!(seen.insert(tool.name), "core names a tool twice: {}", tool.name);
         }
         // The split has to be a SPLIT: a core list equal to the whole surface saves nothing.
         assert!(
-            CORE_TOOLS.len() < TOOLS.len() / 2,
+            core_count() < TOOLS.len() / 2,
             "core is {} of {} — not a hot path",
-            CORE_TOOLS.len(),
+            core_count(),
             TOOLS.len()
         );
+        // The table is the only list: a duplicate name is a name with two answers.
+        let mut names = std::collections::BTreeSet::new();
+        for tool in TOOLS {
+            assert!(names.insert(tool.name), "TOOLS names a tool twice: {}", tool.name);
+        }
     }
 
     /// ★ THE COMPOSITION IS THE CONTRACT (soma/ellmephant#50). `MemoryServer::tool_router` merges
@@ -336,7 +335,7 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         served.sort();
-        let mut expected: Vec<String> = TOOLS.iter().map(|t| t.to_string()).collect();
+        let mut expected: Vec<String> = TOOLS.iter().map(|t| t.name.to_string()).collect();
         expected.sort();
         assert_eq!(
             served, expected,
@@ -349,10 +348,10 @@ mod tests {
     fn the_core_surface_advertises_exactly_core() {
         let full = MemoryServer::tool_router().list_all();
         let mut core = full.clone();
-        core.retain(|tool| CORE_TOOLS.contains(&tool.name.as_ref()));
-        assert_eq!(core.len(), CORE_TOOLS.len());
+        core.retain(|tool| is_core(tool.name.as_ref()));
+        assert_eq!(core.len(), core_count());
         for tool in &full {
-            let expected = CORE_TOOLS.contains(&tool.name.as_ref());
+            let expected = is_core(tool.name.as_ref());
             assert_eq!(
                 core.iter().any(|t| t.name == tool.name),
                 expected,
@@ -365,7 +364,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_api_group() {
         let groups: std::collections::BTreeSet<&str> =
-            TOOLS.iter().map(|tool| group_of(tool)).collect();
+            TOOLS.iter().map(|tool| group_of(tool.name)).collect();
         assert_eq!(
             groups,
             [
@@ -382,7 +381,11 @@ mod tests {
         let tools = MemoryServer::tool_router().list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in TOOLS {
-            assert!(names.contains(expected), "missing {expected:?}: {names:?}");
+            assert!(
+                names.contains(&expected.name),
+                "missing {:?}: {names:?}",
+                expected.name
+            );
         }
 
         let find = |name: &str| {
@@ -707,6 +710,14 @@ pub use params::*;
 /// One JSON object as the tool's text result.
 pub(crate) fn json_ok(value: serde_json::Value) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The one serialization a tool result is allowed, for a body that logs its own fields first.
+///
+/// A tool that cannot render its own outcome is a bug, not an empty object: `json_ok`'s `{}`
+/// fallback would hand a model a success with no content.
+pub(crate) fn json_out<T: serde::Serialize>(value: &T) -> std::result::Result<String, String> {
+    serde_json::to_string(value).map_err(|e| e.to_string())
 }
 /// The `memory_upvote` sweep, implemented ONCE for both doors.
 ///

@@ -1563,7 +1563,7 @@ async fn the_core_door_advertises_only_the_hot_path() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), ellmephant::mcp::CORE_TOOLS.len());
+    assert_eq!(names.len(), ellmephant::mcp::core_count());
     assert!(!names.contains(&"memory_dupes"), "hygiene is not core");
     assert!(
         !names.contains(&"channel_prune"),

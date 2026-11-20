@@ -5,7 +5,7 @@
 //! getter per field would be noise, and a private field would make the tools unable to compile.
 
 use super::*;
-use crate::mcp::context::{pen_name, reader_of};
+use crate::mcp::context::{caller_of, pen_name, reader_of};
 
 /// The MCP server. Holds the single store [`Session`] behind a mutex; `#[tool_handler]`
 /// reaches the tool table through the generated `Self::tool_router()`, so there is no field.
@@ -223,6 +223,85 @@ impl MemoryServer {
                 Err(err)
             }
         }
+    }
+
+    /// ★ THE WRITE ENVELOPE (soma/ellmephant#231, #237).
+    ///
+    /// Every write tool used to open with the same five lines — borrow the pen, open the store, gate,
+    /// serialize, log — written out by hand 42 times. The gate is NOT a parameter here on purpose:
+    /// #234 moved every `channel_gate` inside `ops::`, so the gate travels with the VERB, not with
+    /// the door. A helper that accepted one would be a second place to forget it.
+    ///
+    /// Returns the outcome so the body can log its own fields or branch on it (an upsert conflict is
+    /// a result, not an error, and only the verb knows that). [`Self::write_tool`] is the common tail.
+    pub(crate) async fn write_outcome<T, F>(
+        &self,
+        name: &'static str,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        f: F,
+    ) -> std::result::Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Session, &crate::names::Pen) -> crate::error::Result<T> + Send + 'static,
+    {
+        let pen = caller_of(ctx, self.declared.as_deref(), &self.paths)
+            .pen()
+            .map_err(|r| r.to_string())?
+            .clone();
+        let actor = pen.clone();
+        self.with_store(name, move |s| f(s, &actor))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The write envelope, ending in the one serialization a tool result is allowed.
+    ///
+    /// A body that calls this is the closure only: no pen, no store handle, no `to_string`.
+    pub(crate) async fn write_tool<T, F>(
+        &self,
+        name: &'static str,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        f: F,
+    ) -> std::result::Result<String, String>
+    where
+        T: serde::Serialize + Send + 'static,
+        F: FnOnce(&mut Session, &crate::names::Pen) -> crate::error::Result<T> + Send + 'static,
+    {
+        let out = self.write_outcome(name, ctx, f).await?;
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// ★ THE READ ENVELOPE. A read is scoped by who is asking and runs on its own connection, so a
+    /// reader never queues behind a write; the body supplies only the question.
+    pub(crate) async fn read_outcome<T, F>(
+        &self,
+        name: &'static str,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        f: F,
+    ) -> std::result::Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Session) -> crate::error::Result<T> + Send + 'static,
+    {
+        let reader = reader_of(ctx, self.declared.as_deref(), &self.paths);
+        self.with_read(name, reader, f)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The read envelope, ending in the one serialization a tool result is allowed.
+    pub(crate) async fn read_tool<T, F>(
+        &self,
+        name: &'static str,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        f: F,
+    ) -> std::result::Result<String, String>
+    where
+        T: serde::Serialize + Send + 'static,
+        F: FnOnce(&Session) -> crate::error::Result<T> + Send + 'static,
+    {
+        let out = self.read_outcome(name, ctx, f).await?;
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// Count a read (`visits`) without ever waiting for the store.

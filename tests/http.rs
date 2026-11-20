@@ -334,8 +334,9 @@ fn every_tool_has_a_route() {
     );
     for tool in TOOLS {
         assert!(
-            ROUTES.iter().any(|route| route.tool == *tool),
-            "no HTTP route maps to `{tool}`"
+            ROUTES.iter().any(|route| route.tool == tool.name),
+            "no HTTP route maps to `{}`",
+            tool.name
         );
     }
 }

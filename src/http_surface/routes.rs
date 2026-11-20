@@ -149,6 +149,11 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/memory-health",
+        tool: "memory_health",
+    },
+    Route {
+        method: "GET",
         path: "/dupes",
         tool: "memory_dupes",
     },

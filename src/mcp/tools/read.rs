@@ -440,6 +440,38 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Ok(crate::wire::links::dangling_to_wire_json(&edges))
     }
 
+    /// The five-number health surface: one call, and the definition travels with each number.
+    #[tool(
+        name = "memory_health",
+        description = "One call, five numbers, each carrying its definition: `body_chars`, `log_share` (eight operational-log key prefixes), `dup_pairs` (what `memory_dupes` counts: class `duplicate` only, default cosine distance 0.05 — NOT computed in this call; it is `null` with a `suppressed` line naming `memory_dupes`, the exact finder that returns the pairs), `woven` (one link edge, any direction, with `woven_inbound`/`woven_outbound` beside it) and `cold30` (visible rows older than 30 days that were never read). ★ These numbers are VISIBLE-scoped: they are computed through the caller's own Reader and the response says `scope: \"visible\"`; no store total is reported (shape (a), decided 2026-11-14). `suppressed` names any number that could not be computed — `cold30` is `null`, never `0`, when no visible row is older than 30 days, because `0` would assert 'nothing is cold'; `dup_pairs` is `null`, never `0`, because the finder is budgeted out of this call. Also returns rows, log_chars, dup_pairs_min_distance, cold30_population, tag_distinct, tag_singletons, rows_untagged, edges, edges_per_row and dangling. Read-only, no args, no writes.",
+        annotations(
+            title = "Memory health (five numbers)",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn memory_health(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<String, String> {
+        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
+        let health = self
+            .with_read("memory_health", reader, |s| s.health())
+            .await?;
+        tracing::info!(
+            tool = "memory_health",
+            rows = health.rows,
+            log_share = ?health.log_share,
+            dup_pairs = health.dup_pairs,
+            woven = ?health.woven,
+            cold30 = ?health.cold30,
+            "health"
+        );
+        serde_json::to_string(&health).map_err(|e| e.to_string())
+    }
+
     /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
     #[tool(
         name = "memory_stats",

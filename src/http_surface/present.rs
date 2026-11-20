@@ -237,6 +237,61 @@ pub(super) fn stats_text(s: &store::stats::Stats) -> String {
     out
 }
 
+/// The `GET /memory-health` prose: the five numbers, their context, and anything suppressed.
+pub(super) fn health_text(h: &store::health::Health) -> String {
+    let pct = |v: Option<f64>| match v {
+        Some(n) => format!("{n:.2}%"),
+        None => "null".to_string(),
+    };
+    let mut out = format!("ellmephant memory health — scope: {}\n", h.scope);
+    for (label, value) in [
+        ("rows", h.rows.to_string()),
+        ("body_chars", h.body_chars.to_string()),
+        ("log_chars", h.log_chars.to_string()),
+        ("log_share", pct(h.log_share)),
+        (
+            "dup_pairs",
+            match h.dup_pairs {
+                Some(n) => n.to_string(),
+                None => "null".to_string(),
+            },
+        ),
+        (
+            "dup_min_distance",
+            match h.dup_pairs_min_distance {
+                Some(d) => format!("{d:.4}"),
+                None => "null".to_string(),
+            },
+        ),
+        ("woven", pct(h.woven)),
+        ("woven_inbound", pct(h.woven_inbound)),
+        ("woven_outbound", pct(h.woven_outbound)),
+        ("cold30", pct(h.cold30)),
+        ("cold30_population", h.cold30_population.to_string()),
+        ("tag_distinct", h.tag_distinct.to_string()),
+        ("tag_singletons", h.tag_singletons.to_string()),
+        ("rows_untagged", h.rows_untagged.to_string()),
+        ("edges", h.edges.to_string()),
+        (
+            "edges_per_row",
+            match h.edges_per_row {
+                Some(v) => format!("{v:.4}"),
+                None => "null".to_string(),
+            },
+        ),
+        ("dangling", h.dangling.to_string()),
+    ] {
+        out.push_str(&format!("  {label:<18}{value}\n"));
+    }
+    for reason in &h.suppressed {
+        out.push_str(&format!("  suppressed        {reason}\n"));
+    }
+    out.push('\n');
+    out.push_str(h.scope_note);
+    out.push('\n');
+    out
+}
+
 /// The `GET /memory/{key}` prose: the header fields, then the body.
 pub(super) fn memory_text(mem: &store::Memory, relation: Option<&str>) -> String {
     let mut out = format!("{}\n", mem.key);

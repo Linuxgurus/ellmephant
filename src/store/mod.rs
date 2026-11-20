@@ -10,6 +10,7 @@ pub mod config;
 pub mod credential;
 pub mod dupes;
 pub mod encode;
+pub mod health;
 pub mod links;
 pub mod mail;
 pub mod maintain;

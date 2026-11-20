@@ -233,6 +233,114 @@ fn a_cluster_of_three_gets_one_keeper_and_executable_steps() {
     );
 }
 
+/// The acceptance question is whether ALL the steps can be executed, not whether each step is right.
+///
+/// Three rows, one connected component: the finder returns `(A,B)` and `(B,C)` and nothing else. A
+/// plan built per PAIR absorbs `B` twice (or absorbs the keeper that step 1 just named), which is an
+/// instruction no order can follow. So this test does not inspect the plan's shape — it APPLIES the
+/// plan to a simulated row set and fails on the first step that cannot be carried out.
+#[test]
+fn a_three_row_cluster_plan_is_executable() {
+    use std::collections::{BTreeSet, HashMap};
+
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(4);
+
+    // Same content in every row, so every close pair is `duplicate`. The geometry is set by hand:
+    // A~B and B~C sit inside the 0.05 ceiling, A~C sits outside it, so the finder's pairs are
+    // exactly the two edges of one path — a component of three with no shortcut edge.
+    let body = "the turn boundary is offered once per wake, and a miss is not a failure.";
+    let rows_in: [(&str, [f32; 4]); 3] = [
+        ("aaa-row", [1.0, 0.0, 0.0, 0.0]),
+        ("bbb-row", [1.0, 0.2, 0.0, 0.0]),
+        ("ccc-row", [1.0, 0.4, 0.0, 0.0]),
+    ];
+    for (key, vector) in rows_in {
+        let (id, _) = common::add_now(&conn, &embedder, &memory(key, key, body)).unwrap();
+        vec::upsert(&conn, id, "memory", key, &vector).unwrap();
+    }
+
+    let pairs = dupes::find(&conn, 0.05, 50).unwrap();
+    // ★ The pair SHAPE is checked, not assumed: if the finder returns something else (a star, a
+    // triangle, one pair, or a refusal class), this test says so instead of quietly adapting.
+    let shape: BTreeSet<(String, String)> = pairs
+        .iter()
+        .map(|p| (p.key_a.clone(), p.key_b.clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        BTreeSet::from([
+            ("aaa-row".to_string(), "bbb-row".to_string()),
+            ("bbb-row".to_string(), "ccc-row".to_string()),
+        ]),
+        "the finder returned a different pair shape: {pairs:?}"
+    );
+    assert!(
+        pairs.iter().all(|p| p.class == dupes::Class::Duplicate),
+        "every close pair here is a duplicate: {pairs:?}"
+    );
+
+    let plan = dupes::plan(&conn, &pairs).unwrap();
+
+    // Apply the plan IN THE ORDER PRINTED to a simulated row set, mutating it as a real merge would.
+    let mut rows: HashMap<String, String> = rows_in
+        .iter()
+        .map(|(key, _)| (key.to_string(), body.to_string()))
+        .collect();
+    let inputs: BTreeSet<String> = rows.keys().cloned().collect();
+    let mut absorbed: BTreeSet<String> = BTreeSet::new();
+    let mut keeper_of_step_one: Option<String> = None;
+    for (i, step) in plan.steps.iter().enumerate() {
+        assert!(
+            rows.contains_key(&step.absorb),
+            "step {i} absorbs `{}`, which does not exist when the step is applied — the plan is \
+             not executable in order: {plan:?}",
+            step.absorb
+        );
+        assert!(
+            rows.contains_key(&step.keep),
+            "step {i} keeps `{}`, which does not exist when the step is applied: {plan:?}",
+            step.keep
+        );
+        assert!(
+            absorbed.insert(step.absorb.clone()),
+            "`{}` is absorbed more than once: {plan:?}",
+            step.absorb
+        );
+        if i == 0 {
+            keeper_of_step_one = Some(step.keep.clone());
+        } else if let Some(keeper) = &keeper_of_step_one {
+            assert_ne!(
+                &step.absorb, keeper,
+                "the keeper named in step 1 (`{keeper}`) is absorbed by a later step: {plan:?}"
+            );
+        }
+        rows.remove(&step.absorb);
+    }
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row must survive the whole plan, found {:?}: {plan:?}",
+        rows.keys().collect::<Vec<_>>()
+    );
+    let survivor = rows.keys().next().expect("one survivor");
+    assert_eq!(
+        Some(survivor),
+        keeper_of_step_one.as_ref(),
+        "the surviving row must be the keeper the plan names: {plan:?}"
+    );
+
+    let mut covered = absorbed;
+    covered.insert(survivor.clone());
+    assert_eq!(
+        covered, inputs,
+        "absorbed ∪ {{keeper}} must be the three input keys exactly — nothing lost, nothing \
+         invented: {plan:?}"
+    );
+}
+
 #[test]
 fn a_capture_quoted_by_a_lesson_is_refused_not_merged() {
     let (_dir, paths) = temp_store();

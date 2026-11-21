@@ -311,7 +311,7 @@ Reads — no auth, `?format=json` everywhere; pure except the `visits` counter:
 | GET | `/stats` | `memory_stats` | `?tags=true` |
 | GET | `/memory/{key}` | `memory_get` | counts a `visits` read, exactly as MCP does |
 | GET | `/memory/{key}/backlinks` | `memory_backlinks` | — |
-| GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&fields=a,b&tag=x&tag=y` |
+| GET | `/search` | `memory_search` | `?q=&k=&max_distance=&expand=&min_chars=&max_chars=&orphans=true&untagged=true&fields=a,b&tag=x&tag=y` |
 | GET | `/dupes` | `memory_dupes` | `?max_distance=&limit=` |
 | GET | `/projects` | `project_list` | `?status=&pattern=&mode=&tag=` |
 | GET | `/project/{key}` | `project_get` | `?hydrate=none\|snippet\|full` |

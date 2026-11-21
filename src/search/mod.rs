@@ -44,6 +44,8 @@ pub struct Query {
     pub updated_before: Option<String>,
     pub key: Option<String>,
     pub key_prefix: bool,
+    pub orphans: bool,
+    pub untagged: bool,
     pub title: Option<String>,
     pub status: Option<String>,
 }
@@ -57,6 +59,10 @@ impl Query {
             || self.created_before.is_some()
             || self.updated_after.is_some()
             || self.updated_before.is_some()
+    }
+
+    fn has_filters(&self) -> bool {
+        self.has_structured() || self.orphans || self.untagged
     }
 }
 
@@ -276,7 +282,7 @@ pub fn run(
     if q.semantic_only {
         ordered.retain(|(id, _)| semantic_ids.contains(id));
         ordered.truncate(q.k.max(1));
-    } else if ranked && lexical.is_none() {
+    } else if ranked || lexical.is_some() || q.has_filters() {
         ordered.truncate(q.k.max(1));
     }
 
@@ -391,6 +397,26 @@ fn predicate_set(
             .query_map(rusqlite::params![term], |r| r.get::<_, i64>(0))?
             .collect::<rusqlite::Result<HashSet<i64>>>()?;
         applied.push("title".into());
+        sets.push(ids);
+    }
+    if q.orphans {
+        let mut st = conn.prepare(
+            "SELECT m.id FROM memory m
+              WHERE m.id NOT IN (SELECT from_id FROM memory_link)
+                AND m.key NOT IN (SELECT to_key FROM memory_link WHERE to_type = 'memory')",
+        )?;
+        let ids = st
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<HashSet<i64>>>()?;
+        applied.push("orphans".into());
+        sets.push(ids);
+    }
+    if q.untagged {
+        let mut st = conn.prepare("SELECT id FROM memory WHERE tags = ''")?;
+        let ids = st
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<HashSet<i64>>>()?;
+        applied.push("untagged".into());
         sets.push(ids);
     }
     if sets.is_empty() {
@@ -665,6 +691,8 @@ mod tests {
             updated_before: None,
             key: None,
             key_prefix: false,
+            orphans: false,
+            untagged: false,
             title: None,
             status: None,
         };

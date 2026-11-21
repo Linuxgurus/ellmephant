@@ -42,6 +42,8 @@ fn query(text: Option<&str>) -> Query {
         updated_before: None,
         key: None,
         key_prefix: false,
+        orphans: false,
+        untagged: false,
         title: None,
         status: None,
     }
@@ -655,4 +657,80 @@ fn status_on_a_memory_search_is_an_error_that_names_the_field() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("status") && err.contains("PROJECTS"), "{err}");
+}
+
+#[test]
+fn the_orphan_predicate_lists_what_the_stat_counts_and_retires_a_row_that_gains_an_edge() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "lonely", "nobody names me", &["mail"]);
+    seed(&conn, &embedder, "root", "points at [[leaf]]", &["mail"]);
+    seed(&conn, &embedder, "leaf", "named by root", &["mail"]);
+
+    let mut q = query(None);
+    q.orphans = true;
+    q.k = 50;
+    assert_eq!(hit_keys(&conn, &q), ["lonely"]);
+    let stats = ellmephant::store::stats::compute(&conn).expect("stats");
+    assert_eq!(
+        stats.orphans, 1,
+        "the predicate and the count read the same tables"
+    );
+    assert_eq!(q.k, 50);
+
+    let mut capped = query(None);
+    capped.orphans = true;
+    capped.k = 1;
+    assert_eq!(
+        hit_keys(&conn, &capped).len(),
+        1,
+        "k caps a filtered listing"
+    );
+
+    let patch = ellmephant::store::Patch {
+        key: Some("lonely".into()),
+        body: Some("now I name [[leaf]]".into()),
+        ..Default::default()
+    };
+    common::merge_now(&conn, &embedder, &patch).expect("link it");
+    assert!(
+        hit_keys(&conn, &q).is_empty(),
+        "an edge retires the row with no reparse"
+    );
+}
+
+#[test]
+fn the_untagged_predicate_intersects_and_agrees_with_the_stat() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("open");
+    let embedder = HashEmbedder::new(DIM);
+    seed(&conn, &embedder, "linked-tagged", "[[anchor]]", &["x"]);
+    seed(&conn, &embedder, "anchor", "the target", &["x"]);
+    seed(&conn, &embedder, "bare", "no tag, no edge", &[]);
+    seed(&conn, &embedder, "bare-linked", "[[anchor]]", &[]);
+
+    let mut q = query(None);
+    q.untagged = true;
+    q.k = 50;
+    assert_eq!(hit_keys(&conn, &q), ["bare", "bare-linked"]);
+    let stats = ellmephant::store::stats::compute(&conn).expect("stats");
+    assert_eq!(stats.untagged, 2);
+
+    q.orphans = true;
+    assert_eq!(hit_keys(&conn, &q), ["bare"], "the predicates intersect");
+
+    let patch = ellmephant::store::Patch {
+        key: Some("bare".into()),
+        tags: Some(vec!["x".into()]),
+        ..Default::default()
+    };
+    common::merge_now(&conn, &embedder, &patch).expect("tag it");
+    let mut after = query(None);
+    after.untagged = true;
+    assert_eq!(
+        hit_keys(&conn, &after),
+        ["bare-linked"],
+        "a new tag retires the row with no reparse"
+    );
 }

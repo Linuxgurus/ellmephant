@@ -72,6 +72,8 @@ fn case_query(case: &Case, k: usize) -> Query {
     Query {
         key: None,
         key_prefix: false,
+        orphans: false,
+        untagged: false,
         title: None,
         status: None,
         text: Some(case.query.clone()),

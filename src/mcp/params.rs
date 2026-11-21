@@ -359,6 +359,16 @@ pub struct SearchParams {
     )]
     pub key_prefix: Option<bool>,
     #[serde(default)]
+    #[schemars(
+        description = "`true` returns only rows with NO `memory_link` edge in either direction — never linked, never named. Answered from the edge table, so it costs one join, not a body scan; intersects every other filter, and a row that gains an edge stops appearing with no reparse."
+    )]
+    pub orphans: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "`true` returns only rows whose tag array is empty — the population `memory_stats.untagged` counts. Answered from the tag column; intersects every other filter."
+    )]
+    pub untagged: Option<bool>,
+    #[serde(default)]
     #[schemars(description = "Case-insensitive substring, scoped to the TITLE field only.")]
     pub title: Option<String>,
     #[serde(default)]

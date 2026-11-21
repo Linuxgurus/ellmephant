@@ -33,6 +33,8 @@ fn q(text: &str, k: usize) -> Query {
         updated_before: None,
         key: None,
         key_prefix: false,
+        orphans: false,
+        untagged: false,
         title: None,
         status: None,
     }

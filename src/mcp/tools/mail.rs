@@ -216,8 +216,7 @@ impl MemoryServer {
                     // hour of theorising about a 273-letter discrepancy that never existed
                     // (measured 2026-10-21).
                     let stored = s.mail_cursor(&me, &who)?;
-                    let seq =
-                        since.unwrap_or_else(|| stored.as_ref().map(|c| c.seq).unwrap_or(0));
+                    let seq = since.unwrap_or_else(|| stored.as_ref().map(|c| c.seq).unwrap_or(0));
                     Ok((s.mail_inbox(&who, seq, limit)?, s.mail_head(&who)?, stored))
                 })
                 .await?;

@@ -140,7 +140,8 @@ impl MemoryServer {
         let ChannelFetchParams { channel, limit } = p;
         let (rows, pen) = self
             .write_outcome("channel_fetch", &ctx, move |s, pen| {
-                let rows = s.channel_fetch(pen.as_str(), channel.as_deref(), limit.unwrap_or(50))?;
+                let rows =
+                    s.channel_fetch(pen.as_str(), channel.as_deref(), limit.unwrap_or(50))?;
                 Ok((rows, pen.as_str().to_string()))
             })
             .await?;
@@ -255,7 +256,10 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelInviteParams>,
     ) -> std::result::Result<String, String> {
-        let ChannelInviteParams { channel, pen: guest } = p;
+        let ChannelInviteParams {
+            channel,
+            pen: guest,
+        } = p;
         let (chan, guest_in) = (channel.clone(), guest.clone());
         let actor = self
             .write_outcome("channel_invite", &ctx, move |s, actor| {
@@ -330,7 +334,9 @@ impl MemoryServer {
         loop {
             let who = pen.clone();
             let rows = self
-                .read_outcome("channel_wait", &ctx, move |s| s.channel_since(&who, after, 200))
+                .read_outcome("channel_wait", &ctx, move |s| {
+                    s.channel_since(&who, after, 200)
+                })
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
                 let truncated = rows.len() >= 200;

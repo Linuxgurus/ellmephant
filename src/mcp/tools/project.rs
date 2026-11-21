@@ -107,9 +107,7 @@ impl MemoryServer {
             mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
         };
         let rows = self
-            .read_outcome("project_list", &ctx, move |s| {
-                s.project_list(&filter)
-            })
+            .read_outcome("project_list", &ctx, move |s| s.project_list(&filter))
             .await?;
         tracing::info!(tool = "project_list", projects = rows.len(), "projects");
         crate::wire::project::list_to_wire_json(&rows).map_err(|e| e.to_string())

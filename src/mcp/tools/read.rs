@@ -507,7 +507,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
         if p.plan.unwrap_or(false) {
             let plan = self
-                .read_outcome("memory_dupes", &ctx, move |s| s.dupes_plan(max_distance, limit))
+                .read_outcome("memory_dupes", &ctx, move |s| {
+                    s.dupes_plan(max_distance, limit)
+                })
                 .await?;
             tracing::info!(
                 tool = "memory_dupes",

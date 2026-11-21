@@ -184,4 +184,3 @@ fn tool_bodies_go_through_the_envelope() {
          ladder #237 deleted; use `read_outcome`/`write_outcome` from `mcp/server.rs`"
     );
 }
-

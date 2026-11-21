@@ -224,7 +224,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<AppendParams>,
     ) -> std::result::Result<String, String> {
-
         let key = p.key;
         let line = p.line;
         let force = p.force.unwrap_or(false);
@@ -262,7 +261,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<FoldParams>,
     ) -> std::result::Result<String, String> {
-
         let from = p.from;
         let into = p.into;
         let log_from = from.clone();

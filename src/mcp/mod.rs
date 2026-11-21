@@ -55,70 +55,326 @@ pub struct ToolSpec {
 }
 
 pub const TOOLS: &[ToolSpec] = &[
-    ToolSpec { name: "whoami", group: "core", core: true },
-    ToolSpec { name: "memory_unowned", group: "hygiene", core: false },
-    ToolSpec { name: "whois", group: "identity", core: false },
-    ToolSpec { name: "pen_mint", group: "identity", core: false },
-    ToolSpec { name: "pen_rotate", group: "identity", core: false },
-    ToolSpec { name: "pen_lend", group: "identity", core: false },
-    ToolSpec { name: "sudo", group: "identity", core: false },
-    ToolSpec { name: "sudo_pass", group: "identity", core: false },
-    ToolSpec { name: "sudo_release", group: "identity", core: false },
-    ToolSpec { name: "sudo_sessions", group: "identity", core: false },
-    ToolSpec { name: "memory_upsert", group: "core", core: true },
-    ToolSpec { name: "memory_append", group: "hygiene", core: false },
-    ToolSpec { name: "memory_delete", group: "core", core: true },
-    ToolSpec { name: "memory_history_erase", group: "hygiene", core: false },
-    ToolSpec { name: "memory_history_search", group: "hygiene", core: false },
-    ToolSpec { name: "memory_merge", group: "hygiene", core: false },
-    ToolSpec { name: "memory_fold", group: "hygiene", core: false },
-    ToolSpec { name: "memory_adopt", group: "hygiene", core: false },
-    ToolSpec { name: "memory_search", group: "core", core: true },
-    ToolSpec { name: "semantic_search", group: "hygiene", core: false },
-    ToolSpec { name: "memory_get", group: "core", core: true },
-    ToolSpec { name: "memory_history", group: "core", core: true },
-    ToolSpec { name: "memory_backlinks", group: "core", core: true },
-    ToolSpec { name: "memory_dangling", group: "hygiene", core: false },
-    ToolSpec { name: "memory_upvote", group: "core", core: true },
-    ToolSpec { name: "memory_stats", group: "core", core: true },
-    ToolSpec { name: "memory_health", group: "hygiene", core: false },
-    ToolSpec { name: "memory_dupes", group: "hygiene", core: false },
-    ToolSpec { name: "memory_reembed", group: "hygiene", core: false },
-    ToolSpec { name: "memory_reparse", group: "hygiene", core: false },
-    ToolSpec { name: "project_upsert", group: "core", core: true },
-    ToolSpec { name: "project_get", group: "core", core: true },
-    ToolSpec { name: "project_list", group: "core", core: true },
-    ToolSpec { name: "config_get", group: "config", core: false },
-    ToolSpec { name: "config_set", group: "config", core: false },
-    ToolSpec { name: "config_define", group: "config", core: false },
-    ToolSpec { name: "config_list", group: "config", core: false },
-    ToolSpec { name: "claim_acquire", group: "claim", core: false },
-    ToolSpec { name: "claim_release", group: "claim", core: false },
-    ToolSpec { name: "claim_list", group: "claim", core: false },
-    ToolSpec { name: "mail_send", group: "core", core: true },
-    ToolSpec { name: "mail_inbox", group: "core", core: true },
-    ToolSpec { name: "mail_read", group: "core", core: true },
-    ToolSpec { name: "mail_ack", group: "core", core: true },
-    ToolSpec { name: "mail_prune", group: "mail", core: false },
-    ToolSpec { name: "channel_list", group: "core", core: true },
-    ToolSpec { name: "channel_send", group: "core", core: true },
-    ToolSpec { name: "channel_history", group: "core", core: true },
-    ToolSpec { name: "channel_fetch", group: "core", core: true },
-    ToolSpec { name: "channel_present", group: "channel", core: false },
-    ToolSpec { name: "channel_invite", group: "channel", core: false },
-    ToolSpec { name: "channel_breach", group: "channel", core: false },
-    ToolSpec { name: "channel_join", group: "channel", core: false },
-    ToolSpec { name: "channel_leave", group: "channel", core: false },
-    ToolSpec { name: "channel_wait", group: "channel", core: false },
-    ToolSpec { name: "channel_members", group: "channel", core: false },
-    ToolSpec { name: "channel_create", group: "channel", core: false },
-    ToolSpec { name: "channel_set_gate", group: "channel", core: false },
-    ToolSpec { name: "channel_events", group: "channel", core: false },
-    ToolSpec { name: "channel_set_retention", group: "channel", core: false },
-    ToolSpec { name: "channel_prune", group: "channel", core: false },
-    ToolSpec { name: "mail_surrogate_grant", group: "mail", core: false },
-    ToolSpec { name: "mail_surrogate_revoke", group: "mail", core: false },
-    ToolSpec { name: "mail_surrogate_list", group: "mail", core: false },
+    ToolSpec {
+        name: "whoami",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_unowned",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "whois",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "pen_mint",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "pen_rotate",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "pen_lend",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "sudo",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "sudo_pass",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "sudo_release",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "sudo_sessions",
+        group: "identity",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_upsert",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_append",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_delete",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_history_erase",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_history_search",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_merge",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_fold",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_adopt",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_search",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "semantic_search",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_get",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_history",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_backlinks",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_dangling",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_upvote",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_stats",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "memory_health",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_dupes",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_reembed",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "memory_reparse",
+        group: "hygiene",
+        core: false,
+    },
+    ToolSpec {
+        name: "project_upsert",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "project_get",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "project_list",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "config_get",
+        group: "config",
+        core: false,
+    },
+    ToolSpec {
+        name: "config_set",
+        group: "config",
+        core: false,
+    },
+    ToolSpec {
+        name: "config_define",
+        group: "config",
+        core: false,
+    },
+    ToolSpec {
+        name: "config_list",
+        group: "config",
+        core: false,
+    },
+    ToolSpec {
+        name: "claim_acquire",
+        group: "claim",
+        core: false,
+    },
+    ToolSpec {
+        name: "claim_release",
+        group: "claim",
+        core: false,
+    },
+    ToolSpec {
+        name: "claim_list",
+        group: "claim",
+        core: false,
+    },
+    ToolSpec {
+        name: "mail_send",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "mail_inbox",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "mail_read",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "mail_ack",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "mail_prune",
+        group: "mail",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_list",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "channel_send",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "channel_history",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "channel_fetch",
+        group: "core",
+        core: true,
+    },
+    ToolSpec {
+        name: "channel_present",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_invite",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_breach",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_join",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_leave",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_wait",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_members",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_create",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_set_gate",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_events",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_set_retention",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "channel_prune",
+        group: "channel",
+        core: false,
+    },
+    ToolSpec {
+        name: "mail_surrogate_grant",
+        group: "mail",
+        core: false,
+    },
+    ToolSpec {
+        name: "mail_surrogate_revoke",
+        group: "mail",
+        core: false,
+    },
+    ToolSpec {
+        name: "mail_surrogate_list",
+        group: "mail",
+        core: false,
+    },
 ];
 
 /// Which tools an MCP door ADVERTISES.
@@ -309,7 +565,11 @@ mod tests {
     fn core_is_a_subset_of_every_tool_and_none_is_duplicated() {
         let mut seen = std::collections::BTreeSet::new();
         for tool in TOOLS.iter().filter(|t| t.core) {
-            assert!(seen.insert(tool.name), "core names a tool twice: {}", tool.name);
+            assert!(
+                seen.insert(tool.name),
+                "core names a tool twice: {}",
+                tool.name
+            );
         }
         // The split has to be a SPLIT: a core list equal to the whole surface saves nothing.
         assert!(
@@ -321,7 +581,11 @@ mod tests {
         // The table is the only list: a duplicate name is a name with two answers.
         let mut names = std::collections::BTreeSet::new();
         for tool in TOOLS {
-            assert!(names.insert(tool.name), "TOOLS names a tool twice: {}", tool.name);
+            assert!(
+                names.insert(tool.name),
+                "TOOLS names a tool twice: {}",
+                tool.name
+            );
         }
     }
 

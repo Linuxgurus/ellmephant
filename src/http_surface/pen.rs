@@ -1,11 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// `POST /pen/lend` — lend this request's pen's authority down to a descendant (`pen_lend`).
 pub async fn pen_lend(
     State(state): State<HttpState>,
     server: Server,
@@ -58,7 +52,6 @@ pub async fn pen_lend(
     }
 }
 
-/// `POST /sudo` — borrow a pen's authority (`sudo`).
 pub async fn sudo(
     State(state): State<HttpState>,
     server: Server,
@@ -101,11 +94,6 @@ pub async fn sudo(
     }
 }
 
-/// `GET /sudo/sessions` — who holds what, until when (`sudo_sessions`).
-///
-/// Read-only, and the answer to "has my authority lapsed?" without a guess. Any proven pen may ask:
-/// sessions are the estate's business — an agent that is about to act on borrowed authority should be
-/// able to see its own clock, and an operator should be able to see everyone's.
 pub async fn sudo_sessions(
     State(state): State<HttpState>,
     server: Server,
@@ -151,7 +139,6 @@ pub async fn sudo_sessions(
     }
 }
 
-/// `POST /sudo/pass` — pass a session down (`sudo_pass`).
 pub async fn sudo_pass(
     State(state): State<HttpState>,
     server: Server,
@@ -197,7 +184,6 @@ pub async fn sudo_pass(
     }
 }
 
-/// `POST /sudo/release` — end a session and its chain (`sudo_release`).
 pub async fn sudo_release(
     State(state): State<HttpState>,
     server: Server,
@@ -242,7 +228,6 @@ pub async fn sudo_release(
     }
 }
 
-/// `POST /pen/mint` — create a pen under this request's pen (`pen_mint`).
 pub async fn pen_mint(
     State(state): State<HttpState>,
     server: Server,
@@ -253,7 +238,6 @@ pub async fn pen_mint(
 ) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let scope = authorize(&state, &headers, json)?;
-    // A mint is a WRITE: the caller is the parent, and an unproven caller is nobody.
     let caller = match caller
         .pen_or("refused: minting needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
     {
@@ -299,7 +283,6 @@ pub async fn pen_mint(
     }
 }
 
-/// `POST /pen/rotate` — replace a credential, returning the new secret once (`pen_rotate`).
 pub async fn pen_rotate(
     State(state): State<HttpState>,
     server: Server,
@@ -324,7 +307,6 @@ pub async fn pen_rotate(
     struct Ask {
         pen: Option<String>,
     }
-    // An empty body is the common case: "rotate MY secret". It is not a malformed request.
     let ask: Ask = if bytes.iter().all(u8::is_ascii_whitespace) {
         Ask { pen: None }
     } else {
@@ -361,7 +343,6 @@ pub async fn pen_rotate(
     }
 }
 
-/// `GET /whois/{pen}` — one pen and what it is to this request's pen (`whois`).
 pub async fn whois(
     server: Server,
     caller: crate::identity::Caller,
@@ -417,9 +398,6 @@ pub async fn whois(
     }
 }
 
-/// `GET /whoami` — the identity this request would be stamped with, and whether it is PROVEN.
-/// Touches no store and changes nothing: the REST twin of the MCP `whoami`, so a `curl` can ask the
-/// same question the model asks instead of guessing from a remembered flag.
 pub async fn whoami(caller: crate::identity::Caller) -> ApiResult<Response> {
     let (doc, text) = match caller.denied() {
         None => match caller.proven() {
@@ -435,10 +413,6 @@ pub async fn whoami(caller: crate::identity::Caller) -> ApiResult<Response> {
                 format!("{} (not proven)\n", crate::identity::ANONYMOUS),
             ),
         },
-        // ★ A FORGED CLAIM IS STILL WORTH REPORTING; AN UNREADABLE STORE IS NOT AN ANSWER
-        // (2026-10-30, Stet on #204). Forged stays a 200 that names the claim, because that is what
-        // `whoami` is for; Unavailable is a 503, because "anonymous" would be a guess presented as a
-        // fact.
         Some(crate::identity::Denied::Unavailable(why)) => {
             return Err(ApiError::new(
                 true,
@@ -471,7 +445,6 @@ pub async fn whoami(caller: crate::identity::Caller) -> ApiResult<Response> {
     )
 }
 
-/// `GET /memory-health` — the five-number health surface (`memory_health`), visible-scoped.
 pub async fn memory_health(
     server: Server,
     caller: crate::identity::Caller,
@@ -488,7 +461,6 @@ pub async fn memory_health(
     }
 }
 
-/// `GET /stats` — the whole-store digest (`memory_stats`).
 pub async fn stats(
     server: Server,
     caller: crate::identity::Caller,

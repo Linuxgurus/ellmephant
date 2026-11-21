@@ -1,8 +1,3 @@
-//! The binary's command surface: the MCP server, plus two operational commands.
-//!
-//! The interactive REPL and the one-shot store commands (add/search/show/stats/…) are gone:
-//! MCP is the read/write path, and anything that is not MCP is better served by the API.
-
 pub mod doctor;
 pub mod format;
 pub mod model;
@@ -225,10 +220,8 @@ pub fn run(cli: Cli) -> Result<()> {
     if let Some(precision) = cli.precision.clone() {
         cfg.precision = precision;
     }
-    // Flags override the file, so re-check here too.
     cfg.validate()?;
 
-    // Flags override config (SPEC §12); `--model-dir` is inherently offline.
     let mut spec = crate::model::Spec::from_config(&cfg, &paths);
     if cli.offline {
         spec.offline = true;
@@ -275,7 +268,6 @@ pub fn run(cli: Cli) -> Result<()> {
             PenCommand::Policies => pen::policies(&paths, &cfg),
         },
         Command::Model { command } => model::cmd(&spec, command),
-        // MCP holds the store open and serves until the client disconnects (P7).
         Command::Mcp { stdio, host, port } => {
             let transport = if stdio {
                 crate::mcp::Transport::Stdio

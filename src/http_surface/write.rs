@@ -1,11 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// `POST /memory` — store one memory (`memory_upsert`); text front-matter or JSON.
 pub async fn upsert(
     State(state): State<HttpState>,
     server: Server,
@@ -16,8 +10,6 @@ pub async fn upsert(
 ) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    // `?wait=true`: settle this document before answering, so the caller can search the moment it has
-    // a reply. Opt-in, because it is the one path that holds the store lock across the model call.
     let wait = matches!(params.get("wait"), Some("true") | Some("1"));
     let scope = authorize(&state, &headers, json)?;
     let bytes = match body_bytes(body).await {
@@ -33,12 +25,6 @@ pub async fn upsert(
         Ok(p) => p,
         Err(e) => return Err(ApiError::bad(json, e)),
     };
-    // ★ THE COMMENT ABOVE WAS TRUE AND THE CODE WAS NOT: the parsers return `asserted_by: None` and
-    // nobody stamped it, so every row written over HTTP landed in the COMMONS — owner NULL — and
-    // since #119 that means any pen may rewrite it. The bearer proves the door; the identity pair
-    // names the pen, and only a PROVEN one is stamped (#109).
-    // ★ ONE CALLER, AND A WRITE WITHOUT ONE IS REFUSED (soma/ellmephant#231) — including a FORGED
-    // claim, which `.ok().flatten()` used to collapse into "nobody" and then write as the commons.
     let caller = caller
         .pen()
         .map_err(|r| refusal_response(json, r, StatusCode::UNAUTHORIZED))?
@@ -55,12 +41,6 @@ pub async fn upsert(
         .await
     {
         Ok(out) => {
-            // ★ A REFUSED COMPARE-AND-SWAP WRITE IS NOT A SUCCESS (#101). `expected_version` is the
-            // documented way to do read-modify-write ("a bank balance, a counter"), so a 200
-            // `updated` for a write that did not land is a silent failure: the reconcile loop
-            // believes it reconciled. Answer 409 with the SAME body the MCP tool returns, so a
-            // client that only checks the code is right too, and one that reads the body sees the
-            // version to retry against.
             if let Some(current) = out.conflict {
                 let key = out.key;
                 tracing::info!(
@@ -93,14 +73,11 @@ pub async fn upsert(
                 "key": key.clone(),
                 "queued": out.queued,
             });
-            // Filled in below when `?wait=true` was asked for.
             let mut indexed: Option<bool> = None;
             if wait {
                 indexed = Some(match server.encode_now(&out.key).await {
                     Ok(indexed) => indexed,
                     Err(err) => {
-                        // The WRITE stands: the queue is derived state, so the row is safe and the
-                        // worker will come back to it. Say so rather than claim a guarantee we missed.
                         tracing::warn!(key = %out.key, error = %err, "?wait=true could not index");
                         result["encode_error"] = serde_json::json!(err.to_string());
                         false
@@ -128,7 +105,6 @@ pub async fn upsert(
     }
 }
 
-/// `DELETE /memory/{key}` — remove one memory (`memory_delete`).
 pub async fn memory_delete(
     State(state): State<HttpState>,
     server: Server,
@@ -139,8 +115,6 @@ pub async fn memory_delete(
 ) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let scope = authorize(&state, &headers, json)?;
-    // The bearer proves the DOOR; the identity pair names the PEN. A removal with no proven pen has
-    // nobody to name in the ledger — and since #231 it is REFUSED, not passed as `None`.
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
@@ -163,7 +137,6 @@ pub async fn memory_delete(
                         json_ok(serde_json::json!({
                             "status": "removed",
                             "key": key,
-                            // The newest of these is the state it was deleted in (the delete snapshots it).
                             "versions_remaining": remaining,
                         }))
                     },
@@ -180,7 +153,6 @@ pub async fn memory_delete(
     }
 }
 
-/// `GET /history/search?q=<words>` — exact words over every PAST state (`memory_history_search`).
 pub async fn history_search(
     State(state): State<HttpState>,
     server: Server,
@@ -200,7 +172,6 @@ pub async fn history_search(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10)
         .clamp(1, 200);
-    // Reads need no bearer beyond the door's own, like every other GET on this surface.
     let scope = authorize(&state, &headers, true)?;
     match server
         .with_store("memory_history_search", move |s| {
@@ -241,11 +212,6 @@ pub async fn history_search(
     }
 }
 
-/// `DELETE /history?key=<slug>` or `?orphans=true` — erase HISTORY (`memory_history_erase`).
-///
-/// The store's only act that destroys text. `memory_delete` snapshots the row and keeps its versions,
-/// so a deleted key still holds its body in full; this is the door out. `confirm=true` is required on
-/// both shapes, and a LIVE key is refused: its history is the only copy of what it said.
 pub async fn history_erase(
     State(state): State<HttpState>,
     server: Server,
@@ -330,7 +296,6 @@ pub async fn history_erase(
     }
 }
 
-/// `POST /memory/{key}/upvote` — mark one memory useful (`memory_upvote`).
 pub async fn upvote(
     State(state): State<HttpState>,
     server: Server,
@@ -342,15 +307,10 @@ pub async fn upvote(
 ) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     let scope = authorize(&state, &headers, json)?;
-    // MCP's `memory_upvote` takes `{"keys": [...]}` — a BATCH, and that is what a caller who knows the
-    // tool will send. Accept it; the path key is the one-key shorthand. A body that names other keys
-    // must never be ignored, and this route used to upvote the PATH key and silently drop the body.
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
         Err(e) => return Err(ApiError::bad(json, e)),
     };
-    // ★ ONE KEY OR MANY (#mem): the tool takes either shape, so the route must too — a client that
-    // sends `{"keys":"one"}` is asking the same question as `{"keys":["one"]}`.
     let keys = match body.as_ref().and_then(|b| b.get("keys")) {
         Some(value) => match serde_json::from_value::<crate::mcp::OneOrMany>(value.clone()) {
             Ok(parsed) => parsed.into_vec(),
@@ -364,8 +324,6 @@ pub async fn upvote(
         None => vec![key.clone()],
     };
     let named = keys.join(", ");
-    // One implementation, two doors: the tool and this route share `upvote_sweep`, so neither the
-    // errors nor the JSON can drift apart.
     match crate::mcp::upvote_sweep(&server, reader_from(&caller), keys).await {
         Ok(payload) => {
             tracing::info!(area = scope.area, keys = %named, "upvoted over http");
@@ -386,10 +344,6 @@ pub async fn upvote(
     }
 }
 
-/// `POST /memory/{key}/append` — continue a subject with one line (`memory_append`).
-///
-/// Body: `{"line": "..."}`. The line is the whole payload; there is no body resend, which is the
-/// entire point of the verb.
 pub async fn append(
     State(state): State<HttpState>,
     server: Server,
@@ -456,7 +410,6 @@ pub async fn append(
     }
 }
 
-/// `POST /memory/{key}/merge?into=` — integrate one memory into another and delete it (`memory_merge`).
 pub async fn merge(
     State(state): State<HttpState>,
     server: Server,
@@ -469,9 +422,6 @@ pub async fn merge(
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let scope = authorize(&state, &headers, json)?;
-    // The MCP tool takes `{"from", "into"}`; accept it, so a caller can send the tool's own arguments
-    // unchanged. The path names `from` here, so a body `from` must AGREE with it rather than quietly
-    // win. `?into=` stays for a caller that only has a URL.
     let body = match json_body(&headers, body).await {
         Ok(b) => b,
         Err(e) => return Err(ApiError::bad(json, e)),
@@ -505,7 +455,6 @@ pub async fn merge(
     };
     let from = key.clone();
     let target = into.clone();
-    // A merge DESTROYS the source; the pen the identity pair proves is the one whose word it is.
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
@@ -538,11 +487,6 @@ pub async fn merge(
     }
 }
 
-/// `POST /memory/{key}/fold?into=` — append one memory's lines to another (`memory_fold`).
-///
-/// The cross-pen maintenance verb: `from` (the path key) keeps existing, and `into` is appended to
-/// without needing its write authority. The two rows' arguments are parsed exactly as `merge`'s so a
-/// caller can send the MCP tool's arguments unchanged.
 pub async fn fold(
     State(state): State<HttpState>,
     server: Server,
@@ -588,10 +532,6 @@ pub async fn fold(
     };
     let from = key.clone();
     let target = into.clone();
-    // A fold changes the record, so it takes the same channel gate a merge does; it does NOT take
-    // the source's write authority, which is the whole point. It DOES require a proven pen: the
-    // store refuses a fold with no actor (an append nobody is named for), so since #231 the door
-    // refuses first rather than letting an unproven caller reach `fold_into`.
     let pen = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),
@@ -628,10 +568,6 @@ pub async fn fold(
     }
 }
 
-/// `POST /memory/{key}/adopt` — take responsibility for a memory (`memory_adopt`).
-///
-/// Responsibility, not authorship: `asserted_by` is untouched. An ownerless row needs no `force`;
-/// an owned row needs `force=true` AND the caller to be an ancestor of its owner.
 pub async fn adopt(
     State(state): State<HttpState>,
     server: Server,
@@ -661,8 +597,6 @@ pub async fn adopt(
     let actor = pen.clone();
     match server
         .with_store("memory_adopt", move |s| {
-            // The REST route adopts for the CALLER; `to` is the MCP tool's extra, and passing it
-            // here would change `adopt` into `assign` — a different rule for the same verb.
             crate::ops::memory_adopt(s, &actor, &adopting, None, force)
         })
         .await
@@ -690,9 +624,6 @@ pub async fn adopt(
     }
 }
 
-/// `POST /reparse` — rebuild the `[[link]]` graph from every body (`memory_reparse`).
-///
-/// Model-free and seconds long, which is the whole point: the alternative was a full re-embed.
 pub async fn reparse(
     State(state): State<HttpState>,
     server: Server,
@@ -704,12 +635,7 @@ pub async fn reparse(
     let scope = authorize(&state, &headers, json)?;
     let caller = proven_pen(&caller, json)?;
     match server
-        .with_store("memory_reparse", move |s| {
-            // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): identity is what makes the call
-            // attributable, but a rebuild is derived data — it is not "acting", and a locked pen may
-            // still repair the graph. So `caller` is logged, not consulted.
-            s.reparse()
-        })
+        .with_store("memory_reparse", move |s| s.reparse())
         .await
     {
         Ok(report) => {
@@ -745,11 +671,6 @@ pub async fn reparse(
     }
 }
 
-/// `POST /reembed` — queue every document that needs (re-)embedding (`memory_reembed`).
-///
-/// It used to be the heaviest lock holder in the store: one transaction from the first row to the last,
-/// ~45 minutes on a 291-row store, with every write timing out for the duration. Now it enqueues and
-/// returns, so it is one of the cheapest.
 pub async fn reembed(
     State(state): State<HttpState>,
     server: Server,
@@ -761,11 +682,7 @@ pub async fn reembed(
     let scope = authorize(&state, &headers, json)?;
     let caller = proven_pen(&caller, json)?;
     match server
-        .with_store("memory_reembed", move |s| {
-            // ★ A PEN IS REQUIRED, A GATE IS NOT (#168 review): same rule as `reparse` above — a
-            // rebuild is derived data, not an act on the world.
-            s.reembed()
-        })
+        .with_store("memory_reembed", move |s| s.reembed())
         .await
     {
         Ok(report) => {
@@ -802,7 +719,6 @@ pub async fn reembed(
     }
 }
 
-/// `POST /project` — create or replace a project (`project_upsert`); JSON or text front-matter.
 pub async fn project_upsert(
     State(state): State<HttpState>,
     server: Server,
@@ -826,8 +742,6 @@ pub async fn project_upsert(
         Ok(p) => p,
         Err(e) => return Err(ApiError::bad(json, e)),
     };
-    // The pen the identity pair proves. A project write is a write: since #231 it needs one, the
-    // same as on the MCP door, so the channel gate can bite and the row records who stored it.
     let proven = match caller.pen() {
         Ok(name) => name.clone(),
         Err(r) => return Err(refusal_response(json, r, StatusCode::UNAUTHORIZED)),

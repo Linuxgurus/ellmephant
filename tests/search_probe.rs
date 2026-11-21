@@ -1,31 +1,3 @@
-//! The known-answer probe set: does a search tell the caller *how* it was answered?
-//!
-//! `soma/ellmephant#59` / `#213`. A fused list is not a similarity list — the lexical leg fills the
-//! page when the semantic leg has nothing, and `hits.len()` cannot say so. Before this change a
-//! caller saw ten rows with `distance: null` and had no way to learn that their phrase reached
-//! nothing. These probes are the regression.
-//!
-//! ## What this test can and cannot prove
-//!
-//! `HashEmbedder` is a stand-in: its vectors are not semantic, so a question phrased in words that
-//! *mean* the right row will not necessarily rank it first. This test therefore asserts only the
-//! invariants that hold **by construction**, whatever the embeddings are:
-//!
-//! 1. every hit carries a `via`;
-//! 2. `distance` is present exactly when the semantic leg ranked the row;
-//! 3. `semantic_only` never returns a lexical hit;
-//! 4. a phrase-less, pattern-less query reports `listing`;
-//! 5. the envelope cannot contradict the hits: `semantic_candidates == 0` implies no hit came from
-//!    the semantic leg.
-//!
-//! The converse is deliberately NOT asserted — `semantic_candidates > 0` does not imply a semantic
-//! hit survives into the page, because the RRF `k` cap can legitimately leave it out.
-//!
-//! Ranking *quality* — whether a paraphrase finds the row at all — needs real vectors and is
-//! measured out of band against a live store. That is the number that must exist before
-//! `DEFAULT_MAX_DISTANCE` moves; this test guarantees that a blind answer can no longer look like a
-//! confident one.
-
 mod common;
 
 use common::temp_store;
@@ -35,8 +7,6 @@ use ellmephant::search::{self, Query, Via};
 use ellmephant::store::Memory;
 use ellmephant::store::audience::Reader;
 
-/// Twenty known-answer pairs. The questions avoid their answer's words on purpose: that is the
-/// shape where only the vector leg can help, and the shape the ceiling was silently cutting.
 const PROBES: [(&str, &str); 20] = [
     (
         "the thing that wakes a person in the night when nothing is wrong",
@@ -155,8 +125,6 @@ fn is_semantic(v: Via) -> bool {
     matches!(v, Via::Semantic | Via::Both)
 }
 
-/// A page can no longer be blind without saying so. Run over all twenty probes, so an edit that
-/// drops the labels fails everywhere rather than only on the query somebody wrote a test for.
 #[test]
 fn every_hit_reports_which_leg_found_it() {
     let (_dir, conn, embedder) = store_with_probes();
@@ -191,8 +159,6 @@ fn every_hit_reports_which_leg_found_it() {
     }
 }
 
-/// The honest-empty-list guarantee: asking for a semantic answer either returns semantic rows or
-/// returns nothing — never a page of word matches dressed as an answer.
 #[test]
 fn semantic_only_never_returns_a_lexical_hit() {
     let (_dir, conn, embedder) = store_with_probes();
@@ -211,18 +177,6 @@ fn semantic_only_never_returns_a_lexical_hit() {
     );
 }
 
-/// ★ THE GUARANTEE THE FLAG EXISTS FOR, and the one it did not have at first: when the phrase leg
-/// found something, `semantic_only` must return something.
-///
-/// The first version applied the filter AFTER `fuse`, which had already spent all `k` slots on the
-/// combined ranking — so word matches could crowd every semantic row out of the page and
-/// `semantic_only` returned EMPTY while `semantic_candidates` was greater than zero. The flag then
-/// contradicted the envelope it was supposed to corroborate. Fixed by skipping the fusion under
-/// `semantic_only` and taking the phrase leg's own top-k; this test is what keeps it fixed.
-///
-/// The counter-case is deliberate and NOT asserted: a structured filter (`tags`, size, time) can
-/// legitimately empty the semantic page while candidates exist, because the filter removed them.
-/// That is an honest empty list and a different fact from "the phrase leg answered nothing".
 #[test]
 fn semantic_only_is_never_empty_when_the_phrase_leg_found_something() {
     let (_dir, conn, embedder) = store_with_probes();
@@ -255,8 +209,6 @@ fn semantic_only_is_never_empty_when_the_phrase_leg_found_something() {
     }
 }
 
-/// The word index must not be able to crowd the phrase leg out of its own answer: with `k` smaller
-/// than the semantic candidate set, `semantic_only` still returns a full page of semantic rows.
 #[test]
 fn a_crowded_page_does_not_starve_semantic_only() {
     let (_dir, conn, embedder) = store_with_probes();
@@ -269,8 +221,6 @@ fn a_crowded_page_does_not_starve_semantic_only() {
     assert!(is_semantic(page.hits[0].via), "and it is the phrase leg's");
 }
 
-/// No phrase and no pattern is a listing, not a search — and it says so rather than looking like a
-/// perfect match.
 #[test]
 fn a_bare_listing_reports_listing() {
     let (_dir, conn, embedder) = store_with_probes();

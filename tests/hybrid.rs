@@ -1,9 +1,3 @@
-//! The two legs, fused (soma/ellmephant#62).
-//!
-//! The semantic leg answers "means this"; the word index answers "says this". These tests pin the
-//! three shapes that justify keeping both, and the one that proves the prize: **a document with no
-//! vector at all is still findable.**
-
 mod common;
 
 use common::temp_store;
@@ -44,8 +38,6 @@ fn q(text: &str, k: usize) -> Query {
     }
 }
 
-/// ★ THE MEASUREMENT THAT STARTED THIS: `runner has no cargo` ranked the right memory FIFTH, 0.015
-/// behind an unrelated one. An identifier query must be answered by the word leg, not by cosine noise.
 #[test]
 fn an_exact_identifier_is_found_by_the_word_leg() {
     let (_d, paths) = temp_store();
@@ -83,10 +75,6 @@ fn an_exact_identifier_is_found_by_the_word_leg() {
     );
 }
 
-/// The other half: a phrase sharing no words with any document still returns the semantic
-/// neighbourhood, because the lexical leg simply finds nothing and the fusion degrades to the vector
-/// ordering. (With the hash embedder "semantic" is arithmetic, not meaning — what is under test here
-/// is that an empty lexical leg does not empty the result.)
 #[test]
 fn a_phrase_with_no_lexical_match_still_returns_vector_hits() {
     let (_d, paths) = temp_store();
@@ -115,9 +103,6 @@ fn a_phrase_with_no_lexical_match_still_returns_vector_hits() {
     );
 }
 
-/// ★ THE PRIZE (issue #62): a document that was never embedded is still findable, because the word
-/// index does not need a model. `distance` is `None` for it — BM25 is not a distance, and reporting one
-/// would repeat the unit confusion #59 exists to prevent.
 #[test]
 fn a_document_with_no_vector_is_still_findable_lexically() {
     let (_d, paths) = temp_store();
@@ -131,7 +116,6 @@ fn a_document_with_no_vector_is_still_findable_lexically() {
         &mem("settled", "Settled", "an indexed document"),
     )
     .expect("add");
-    // Written but deliberately NOT settled: no vector exists for it.
     store::add(
         &conn,
         &mem(
@@ -165,7 +149,6 @@ fn a_document_with_no_vector_is_still_findable_lexically() {
     );
 }
 
-/// A structured filter still intersects a FUSED result: the legs rank, the predicate decides.
 #[test]
 fn a_tag_filter_still_applies_to_a_fused_search() {
     let (_d, paths) = temp_store();
@@ -201,10 +184,6 @@ fn a_tag_filter_still_applies_to_a_fused_search() {
     assert_eq!(bundle.hits[0].key, "tagged");
 }
 
-/// ★ THE SHAPE JAMES ASKED FOR (2026-11-11): `{semantic: [...], lexical: [...]}`, each sorted by its
-/// own metric — distance for meaning, BM25 for words — instead of one fused order that ranks leg
-/// membership above closeness. `None` means the leg never ran; `Some(vec![])` means it ran and found
-/// nothing (Stet, review of #224).
 #[test]
 fn the_two_legs_are_reported_separately_each_in_its_own_order() {
     let (_d, paths) = temp_store();
@@ -238,7 +217,6 @@ fn the_two_legs_are_reported_separately_each_in_its_own_order() {
             .map(|h| (h.key.clone(), h.score))
             .collect::<Vec<_>>()
     );
-    // Best-first: SQLite's BM25 is lower-is-better, the same direction as distance.
     let scores: Vec<f64> = lexical.iter().filter_map(|h| h.score).collect();
     let mut sorted = scores.clone();
     sorted.sort_by(|a, c| a.partial_cmp(c).unwrap());
@@ -257,8 +235,6 @@ fn the_two_legs_are_reported_separately_each_in_its_own_order() {
     );
 }
 
-/// ★ A FILTER APPLIES TO EVERY LIST (Stet, review of #224): the leg lists used to bypass the
-/// structured filters, so the very rows this PR exists to expose could violate the caller's filter.
 #[test]
 fn a_tag_filter_applies_to_the_leg_lists_too() {
     let (_d, paths) = temp_store();
@@ -276,7 +252,6 @@ fn a_tag_filter_applies_to_the_leg_lists_too() {
     let mut q = q("cargo runner", 5);
     q.tags = vec!["prj:x".into()];
     let b = search::run(&conn, Some(&embedder), &reader, &q).expect("run");
-    // ★ A TEST MUST NOT PASS BY FINDING NOTHING (Stet, review of #224, again): both legs ran here.
     assert!(b.semantic.is_some(), "the phrase leg ran");
     assert!(b.lexical.is_some(), "the word leg ran");
     for (name, list) in [("semantic", &b.semantic), ("lexical", &b.lexical)] {
@@ -311,7 +286,6 @@ fn a_row_both_legs_found_appears_in_both_lists() {
     }
     let reader = ellmephant::store::audience::Reader::everything();
     let b = search::run(&conn, Some(&embedder), &reader, &q("runner cargo", 5)).expect("run");
-    // ★ THE TEST MUST NOT PASS BY FINDING NOTHING (Stet, review of #224): collect first.
     let both: Vec<&ellmephant::search::Hit> = b
         .hits
         .iter()

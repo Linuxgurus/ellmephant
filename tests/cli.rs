@@ -1,6 +1,3 @@
-//! Black-box CLI tests. `ELLMEPHANT_HOME` points every run at a throwaway store, so
-//! these never touch the real `~/.ellmephant`.
-
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -32,8 +29,6 @@ fn version_reports_the_package_version() {
 
 #[test]
 fn help_lists_the_surviving_subcommands() {
-    // The REPL and the one-shot store commands were removed; what remains is the MCP
-    // server plus the two operational commands.
     let dir = tempfile::tempdir().unwrap();
     let out = run(dir.path(), &["--help"]);
     assert!(out.status.success());
@@ -59,7 +54,6 @@ fn doctor_bootstraps_a_fresh_home() {
     );
 
     let text = stdout(&out);
-    // Track the binary's own schema version rather than hard-coding it.
     let schema = format!("v{}", ellmephant::db::migrate::latest());
     for needle in ["schema", schema.as_str(), "memory.db", "model"] {
         assert!(
@@ -79,8 +73,6 @@ fn doctor_bootstraps_a_fresh_home() {
 
 #[test]
 fn an_invalid_device_flag_is_rejected_before_any_model_load() {
-    // Flags override the config file, so they are validated too (REFACTOR follow-up):
-    // a bad `--device` must fail fast with one clear message, not at encoder load.
     let dir = tempfile::tempdir().unwrap();
     let out = run(dir.path(), &["--device", "tpu", "doctor"]);
     assert!(!out.status.success(), "a bad device must not exit 0");
@@ -121,8 +113,6 @@ fn model_rm_is_a_no_op_on_an_empty_cache() {
 
 #[test]
 fn model_status_verify_fails_loudly_on_an_empty_cache() {
-    // The strict path: `model status --verify` propagates a verification error rather than
-    // printing a `skipped` line (that leniency belongs to `doctor`).
     let dir = tempfile::tempdir().unwrap();
     let out = run(dir.path(), &["model", "status", "--verify"]);
     assert!(!out.status.success(), "verifying nothing must not exit 0");
@@ -134,8 +124,6 @@ fn model_status_verify_fails_loudly_on_an_empty_cache() {
 
 #[test]
 fn doctor_verify_is_lenient_about_missing_weights() {
-    // The other half of the pair: `doctor --verify` degrades to a `skipped` line instead of
-    // failing, because a cluster without egress still has to boot (SPEC §6.4).
     let dir = tempfile::tempdir().unwrap();
     let out = run(dir.path(), &["doctor", "--verify"]);
     assert!(
@@ -148,8 +136,6 @@ fn doctor_verify_is_lenient_about_missing_weights() {
 
 #[test]
 fn the_home_flag_beats_the_env_and_offline_flags_are_accepted() {
-    // `--home` picks the store root directly, the branch the env var does not take; and the
-    // offline/model-dir flags override config (SPEC §12) without touching the network.
     let env_home = tempfile::tempdir().unwrap();
     let flag_home = tempfile::tempdir().unwrap();
     let models = tempfile::tempdir().unwrap();

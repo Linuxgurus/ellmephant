@@ -1,12 +1,6 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
 impl BootView {
-    /// Read the boot from the store on a read-only connection of our own.
     fn read(paths: &Paths, reader: &crate::store::audience::Reader) -> Self {
         let conn = match db::open_read_only(paths) {
             Ok(conn) => conn,
@@ -59,28 +53,14 @@ impl BootView {
     }
 }
 
-/// One tool as the boot presents it: the MCP card with an HTTP verb and path where the MCP tool
-/// name was. Every other field is the MCP field unchanged — same description, same schema, same
-/// annotations — because the requirement is that changing transport changes the verbs and nothing
-/// else.
 pub(super) struct BootTool {
-    /// The HTTP verb that reaches this tool.
     method: &'static str,
-    /// The path template; `{key}` is the placeholder.
     path: &'static str,
-    /// The law, verbatim from the tool.
     description: String,
-    /// The argument schema, verbatim from the tool.
     input_schema: serde_json::Value,
-    /// The annotation hints, as `tools/list` serializes them.
     annotations: serde_json::Value,
 }
 
-/// The tool surface, each MCP tool paired with the route that reaches it.
-///
-/// The cards come from the MCP server's own router and the verbs from [`ROUTES`], so the boot
-/// cannot describe a toolkit the doors do not have: a tool the router carries but no route reaches
-/// is dropped here, and `every_tool_has_a_route` fails the suite for it.
 pub(super) fn boot_tools() -> Vec<BootTool> {
     tool_catalog()
         .into_iter()
@@ -97,36 +77,20 @@ pub(super) fn boot_tools() -> Vec<BootTool> {
         .collect()
 }
 
-/// How much of an index entry's title the boot keeps. The index exists so a cold client knows what it
-/// HAS, not what it says — the body is one call away — and the whole document must survive being
-/// fetched by a client that truncates on size (see [`BOOT_BUDGET_BYTES`]).
 pub(super) const INDEX_TITLE_CHARS: usize = 40;
 
-/// How much of a project's goal the boot keeps, for the same reason.
 pub(super) const PROJECT_GOAL_CHARS: usize = 56;
 
-/// What `/bootstrap` found when it looked. Every field is `None`/empty when the store could not be
-/// read — the boot still says what it is and what it can be asked for, and names the missing facts
-/// rather than omitting them, because silence reads as "nothing to report".
 #[derive(Default)]
 pub(super) struct BootView {
-    /// The resident note: `(key, title, body)`.
     note: Option<(String, String, String)>,
-    /// The self set's tag for THIS caller — `self:<pen>`; empty when no pen was proven.
     tag: String,
-    /// The self set as `(key, title)`, key-ascending.
     self_set: Vec<(String, String)>,
-    /// Open projects as `(key, status, goal)`.
     projects: Vec<(String, String, String)>,
-    /// The one-line state, or `None` when there was nothing to read.
     state: Option<String>,
-    /// Why there is no content, when there is none.
     unreadable: Option<String>,
 }
 
-/// The state line: the facts a caller needs before trusting anything else, all from the boot's own
-/// read-only connection. A *view* of the same facts `/health` reports — no readiness predicate is
-/// reimplemented here (readiness is `/health`'s job), and the encode queue is the metric it is there.
 pub(super) fn state_line(conn: &rusqlite::Connection) -> crate::error::Result<String> {
     let memories: i64 = conn.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
     let projects = project::count(conn)?;
@@ -150,16 +114,8 @@ pub(super) fn state_line(conn: &rusqlite::Connection) -> crate::error::Result<St
     ))
 }
 
-/// The shared floor: the one document every caller may be given, whoever it is.
 pub(super) const BOOT_FLOOR: &str = "bootstrap";
 
-/// The keys a caller's resident note is looked for under, in order.
-///
-/// ★ A DOOR THAT CANNOT NAME ITS CALLER MUST NOT NAME A CALLER (2026-10-22). This endpoint used to
-/// inline `stet-self` for everybody and index the tag `cline-self` — one agent's first-person
-/// identity, served to all — which is how a cold Cline came to narrate itself as Stet. The address is
-/// now built from the PROVEN pen: `bootstrap-<pen>` when it exists, else the shared floor. Anonymous
-/// callers get the floor and no self set, which is honest rather than generous.
 pub(super) fn boot_candidates(pen: Option<&str>) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(pen) = pen {
@@ -169,25 +125,10 @@ pub(super) fn boot_candidates(pen: Option<&str>) -> Vec<String> {
     keys
 }
 
-/// The self set's tag for a caller: `self:<pen>`. `None` for a caller who proved nothing.
 pub(super) fn boot_tag(pen: Option<&str>) -> Option<String> {
     pen.map(|pen| format!("self:{pen}"))
 }
 
-/// `GET /bootstrap` — **the door, and what is behind it**: everything a cold client needs in one
-/// read, in the order it needs it, small enough to arrive intact.
-///
-/// This is the view HTTP.md promised and the code never delivered. What it used to be was a verbatim
-/// dump of `initialize` + all 14 tool cards — 14.8 KB, which a fetching client middle-truncated
-/// (7 KB punched out of the tool list), and which contains no memory at all. A client that read it
-/// learned the *shape of the API* and nothing about the store: not that there are 302 memories, not
-/// that one of them is its own boot note, not that eight projects are open and waiting. So it did
-/// not think of this endpoint as how you get memories — and it was right, because it was not.
-///
-/// So the boot leads with what is here and how to fetch it: the four calls that reach the store, the
-/// resident note in full, an index of the self set, the work still open, and the style. The tool
-/// catalogue is `?tools=true` — the one part that cannot be small, which the caller should choose to
-/// spend tokens on rather than receive by default.
 pub async fn bootstrap(
     State(state): State<HttpState>,
     RawQuery(raw): RawQuery,
@@ -197,8 +138,6 @@ pub async fn bootstrap(
     let params = Params::parse(raw.as_deref());
     let json = params.json();
     let with_tools = params.flag("tools");
-    // The boot reads the store on its OWN read-only connection: no lock, so a boot never queues
-    // behind a writer, and a boot during an outage still describes a store it cannot read.
     let view = tokio::task::spawn_blocking({
         let paths = state.paths.clone();
         move || BootView::read(&paths, &reader)
@@ -217,18 +156,10 @@ pub async fn bootstrap(
     )
 }
 
-/// The boot document in the store's text form: for a client to read, in the order it should read it.
-///
-/// The order is the point. A client arriving cold asks, in sequence: *what is this*, *what is in it*,
-/// *how do I fetch it*, *what is mine*, *what is open*, *how does this person want me to write*,
-/// *where is the rest*. The document answers in that order, and every line that names a memory or a
-/// project is a call the reader can make.
 pub(super) fn boot_text(view: &BootView, tools: Option<&[BootTool]>) -> String {
     let mut out = String::from("# ellmephant — your memory, over plain HTTP\n");
     match &view.state {
         Some(state) => out.push_str(&format!("# {state}\n")),
-        // A boot with no store still says what it is and what it can be asked for; the missing facts
-        // are NAMED, because silence would read as "there is nothing in here".
         None => out.push_str(&format!(
             "# STORE UNREADABLE, API ONLY — {}\n",
             view.unreadable.as_deref().unwrap_or("unknown error")
@@ -298,9 +229,6 @@ pub(super) fn boot_text(view: &BootView, tools: Option<&[BootTool]>) -> String {
             out.push_str(&catalogue_text(tools));
         }
         None => {
-            // The size is MEASURED, not stated: it is the one number a caller deciding whether to
-            // spend the tokens needs, and a hardcoded size drifts the first time a tool description
-            // grows. Rendering it here costs nothing (the catalogue is code, not a database read).
             let catalogue = catalogue_text(&boot_tools());
             out.push_str(&format!(
                 "\n## 5. THE FULL CATALOGUE — all {} tools with every argument: GET /bootstrap?tools=true\n\
@@ -315,8 +243,6 @@ pub(super) fn boot_text(view: &BootView, tools: Option<&[BootTool]>) -> String {
     out
 }
 
-/// The catalogue half of the boot: every tool, its verb, and its arguments. Split out so the default
-/// view can measure it without including it.
 pub(super) fn catalogue_text(tools: &[BootTool]) -> String {
     let mut out = String::new();
     for tool in tools {
@@ -329,8 +255,6 @@ pub(super) fn catalogue_text(tools: &[BootTool]) -> String {
     out
 }
 
-/// A tool's arguments, one line, read from the tool's own schema — so the text form cannot drift
-/// from the schema the MCP door hands a model.
 pub(super) fn args_text(schema: &serde_json::Value) -> Option<String> {
     let props = schema.get("properties")?.as_object()?;
     if props.is_empty() {
@@ -361,11 +285,6 @@ pub(super) fn args_text(schema: &serde_json::Value) -> Option<String> {
     Some(parts.join("; "))
 }
 
-/// A property's type as a reader wants it: scalars, arrays of them, and `enum` value sets.
-///
-/// A nullable property is reported by the type it actually carries — `k` is an integer you may
-/// omit, not "any" — and a `$ref` is resolved against the tool's own `$defs`, so an enum shows the
-/// values a caller may actually send.
 pub(super) fn schema_type(spec: &serde_json::Value, root: &serde_json::Value) -> String {
     let resolved = deref(spec, root);
     if let Some(real) = resolved
@@ -386,7 +305,6 @@ pub(super) fn schema_type(spec: &serde_json::Value, root: &serde_json::Value) ->
             .collect::<Vec<_>>()
             .join("|");
     }
-    // A unit-only enum is spelled `oneOf` of `const`s (`literal` | `regex`), one entry per variant.
     if let Some(branches) = resolved.get("oneOf").and_then(|o| o.as_array()) {
         let consts: Vec<String> = branches
             .iter()
@@ -405,7 +323,6 @@ pub(super) fn schema_type(spec: &serde_json::Value, root: &serde_json::Value) ->
             let inner = resolved
                 .get("items")
                 .map_or_else(|| "any".to_string(), |item| schema_type(item, root));
-            // `"a"|"b"[]` would read as if only the last value were the array.
             if inner.contains('|') {
                 format!("({inner})[]")
             } else {
@@ -417,8 +334,6 @@ pub(super) fn schema_type(spec: &serde_json::Value, root: &serde_json::Value) ->
     }
 }
 
-/// Follow a `$ref` one hop against the schema's own `$defs`. A ref that does not resolve is left
-/// alone rather than guessed at.
 pub(super) fn deref<'a>(
     spec: &'a serde_json::Value,
     root: &'a serde_json::Value,
@@ -431,8 +346,6 @@ pub(super) fn deref<'a>(
         .unwrap_or(spec)
 }
 
-/// The type a property actually carries: a `type` may be a name, or an array of them when the
-/// property is nullable (`["integer", "null"]` is an optional integer).
 pub(super) fn non_null_type(spec: &serde_json::Value) -> Option<String> {
     match spec.get("type")? {
         serde_json::Value::String(name) => (name != "null").then(|| name.clone()),
@@ -445,7 +358,6 @@ pub(super) fn non_null_type(spec: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Prefix every line of `text` with `pad`, so a block reads as one section.
 pub(super) fn indent_block(text: &str, pad: &str) -> String {
     text.lines()
         .map(|line| format!("{pad}{line}"))
@@ -453,9 +365,6 @@ pub(super) fn indent_block(text: &str, pad: &str) -> String {
         .join("\n")
 }
 
-/// Cut `text` to at most `max` characters on a word boundary, marking the cut — an index entry says
-/// what a memory is ABOUT, and a hard cut mid-word reads as corruption where a marked cut reads as a
-/// limit. Every index line in the boot goes through this.
 pub(super) fn clip(text: &str, max: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max {
@@ -469,19 +378,6 @@ pub(super) fn clip(text: &str, max: usize) -> String {
     format!("{cut} …")
 }
 
-/// The boot document as `?format=json` — the MCP handshake's own shape.
-///
-/// The fields are `initialize`'s (`serverInfo`, `capabilities`, `instructions`) plus `tools/list`'s
-/// (`tools`), and each tool carries `method`/`path` **where MCP carried `name`**. Everything else on
-/// a card — `title`, `description`, `inputSchema`, `annotations` — is the MCP field untouched.
-///
-/// `protocolVersion` is the one field an MCP boot has that this does not: it names a *transport*
-/// version, and over HTTP there is no MCP protocol to negotiate. Left out rather than faked.
-/// The boot document as `?format=json` — the same facts, shaped for a machine.
-///
-/// `serverInfo`/`capabilities`/`instructions` stay in MCP's own names so a client moving over from
-/// MCP can read what it already knows how to read; `tools` appears only with `?tools=true`, and the
-/// content sections carry the same cuts as the text form so the two cannot diverge in size or shape.
 pub(super) fn boot_json(view: &BootView, tools: Option<&[BootTool]>) -> serde_json::Value {
     let mut doc = serde_json::json!({
         "serverInfo": { "name": SERVER_NAME, "version": crate::VERSION },

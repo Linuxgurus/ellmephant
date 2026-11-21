@@ -1,9 +1,3 @@
-//! The `read` tool group, split out of `mcp/mod.rs` (soma/ellmephant#50).
-//!
-//! Each group is its own `#[tool_router]` impl, which is what makes the split possible:
-//! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
-//! into the one table the handler dispatches through.
-
 use crate::mcp::context::{pen_name, reader_of};
 use crate::mcp::*;
 use crate::search::{Fields, Query};
@@ -14,7 +8,6 @@ use rmcp::{tool, tool_router};
 
 #[tool_router(router = read_tool_router, vis = "pub(crate)")]
 impl MemoryServer {
-    /// WHICH rows have no owner — the list behind `memory_stats`' two counts.
     #[tool(
         name = "memory_unowned",
         description = "List the rows nobody owns, newest first, with WHY each is ownerless: `disclaimed` (somebody released it — the author is still named, and this is a supported, deliberate state: retiring a descendant can disclaim its rows) or `unrecorded` (no currently existing pen is named as author at all — either a write made with no pen, or a pen that is gone). These are the rows an owner can CLAIM: anyone may adopt an ownerless row. Use it after `memory_stats` says how many; a count without a list gets quoted and never acted on.",
@@ -30,7 +23,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<UnownedParams>,
     ) -> std::result::Result<String, String> {
-        // An ownerless row is a row, so the audience tier applies exactly as it does to a search hit.
         let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let limit = p.limit.unwrap_or(50).clamp(1, 500);
         let rows = self
@@ -41,7 +33,6 @@ impl MemoryServer {
         ))
     }
 
-    /// Semantic phrase search across every document type, with the graveyard behind a flag.
     #[tool(
         name = "semantic_search",
         description = SEMANTIC_SEARCH_DESCRIPTION,
@@ -62,7 +53,6 @@ impl MemoryServer {
         self.run_semantic(p, reader).await
     }
 
-    /// The `semantic_search` body, shared by the tool and `GET /semantic` so the two doors cannot drift.
     pub(crate) async fn run_semantic(
         &self,
         p: SemanticSearchParams,
@@ -101,8 +91,6 @@ impl MemoryServer {
             return serde_json::to_string(&serde_json::json!({ "deleted": true, "hits": hits }))
                 .map_err(|e| e.to_string());
         }
-        // A live search: one type if asked, otherwise the whole store. Today only memories are
-        // enqueued, so a request for another type must SAY that rather than return a quiet empty.
         if let Some(kind) = p.doc_type.as_deref() {
             let kind = kind.trim().to_string();
             if kind != "memory" {
@@ -127,11 +115,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             mode: None,
             k: Some(k),
             max_distance: p.max_distance,
-            // ★ `semantic_search` is the vector door and does not expose `semantic_only`: not
-            // because the knob is dangerous (it can only *remove* the lexical refill, never add
-            // one) but because changing this tool's default answer for existing callers is its own
-            // change. Today's refill is VISIBLE through `via` and `search.semantic_candidates`, so
-            // turning it off is an opt-in that can wait.
             semantic_only: None,
             expand: None,
             tags: Vec::new(),
@@ -150,7 +133,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         self.run_search(params, reader).await
     }
 
-    /// Semantic phrase search: KNN over the document embeddings.
     #[tool(
         name = "memory_search",
         description = SEARCH_DESCRIPTION,
@@ -171,8 +153,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         self.run_search(p, reader).await
     }
 
-    /// Run a search and render its wire JSON. Shared by the MCP tool and `GET /search`, so the two
-    /// doors emit byte-identical bodies (HTTP.md § "the wire grammar").
     pub(crate) async fn run_search(
         &self,
         p: SearchParams,
@@ -196,9 +176,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let key_prefix = p.key_prefix.unwrap_or(false);
         let title = p.title;
         let status = p.status;
-        // Default: `key` only (lean). Named fields are added, in canonical order.
         let fields = Fields::selection(p.fields.into_iter().map(FieldParam::to_field));
-        // Keep a copy for the log line: the original moves into the store closure.
         let log_query = query.clone();
         let started = std::time::Instant::now();
         let bundle = self
@@ -208,7 +186,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     pattern,
                     mode,
                     k: k.unwrap_or_else(|| s.default_k()),
-                    // Fall back to the configured ceiling so a bare semantic search is capped.
                     max_distance: max_distance.or_else(|| s.default_max_distance()),
                     semantic_only: semantic_only.unwrap_or(false),
                     expand,
@@ -239,7 +216,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Ok(json)
     }
 
-    /// Fetch one memory in full by key.
     #[tool(
         name = "memory_get",
         description = "Pull one memory whole by `key` — the only read that returns a body. If it shaped your task, `memory_upvote` it.",
@@ -258,9 +234,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
     ) -> std::result::Result<String, String> {
         let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
-        // A VERSION is reached by address, never resolved through the live row (which need not exist
-        // — its history outlives it), and it counts no visit: `visits` measures the memory, not a
-        // state the memory held.
         if let Some(n) = p.version {
             let lookup = key.clone();
             let past = self
@@ -275,8 +248,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return serde_json::to_string(&v).map_err(|e| e.to_string());
         }
         let lookup = key.clone();
-        // The relation is computed INSIDE the read, where the session's proven pen is in hand: what
-        // the owner is to the ASKER, not a property of the row.
         let (mut mem, relation) = match self
             .with_read("memory_get", reader.clone(), move |s| {
                 let mem = s.show(&lookup)?;
@@ -290,15 +261,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                 return Err(self.explain_miss(&key, e.to_string(), reader.clone()).await);
             }
         };
-        // Count the read best-effort: `visits` is telemetry, so a read must never wait for it. If a
-        // write holds the store this visit simply goes uncounted — which is nothing, next to a read
-        // that queued behind the entire write.
         if let Some(seen) = self.bump_visit(&key) {
             mem.visits = seen;
         }
         tracing::debug!(tool = "memory_get", key = %key, "memory fetched");
-        // Carry the firing cue in the payload, not only the static description: the model reads
-        // the returned body here, so this is where the upvote ask must live.
         let mut v = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
         if let Some(obj) = v.as_object_mut() {
             obj.insert("_nudge".to_string(), serde_json::json!(GET_NUDGE));
@@ -309,7 +275,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
-    /// List a memory's versions, or the index of every key that holds one.
     #[tool(
         name = "memory_history",
         description = HISTORY_DESCRIPTION,
@@ -360,7 +325,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         }
     }
 
-    /// Bump the `times_useful` counter on a memory that helped the task.
     #[tool(
         name = "memory_upvote",
         description = UPVOTE_DESCRIPTION,
@@ -377,12 +341,11 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeysParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         upvote_sweep(self, reader, p.keys.into_vec()).await
     }
 
-    /// List the memories whose bodies link to `key`.
     #[tool(
         name = "memory_backlinks",
         description = "List memories whose body point at `key` with `[[…]]`.",
@@ -411,7 +374,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
     }
 
-    /// Name every broken `[[…]]` edge — the finder `memory_stats.dangling` never had.
     #[tool(
         name = "memory_dangling",
         description = "List every BROKEN `[[…]]` edge as a row: the referrer (`from`), the target that resolves to nothing (`to`), and the table it was expected in (`to_type`). ★ `memory_stats.dangling` counts DISTINCT MISSING TARGETS, not edges — two bodies pointing at one missing key are `dangling: 1` and TWO rows here, so the count can never tell you which body to repair. Repair by deleting the token, renaming the target, or writing the missing memory; an empty list is the only proof the count is honestly 0.",
@@ -440,7 +402,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         Ok(crate::wire::links::dangling_to_wire_json(&edges))
     }
 
-    /// The five-number health surface: one call, and the definition travels with each number.
     #[tool(
         name = "memory_health",
         description = "One call, five numbers, each carrying its definition: `body_chars`, `log_share` (eight operational-log key prefixes), `dup_pairs` (what `memory_dupes` counts: class `duplicate` only, default cosine distance 0.05 — NOT computed in this call; it is `null` with a `suppressed` line naming `memory_dupes`, the exact finder that returns the pairs), `woven` (one link edge, any direction, with `woven_inbound`/`woven_outbound` beside it) and `cold30` (visible rows older than 30 days that were never read). ★ These numbers are VISIBLE-scoped: they are computed through the caller's own Reader and the response says `scope: \"visible\"`; no store total is reported (shape (a), decided 2026-11-14). `suppressed` names any number that could not be computed — `cold30` is `null`, never `0`, when no visible row is older than 30 days, because `0` would assert 'nothing is cold'; `dup_pairs` is `null`, never `0`, because the finder is budgeted out of this call. Also returns rows, log_chars, dup_pairs_min_distance, cold30_population, tag_distinct, tag_singletons, rows_untagged, edges, edges_per_row and dangling. Read-only, no args, no writes.",
@@ -472,7 +433,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         serde_json::to_string(&health).map_err(|e| e.to_string())
     }
 
-    /// Read-only digest: how much is stored, how it is tagged and linked, and what earned its keep.
     #[tool(
         name = "memory_stats",
         description = "Read-only digest of the whole store — counts, size, tag/link shape, top tags, usage (`visits`/`times_useful`), top useful, age, and the ENCODE QUEUE (`encode_pending` documents still owing a vector, `encode_failed` those the encoder gave up on, `encode_oldest_s` how long the oldest has waited). A non-empty `encode_pending` is normal — a write schedules its document and returns; a growing `encode_oldest_s` means the worker is not keeping up. ★ `dangling` is a count of DISTINCT MISSING TARGETS, not edges: `memory_dangling` is the finder that names each broken edge.",
@@ -498,7 +458,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         serde_json::to_string(&stats).map_err(|e| e.to_string())
     }
 
-    /// Find near-duplicate candidates: memory pairs closer than a tight distance.
     #[tool(
         name = "memory_dupes",
         description = DUPES_DESCRIPTION,
@@ -548,8 +507,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         crate::wire::dupes::to_wire_json(&pairs).map_err(|e| e.to_string())
     }
 
-    /// Recompute every vector and rebuild the derived index — the only path out of a model or
-    /// dimension change, which [`crate::index::vec::ensure`] deliberately refuses to absorb.
     #[tool(
         name = "memory_reembed",
         description = REEMBED_DESCRIPTION,
@@ -566,15 +523,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let report = self
-            .with_store("memory_reembed", move |s| {
-                // ★ NOT GATED, AND THAT IS THE DECISION (#168 review): a rebuild is derived data —
-                // idempotent, and its output depends on the bodies, not on the news. A pen locked out
-                // of an incident may still repair the index; making maintenance mean "acting" would
-                // dilute the class until someone weakens it to stop the noise.
-                s.reembed()
-            })
+            .with_store("memory_reembed", move |s| s.reembed())
             .await?;
         tracing::info!(
             tool = "memory_reembed",
@@ -585,7 +536,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             model = %report.model,
             "queued a re-embed of the store"
         );
-        // `Report` is not Serialize; spell the fields out so the response stays explicit.
         Ok(json_ok(serde_json::json!({
             "status": "queued",
             "queued": report.queued,
@@ -595,13 +545,6 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         })))
     }
 
-    /// Rebuild the `[[link]]` graph from every body. Model-free and seconds long.
-    ///
-    /// `memory_link` is derived, but its edges are computed at *write* time, so a body rewritten by
-    /// a path that does not re-derive leaks a stale edge: a rename or merge `replace()`, a parser
-    /// change, a binary that predates the current one. `memory_reembed` repairs it as a side effect
-    /// at the cost of a model load and an hour of worker time, so small drift went unrepaired and
-    /// `stats.dangling` accused the writer for edits that were already correct.
     #[tool(
         name = "memory_reparse",
         description = "Rebuild the `[[link]]` graph from every memory body — NO model, NO queue, \
@@ -624,13 +567,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
+        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let report = self
-            .with_store("memory_reparse", move |s| {
-                // ★ NOT GATED (#168 review): the link graph is derived data. Rebuilding it is
-                // idempotent and changes nothing anyone was told, so a locked pen may do it.
-                s.reparse()
-            })
+            .with_store("memory_reparse", move |s| s.reparse())
             .await?;
         tracing::info!(
             tool = "memory_reparse",

@@ -1,8 +1,3 @@
-//! Integration: the `stats` digest over a real store file (the `summary` command's core).
-//!
-//! Runs offline on the deterministic [`HashEmbedder`]; the numbers are hand-checked against a
-//! three-memory fixture.
-
 mod common;
 
 use common::temp_store;
@@ -12,7 +7,6 @@ use ellmephant::store::{self, Memory, stats};
 
 const DIM: usize = 8;
 
-/// A memory with an explicit key, body, tags and a source.
 fn memory(key: &str, body: &str, tags: &[&str]) -> Memory {
     Memory {
         key: key.to_string(),
@@ -30,8 +24,6 @@ fn digest_counts_spread_tags_and_links() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    // a: two tags, links to b (resolved) and `missing` (dangling). b: one tag, no links.
-    // c: no tags, no links -> the one orphan.
     common::add_now(
         &conn,
         &embedder,
@@ -43,7 +35,6 @@ fn digest_counts_spread_tags_and_links() {
 
     let s = stats::compute(&conn).expect("stats");
 
-    // size
     assert_eq!(s.memories, 3);
     assert_eq!(s.body_min, "plain body".len() as i64);
     assert_eq!(s.body_max, "links to [[b]] and [[missing]]".len() as i64);
@@ -54,7 +45,6 @@ fn digest_counts_spread_tags_and_links() {
         "the digest sizes the store file itself, so the field never reads as an empty database"
     );
 
-    // tags: k8s x2 + infra x1
     assert_eq!(s.distinct_tags, 2);
     assert_eq!(s.tag_assignments, 3);
     assert_eq!(s.singleton_tags, 1, "infra is used once");
@@ -66,25 +56,20 @@ fn digest_counts_spread_tags_and_links() {
     assert!((s.avg_tags_per_memory() - 1.0).abs() < 1e-9);
     assert!((s.avg_memories_per_tag() - 1.5).abs() < 1e-9);
 
-    // links: two outgoing edges from a, one dangling target, one orphan (c)
     assert_eq!(s.edges, 2);
     assert_eq!(s.dangling, 1);
     assert_eq!(s.orphans, 1);
     assert_eq!(s.linked, 2);
 
-    // dense clusters: one component of two (a -> b); c is a lone orphan
     assert_eq!(s.link_components, 1);
     assert_eq!(s.largest_component, 2);
 
-    // bare tags: c carries none
     assert_eq!(s.untagged, 1);
 
-    // no usage recorded yet
     assert_eq!(s.visits_total, 0);
     assert_eq!(s.useful_total, 0);
     assert!(s.top_useful.is_empty());
 
-    // The CLI-supplied on-disk size is positive once the file exists.
     assert!(stats::disk_bytes(&paths.db()) > 0);
 }
 
@@ -95,7 +80,6 @@ fn the_digest_carries_the_encode_queue() {
     let embedder = HashEmbedder::new(DIM);
     let _spec = ellmephant::embed::VecSpec::of(&embedder);
 
-    // `store::add` and NOT `add_now`: the point is the unsettled document a write leaves behind.
     store::add(&conn, &memory("queued", "owed a vector", &["k8s"])).expect("add");
     let s = stats::compute(&conn).expect("stats");
     assert_eq!(s.encode_pending, 1, "the write scheduled its document");
@@ -105,7 +89,6 @@ fn the_digest_carries_the_encode_queue() {
         "a document that is waiting has an age — this is the number that shows a stalled worker"
     );
 
-    // Settle it: the queue empties, and with it the age.
     let processed = ellmephant::store::encode::drain(&conn, &embedder, 10).expect("drain");
     assert_eq!(processed, 1);
     let s = stats::compute(&conn).expect("stats");
@@ -151,7 +134,6 @@ fn telemetry_totals_and_top_useful() {
     let s = stats::compute(&conn).expect("stats");
     assert_eq!(s.visits_total, 3);
     assert_eq!(s.useful_total, 3);
-    // Busiest first: b (2) then a (1).
     assert_eq!(s.top_useful.first(), Some(&("b".to_string(), 2)));
 }
 
@@ -165,27 +147,21 @@ fn unvoted_hot_surfaces_read_but_never_marked_useful() {
     common::add_now(&conn, &embedder, &memory("cold", "cold body", &["k8s"])).expect("add cold");
     common::add_now(&conn, &embedder, &memory("voted", "voted body", &["k8s"])).expect("add voted");
 
-    // `hot`: read three times, never upvoted -- the store's blind spot.
     for _ in 0..3 {
         store::record_visit(&conn, "hot").unwrap();
     }
-    // `cold`: a single read is a glance, below the floor.
     store::record_visit(&conn, "cold").unwrap();
-    // `voted`: read twice and also marked useful -- excluded (it is not unvoted).
     store::record_visit(&conn, "voted").unwrap();
     store::record_visit(&conn, "voted").unwrap();
     store::record_useful(&conn, "voted").unwrap();
 
     let s = stats::compute(&conn).expect("stats");
     assert_eq!(s.unvoted_hot, vec![("hot".to_string(), 3)]);
-    // It is a candidate list, not a vote total: the useful row still counts.
     assert_eq!(s.useful_total, 1);
 }
 
 #[test]
 fn vocabulary_is_the_whole_tag_set_count_desc_then_name() {
-    // The readable half of tag hygiene: the WHOLE set, so a caller stops inventing a synonym for a
-    // tag that already exists. (The write half — renaming/merging one — is separate work.)
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);

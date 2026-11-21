@@ -1,28 +1,3 @@
-//! THE TWO DOORS AGREE ON WHO MAY WRITE (soma/ellmephant#231, #232).
-//!
-//! The defect this exists to remove is not a bug in the store: it is that a write's *authority*
-//! was decided twice, once per door, and the copies disagreed. On HTTP a pen was optional — four
-//! (then six) handlers did `identity::resolve(...).ok().flatten()`, which collapses FORGED and
-//! MISSING into `None`, so an unidentified caller wrote as `anonymous` (owner NULL, the commons,
-//! and `channel_gate` skipped). On MCP the same verb refused both.
-//!
-//! So the contract is a table, and it is behaviour-level on purpose: whatever refactor moves the
-//! code underneath, this test must still pass. For every write verb, and for each caller
-//! `{no proof, forged proof, valid proof}`, the two doors must answer the same way.
-//!
-//! ★ EXACT, NOT MERELY NEGATIVE (Stet's review on !241). The first draft asserted `!is_success()`,
-//! which passes for the wrong reason: on `dev` four of the six verbs refused an unproven caller
-//! anyway — `memory_delete`/`memory_append`/`memory_merge` 400 from the store's owner check,
-//! `memory_fold` 403 from `fold_into` — so a loose assertion was green on refusals that had nothing
-//! to do with authority. The HTTP door must answer **401**, and the MCP door must refuse with a
-//! sentence naming the identity. Redness on `dev` was therefore 2 of 6, not 6 of 6.
-//!
-//! ★ A FORGED CLAIM IS AN HTTP SHAPE. An in-process MCP transport DECLARES its pen (`with_identity`)
-//! rather than proving it, so `declared: None` is not a forgery — it is byte-identical to "no
-//! identity", which is what the first draft's "forged" column actually sent. The forged case is
-//! driven over the MCP door's real HTTP transport, where the header pair decides, so both doors get
-//! the same forgery.
-
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -58,10 +33,6 @@ fn session(dir: &std::path::Path) -> Session {
         .with_embedder(Box::new(HashEmbedder::new(DIM)))
 }
 
-/// Give the store a pen that can prove itself, and return its secret.
-///
-/// `tester` hangs from the root `estate` because a parentless pen cannot hold a credential — a
-/// fixture that makes its pen a root is testing a state the code refuses.
 fn provision(dir: &std::path::Path) -> String {
     let paths = Paths::from_root(dir);
     let conn = ellmephant::db::open(&paths).expect("open");
@@ -74,7 +45,6 @@ fn provision(dir: &std::path::Path) -> String {
     ellmephant::store::credential::issue(&conn, PEN, None).expect("issue credential")
 }
 
-/// The HTTP door and an MCP server over the SAME store, as `serve` wires them.
 fn doors(dir: &std::path::Path) -> (axum::Router, MemoryServer) {
     let watch = Arc::new(LockWatch::new());
     let shared = Arc::new(Mutex::new(session(dir)));
@@ -94,7 +64,6 @@ fn doors(dir: &std::path::Path) -> (axum::Router, MemoryServer) {
     (app, mcp)
 }
 
-/// One request with the door's bearer, an optional identity pair, and an optional body.
 async fn request(
     app: &axum::Router,
     method: Method,
@@ -120,14 +89,11 @@ async fn request(
         .oneshot(builder.body(Body::from(body.to_string())).unwrap())
         .await
         .expect("http request");
-    // Drain the body so the connection finishes whatever it queued.
     let status = response.status();
     let _ = to_bytes(response.into_body(), usize::MAX).await;
     status
 }
 
-/// An in-process MCP peer. `None` is a transport that declared no pen — the MCP shape of "no
-/// headers". (A forged claim can only arrive over an HTTP transport, so it has no in-process twin.)
 async fn peer(
     server: MemoryServer,
     declared: Option<&str>,
@@ -149,8 +115,6 @@ async fn peer(
     ().serve(client_io).await.expect("client handshake")
 }
 
-/// Call one write tool on an in-process peer. Returns `(refused, text)`: `refused` is the door's
-/// `isError`, and `text` is the refusal sentence the caller would read.
 async fn mcp_answer(
     server: MemoryServer,
     declared: Option<&str>,
@@ -176,7 +140,6 @@ async fn mcp_answer(
     (refused, text)
 }
 
-/// One JSON-RPC POST to the MCP door over HTTP, with an optional identity pair.
 async fn mcp_post(
     app: &axum::Router,
     session: Option<&str>,
@@ -215,8 +178,6 @@ async fn mcp_post(
     )
 }
 
-/// The JSON-RPC payload out of whichever `data:` frame carries it (the stream opens with an empty
-/// one), or the bare body when the door answered with JSON.
 fn payload(body: &str) -> serde_json::Value {
     for frame in body
         .lines()
@@ -230,7 +191,6 @@ fn payload(body: &str) -> serde_json::Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON-RPC: {e}: {body}"))
 }
 
-/// Open an MCP session over the HTTP door.
 async fn mcp_session(app: &axum::Router) -> String {
     let (status, session, body) = mcp_post(
         app,
@@ -261,8 +221,6 @@ async fn mcp_session(app: &axum::Router) -> String {
     session
 }
 
-/// Call one write tool over the MCP door's HTTP transport, with an identity pair on the request.
-/// Returns `(refused, text)`, like [`mcp_answer`].
 async fn mcp_over_http(
     app: &axum::Router,
     session: &str,
@@ -293,22 +251,14 @@ async fn mcp_over_http(
     (refused, text)
 }
 
-/// The sentence a write must refuse with when NOTHING was claimed (both doors say it).
 const MISSING: &str = "a write requires a proven identity";
 
-/// One write verb, spelled both ways.
 struct Case {
-    /// The MCP tool name.
     tool: &'static str,
-    /// The MCP arguments.
     args: serde_json::Value,
-    /// The HTTP method.
     method: fn() -> Method,
-    /// The HTTP path, with any query string.
     uri: &'static str,
-    /// The HTTP content type, when the route wants a body.
     content_type: Option<&'static str>,
-    /// The HTTP body (text front matter or JSON).
     body: &'static str,
 }
 
@@ -366,7 +316,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Seed the two rows the destructive verbs need, as a proven pen.
 async fn seed(app: &axum::Router, secret: &str) {
     for (key, title) in [("alpha", "Alpha"), ("beta", "Beta")] {
         let body = format!("Key: {key}\nTitle: {title}\n---\nthe body of {key}\n");
@@ -386,8 +335,6 @@ async fn seed(app: &axum::Router, secret: &str) {
 #[tokio::test]
 async fn a_valid_pen_writes_on_both_doors() {
     for case in cases() {
-        // One store per door: the destructive verbs consume their target, and comparing "the same
-        // answer" must not mean "the second door found the first door's leftovers".
         let http_dir = tempfile::tempdir().unwrap();
         let secret = provision(http_dir.path());
         let (app, _mcp) = doors(http_dir.path());
@@ -418,9 +365,6 @@ async fn a_valid_pen_writes_on_both_doors() {
             case.tool
         );
 
-        // The same verb over the MCP door's HTTP transport, whose identity comes from the header
-        // pair. This is the positive half of the FORGED test: it proves the headers reach the
-        // server, so a refusal there is a decision and not a broken endpoint.
         let http_dir = tempfile::tempdir().unwrap();
         let secret = provision(http_dir.path());
         let (app, _mcp) = doors(http_dir.path());
@@ -436,10 +380,6 @@ async fn a_valid_pen_writes_on_both_doors() {
     }
 }
 
-/// ★ THE REGRESSION, HTTP DOOR (soma/ellmephant#231, #232). `dev` accepted an unidentified writer
-/// on two of these six verbs (`memory_upsert`, `project_upsert` — 200 OK), and refused the other
-/// four for reasons that had nothing to do with authority (400 owner checks, `fold_into`'s 403). A
-/// 401-exact assertion is what tells those apart; `!is_success()` did not.
 #[tokio::test]
 async fn http_refuses_an_unproven_writer_with_401() {
     for case in cases() {
@@ -468,8 +408,6 @@ async fn http_refuses_an_unproven_writer_with_401() {
     }
 }
 
-/// ★ THE REGRESSION, MCP DOOR, IN-PROCESS. No transport declaration means no proof, so the write is
-/// refused — and the sentence names the identity, which is what a caller can act on.
 #[tokio::test]
 async fn mcp_refuses_an_unproven_writer_by_name() {
     for case in cases() {
@@ -492,10 +430,6 @@ async fn mcp_refuses_an_unproven_writer_by_name() {
     }
 }
 
-/// ★ THE FORGED COLUMN, BOTH DOORS. A forged pair must be a REFUSAL, not a downgrade to
-/// `anonymous` — `.ok().flatten()` collapsed the two and wrote the commons. On MCP this can only
-/// arrive over the HTTP transport (an in-process peer declares its pen, it does not prove it), so
-/// the same header pair is sent to both doors.
 #[tokio::test]
 async fn a_forged_writer_is_refused_on_both_doors() {
     for case in cases() {

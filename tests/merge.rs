@@ -1,9 +1,3 @@
-//! Integration: partial writes (`store::merge`) against a real store file and real `vec0` tables.
-//!
-//! Runs offline against the deterministic [`HashEmbedder`]. What is worth proving here is the
-//! per-field law — which writes move the vector, which move the split-review verdict, and which
-//! move neither — plus the one thing a field write must never do: change a key.
-
 mod common;
 
 use common::{count, temp_store};
@@ -15,7 +9,6 @@ use rusqlite::Connection;
 
 const DIM: usize = 8;
 
-/// Add one memory and hand back `(id, key)`.
 fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str) -> (i64, String) {
     let mem = Memory {
         key: key.to_string(),
@@ -27,7 +20,6 @@ fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str) -> (i
     common::add_now(conn, embedder, &mem).expect("add memory")
 }
 
-/// A patch that names `key` and touches nothing else.
 fn bare(key: &str) -> store::Patch {
     store::Patch {
         key: Some(key.to_string()),
@@ -100,9 +92,6 @@ fn a_title_write_re_embeds_the_document() {
 
 #[test]
 fn a_tags_write_re_embeds_nothing() {
-    // Tags are FILING, not MEANING — and not part of the document either. So a tag write moves
-    // neither the vector nor the document: retro-tagging a memory is cheap and the
-    // vector keeps describing what the memory *means*.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -152,7 +141,6 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
     )
     .expect("set source");
 
-    // Empty IS an instruction where empty is a fact.
     common::merge_now(
         &conn,
         &embedder,
@@ -177,7 +165,6 @@ fn empty_clears_where_it_is_a_fact_and_is_refused_where_it_is_not() {
     .expect("clear tags");
     assert!(store::get(&conn, &key).unwrap().unwrap().tags.is_empty());
 
-    // Empty is a REFUSAL where empty is nonsense — and the refusal writes nothing.
     for (field, patch) in [
         (
             "title",
@@ -275,20 +262,15 @@ fn a_new_key_needs_a_title_and_a_body() {
 
 #[test]
 fn key_is_an_address_not_a_field() {
-    // The one thing a field write must never do. No statement anywhere puts `key` in an UPDATE's
-    // SET clause — a key is only ever a predicate (`WHERE key = ?1`) or an INSERT column for a
-    // brand-new row — so a rename is not expressible through a patch.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let (id, key) = seed(&conn, &embedder, "anchor", "the facts");
 
-    // Rewrite every writable field at once: the key must not move with them.
     common::merge_now(
         &conn,
         &embedder,
         &store::Patch {
-            // A PROVEN writer: the actor is named, and `edited_by` records it (soma/ellmephant#192).
             acted_by: Some("James".into()),
             key: Some(key.clone()),
             title: Some("a new title".into()),
@@ -306,10 +288,6 @@ fn key_is_an_address_not_a_field() {
     )
     .expect("merge everything");
 
-    // PROVENANCE is part of the row now, and it is TWO facts: who asserted this row (write-once —
-    // the seeded row proved nothing, so it is `anonymous`) and who wrote it last (this patch, James).
-    // A write may not restamp authorship: that was the #107 bug, where a tag pass rewrote the author
-    // with no version to show for it.
     let (asserted, last_written, origin): (String, String, Option<String>) = conn
         .query_row(
             "SELECT asserted_by, edited_by, origin FROM memory WHERE id = ?1",
@@ -336,7 +314,6 @@ fn key_is_an_address_not_a_field() {
         .expect("the row still exists");
     assert_eq!(stored, "anchor", "the key survived a whole-row rewrite");
 
-    // Naming a DIFFERENT key does not rename: it addresses another row, so it creates one.
     let out = common::merge_now(
         &conn,
         &embedder,
@@ -358,8 +335,6 @@ fn key_is_an_address_not_a_field() {
 
 #[test]
 fn a_patch_that_changes_nothing_re_embeds_nothing() {
-    // Re-writing the same text has to be a no-op, so a retry — or any client that echoes every
-    // field back — cannot silently move the document.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -392,9 +367,6 @@ fn a_patch_that_changes_nothing_re_embeds_nothing() {
 
 #[test]
 fn private_and_an_explicit_audience_are_refused_together() {
-    // soma/ellmephant#189 D5. Asked for both, the store used to keep the `audience` and drop `private`
-    // without a word — and when that audience did not include the author, the author lost the row:
-    // invisible to every read, and every repair refused.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -424,8 +396,6 @@ fn private_and_an_explicit_audience_are_refused_together() {
     );
 }
 
-/// ★ THE GATE (#217): a body whose shape is a run record is refused, the refusal names the shelf and
-/// the arguments it inferred, and `force: true` writes it anyway.
 #[test]
 fn a_run_shape_is_refused_and_force_writes_it() {
     let (_dir, paths) = temp_store();
@@ -453,7 +423,6 @@ fn a_run_shape_is_refused_and_force_writes_it() {
     );
     assert!(err.contains("force: true"), "the override is named: {err}");
 
-    // The door is not a wall: the same body with `force` is written unchanged.
     let forced = common::merge_now(
         &conn,
         &embedder,
@@ -469,7 +438,6 @@ fn a_run_shape_is_refused_and_force_writes_it() {
     );
     assert!(forced.is_ok(), "force must override: {:?}", forced.err());
 
-    // And a lesson that merely cites a date is not touched.
     let lesson = common::merge_now(
         &conn,
         &embedder,

@@ -1,13 +1,3 @@
-//! The full plain-HTTP surface (HTTP.md slice 2): every MCP tool as a route over the same
-//! `Session`, plus `/bootstrap`.
-//!
-//! Three laws hold here, in order of strength. **Reads are pure — telemetry aside**: no `GET` writes
-//! *data*, but a counter is not data, so `GET /memory/{key}` counts a `visits` read exactly as
-//! `memory_get` does (HTTP.md invariant 1). **`/health` and `/bootstrap` never touch `Session`** —
-//! they answer from their own read-only connection, so a read never queues behind a writer. **Auth
-//! before writes** — every `POST`/`PUT`/`DELETE` resolves a bearer to a scope first, and a rejection
-//! carries `WWW-Authenticate: Bearer` and nothing else.
-
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -25,32 +15,19 @@ use crate::store::{self, encode, project, tags};
 use crate::wire::links::{backlinks_to_wire_json, dangling_to_wire_json};
 use rusqlite::OptionalExtension;
 
-/// The resolved authority of a request. Today one constant covers the store; per-area credentials
-/// land later by resolving a different `Scope` in [`authorize`], and no handler changes.
 #[derive(Clone, Copy)]
 pub struct Scope {
-    /// The namespace this credential may write.
     pub area: &'static str,
-    /// The namespace, once per-area credentials exist (`None` = the whole store).
     pub namespace: Option<&'static str>,
 }
 
-/// The one scope every valid bearer resolves to today.
 const STORE_SCOPE: Scope = Scope {
     area: "store",
     namespace: None,
 };
 
-/// The largest request body accepted (a memory, not a payload).
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
-/// Resolve a credential → a scope, or `None`. The seam: handlers receive the scope, never the token.
-///
-/// **An unset server token means the write routes are OPEN.** That is deliberate and temporary:
-/// requiring a bearer before there is any way to issue one would leave this surface read-only,
-/// which is the one state it exists to end. Setting `ELLMEPHANT_WRITE_TOKEN` closes the door
-/// again with no code change, so the gate stays a config flip rather than a rewrite. Read this
-/// as a decision with an expiry date, not as the shape of the thing.
 fn resolve(provided: Option<&str>, expected: Option<&str>) -> Option<Scope> {
     match (provided, expected) {
         (_, None) => Some(STORE_SCOPE),
@@ -59,7 +36,6 @@ fn resolve(provided: Option<&str>, expected: Option<&str>) -> Option<Scope> {
     }
 }
 
-/// The bearer on the request, if any.
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -67,19 +43,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-/// Authorize a write: resolve the bearer, or hand back the bare 401 (no `resource_metadata`).
-///
-/// With no `ELLMEPHANT_WRITE_TOKEN` configured there is nothing to check and nothing to hand a
-/// caller, so the door is open — see [`resolve`]. Configure the token and this becomes a gate.
 fn authorize(state: &HttpState, headers: &HeaderMap, json: bool) -> ApiResult<Scope> {
     resolve(bearer(headers), state.write_token()).ok_or_else(|| ApiError::unauthorized(json))
 }
 
-/// A text or JSON body with an explicit content type.
-///
-/// Returns an [`ApiResult`] rather than a bare `Response` so a handler's success and refusal are the
-/// same type: the caller writes `render(...)` at the tail and `return Err(...)` for a refusal, and
-/// the signature is one shape everywhere (soma/ellmephant#233).
 fn render(
     status: StatusCode,
     json: bool,
@@ -98,19 +65,6 @@ fn render(
         .expect("http response"))
 }
 
-/// The session shared with `/mcp`, or the 500 that means the router forgot to attach it.
-/// ★ THE SESSION IS AN EXTRACTOR, NOT SIXTY-TWO PREAMBLES (soma/ellmephant#233).
-///
-/// Every handler in this file began with
-///
-/// ```ignore
-/// let server = match session(&state) { Ok(s) => s, Err(r) => return r };
-/// ```
-///
-/// which is the same sentence sixty-two times: "if the router forgot to attach the session, answer
-/// 500". It is a property of the request, so it belongs in the request's type. `Server` is a thin
-/// borrow of the `MemoryServer` — it derefs, so a handler's body is unchanged — and its rejection is
-/// the same 500 the preamble built.
 pub struct Server(MemoryServer);
 
 impl std::ops::Deref for Server {
@@ -136,12 +90,9 @@ impl axum::extract::FromRequestParts<HttpState> for Server {
     }
 }
 
-/// The decoded query string, as ordered pairs so a repeated key (`tag=a&tag=b`) survives — which
-/// `HashMap` extraction would collapse to the last. Small by hand: no percent-decoder dependency.
 struct Params(Vec<(String, String)>);
 
 impl Params {
-    /// Parse `a=1&b=2`; a bare `?` or `None` yields no pairs.
     fn parse(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
             return Self(Vec::new());
@@ -157,7 +108,6 @@ impl Params {
         )
     }
 
-    /// The first value for `name`.
     fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
@@ -165,7 +115,6 @@ impl Params {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Every value for `name`, in order.
     fn all(&self, name: &str) -> Vec<String> {
         self.0
             .iter()
@@ -174,17 +123,14 @@ impl Params {
             .collect()
     }
 
-    /// A trimmed non-empty value for `name` (`""` reads as absent).
     fn maybe(&self, name: &str) -> Option<&str> {
         self.get(name).map(str::trim).filter(|v| !v.is_empty())
     }
 
-    /// `true` only for `?format=json`.
     fn json(&self) -> bool {
         self.get("format") == Some("json")
     }
 
-    /// Parse `name` as `T`, erroring with a line naming it on failure.
     fn parse_as<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>, String> {
         match self.maybe(name) {
             None => Ok(None),
@@ -195,13 +141,11 @@ impl Params {
         }
     }
 
-    /// A boolean flag (`true` or `1`; everything else, including absent, is `false`).
     fn flag(&self, name: &str) -> bool {
         matches!(self.maybe(name), Some("true") | Some("1"))
     }
 }
 
-/// Percent-decode `+` and `%XX`; a stray `%` is left literal.
 fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -231,12 +175,10 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// One hex digit.
 fn hex(b: u8) -> Option<u8> {
     (b as char).to_digit(16).map(|d| d as u8)
 }
 
-/// A parsed `text/plain` write: the named front matter and the verbatim body.
 #[derive(Debug, Default)]
 struct FrontMatter {
     key: Option<String>,
@@ -247,14 +189,10 @@ struct FrontMatter {
     version_note: Option<String>,
     private: Option<bool>,
     audience: Option<String>,
-    /// `Force: true` — write a run shape here anyway (soma/ellmephant#221). Consumed by the header
-    /// parse, so it never reaches the body: a leaked `Force: true` would live in every future diff.
     force: Option<bool>,
     body: String,
 }
 
-/// Parse the front matter: `Key:`/`Title:`/`Tags:`/`Source:`/`Note:` before the first `---`, the body
-/// after it byte-for-byte with a trailing newline trimmed. An unknown field is an error that names it.
 fn front_matter(text: &str) -> Result<FrontMatter, String> {
     let mut out = FrontMatter::default();
     let mut header_end = text.len();
@@ -316,10 +254,6 @@ fn front_matter(text: &str) -> Result<FrontMatter, String> {
     Ok(out)
 }
 
-/// A `memory_upsert` patch from a text body (`Key:` required: it is the address).
-///
-/// Returns the patch and the pen to CREDIT, if any — `None` for the text door, where a front-matter
-/// `As:` field would be a second spelling of the JSON `as` with no caller asking for it yet.
 fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), String> {
     let fm = front_matter(text)?;
     let Some(key) = fm.key else {
@@ -332,7 +266,6 @@ fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), Strin
             title: fm.title,
             body: Some(fm.body),
             source: fm.source,
-            // A text body carries no speaker: the handler stamps `asserted_by` from the request.
             asserted_by: None,
             origin: fm.origin,
             tags: fm.tags,
@@ -340,16 +273,12 @@ fn memory_patch_text(text: &str) -> Result<(store::Patch, Option<String>), Strin
             audience: fm.audience,
             version_note: fm.version_note,
             expected_version: None,
-            // ★ THE TEXT DOOR HAS THE OVERRIDE TOO (Stet, review of #221). Without it the only way
-            // past the gate here is to EDIT THE PROSE until it stops looking like a receipt, which
-            // corrupts the record to satisfy a linter — worse than the log we are stopping.
             force: fm.force.unwrap_or(false),
         },
         None,
     ))
 }
 
-/// The JSON shape `POST /memory` accepts under `Content-Type: application/json`.
 #[derive(serde::Deserialize)]
 struct MemoryJson {
     key: Option<String>,
@@ -359,23 +288,14 @@ struct MemoryJson {
     origin: Option<String>,
     tags: Option<Vec<String>>,
     version_note: Option<String>,
-    /// Credit this write to a descendant of the calling pen (`as`), then validated against a live
-    /// lend. Both doors offer the same argument, or the door is a second, weaker store.
     #[serde(default, rename = "as")]
     as_pen: Option<String>,
-    /// Keep this row to the writing pen alone.
     private: Option<bool>,
-    /// An explicit audience — a SHARE: `public`, or `pen:<name>` / `subtree:<name>` addresses
-    /// (comma-separated, at most 8). Validated against the registry; unlike `private`, it names others
-    /// on purpose. Omit to keep the stored audience.
     audience: Option<String>,
-    /// The CAS token, as `memory_get` returns it.
     expected_version: Option<i64>,
-    /// Bypass the run-shape gate (soma/ellmephant#217).
     force: Option<bool>,
 }
 
-/// A `memory_upsert` patch from a JSON body.
 fn memory_patch_json(bytes: &[u8]) -> Result<(store::Patch, Option<String>), String> {
     let m: MemoryJson = serde_json::from_slice(bytes).map_err(|e| format!("bad JSON: {e}"))?;
     let as_pen = m.as_pen;
@@ -399,7 +319,6 @@ fn memory_patch_json(bytes: &[u8]) -> Result<(store::Patch, Option<String>), Str
     ))
 }
 
-/// The JSON shape `POST /project` accepts under `Content-Type: application/json`.
 #[derive(serde::Deserialize)]
 struct ProjectJson {
     key: Option<String>,
@@ -415,7 +334,6 @@ struct ProjectJson {
 }
 
 impl ProjectJson {
-    /// Fold the JSON onto a partial project patch.
     fn into_patch(self) -> project::Patch {
         project::Patch {
             key: self.key,
@@ -432,14 +350,11 @@ impl ProjectJson {
     }
 }
 
-/// A project patch from a JSON body.
 fn project_patch_json(bytes: &[u8]) -> Result<project::Patch, String> {
     let p: ProjectJson = serde_json::from_slice(bytes).map_err(|e| format!("bad JSON: {e}"))?;
     Ok(p.into_patch())
 }
 
-/// A project patch from text front matter — the structured set is JSON's job, so text maps
-/// `Key`/`Title`/`Tags` and carries the body as the project's `goal`.
 fn project_patch_text(text: &str) -> Result<project::Patch, String> {
     let fm = front_matter(text)?;
     Ok(project::Patch {
@@ -456,7 +371,6 @@ fn project_patch_text(text: &str) -> Result<project::Patch, String> {
     })
 }
 
-/// Read a content type: JSON only when the caller says so.
 fn is_json_content(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -465,7 +379,6 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Collect a request body, erroring (as a 400) past [`MAX_BODY`].
 async fn body_bytes(body: Body) -> Result<Vec<u8>, String> {
     to_bytes(body, MAX_BODY)
         .await
@@ -473,11 +386,6 @@ async fn body_bytes(body: Body) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("bad body: {e}"))
 }
 
-/// The request's JSON body, when it sent one — `None` for an empty body or a non-JSON content type.
-///
-/// This is what lets a route take its arguments **the way the MCP tool does** (`{"into": ...}`)
-/// *and* its own query parameters, so a caller that knows the tool can post the
-/// tool's own arguments unchanged. Parity is the point of this door; guessing at the shape is not.
 async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json::Value>, String> {
     if !is_json_content(headers) {
         return Ok(None);
@@ -491,10 +399,6 @@ async fn json_body(headers: &HeaderMap, body: Body) -> Result<Option<serde_json:
         .map_err(|e| format!("bad json body: {e}"))
 }
 
-/// ★ UNAVAILABLE IS NOT FORGED (2026-10-30, Stet on #204): the split exists in `identity::Denied`
-/// because a store that cannot be read is not a caller who lied. This is where it reaches the
-/// client — 503 for the store, the route's own refusal code for a bad proof. Rotating secrets
-/// because a database blinked is the failure this prevents.
 fn denied_response(json: bool, denied: crate::identity::Denied, forged: StatusCode) -> ApiError {
     let code = match denied {
         crate::identity::Denied::Forged(_) => forged,
@@ -503,9 +407,6 @@ fn denied_response(json: bool, denied: crate::identity::Denied, forged: StatusCo
     ApiError::new(json, code, denied)
 }
 
-/// A [`Caller`](crate::identity::Caller) refusal as a response: the denial keeps its own code split
-/// (503 for an unreadable store, the route's code for a bad proof), and an absent pen gets the
-/// route's sentence. One mapper, so no door invents a fourth answer.
 fn refusal_response(json: bool, refusal: crate::identity::Refusal, absent: StatusCode) -> ApiError {
     match refusal {
         crate::identity::Refusal::Denied(denied) => denied_response(json, denied, absent),
@@ -513,15 +414,6 @@ fn refusal_response(json: bool, refusal: crate::identity::Refusal, absent: Statu
     }
 }
 
-/// ★ THE CALLER IS AN EXTRACTOR TOO (soma/ellmephant#231's invariant): a door may not be able to
-/// name a pen, decide a gate, or choose a status. Building a `Caller` used to be something every
-/// handler did for itself, from headers it fetched itself — twenty copies of
-/// `Caller::from_headers(&state.paths, &headers)`. Now the request is read ONCE, here, and a handler
-/// receives the answer, so the door has one way to ask who is speaking.
-///
-/// The extractor cannot fail: an unproven or forged claim is not an error at extraction time, it is
-/// a `Caller` whose `pen()` refuses. That is the distinction #232 exists to keep — reading is open,
-/// writing needs a pen — so the refusal belongs at the verb, not at the transport.
 impl axum::extract::FromRequestParts<HttpState> for crate::identity::Caller {
     type Rejection = std::convert::Infallible;
 
@@ -536,8 +428,6 @@ impl axum::extract::FromRequestParts<HttpState> for crate::identity::Caller {
     }
 }
 
-/// The proven pen of a request, or the 401 that says what to send — the sudo routes all need one,
-/// because authority is always borrowed BY somebody.
 fn proven_pen(caller: &crate::identity::Caller, json: bool) -> ApiResult<String> {
     caller
         .pen_or("refused: this needs a proven pen — send `X-Stet-From` and `X-Stet-Auth`")
@@ -545,7 +435,6 @@ fn proven_pen(caller: &crate::identity::Caller, json: bool) -> ApiResult<String>
         .map_err(|r| refusal_response(json, r, StatusCode::UNAUTHORIZED))
 }
 
-/// One required string field of a JSON body, or the 400 that names what is missing.
 fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> ApiResult<String> {
     doc.get(name)
         .and_then(|v| v.as_str())
@@ -553,13 +442,10 @@ fn body_str(doc: &serde_json::Value, name: &str, json: bool) -> ApiResult<String
         .ok_or_else(|| ApiError::bad(json, format!("missing `{name}`")))
 }
 
-/// Who this request reads as. A proven pair decides; anything else — including a forged claim — is
-/// nobody, and nobody sees public rows only. Reads never fail for want of a pen.
 fn reader_from(caller: &crate::identity::Caller) -> crate::store::audience::Reader {
     caller.reader()
 }
 
-/// Build a `memory_search` request from the query string, so `GET /search` runs the MCP path.
 fn search_params(p: &Params) -> Result<SearchParams, String> {
     let mut fields = Vec::new();
     if let Some(raw) = p.maybe("fields") {
@@ -582,8 +468,6 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         mode: Some(match_mode_param(p.maybe("mode"))?),
         k: p.parse_as::<usize>("k")?,
         max_distance: p.parse_as::<f32>("max_distance")?,
-        // The MCP door has `semantic_only`; the HTTP door must not be the one place it is
-        // unreachable. Absent stays `None`, so today's callers see no change.
         semantic_only: p
             .maybe("semantic_only")
             .map(|v| bool_param(v, "semantic_only"))
@@ -596,8 +480,6 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
         created_before: p.maybe("created_before").map(ToString::to_string),
         updated_after: p.maybe("updated_after").map(ToString::to_string),
         updated_before: p.maybe("updated_before").map(ToString::to_string),
-        // ★ THE SAME PREDICATES ON BOTH DOORS (soma/ellmephant#114): a filter reachable from one
-        // door and not the other is a search that answers differently depending on how it was asked.
         key: p.maybe("key").map(ToString::to_string),
         key_prefix: p
             .maybe("key_prefix")
@@ -609,7 +491,6 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
     })
 }
 
-/// The `mode` as the search layer spells it.
 fn match_mode_param(raw: Option<&str>) -> Result<MatchModeParam, String> {
     match raw.map(str::trim).unwrap_or("") {
         "" | "literal" => Ok(MatchModeParam::Literal),
@@ -618,7 +499,6 @@ fn match_mode_param(raw: Option<&str>) -> Result<MatchModeParam, String> {
     }
 }
 
-/// The `mode` as `project_list` spells it.
 fn mode_param(raw: Option<&str>) -> Result<MatchMode, String> {
     match raw.map(str::trim).unwrap_or("") {
         "" | "literal" => Ok(MatchMode::Literal),
@@ -627,9 +507,6 @@ fn mode_param(raw: Option<&str>) -> Result<MatchMode, String> {
     }
 }
 
-/// A query-string boolean: `1`/`true`/`yes` and `0`/`false`/`no`; anything else is a clean
-/// error. A silently-false `semantic_only=1` would answer a different question than the caller
-/// asked, which is the failure mode #215 exists to expose.
 fn bool_param(raw: &str, name: &str) -> Result<bool, String> {
     match raw.trim() {
         "1" | "true" | "yes" => Ok(true),
@@ -640,7 +517,6 @@ fn bool_param(raw: &str, name: &str) -> Result<bool, String> {
     }
 }
 
-/// One hit field name, or `None` if it is not a field.
 fn field_param(name: &str) -> Option<FieldParam> {
     match name {
         "key" => Some(FieldParam::Key),
@@ -654,22 +530,12 @@ fn field_param(name: &str) -> Option<FieldParam> {
     }
 }
 
-/// The ceiling the default boot is held under, in bytes — public because the suite asserts it
-/// (`tests/http.rs`), and a budget nothing checks is a comment.
-///
-/// Not a style preference: a fetching client truncates a large response, and a boot truncated
-/// mid-way is worse than no boot — the reader gets a document it believes is complete. The default
-/// view is the resident set plus the calls that reach everything else, so it stays small; the 14-tool
-/// catalogue (every argument schema) is `?tools=true` and says so, because it is the one part that
-/// cannot be made small and must never be silently cut in half.
 pub const BOOT_BUDGET_BYTES: usize = 8_192;
 
 #[cfg(test)]
 mod front_matter_tests {
     use super::front_matter;
 
-    /// ★ THE OVERRIDE MUST NOT LEAK INTO THE DOCUMENT (Stet, review of #221): `Force:` is consumed by
-    /// the header parse, so the versioned body is byte-identical with and without it.
     #[test]
     fn force_is_consumed_and_never_stored() {
         let text =

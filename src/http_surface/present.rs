@@ -1,31 +1,14 @@
-//! The presenter: one outcome, ONE body, two renderings (soma/ellmephant#236).
-//!
-//! A rendered verb used to build its JSON and its text in two independent code paths in the same
-//! function, so adding a field could update one and forget the other (`channel_send`'s text said
-//! `sent #{} seq {}` while its JSON named the same facts differently). [`Present`] makes the pair a
-//! property of one value: an implementation must answer both questions, side by side, and
-//! [`present`] is the only thing that turns the pair into a response.
-//!
-//! The table renderer is the same idea already at work in the MCP wire: a `cols` header governs the
-//! rows, so the text view is a projection of the JSON body rather than a second report of the data.
-
 use super::*;
 
-/// One outcome, rendered both ways. Implementations live beside the verb they render.
 pub trait Present {
-    /// The JSON body, already serialized (so a row-per-line table stays byte-identical).
     fn json(&self) -> String;
-    /// The plain-text body a curl caller reads.
     fn text(&self) -> String;
 }
 
-/// Render a presenter at a status.
 pub fn present<T: Present>(status: StatusCode, json: bool, value: &T) -> ApiResult<Response> {
     render(status, json, value.json(), value.text())
 }
 
-/// One memory as the door shows it: the stored row plus the two facts only the READER can add —
-/// the walk to the owner, and the read nudge. The JSON and the prose both read this value.
 pub struct MemoryCard<'a> {
     pub mem: &'a store::Memory,
     pub relation: Option<&'a str>,
@@ -52,8 +35,6 @@ impl Present for MemoryCard<'_> {
     }
 }
 
-/// A positional `cols`/rows wire body: the JSON body is the wire itself, and the text is a
-/// projection of it, so the two can never disagree about the rows.
 pub struct Table {
     label: String,
     wire: String,
@@ -78,14 +59,11 @@ impl Present for Table {
     }
 }
 
-/// A domain value and the text renderer registered for it. The JSON comes from `serde`, so a field
-/// added to the value appears in both bodies or in neither.
 pub struct Viewed<'a, T> {
     value: &'a T,
     text: fn(&T) -> String,
 }
 
-/// Present `value` with `text` as its plain-text rendering.
 pub fn viewed<'a, T: serde::Serialize>(value: &'a T, text: fn(&T) -> String) -> Viewed<'a, T> {
     Viewed { value, text }
 }
@@ -100,17 +78,12 @@ impl<T: serde::Serialize> Present for Viewed<'_, T> {
     }
 }
 
-/// A verb whose wire shape is assembled by hand (`json!`) rather than serialized from one struct.
-///
-/// Both renderers are functions OF THE SAME VALUE, so a field added to the outcome cannot reach one
-/// body and miss the other: the compiler hands both closures the identical tuple/struct.
 pub struct Report<T> {
     value: T,
     json: fn(&T) -> String,
     text: fn(&T) -> String,
 }
 
-/// Present `value` through the two renderers registered for its shape.
 pub fn report<T>(value: T, json: fn(&T) -> String, text: fn(&T) -> String) -> Report<T> {
     Report { value, json, text }
 }
@@ -125,7 +98,6 @@ impl<T> Present for Report<T> {
     }
 }
 
-/// Render a positional `cols`/rows wire body as a header line and one line per row.
 pub(super) fn list_text(label: &str, wire: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(wire) else {
         return wire.to_string();
@@ -148,8 +120,6 @@ pub(super) fn list_text(label: &str, wire: &str) -> String {
     }
 }
 
-/// The first array-of-arrays under an object that also carries a `cols` header (searching nested
-/// tables like `project_get`'s `preload`).
 pub(super) fn first_table(value: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
     let obj = value.as_object()?;
     if obj.contains_key("cols") {
@@ -172,7 +142,6 @@ pub(super) fn first_table(value: &serde_json::Value) -> Option<Vec<serde_json::V
     None
 }
 
-/// One wire cell as plain text (strings unquoted, arrays comma-joined).
 pub(super) fn cell(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
@@ -182,7 +151,6 @@ pub(super) fn cell(value: &serde_json::Value) -> String {
     }
 }
 
-/// The `GET /stats` prose: the headline counts, then the heads of the tag and usefulness lists.
 pub(super) fn stats_text(s: &store::stats::Stats) -> String {
     let mut out = format!(
         "ellmephant store — {} memories, {} bytes on disk\n",
@@ -195,7 +163,6 @@ pub(super) fn stats_text(s: &store::stats::Stats) -> String {
         ("link edges", s.edges.to_string()),
         ("orphans", s.orphans.to_string()),
         ("dangling", s.dangling.to_string()),
-        // Two numbers, because they are two facts that share one value (owner NULL).
         ("commons", s.commons.to_string()),
         (
             "unattributed",
@@ -237,7 +204,6 @@ pub(super) fn stats_text(s: &store::stats::Stats) -> String {
     out
 }
 
-/// The `GET /memory-health` prose: the five numbers, their context, and anything suppressed.
 pub(super) fn health_text(h: &store::health::Health) -> String {
     let pct = |v: Option<f64>| match v {
         Some(n) => format!("{n:.2}%"),
@@ -292,12 +258,9 @@ pub(super) fn health_text(h: &store::health::Health) -> String {
     out
 }
 
-/// The `GET /memory/{key}` prose: the header fields, then the body.
 pub(super) fn memory_text(mem: &store::Memory, relation: Option<&str>) -> String {
     let mut out = format!("{}\n", mem.key);
     out.push_str(&format!("  {:<8}{}\n", "title", mem.title));
-    // Who answers for it, and what they are to the reader: a name is an address, and the walk is the
-    // rest of the sentence.
     if let Some(owner) = &mem.owner {
         match relation {
             Some(walk) => out.push_str(&format!("  {:<8}{owner}  {walk}\n", "owner")),

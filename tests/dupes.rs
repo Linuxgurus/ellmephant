@@ -1,8 +1,3 @@
-//! Integration: the duplicate-candidate audit (`memory_dupes`) against real `vec0` vectors.
-//!
-//! Runs offline. Vectors are written directly so the distances are exact — the finder is about
-//! geometry, not the embedder.
-
 mod common;
 
 use common::temp_store;
@@ -11,7 +6,6 @@ use ellmephant::embed::HashEmbedder;
 use ellmephant::index::vec;
 use ellmephant::store::{Memory, dupes};
 
-/// A memory with an explicit key.
 fn memory(key: &str, title: &str, body: &str) -> Memory {
     Memory {
         key: key.to_string(),
@@ -31,7 +25,6 @@ fn finds_only_the_pair_inside_the_ceiling() {
     let (b, _) = common::add_now(&conn, &embedder, &memory("beta", "B", "body b")).unwrap();
     let (c, _) = common::add_now(&conn, &embedder, &memory("gamma", "C", "body c")).unwrap();
 
-    // Controlled vectors: alpha ≈ beta; gamma orthogonal to both.
     vec::upsert(&conn, a, "memory", "ka", &[1.0, 0.0, 0.0, 0.0]).unwrap();
     vec::upsert(&conn, b, "memory", "kb", &[0.9998, 0.02, 0.0, 0.0]).unwrap();
     vec::upsert(&conn, c, "memory", "kc", &[0.0, 1.0, 0.0, 0.0]).unwrap();
@@ -43,9 +36,7 @@ fn finds_only_the_pair_inside_the_ceiling() {
     assert_eq!((p.title_a.as_str(), p.title_b.as_str()), ("A", "B"));
     assert!(p.distance < 0.01, "closer than the ceiling: {}", p.distance);
 
-    // A ceiling below the actual distance finds nothing...
     assert!(dupes::find(&conn, 0.0001, 50).unwrap().is_empty());
-    // ...and `limit` caps the list.
     assert!(dupes::find(&conn, 0.05, 0).unwrap().is_empty());
 }
 
@@ -56,7 +47,6 @@ fn a_pair_is_emitted_once_not_twice() {
     let embedder = HashEmbedder::new(4);
     let (a, _) = common::add_now(&conn, &embedder, &memory("one", "One", "x")).unwrap();
     let (b, _) = common::add_now(&conn, &embedder, &memory("two", "Two", "y")).unwrap();
-    // Identical vectors: distance 0, and the pair must not appear from both ends.
     vec::upsert(&conn, a, "memory", "ka", &[1.0, 0.0, 0.0, 0.0]).unwrap();
     vec::upsert(&conn, b, "memory", "kb", &[1.0, 0.0, 0.0, 0.0]).unwrap();
 
@@ -76,8 +66,6 @@ fn an_empty_or_single_row_store_is_quiet() {
     assert!(dupes::find(&conn, 0.05, 50).unwrap().is_empty());
 }
 
-/// A pair of rows with controlled, identical vectors: distance 0, so the class is the only thing
-/// under test.
 fn pair(
     conn: &rusqlite::Connection,
     embedder: &HashEmbedder,
@@ -97,8 +85,6 @@ fn a_dated_series_is_marked_series_and_the_plan_refuses_it() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
-    // The same measurement on two days is near-identical prose — that is exactly why the class
-    // cannot come from distance.
     let body = "offsite backup verified: 606 ids, 0 unreconstructable.";
     pair(
         &conn,
@@ -178,8 +164,6 @@ fn a_cluster_of_three_gets_one_keeper_and_executable_steps() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(4);
 
-    // Three rows, one content, one vector: with NEIGHBOURS = 3 this is the ordinary mutual cluster,
-    // not an edge case, and it is where a pair-per-step plan stops being executable.
     let body = "the turn boundary is offered once per wake, and a miss is not a failure.";
     for key in ["aaa-cluster", "bbb-cluster", "ccc-cluster"] {
         let (id, _) = common::add_now(&conn, &embedder, &memory(key, key, body)).unwrap();
@@ -221,8 +205,6 @@ fn a_cluster_of_three_gets_one_keeper_and_executable_steps() {
         );
     }
 
-    // The pair order is not deterministic (`find_seen` sorts by distance alone), so the plan must
-    // not inherit it: the same pairs in another order must produce the same plan.
     let mut backwards = pairs.clone();
     backwards.reverse();
     let again = dupes::plan(&conn, &backwards).unwrap();

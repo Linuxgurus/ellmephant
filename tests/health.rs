@@ -1,9 +1,3 @@
-//! Integration: the `memory_health` surface over a real store file.
-//!
-//! Every expected number is derived from the fixture independently — sums of the bodies and links
-//! written below, not from a second call to the implementation. Vectors are written directly so the
-//! duplicate pair is exact, and the private-row test proves shape (a) rather than assuming it.
-
 mod common;
 
 use common::temp_store;
@@ -26,7 +20,6 @@ fn memory(key: &str, body: &str, tags: &[&str]) -> Memory {
     }
 }
 
-/// Write and settle a row, returning its id.
 fn add(conn: &rusqlite::Connection, embedder: &HashEmbedder, mem: &Memory) -> i64 {
     common::add_now(conn, embedder, mem).expect("add memory").0
 }
@@ -45,16 +38,15 @@ fn the_five_numbers_match_the_fixture() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    // Eight operational-log rows, one per prefix. Their bodies are the only source of `log_chars`.
     let log_bodies = [
-        "alerts log body",        // 15
-        "hygiene log body",       // 16
-        "recess log body",        // 15
-        "maintenance log body",   // 20
-        "pr-watch log body",      // 17
-        "dispatch log body",      // 17
-        "offsite log body",       // 16
-        "cluster-watch log body", // 22
+        "alerts log body",
+        "hygiene log body",
+        "recess log body",
+        "maintenance log body",
+        "pr-watch log body",
+        "dispatch log body",
+        "offsite log body",
+        "cluster-watch log body",
     ];
     let log_keys = [
         "alerts-2026-11-01",
@@ -71,18 +63,15 @@ fn the_five_numbers_match_the_fixture() {
         ids.push(add(&conn, &embedder, &memory(key, body, &[])));
     }
 
-    // A link: note-src -> note-dst. That is one outbound and one inbound row, two woven rows.
     let note_src = "see [[note-dst]]";
     let note_dst = "target body";
     let src_id = add(&conn, &embedder, &memory("note-src", note_src, &["link"]));
     let dst_id = add(&conn, &embedder, &memory("note-dst", note_dst, &["link"]));
 
-    // One genuine duplicate pair (identical bodies) plus one singleton tag.
     let dup_body = "duplicate body";
     let dup_a = add(&conn, &embedder, &memory("dup-a", dup_body, &["dup"]));
     let dup_b = add(&conn, &embedder, &memory("dup-b", dup_body, &[]));
 
-    // The independent expected values, straight from the fixture.
     let all_bodies = [
         log_bodies[0],
         log_bodies[1],
@@ -101,7 +90,6 @@ fn the_five_numbers_match_the_fixture() {
     let log_chars: i64 = log_bodies.iter().map(|b| b.len() as i64).sum();
     let rows = all_bodies.len() as i64;
 
-    // Two rows are older than 30 days: one never read, one read twice. cold30 is therefore 50%.
     conn.execute(
         "UPDATE memory SET created = datetime('now', '-40 days') \
           WHERE key IN ('alerts-2026-11-01', 'note-dst')",
@@ -111,8 +99,6 @@ fn the_five_numbers_match_the_fixture() {
     store::record_visit(&conn, "note-dst").unwrap();
     store::record_visit(&conn, "note-dst").unwrap();
 
-    // Exact geometry: dup-a and dup-b are the same vector; every other row is orthogonal to both and
-    // to every other row, so the only pair inside 0.05 is the duplicate.
     for (i, id) in ids.iter().enumerate() {
         let mut v = vec![0.0; DIM];
         v[i + 1] = 1.0;
@@ -138,8 +124,6 @@ fn the_five_numbers_match_the_fixture() {
     approx(h.log_share, log_chars as f64 / total_chars as f64 * 100.0);
     assert_eq!(h.log_share_definition, LOG_SHARE_DEFINITION);
 
-    // The duplicate finder is budgeted out of the aggregate: null + a `suppressed` line that names
-    // the exact finder, never a silent 0.
     assert_eq!(h.dup_pairs, None);
     assert_eq!(h.dup_pairs_min_distance, None);
     assert!(
@@ -156,7 +140,6 @@ fn the_five_numbers_match_the_fixture() {
     assert_eq!(h.cold30_population, 2);
     assert_eq!(h.cold30, Some(50.0));
 
-    // Tags: `link` x2, `dup` x1; nine rows are bare.
     assert_eq!(h.tag_distinct, 2);
     assert_eq!(h.tag_singletons, 1);
     assert_eq!(h.rows_untagged, 9);
@@ -202,7 +185,6 @@ fn a_second_pens_private_row_does_not_move_the_callers_numbers() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    // An audience must name a pen that exists; `private: true` is written TO someone.
     conn.execute(
         "INSERT INTO pen (name, kind) VALUES ('stet', 'self'), ('james', 'self')",
         [],
@@ -224,7 +206,6 @@ fn a_second_pens_private_row_does_not_move_the_callers_numbers() {
     assert_eq!(before.rows, 2);
     assert_eq!(before.scope, "visible");
 
-    // James writes a private row with a distinctive size, tag and link. Stet must not see any of it.
     store::merge(
         &conn,
         &store::Patch {
@@ -252,7 +233,6 @@ fn a_second_pens_private_row_does_not_move_the_callers_numbers() {
     );
     assert_eq!(after_stet.scope, "visible");
 
-    // The row is real: its author sees one more row and a larger body.
     let james = health::compute_seen(&conn, &Reader::pen("james")).expect("health as james");
     assert_eq!(james.rows, after_stet.rows + 1);
     assert!(james.body_chars > after_stet.body_chars);
@@ -270,8 +250,6 @@ fn a_visible_row_linking_to_a_private_target_is_not_woven() {
     )
     .expect("seed pens");
 
-    // James' private row exists first, so the visible row's link resolves to a real row only james
-    // can read. Stet sees the source, never the target.
     store::merge(
         &conn,
         &store::Patch {
@@ -312,8 +290,6 @@ fn a_visible_row_linking_to_a_private_target_is_not_woven() {
     assert_eq!(before.woven_outbound, Some(0.0), "{before:?}");
     assert_eq!(before.woven_inbound, Some(0.0), "{before:?}");
 
-    // The owner rewrites its private row; the visible source still names the same key. Stet's whole
-    // Health must not move.
     store::merge(
         &conn,
         &store::Patch {
@@ -386,7 +362,6 @@ fn a_store_with_no_duplicates_still_reports_dup_pairs_as_null() {
 
     let h = health::compute_seen(&conn, &Reader::everything()).expect("health");
     assert_eq!(h.rows, 2);
-    // Even a store that HAS no duplicates must not print 0: the finder did not run.
     assert_eq!(h.dup_pairs, None, "{h:?}");
     assert!(h.dup_pairs_min_distance.is_none(), "{h:?}");
     assert!(
@@ -411,7 +386,6 @@ fn log_share_uses_exactly_the_eight_prefixes_and_carries_its_definition() {
             &memory(&format!("{prefix}row"), "0123456789", &[]),
         );
     }
-    // Near misses: the prefix must be at the START of the key, and `alert-` is not `alerts-`.
     add(
         &conn,
         &embedder,
@@ -422,9 +396,6 @@ fn log_share_uses_exactly_the_eight_prefixes_and_carries_its_definition() {
         &embedder,
         &memory("alert-row", &"y".repeat(100), &[]),
     );
-    // `LIKE` would have accepted this; `GLOB` must not: the definition says "begins with `alerts-`".
-    // `add` slugifies keys to lower case, so write the raw upper-case key directly to exercise the
-    // predicate rather than the slugifier.
     let upper_id = add(
         &conn,
         &embedder,

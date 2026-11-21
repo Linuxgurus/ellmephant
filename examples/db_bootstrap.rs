@@ -1,12 +1,8 @@
-//! Open a throwaway store, report what the migration produced, and tear it down.
-//!
-//! `cargo run --example db_bootstrap`
-
 use ellmephant::config::Paths;
 use ellmephant::db;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?; // removed on drop
+    let dir = tempfile::tempdir()?;
     let paths = Paths::from_root(dir.path());
     let conn = db::open(&paths)?;
 

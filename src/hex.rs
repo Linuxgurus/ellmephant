@@ -1,6 +1,3 @@
-//! Lowercase hex of a byte slice — one home for the sha256 digests in `store` and `model`.
-
-/// Encode `bytes` as lowercase hex.
 pub fn encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

@@ -1,11 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// The router fallback: our own 404, so a gateway never substitutes an empty body.
 pub async fn not_found(uri: axum::http::Uri) -> ApiResult<Response> {
     Err(ApiError::not_found(
         false,
@@ -13,7 +7,6 @@ pub async fn not_found(uri: axum::http::Uri) -> ApiResult<Response> {
     ))
 }
 
-/// The 405 for a known path, wrong method — again our own body, not the gateway's.
 pub async fn method_not_allowed() -> ApiResult<Response> {
     Err(ApiError::new(
         false,
@@ -22,10 +15,6 @@ pub async fn method_not_allowed() -> ApiResult<Response> {
     ))
 }
 
-/// One op in the API index. Deliberately lean by default: a caller reads this to LEARN the surface,
-/// and a full catalogue (every schema, the whole law) is 80 KB — the exact cost the core door exists
-/// to avoid. `?full=true` carries the schema and the untrimmed description for a proxy that has to
-/// construct calls.
 pub(super) fn api_op(route: &Route, card: &crate::mcp::ToolCard, full: bool) -> serde_json::Value {
     let ann = &card.annotations;
     let flag = |name: &str| ann.get(name).and_then(serde_json::Value::as_bool);
@@ -62,7 +51,6 @@ pub(super) fn api_op(route: &Route, card: &crate::mcp::ToolCard, full: bool) -> 
     op
 }
 
-/// The index, optionally narrowed to one group. `None` on an unknown group.
 pub(super) fn api_doc(group: Option<&str>, full: bool) -> Option<serde_json::Value> {
     let cards = tool_catalog();
     let ops: Vec<serde_json::Value> = ROUTES
@@ -97,7 +85,6 @@ pub(super) fn api_doc(group: Option<&str>, full: bool) -> Option<serde_json::Val
     Some(doc)
 }
 
-/// `GET /api` — the map of the surface the core MCP does not carry.
 pub async fn api_index(RawQuery(raw): RawQuery) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let full = params.flag("full");
@@ -115,7 +102,6 @@ pub async fn api_index(RawQuery(raw): RawQuery) -> ApiResult<Response> {
     }
 }
 
-/// `GET /api/{group}` — one shelf of the same index.
 pub async fn api_group(Path(group): Path<String>, RawQuery(raw): RawQuery) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let full = params.flag("full");

@@ -1,26 +1,15 @@
-//! The only network code in the binary (SPEC §6.2).
-//!
-//! [`Fetcher`] is a trait so the whole cache — resolve, download, verify — is testable
-//! without a socket. Production uses [`UreqFetcher`] (ureq + rustls).
-
 use std::io::Write;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-/// Default Hub host; `HF_ENDPOINT` overrides it (mirrors, air-gapped proxies).
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
-/// DNS lookup ceiling — a hung resolver must not stall a fetch forever.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-/// TCP/TLS connect ceiling.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time to first response byte (headers).
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Whole-request ceiling; generous because weights files run to ~1.2 GB.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// URL of one file at a revision: `<endpoint>/<repo>/resolve/<rev>/<file>`.
 pub fn file_url(endpoint: &str, repo: &str, rev: &str, file: &str) -> String {
     format!(
         "{}/{}/resolve/{}/{}",
@@ -31,7 +20,6 @@ pub fn file_url(endpoint: &str, repo: &str, rev: &str, file: &str) -> String {
     )
 }
 
-/// URL of the model-info API used to resolve a ref to a commit sha.
 pub fn revision_api_url(endpoint: &str, repo: &str, reference: &str) -> String {
     format!(
         "{}/api/models/{}/revision/{}",
@@ -41,17 +29,11 @@ pub fn revision_api_url(endpoint: &str, repo: &str, reference: &str) -> String {
     )
 }
 
-/// A source of bytes and revisions. Implemented by [`UreqFetcher`] and, in tests, by a
-/// in-memory fake.
 pub trait Fetcher {
-    /// Stream `url`'s body into `sink`; returns the number of bytes written.
     fn download(&self, url: &str, sink: &mut dyn Write) -> Result<u64>;
-    /// GET `url` and read its JSON `sha` field (a ref resolved to a commit).
     fn resolve_ref(&self, url: &str) -> Result<String>;
 }
 
-/// The shared blocking agent: connection timeouts bound a hung mirror, while the generous
-/// whole-request ceiling still lets large weights files finish.
 fn build_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_resolve(Some(RESOLVE_TIMEOUT))
@@ -62,14 +44,12 @@ fn build_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-/// Blocking HTTP fetcher. Reads `HF_ENDPOINT`/`HF_TOKEN`-style config at construction.
 pub struct UreqFetcher {
     token: Option<String>,
     agent: ureq::Agent,
 }
 
 impl UreqFetcher {
-    /// Build from `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` (the repo is public, so optional).
     pub fn from_env() -> Self {
         let token = std::env::var("HF_TOKEN")
             .ok()
@@ -81,7 +61,6 @@ impl UreqFetcher {
         }
     }
 
-    /// Build with an explicit token (`None` for anonymous).
     pub fn with_token(token: Option<String>) -> Self {
         Self {
             token,
@@ -134,7 +113,6 @@ mod tests {
             ),
             "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/abc/config.json"
         );
-        // trailing slash on the endpoint is tolerated
         assert_eq!(
             file_url("https://mirror/", "o/r", "sha", "f"),
             "https://mirror/o/r/resolve/sha/f"

@@ -1,9 +1,3 @@
-//! Integration: link-graph maintenance — `rename` and the dangling audit (P9).
-//!
-//! Runs offline against a real store file; the deterministic [`HashEmbedder`] stands in for
-//! Qwen3. The sharpest assertions are that a rename rewrites the `[[…]]` tokens in *bodies*
-//! and repoints the `memory_link` *edges* in the same transaction.
-
 mod common;
 
 use common::temp_store;
@@ -51,11 +45,9 @@ fn rename_rewrites_bodies_and_repoints_edges() {
     assert_eq!(outcome.bodies, 2, "both bodies carried the token");
     assert_eq!(outcome.edges, 2, "both edges repointed");
 
-    // The row moved.
     assert!(store::get(&conn, "target").unwrap().is_none());
     assert!(store::get(&conn, "renamed").unwrap().is_some());
 
-    // Every body now points at the new key (no stale `[[target]]`).
     for key in ["a", "b"] {
         let body = store::get(&conn, key).unwrap().unwrap().body;
         assert!(body.contains("[[renamed]]"), "{key}: {body}");
@@ -64,7 +56,6 @@ fn rename_rewrites_bodies_and_repoints_edges() {
     let body = store::get(&conn, "renamed").unwrap().unwrap().body;
     assert_eq!(body, "the target itself", "the row's own body is untouched");
 
-    // The edges repointed in lockstep; nothing is dangling.
     let keys: Vec<String> = conn
         .prepare("SELECT to_key FROM memory_link ORDER BY to_key")
         .unwrap()
@@ -106,21 +97,15 @@ fn rename_to_the_same_key_is_a_noop() {
 
 #[test]
 fn rename_queues_a_new_vector_for_the_row_it_moves() {
-    // `key` IS in the embed projection, so a rename moves the row's *document* — which is why the row
-    // is QUEUED for a new vector, exactly as a write queues it. Once settled, `encode_hash` (and the
-    // vector) describe the NEW key; otherwise the vector drifts until something else writes the row.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let _spec = VecSpec::of(&embedder);
-    // `memory()` uses the key as the title too, so the title stays put across the rename.
     seed(&conn, &embedder, "old-name", "the body");
 
     links::rename(&conn, "old-name", "new-name").expect("rename");
     common::settle(&conn, &embedder);
 
-    // ★ THE VECTOR IS THE EVIDENCE (2026-10-21), because the row keeps no stamp: the stored vector
-    // must be the one for the document rendered under the NEW key, not the old one.
     let id: i64 = conn
         .query_row("SELECT id FROM memory WHERE key = 'new-name'", [], |r| {
             r.get(0)
@@ -179,11 +164,9 @@ fn renaming_clears_a_dangling_edge() {
     let embedder = HashEmbedder::new(DIM);
     let _spec = VecSpec::of(&embedder);
 
-    // `a` references a key that does not exist yet — a forward reference.
     seed(&conn, &embedder, "a", "forward [[later]]");
     assert_eq!(links::dangling(&conn).unwrap().len(), 1);
 
-    // Renaming an unrelated memory into `later` resolves it (no edge repoint needed).
     seed(&conn, &embedder, "stub", "placeholder");
     links::rename(&conn, "stub", "later").expect("rename");
     assert!(links::dangling(&conn).unwrap().is_empty());
@@ -195,8 +178,6 @@ fn a_link_to_a_project_resolves_and_is_not_rot() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    // A memory may link to a project — the `prj:` marker is what makes a key cross between the
-    // two tables without either graph knowing about the other.
     ellmephant::store::project::upsert(
         &conn,
         &ellmephant::store::project::Project {
@@ -221,14 +202,12 @@ fn a_link_to_a_project_resolves_and_is_not_rot() {
 
 #[test]
 fn merge_into_repoints_every_reference_and_deletes_the_source() {
-    // The whole point: a merge must not leave dangling links, or hygiene never happens.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let _spec = VecSpec::of(&embedder);
 
     seed(&conn, &embedder, "old", "the deleted facts");
-    // The caller folded it FIRST, so nothing is missing and this is nothing to integrate.
     seed(
         &conn,
         &embedder,
@@ -280,7 +259,6 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
     seed(&conn, &embedder, "old", "deleted");
     seed(&conn, &embedder, "new", "survivor, now carrying: deleted");
     project::upsert(&conn, &project_fixture("p"), Some(&["old".to_string()])).expect("project");
-    // A `[[prj:old]]` names a PROJECT, not the memory that shares its name.
     seed(&conn, &embedder, "pointer", "aimed at [[prj:old]]");
 
     let out = links::merge_into(&conn, "old", "new", None).expect("merge");
@@ -302,14 +280,11 @@ fn merge_into_repoints_a_preload_but_not_a_project_link() {
 
 #[test]
 fn merge_into_drops_the_self_link_the_rewrite_would_create() {
-    // `new`'s own body points at `old`; rewritten, it would be a self-link, which the write path
-    // never creates. The graph must keep that invariant.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     let _spec = VecSpec::of(&embedder);
     seed(&conn, &embedder, "old", "deleted");
-    // `new` already carries `old`'s prose, so there is nothing to integrate.
     seed(&conn, &embedder, "new", "see [[old]] — and deleted");
 
     links::merge_into(&conn, "old", "new", None).expect("merge");
@@ -322,9 +297,6 @@ fn merge_into_drops_the_self_link_the_rewrite_would_create() {
 
 #[test]
 fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
-    // The integration: a merge APPENDS what the survivor lacks, verbatim. Layout is the caller's, so
-    // an interleaved or re-ordered fold has nothing missing — and a line only the source carries is
-    // folded in rather than refused, which is the case that used to be prose destroyed behind a 200.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -349,9 +321,6 @@ fn merge_integrates_what_the_survivor_lacks_and_is_no_paste_gate() {
         "a caller that folded by hand keeps its layout: {body}"
     );
 
-    // `twin` carries a line the survivor lacks. It is INTEGRATED — appended verbatim, nothing lost,
-    // nothing paraphrased — while the line the survivor already carried is not duplicated. That is
-    // the redundancy a merge exists to remove.
     seed(
         &conn,
         &embedder,
@@ -404,15 +373,10 @@ fn merge_into_refuses_a_missing_target_and_a_self_merge() {
         "self-merge"
     );
 
-    // A refused merge destroyed nothing.
     assert!(store::get(&conn, "a").unwrap().is_some());
     assert!(store::get(&conn, "b").unwrap().is_some());
 }
 
-/// ★ soma/ellmephant#48: the count said `dangling: 2` and no surface could name the two. A finder is
-/// only worth having if its number AGREES with the count while its LEDGER disagrees — one missing
-/// target with two referrers is one count and two rows, and that gap is exactly what the old count
-/// hid. Falsifiable: if the rows were deduped to targets, the second assertion fails.
 #[test]
 fn the_dangling_finder_names_every_edge_not_every_target() {
     let (_dir, paths) = temp_store();
@@ -445,7 +409,6 @@ fn the_dangling_finder_names_every_edge_not_every_target() {
     let referrers: Vec<&str> = edges.iter().map(|e| e.from_key.as_str()).collect();
     assert_eq!(referrers, vec!["first", "second"], "ordered, and named");
 
-    // Repairing the target empties the finder, and the count with it.
     seed(
         &conn,
         &embedder,
@@ -463,9 +426,6 @@ fn the_dangling_finder_names_every_edge_not_every_target() {
     );
 }
 
-/// The graph is derived at WRITE time, so a body rewritten by any path that does not re-derive
-/// leaves edges the rows no longer imply. `maintain::reparse` is the model-free broom for exactly
-/// that — and it must be judged by the BODIES, not by the history of edits (#99).
 #[test]
 fn reparse_makes_the_graph_agree_with_the_bodies() {
     let (_dir, paths) = temp_store();
@@ -485,11 +445,8 @@ fn reparse_makes_the_graph_agree_with_the_bodies() {
         "a live target dangles nothing"
     );
 
-    // Delete the target the way `memory_delete` does: the row goes, its referrers do not.
     store::delete(&conn, "target", None).expect("delete");
 
-    // The body still names `[[target]]`, so the edge is REAL and the audit is right to report it.
-    // Reparsing must agree with the text rather than with the history of edits.
     let rows = links::reparse(&conn).expect("reparse");
     assert_eq!(
         rows, 1,
@@ -501,9 +458,6 @@ fn reparse_makes_the_graph_agree_with_the_bodies() {
         "the body still points at a deleted key"
     );
 
-    // ★ THE DEFECT, reproduced: rewrite a body by a path that does not re-derive edges (a textual
-    // `UPDATE`, which is the shape a rename/merge `replace()` takes). The text is clean; the edge
-    // survives; the count accuses the writer for an edit already made.
     conn.execute(
         "UPDATE memory SET body = ?2 WHERE key = ?1",
         rusqlite::params!["referrer", "a note that points at nothing now"],
@@ -515,7 +469,6 @@ fn reparse_makes_the_graph_agree_with_the_bodies() {
         "the stale edge survives a body rewrite that did not re-derive"
     );
 
-    // The broom. No model, no queue — and the count now follows the bodies.
     links::reparse(&conn).expect("reparse");
     assert!(
         links::dangling(&conn).expect("dangling").is_empty(),
@@ -526,7 +479,6 @@ fn reparse_makes_the_graph_agree_with_the_bodies() {
         .expect("count edges");
     assert_eq!(edges, 0, "the only edge went with the token");
 
-    // And it is idempotent: a second pass changes nothing.
     links::reparse(&conn).expect("reparse again");
     assert!(links::dangling(&conn).expect("dangling").is_empty());
 }

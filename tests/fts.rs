@@ -1,10 +1,3 @@
-//! The word index, end to end: FTS5 over `memory`, with the trigger discipline that makes it honest
-//! (soma/ellmephant#62).
-//!
-//! The trap this test file exists for, paid for once already in `spine` v7: an external-content FTS5
-//! table does **not** maintain itself. A missing UPDATE trigger leaves the index serving text that no
-//! longer exists — silently, for weeks — because a stale hit looks exactly like a hit.
-
 mod common;
 
 use common::temp_store;
@@ -42,8 +35,6 @@ fn an_insert_is_searchable_by_its_words() {
         "BM25 is negative, lower is better: {hits:?}"
     );
 
-    // ★ AN EXACT IDENTIFIER IS FOUND BY ITS TOKENS, not by a model's opinion of meaning. This is the
-    // whole point: `pr53-verification` tokenises to pr53 + verification.
     store::add(
         &conn,
         &mem("pr53-verification", "PR 53 review", "checked the migration"),
@@ -59,8 +50,6 @@ fn an_insert_is_searchable_by_its_words() {
     assert!(keys.contains(&"pr53-verification".to_string()), "{keys:?}");
 }
 
-/// ★ THE TRIGGER TEST — the reason this module can be trusted. An edit must be found by its NEW text
-/// and must NOT be found by its OLD text; anything else is a stale index.
 #[test]
 fn an_update_is_found_by_its_new_text_and_not_its_old() {
     let (_d, paths) = temp_store();
@@ -90,8 +79,6 @@ fn an_update_is_found_by_its_new_text_and_not_its_old() {
     );
 }
 
-/// A delete removes the row from the index. With external content this needs the `'delete'` command
-/// carrying the old values; a plain DELETE cannot work.
 #[test]
 fn a_delete_leaves_nothing_searchable() {
     let (_d, paths) = temp_store();
@@ -111,8 +98,6 @@ fn a_delete_leaves_nothing_searchable() {
     );
 }
 
-/// A TITLE edit moves the tokens too — the same UPDATE trigger, from another column. Worth its own
-/// test because the trigger names all three columns and a typo in one would leave that column stale.
 #[test]
 fn a_title_edit_is_searchable_by_the_new_title() {
     let (_d, paths) = temp_store();

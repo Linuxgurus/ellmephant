@@ -1,11 +1,8 @@
-//! `ellmephant model …` — the weights cache: status / fetch / rm (SPEC §6.5).
-
 use super::ModelCommand;
 use super::format::human_bytes;
 use crate::error::{Error, Result};
 use crate::model;
 
-/// `ellmephant model …` — status / fetch / rm over the weights cache (SPEC §6.5).
 pub fn cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
     match command {
         ModelCommand::Status {
@@ -46,9 +43,6 @@ pub fn cmd(spec: &model::Spec, command: ModelCommand) -> Result<()> {
     }
 }
 
-/// Report a `model::verify` run (SPEC §6.3/§6.5): print the `ok` or `MISMATCH` lines,
-/// then fail on any mismatch. `lenient` (doctor) turns a hashing error into a
-/// `skipped` line; the strict caller (`model status`) propagates it.
 pub(crate) fn verify_weights(spec: &model::Spec, lenient: bool) -> Result<()> {
     let bad = match model::verify(spec) {
         Ok(bad) => bad,
@@ -71,7 +65,6 @@ pub(crate) fn verify_weights(spec: &model::Spec, lenient: bool) -> Result<()> {
     )))
 }
 
-/// Render a [`model::Status`] as a human-readable block.
 fn print_model_status(status: &model::Status) {
     let resolved = match &status.resolved {
         Some(sha) => format!(" -> {sha}"),

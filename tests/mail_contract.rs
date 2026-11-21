@@ -1,20 +1,3 @@
-//! THE TWO DOORS AGREE ON WHO MAY OPEN A BOX (soma/ellmephant#231, #235).
-//!
-//! The authority contract (`tests/authority_contract.rs`) covers who may WRITE. This is its twin for
-//! the other place a rule was decided twice: mail. When this test was written the doors disagreed in
-//! two ways, and both were live defects rather than tidiness:
-//!
-//! 1. **The grant was wrong on one door.** MCP checked `mail_may_ack` for `mail_ack`; HTTP checked
-//!    `mail_may_read`, so a pen holding only an `ack` grant was refused by one door and admitted by
-//!    the other. A rule that is asked twice will always eventually be asked differently.
-//! 2. **The sentence had rotted.** The MCP refusal carried a run of blanks where a word had been
-//!    cut ("or a live              `{scope}` grant") — the corrupted string this epic was filed
-//!    over, in the very function that was supposed to be the one rule.
-//!
-//! So the contract is behavioural, and it compares the WORDS, not just the status: a refusal a
-//! caller can read is part of the law. Drive both doors with the same caller and the same box, and
-//! require the same sentence.
-
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -51,7 +34,6 @@ fn session(dir: &std::path::Path) -> Session {
         .with_embedder(Box::new(HashEmbedder::new(DIM)))
 }
 
-/// Two pens with credentials: `tester` (the caller) and `other` (the box owner).
 fn provision(dir: &std::path::Path) -> (String, String) {
     let paths = Paths::from_root(dir);
     let conn = ellmephant::db::open(&paths).expect("open");
@@ -87,7 +69,6 @@ fn doors(dir: &std::path::Path) -> (axum::Router, MemoryServer) {
     (app, mcp)
 }
 
-/// One HTTP request, with the door's bearer and an optional identity pair. Returns status and body.
 async fn request(
     app: &axum::Router,
     method: Method,
@@ -139,7 +120,6 @@ async fn peer(
     ().serve(client_io).await.expect("client handshake")
 }
 
-/// Call one mail tool; `Err` carries the refusal sentence the caller would read.
 async fn mcp_call(
     server: MemoryServer,
     declared: Option<&str>,
@@ -168,7 +148,6 @@ async fn mcp_call(
     }
 }
 
-/// A letter in `other`'s box, written by `other`, so `tester` has something to be refused.
 async fn seed_letter(app: &axum::Router, secret: &str) -> i64 {
     let body = serde_json::json!({
         "sender": OTHER, "recipient": OTHER, "subject": "s", "body": "private words",
@@ -188,7 +167,6 @@ async fn seed_letter(app: &axum::Router, secret: &str) -> i64 {
     parsed["seq"].as_i64().expect("seq")
 }
 
-/// One mail verb, spelled both ways.
 struct Case {
     tool: &'static str,
     args: fn(&str) -> serde_json::Value,
@@ -223,12 +201,10 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// The clause both doors must say, with the VERB that was denied. `ack` is the one that was wrong.
 fn refusal_clause(verb: &str) -> String {
     format!("may not {verb} `{OTHER}`'s mail")
 }
 
-/// ★ THE CONTRACT: a stranger is refused by both doors, in the same words, with no blank runs.
 #[tokio::test]
 async fn a_stranger_is_refused_on_both_doors_in_the_same_words() {
     for case in cases() {
@@ -257,8 +233,6 @@ async fn a_stranger_is_refused_on_both_doors_in_the_same_words() {
             .await
             .expect_err(&format!("MCP {} accepted a stranger", case.tool));
 
-        // The verb a door names must be the verb the caller asked for: `mail_ack` judged by the
-        // `read` grant was the defect this test exists for.
         let verb = if case.tool == "mail_ack" {
             "ack"
         } else {
@@ -281,8 +255,6 @@ async fn a_stranger_is_refused_on_both_doors_in_the_same_words() {
             "the two doors refused {} in different words — a refusal is part of the law",
             case.tool
         );
-        // ★ The corruption this epic was filed over: a run of four spaces means a word was cut out
-        // of the sentence by a copy-edit, and it shipped for a week because nothing compared it.
         assert!(
             !http_body.contains("    "),
             "the refusal contains a run of blanks — a word was cut out of it: {http_body}"
@@ -290,9 +262,6 @@ async fn a_stranger_is_refused_on_both_doors_in_the_same_words() {
     }
 }
 
-/// ★ AN `ack` GRANT IS AN `ack` GRANT (soma/ellmephant#235). This is the divergence the two
-/// doors carried: HTTP asked the `read` grant for `mail_ack`, so a pen holding only `ack` was
-/// refused here and admitted on MCP. Both doors must now say yes.
 #[tokio::test]
 async fn an_ack_grant_opens_ack_on_both_doors() {
     let dir = tempfile::tempdir().unwrap();
@@ -300,7 +269,6 @@ async fn an_ack_grant_opens_ack_on_both_doors() {
     let (app, mcp) = doors(dir.path());
     seed_letter(&app, &other_secret).await;
 
-    // `other` lends `tester` an `ack` grant — and NOT a `read` one.
     let ask = serde_json::json!({
         "grantor": OTHER, "surrogate": PEN, "scopes": "ack",
     })
@@ -341,15 +309,12 @@ async fn an_ack_grant_opens_ack_on_both_doors() {
     .expect("MCP refused an ack the grant allows");
 }
 
-/// ★ A pen may open its OWN box on both doors — the positive control, so the refusals above are a
-/// decision rather than a broken route.
 #[tokio::test]
 async fn a_pen_may_open_its_own_box_on_both_doors() {
     let dir = tempfile::tempdir().unwrap();
     let (secret, _other_secret) = provision(dir.path());
     let (app, mcp) = doors(dir.path());
 
-    // inbox: `tester` asks for `tester`'s box.
     let (status, body) = request(
         &app,
         Method::GET,
@@ -370,7 +335,6 @@ async fn a_pen_may_open_its_own_box_on_both_doors() {
     .expect("own box over MCP");
 }
 
-/// ★ NO PEN IS REFUSED ON BOTH DOORS — before the box is even consulted.
 #[tokio::test]
 async fn an_unproven_reader_is_refused_on_both_doors() {
     let dir = tempfile::tempdir().unwrap();

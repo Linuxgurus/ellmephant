@@ -1,15 +1,3 @@
-//! A changed (or unprovable) projection is a PURGE AND FULL REBUILD, never a refill.
-//!
-//! The failure this guards, reported by stet (2026-10-21) and reachable in one write:
-//!
-//! 1. the model changes and `meta.PROJECTION` moves;
-//! 2. a write lands before the rebuild — new text, so it enqueues and is embedded with the NEW model
-//!    beside old-model vectors;
-//! 3. a refill asks "what has no vector" and **skips that row, because it has one**.
-//!
-//! Result: a mixed index, an empty queue, and an invariant reporting "current". Distances across two
-//! models are meaningless, so the index ranks garbage confidently — worse than an empty one.
-
 mod common;
 
 use common::temp_store;
@@ -51,7 +39,6 @@ fn a_changed_projection_purges_and_requeues_every_document() {
     let embedder = HashEmbedder::new(8);
     seed(&paths, &embedder, &["alpha", "beta", "gamma"]);
 
-    // The model changed: the stored fingerprint no longer matches the code.
     {
         let conn = open(&paths);
         meta::set(&conn, meta::PROJECTION, "a-recipe-from-before").expect("set");
@@ -59,7 +46,6 @@ fn a_changed_projection_purges_and_requeues_every_document() {
 
     let conn = open(&paths);
 
-    // ★ NOT ONE OLD VECTOR SURVIVES — a write can no longer land a new-model vector beside them.
     assert_eq!(
         vec::count(&conn).expect("count"),
         0,
@@ -72,14 +58,11 @@ fn a_changed_projection_purges_and_requeues_every_document() {
         "every document re-queued"
     );
 
-    // The fingerprint moves in the SAME transaction as the purge, so "stale" cannot linger and be
-    // mistaken for "nothing to do"; what says work is outstanding is the queue.
     assert!(
         !vec::projection_stale(&conn).expect("stale"),
         "the fingerprint is recorded with the purge, not after it"
     );
 
-    // And the index answers honestly meanwhile: nothing, rather than old-model hits.
     let hint = vec::Knn {
         k: 10,
         max_distance: None,
@@ -90,7 +73,6 @@ fn a_changed_projection_purges_and_requeues_every_document() {
         "an unfinished rebuild returns no hits, not wrong ones"
     );
 
-    // Settle: the rebuild completes and the index is whole again.
     common::settle(&conn, &embedder);
     assert_eq!(vec::count(&conn).expect("count"), 3);
     assert_eq!(encode::pending(&conn).expect("pending"), 0);
@@ -102,8 +84,6 @@ fn an_unrecorded_projection_with_vectors_is_rebuilt_not_assumed_current() {
     let embedder = HashEmbedder::new(8);
     seed(&paths, &embedder, &["alpha", "beta"]);
 
-    // A store written before projections were fingerprinted: vectors, no fingerprint. That is
-    // "cannot be proven", and stamping it current would be the silent lie `projection_stale` refuses.
     {
         let conn = open(&paths);
         conn.execute("DELETE FROM meta WHERE k = ?1", [meta::PROJECTION])
@@ -129,16 +109,12 @@ fn a_healthy_store_is_left_alone_by_the_open_path() {
     let embedder = HashEmbedder::new(8);
     seed(&paths, &embedder, &["alpha", "beta"]);
 
-    // Re-opening must not purge, re-queue or otherwise churn a store whose projection is current.
     let conn = open(&paths);
     assert_eq!(vec::count(&conn).expect("count"), 2);
     assert_eq!(encode::pending(&conn).expect("pending"), 0);
     assert!(!vec::projection_stale(&conn).expect("stale"));
 }
 
-/// ★ soma/ellmephant#76: the purge is milliseconds and the rebuild is hours. A config change must not
-/// commit the store to work nobody priced. The refusal is the INDEX-ALREADY-HAS-A-NAME-FOR-THIS state:
-/// STALE, with the old vectors still answering and a decision recorded on the books.
 #[test]
 fn a_rebuild_that_exceeds_the_budget_is_refused_and_nothing_is_purged() {
     use ellmephant::store::{links::Kind, maintain};
@@ -151,7 +127,6 @@ fn a_rebuild_that_exceeds_the_budget_is_refused_and_nothing_is_purged() {
         meta::set(&conn, meta::PROJECTION, "a-recipe-from-before").expect("set");
     }
 
-    // Three documents, ceiling of two: unaffordable by this store's own arithmetic.
     let mut cfg = ellmephant::config::Config {
         rebuild_max_documents: 2,
         ..Default::default()
@@ -184,8 +159,6 @@ fn a_rebuild_that_exceeds_the_budget_is_refused_and_nothing_is_purged() {
         "3 x 11.5s = 34.5, rounded up: {record}"
     );
 
-    // ★ AND THE WALL: a write cannot land a new-model vector beside the old ones. The entry stays
-    // queued (visible debt) and the settle refuses.
     let writ = Memory {
         key: "delta".to_string(),
         title: "delta".to_string(),
@@ -202,7 +175,6 @@ fn a_rebuild_that_exceeds_the_budget_is_refused_and_nothing_is_purged() {
         "the vector is still OWED, visibly, rather than silently mixed"
     );
 
-    // The deliberate override is a config change, and it proceeds.
     cfg.rebuild_allow_over_budget = true;
     let conn = db::open_with(&paths, &cfg).expect("open");
     assert_eq!(vec::count(&conn).expect("count"), 0, "purged");

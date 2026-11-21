@@ -1,9 +1,3 @@
-//! The `project` tool group, split out of `mcp/mod.rs` (soma/ellmephant#50).
-//!
-//! Each group is its own `#[tool_router]` impl, which is what makes the split possible:
-//! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
-//! into the one table the handler dispatches through.
-
 use crate::mcp::context::{caller_of, pen_name, reader_of};
 use crate::mcp::*;
 use crate::store::project;
@@ -12,7 +6,6 @@ use rmcp::{tool, tool_router};
 
 #[tool_router(router = project_tool_router, vis = "pub(crate)")]
 impl MemoryServer {
-    /// Create or replace a project — the structures half of the store.
     #[tool(
         name = "project_upsert",
         description = PROJECT_UPSERT_DESCRIPTION,
@@ -32,7 +25,7 @@ impl MemoryServer {
         let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
             .pen()
             .map_err(|r| r.to_string())?
-            .clone(); // writes are signed; anonymous is read-only
+            .clone();
         let patch = p.into_patch();
         let outcome = self
             .with_store("project_upsert", move |s| {
@@ -51,7 +44,6 @@ impl MemoryServer {
         })))
     }
 
-    /// Read one project whole: its fields, its ordered preload, and the memories it owns.
     #[tool(
         name = "project_get",
         description = PROJECT_GET_DESCRIPTION,
@@ -87,7 +79,6 @@ impl MemoryServer {
         crate::wire::project::view_to_wire_json(&view).map_err(|e| e.to_string())
     }
 
-    /// List the projects: the cheap index (no `state`), with intersecting filters.
     #[tool(
         name = "project_list",
         description = PROJECT_LIST_DESCRIPTION,
@@ -121,7 +112,6 @@ impl MemoryServer {
         crate::wire::project::list_to_wire_json(&rows).map_err(|e| e.to_string())
     }
 
-    /// Read one config item — a stored value with a written ACL.
     #[tool(
         name = "config_get",
         description = "Read one CONFIG item: a small stored answer to `how should this run` (e.g. \
@@ -155,7 +145,6 @@ impl MemoryServer {
         ))
     }
 
-    /// Change an existing config item's value.
     #[tool(
         name = "config_set",
         description = "Change an EXISTING config item's value. The item's `set_audience` is the gate: \
@@ -194,7 +183,6 @@ impl MemoryServer {
         ))
     }
 
-    /// Create a config item or rewrite its ACL.
     #[tool(
         name = "config_define",
         description = "Create a config item, or rewrite one's ACL — the PROVISIONING act, separate \
@@ -242,7 +230,6 @@ impl MemoryServer {
         ))
     }
 
-    /// List the config items this connection may read.
     #[tool(
         name = "config_list",
         description = "List the config items this connection may READ, in key order, optionally \

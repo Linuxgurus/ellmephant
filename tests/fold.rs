@@ -1,9 +1,3 @@
-//! Integration: the append-only cross-pen fold (soma/ellmephant#199).
-//!
-//! The property under test is narrow and load-bearing: a pen with NO write authority over a sibling's
-//! row can still fold its own duplicate's lines into it, because a fold may only APPEND. That is not
-//! a write exemption — nothing that already exists can change.
-
 mod common;
 
 use common::temp_store;
@@ -24,7 +18,6 @@ fn memory(key: &str, body: &str) -> Memory {
     }
 }
 
-/// A live pen row, so `owner` has something to point at.
 fn pen(conn: &Connection, name: &str) {
     conn.execute(
         "INSERT OR IGNORE INTO pen (name, kind) VALUES (?1, 'self')",
@@ -33,7 +26,6 @@ fn pen(conn: &Connection, name: &str) {
     .expect("pen");
 }
 
-/// Give `key` to `pen_name` — the ownership the store sets on a real write.
 fn own(conn: &Connection, key: &str, pen_name: &str) {
     conn.execute(
         "UPDATE memory SET owner = (SELECT id FROM pen WHERE name = ?2) WHERE key = ?1",
@@ -59,7 +51,6 @@ fn a_peer_folds_without_write_authority_and_the_source_survives() {
     own(&conn, "keeper", "pen-a");
     own(&conn, "duplicate", "pen-b");
 
-    // The gap this verb exists to close: B may not merge into A's row.
     let refused = links::merge_into(&conn, "duplicate", "keeper", Some("pen-b"))
         .expect_err("a peer has no write authority on the survivor");
     assert!(
@@ -67,7 +58,6 @@ fn a_peer_folds_without_write_authority_and_the_source_survives() {
         "{refused}"
     );
 
-    // A fold succeeds, because it can only append.
     let out = links::fold_into(&conn, "duplicate", "keeper", Some("pen-b")).expect("fold");
     assert!(out.changed);
     assert_eq!(out.into, "keeper");
@@ -76,21 +66,17 @@ fn a_peer_folds_without_write_authority_and_the_source_survives() {
 
     let keeper = store::get(&conn, "keeper").unwrap().unwrap();
     assert_eq!(keeper.body, "line one\nline two\nline three");
-    // ★ NOTHING THAT ALREADY EXISTED MOVED.
     assert_eq!(keeper.title, "keeper title");
     assert_eq!(keeper.tags, vec!["keep-this-tag".to_string()]);
     assert_eq!(keeper.audience, "public");
-    // ★ AND THE FOLD IS ATTRIBUTED TO THE PEN THAT FOLDED.
     assert_eq!(keeper.edited_by.as_deref(), Some("pen-b"));
 
-    // The absorbed row is still there, with its own text and owner.
     let source = store::get(&conn, "duplicate")
         .unwrap()
         .expect("source survives");
     assert_eq!(source.body, "line two\nline three");
     assert!(source.owner.is_some(), "the source keeps its owner");
 
-    // And the fold is recorded, naming the row it absorbed.
     let (absorbed, actor): (String, Option<String>) = conn
         .query_row(
             "SELECT absorbed_key, actor FROM memory_fold WHERE keeper_id = (SELECT id FROM memory WHERE key = 'keeper')",
@@ -115,9 +101,7 @@ fn the_fold_works_in_both_directions() {
     own(&conn, "a", "pen-a");
     own(&conn, "b", "pen-b");
 
-    // B folds its row into A's keeper...
     links::fold_into(&conn, "b", "a", Some("pen-b")).expect("b -> a");
-    // ...and A folds its row into B's keeper. A sibling pair has no impossible direction.
     links::fold_into(&conn, "a", "b", Some("pen-a")).expect("a -> b");
 
     assert!(
@@ -134,7 +118,6 @@ fn the_fold_works_in_both_directions() {
             .body
             .contains("alpha")
     );
-    // Neither fold created a duplicate "shared" line in the keeper it appended to.
     let b = store::get(&conn, "b").unwrap().unwrap().body;
     assert_eq!(b.matches("shared").count(), 1, "{b}");
 }
@@ -188,7 +171,6 @@ fn you_may_not_fold_a_row_you_cannot_read() {
     let err = links::fold_into(&conn, "duplicate", "keeper", Some("pen-b"))
         .expect_err("cannot append to a row you cannot read");
     assert!(format!("{err}").contains("audience"), "{err}");
-    // The refusal is not a read: the body did not move.
     assert_eq!(
         store::get(&conn, "keeper").unwrap().unwrap().body,
         "private words"
@@ -197,9 +179,6 @@ fn you_may_not_fold_a_row_you_cannot_read() {
 
 #[test]
 fn an_unproven_caller_cannot_fold_even_a_public_row() {
-    // Stet's finding at `fb9ade3`: both rows public (the default) and no pen at all used to append,
-    // leaving `memory_fold.actor` NULL — a write nobody is named for. The read gate answers *may it
-    // see this*, never *whose act is this*, so an absent actor is a refusal, not a public allowance.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -212,7 +191,6 @@ fn an_unproven_caller_cannot_fold_even_a_public_row() {
         .expect_err("an append must name the pen doing it");
     assert!(format!("{err}").contains("must name"), "{err}");
 
-    // The refusal left nothing behind: no body change, no editor, no ledger row.
     let keeper = store::get(&conn, "keeper").unwrap().unwrap();
     assert_eq!(keeper.body, "public words");
     assert_eq!(keeper.edited_by.as_deref(), Some("anonymous"));

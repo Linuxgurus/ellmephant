@@ -1,10 +1,3 @@
-//! Integration: the project tables — identity and the one relation (SPEC §7.1).
-//!
-//! Runs offline against a real store file with the deterministic [`HashEmbedder`]. The sharpest
-//! assertions are that a `preload` key which resolves to nothing is *reported* rather than hidden,
-//! and that membership is nothing but a tag — a memory joins a project by carrying `prj:<key>`, so
-//! its members are found with the ordinary `tags` filter.
-
 mod common;
 
 use common::temp_store;
@@ -80,7 +73,6 @@ fn upsert_and_get_round_trip_with_defaults() {
     );
     assert!(!got.created.is_empty() && !got.updated.is_empty());
 
-    // A `prj:`/`prj-` marker on the read side is optional — stripped, like everywhere else.
     assert!(project::get(&conn, "chronos").unwrap().is_some());
     assert!(project::get(&conn, "prj:chronos").unwrap().is_some());
     assert!(project::get(&conn, "prj-chronos").unwrap().is_some());
@@ -120,8 +112,6 @@ fn a_stated_start_is_kept_and_the_end_follows_the_status() {
     );
     assert!(fresh.end_date.is_empty(), "a running project has no end");
 
-    // An explicit start lands, and a later write leaves it alone -- unlike `updated`, which is
-    // *supposed* to move.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.start_date = "2026-09-01".into();
@@ -143,7 +133,6 @@ fn a_stated_start_is_kept_and_the_end_follows_the_status() {
         "the touch timestamp moves"
     );
 
-    // Ending it stamps the end.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "done".into();
@@ -155,7 +144,6 @@ fn a_stated_start_is_kept_and_the_end_follows_the_status() {
         "and it sorts after the start"
     );
 
-    // An unrelated write leaves the end where it was: this is the bug the column exists to fix.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "done".into();
@@ -167,7 +155,6 @@ fn a_stated_start_is_kept_and_the_end_follows_the_status() {
         "`updated` moves on a touch; the end does not"
     );
 
-    // Reopening clears it: it is not the end any more.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "active".into();
@@ -181,7 +168,6 @@ fn a_stated_start_is_kept_and_the_end_follows_the_status() {
         "reopened = running again"
     );
 
-    // ...and ending it again stamps a fresh one.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "aborted".into();
@@ -200,7 +186,6 @@ fn a_start_is_derived_from_leaving_todo_and_never_cleared() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
-    // Born a todo: nothing has started, so there is nothing to record.
     let mut p = project_fixture("x");
     p.title = "X".into();
     project::upsert(&conn, &p, None).expect("create");
@@ -213,7 +198,6 @@ fn a_start_is_derived_from_leaving_todo_and_never_cleared() {
         "a todo project has not started"
     );
 
-    // Leaving `todo` IS the event — work began, and the store now knows when.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "active".into();
@@ -224,8 +208,6 @@ fn a_start_is_derived_from_leaving_todo_and_never_cleared() {
         "leaving todo stamps the start"
     );
 
-    // ...and it is never cleared. Pushing the project back to `todo` keeps the date, which is the
-    // record that someone worked on it and parked it.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "todo".into();
@@ -236,7 +218,6 @@ fn a_start_is_derived_from_leaving_todo_and_never_cleared() {
         "a start survives a return to todo — it is the hint that the project was dicked with"
     );
 
-    // A project born already started gets the same fact from the same rule.
     let mut p = project_fixture("y");
     p.title = "Y".into();
     p.status = "active".into();
@@ -256,7 +237,6 @@ fn a_date_can_be_backfilled_but_not_invented() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
-    // Backfill: the work started in September and was written down in October.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "done".into();
@@ -270,7 +250,6 @@ fn a_date_can_be_backfilled_but_not_invented() {
         "an explicit end is kept as given"
     );
 
-    // You cannot date the end of something that has not ended: that is a contradiction, not a filter.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.status = "active".into();
@@ -283,7 +262,6 @@ fn a_date_can_be_backfilled_but_not_invented() {
         "the rejected write changed nothing"
     );
 
-    // Nor a date that is not a date: it would sort wrongly forever.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.start_date = "Sept 3".into();
@@ -312,8 +290,6 @@ fn an_unknown_owner_is_not_an_error() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
-    // No vocabulary exists to reject against: whoever writes a project owns it, and the store has
-    // no business guessing who that is.
     let mut p = project_fixture("x");
     p.title = "X".into();
     p.owner = vec!["nobody-you-know".to_string()];
@@ -379,7 +355,6 @@ fn preload_is_ordered_and_replaced_wholesale() {
     assert_eq!(keys, vec!["c", "a", "b"], "the ORDER is the point");
     assert!(refs.iter().all(|r| r.title.is_some()), "titles hydrate");
 
-    // The list is ONE column on the row, in list order — no tie table, no `position`.
     let raw: String = conn
         .query_row(
             "SELECT mem_preload FROM project WHERE key = ?1",
@@ -392,7 +367,6 @@ fn preload_is_ordered_and_replaced_wholesale() {
         "comma-joined memory keys, ordered by priority"
     );
 
-    // A second `Some` replaces the list; `None` leaves it alone.
     project::upsert(&conn, &project_fixture("chronos"), Some(&["b".to_string()])).expect("replace");
     assert_eq!(
         project::preload(&conn, &key, project::Hydrate::None)
@@ -427,7 +401,6 @@ fn preload_survives_a_reopen_in_order() {
     .expect("set preload");
     drop(conn);
 
-    // The order is *stored*, not recomputed on the way out.
     let conn = db::open(&paths).expect("reopen");
     let refs = project::preload(&conn, &key, project::Hydrate::None).unwrap();
     let keys: Vec<&str> = refs.iter().map(|r| r.key.as_str()).collect();
@@ -438,9 +411,6 @@ fn preload_survives_a_reopen_in_order() {
 fn a_project_tag_is_how_memories_join() {
     use ellmephant::search::{MatchMode, Query};
 
-    // Membership is a TAG, not a relation: `prj:<key>` names the project, nothing enforces a single
-    // home (a fact may bear on two projects), and nothing can dangle. A project's memories are
-    // therefore just the rows carrying its tag.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -590,7 +560,6 @@ fn list_filters_intersect() {
     let keys: Vec<&str> = active.iter().map(|p| p.key.as_str()).collect();
     assert_eq!(keys, vec!["alpha", "gamma"], "key order");
 
-    // Tags are AND, not OR.
     let both = project::list(
         &conn,
         &project::Filter {
@@ -602,7 +571,6 @@ fn list_filters_intersect() {
     assert_eq!(both.len(), 1);
     assert_eq!(both[0].key, "beta");
 
-    // The lexical leg reaches `goal` (and `state`), literal by default…
     let literal = project::list(
         &conn,
         &project::Filter {
@@ -614,7 +582,6 @@ fn list_filters_intersect() {
     assert_eq!(literal.len(), 1);
     assert_eq!(literal[0].key, "alpha");
 
-    // …or as a regex, and a blank pattern is no leg at all.
     let regex = project::list(
         &conn,
         &project::Filter {
@@ -636,7 +603,6 @@ fn list_filters_intersect() {
     .unwrap();
     assert_eq!(blank.len(), 3, "a blank pattern is not a leg");
 
-    // Everything intersects: a status no project with that goal has = nothing.
     let none = project::list(
         &conn,
         &project::Filter {
@@ -664,13 +630,11 @@ fn dangling_reports_forward_references_and_keeps_them_visible() {
     )
     .expect("preload");
 
-    // `later` is a forward reference: allowed, reported, never a broken FK.
     let rot = project::dangling(&conn).unwrap();
     assert_eq!(rot.len(), 1, "{rot:?}");
     assert_eq!(rot[0].to_key, "later");
     assert_eq!(rot[0].from_keys, vec![key.clone()]);
 
-    // …and `project_get` shows it rather than dropping the row.
     let view = project::view(&conn, &key, project::Hydrate::None)
         .unwrap()
         .unwrap();
@@ -678,7 +642,6 @@ fn dangling_reports_forward_references_and_keeps_them_visible() {
     let later = view.preload.iter().find(|r| r.key == "later").unwrap();
     assert!(later.title.is_none(), "a missing target reads as null");
 
-    // Writing the memory clears the rot.
     seed_memory(&conn, &embedder, "later");
     assert!(project::dangling(&conn).unwrap().is_empty());
 }
@@ -703,15 +666,11 @@ fn preload_refuses_a_project_marker() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
-    // `mem_preload` holds MEMORY keys; a `prj:` token names the other kind, so say so rather than
-    // write a key that can never resolve.
     let mut p = project_fixture("x");
     p.title = "X".into();
     let err = project::upsert(&conn, &p, Some(&["prj:chronos".to_string()])).unwrap_err();
     assert!(format!("{err}").contains("preload"), "{err}");
 
-    // A bare name is a memory of that name — even one that reads like the legacy prefix, because in
-    // prose (and in this list) `prj-` is just letters.
     project::upsert(&conn, &p, Some(&["prj-notes".to_string()])).expect("bare name is a memory");
     assert_eq!(
         project::preload(&conn, "x", project::Hydrate::None).unwrap()[0].key,
@@ -725,8 +684,6 @@ fn a_memory_and_a_project_may_share_a_name() {
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
 
-    // The case that moved the type out of the name: `sessions` is a project, and `sessions` is also
-    // what the memories about it get called.
     project::upsert(&conn, &project_fixture("sessions"), None).expect("project");
     common::add_now(
         &conn,
@@ -738,7 +695,6 @@ fn a_memory_and_a_project_may_share_a_name() {
     )
     .expect("memory");
 
-    // Two rows, two tables, one name — and both are findable by it.
     assert!(project::get(&conn, "sessions").unwrap().is_some());
     assert!(store::get(&conn, "sessions").unwrap().is_some());
 
@@ -758,7 +714,6 @@ fn a_memory_and_a_project_may_share_a_name() {
         "the marker is what crosses to the other table"
     );
 
-    // Rot says WHICH kind is missing: `ghost` is a memory that was never written.
     let rot = links::dangling(&conn).unwrap();
     assert_eq!(rot.len(), 1, "{rot:?}");
     assert_eq!(rot[0].to_key, "ghost");
@@ -780,10 +735,8 @@ fn a_project_link_is_not_a_memory_backlink() {
     )
     .expect("memory");
 
-    // The edge is aimed at the PROJECT, so a memory called `sessions` has no backlinks from it...
     assert!(links::backlinks(&conn, "sessions").unwrap().is_empty());
 
-    // ...and renaming that memory must not drag the project's edge along.
     let _spec = VecSpec::of(&embedder);
     links::rename(&conn, "sessions", "session-notes").expect("rename");
     let typed: Vec<(String, String)> = conn
@@ -808,7 +761,6 @@ fn preload_hydrates_bodies_on_request() {
     common::add_now(&conn, &embedder, &memory("a", "alpha body")).expect("a");
     common::add_now(&conn, &embedder, &memory("b", "beta body")).expect("b");
     let key = seed_project(&conn, "chronos");
-    // `ghost` never resolves: it must be SHOWN (a null title), not dropped.
     project::upsert(
         &conn,
         &project_fixture("chronos"),
@@ -816,7 +768,6 @@ fn preload_hydrates_bodies_on_request() {
     )
     .expect("preload");
 
-    // Default: a reading list — keys and titles, no bodies.
     let view = project::view(&conn, &key, project::Hydrate::None)
         .unwrap()
         .unwrap();
@@ -825,7 +776,6 @@ fn preload_hydrates_bodies_on_request() {
         "nothing is hydrated by default"
     );
 
-    // Full: every *resolving* key carries its body, in ORDER; the missing key stays, body-less.
     let view = project::view(&conn, &key, project::Hydrate::Full)
         .unwrap()
         .unwrap();
@@ -838,7 +788,6 @@ fn preload_hydrates_bodies_on_request() {
     );
     assert_eq!(view.preload[2].body.as_deref(), Some("alpha body"));
 
-    // Snippet is a prefix: a body shorter than the cap comes back whole.
     let view = project::view(&conn, &key, project::Hydrate::Snippet)
         .unwrap()
         .unwrap();
@@ -866,7 +815,6 @@ fn project_view_wire_carries_bodies_in_a_sister_table() {
         serde_json::json!(["a", "alpha body"])
     );
 
-    // The lean default shape is UNCHANGED: no `bodies` table at all.
     let plain = project::view(&conn, &key, project::Hydrate::None)
         .unwrap()
         .unwrap();
@@ -931,7 +879,6 @@ fn merge_patches_one_field_and_leaves_the_rest_alone() {
     p.tags = vec!["storage".into()];
     project::upsert(&conn, &p, None).expect("upsert");
 
-    // Only the goal: every other field is left exactly as it was.
     let out = project::merge(
         &conn,
         &project::Patch {
@@ -953,7 +900,6 @@ fn merge_patches_one_field_and_leaves_the_rest_alone() {
 
 #[test]
 fn merge_keeps_the_status_when_it_is_not_the_field_being_written() {
-    // The footgun this design removes: an omitted `status` must not silently mean `todo`.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let mut p = project_fixture("x");
@@ -1023,19 +969,16 @@ fn merge_status_follows_the_project_date_rules() {
         ..Default::default()
     };
 
-    // todo -> active stamps the start and leaves the end empty.
     project::merge(&conn, &status("active")).expect("activate");
     let started = project::get(&conn, "x").unwrap().unwrap();
     assert!(!started.start_date.is_empty(), "work started");
     assert!(started.end_date.is_empty());
 
-    // active -> done stamps the end.
     project::merge(&conn, &status("done")).expect("finish");
     let done = project::get(&conn, "x").unwrap().unwrap();
     assert_eq!(done.status, "done");
     assert!(!done.end_date.is_empty(), "`done` ends it");
 
-    // A merge that touches something else disturbs neither date.
     project::merge(
         &conn,
         &project::Patch {
@@ -1052,7 +995,6 @@ fn merge_status_follows_the_project_date_rules() {
     );
     assert_eq!(kept.start_date, done.start_date);
 
-    // done -> active clears the end and KEEPS the start (never cleared).
     project::merge(&conn, &status("active")).expect("reopen");
     let reopened = project::get(&conn, "x").unwrap().unwrap();
     assert!(reopened.end_date.is_empty(), "reopening clears the end");
@@ -1068,7 +1010,6 @@ fn merge_refuses_an_empty_status_and_needs_a_title_to_create() {
     let conn = db::open(&paths).expect("open");
     seed_project(&conn, "x");
 
-    // Empty is not an instruction here: it must not quietly read as `todo`.
     let empty = project::Patch {
         key: Some("x".into()),
         status: Some(String::new()),
@@ -1081,7 +1022,6 @@ fn merge_refuses_an_empty_status_and_needs_a_title_to_create() {
     );
     assert_eq!(project::get(&conn, "x").unwrap().unwrap().status, "todo");
 
-    // An unknown status is still an error.
     let bad = project::Patch {
         key: Some("x".into()),
         status: Some("nope".into()),
@@ -1089,7 +1029,6 @@ fn merge_refuses_an_empty_status_and_needs_a_title_to_create() {
     };
     assert!(format!("{}", project::merge(&conn, &bad).unwrap_err()).contains("unknown status"));
 
-    // A create keeps the old minimum: you cannot make a nameless project.
     let nameless = project::Patch {
         key: Some("ghost".into()),
         goal: Some("g".into()),
@@ -1134,8 +1073,6 @@ fn merge_preload_replaces_the_list_and_keeps_it_when_absent() {
         "order is the payload"
     );
 
-    // Absent: the ordered list is untouched (this was already the rule; now it is the rule for
-    // every field).
     project::merge(
         &conn,
         &project::Patch {
@@ -1147,7 +1084,6 @@ fn merge_preload_replaces_the_list_and_keeps_it_when_absent() {
     .expect("merge goal");
     assert_eq!(keys(&conn), vec!["rules", "boot-note"]);
 
-    // `Some(vec![])` clears it.
     project::merge(
         &conn,
         &project::Patch {
@@ -1162,9 +1098,6 @@ fn merge_preload_replaces_the_list_and_keeps_it_when_absent() {
 
 #[test]
 fn merge_reports_a_create_so_a_mistyped_key_is_loud() {
-    // `key` is an ADDRESS, not a field: a patch naming a different key addresses a DIFFERENT row.
-    // That is a create, and `created` is the only thing that tells the caller it happened — without
-    // it, "I meant to edit `old`" silently leaves a duplicate behind.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let mut p = project_fixture("old");
@@ -1193,9 +1126,6 @@ fn merge_reports_a_create_so_a_mistyped_key_is_loud() {
 
 #[test]
 fn an_owner_name_with_a_comma_is_refused_not_split() {
-    // `owner` is the only free-text column among the comma-joined three (tags folds a comma away,
-    // a preload key cannot hold one), so a comma in a name is a refusal — not a silent split into
-    // two owners. `Smith, John` names ONE person.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
 
@@ -1209,7 +1139,6 @@ fn an_owner_name_with_a_comma_is_refused_not_split() {
         "a refused owner writes nothing at all"
     );
 
-    // The ordinary case still round-trips, canonicalised as a set.
     p.owner = vec!["James".into(), "Cline".into(), "james".into()];
     project::upsert(&conn, &p, None).expect("upsert");
     let got = project::get(&conn, "wedding").unwrap().expect("exists");
@@ -1222,8 +1151,6 @@ fn an_owner_name_with_a_comma_is_refused_not_split() {
 
 #[test]
 fn merge_refuses_an_end_date_on_a_project_that_has_not_ended() {
-    // A live project may not carry an end date — `upsert` says so. The merge must say so too, or a
-    // caller's `end_date` silently vanishes.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let mut p = project_fixture("x");

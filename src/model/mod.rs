@@ -1,13 +1,3 @@
-//! The model weights cache: resolve, fetch, verify, offline (SPEC §6).
-//!
-//! Weights are *data*: never baked into the binary, and never needed at runtime to *run*
-//! — only to *fetch*. The cache is a plain directory tree with a manifest, so it is
-//! inspectable, `gc`-able and `--model-dir`-compatible.
-//!
-//! ```text
-//! ~/.ellmephant/models/<owner>--<repo>/<sha>/{manifest.json, config.json, ..., model.safetensors}
-//! ```
-
 pub mod cache;
 pub mod fetch;
 pub mod manifest;
@@ -20,9 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::fetch::{DEFAULT_ENDPOINT, Fetcher};
 use crate::model::manifest::{FileEntry, Manifest};
 
-/// Files the encoder cannot run without (SPEC §6.1).
 pub const REQUIRED_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
-/// Fetched when upstream has them; never fatal when absent.
 pub const OPTIONAL_FILES: &[&str] = &[
     "tokenizer_config.json",
     "generation_config.json",
@@ -36,27 +24,18 @@ fn all_names() -> Vec<&'static str> {
     names
 }
 
-/// Everything needed to locate or fetch a model.
 #[derive(Debug, Clone)]
 pub struct Spec {
-    /// HF repo id, `owner/name`.
     pub repo: String,
-    /// Revision requested: a branch/tag (resolved once) or a commit sha.
     pub revision: String,
-    /// Root of the weights cache.
     pub cache_root: PathBuf,
-    /// An explicit flat dir to use instead of the cache (implies offline).
     pub model_dir: Option<PathBuf>,
-    /// Hub endpoint (`HF_ENDPOINT` or the default).
     pub endpoint: String,
-    /// Never open a socket (SPEC §6.4).
     pub offline: bool,
-    /// Re-download even if the cache looks complete.
     pub force: bool,
 }
 
 impl Spec {
-    /// Assemble from config, filling the cache root default (`<home>/models`).
     pub fn from_config(cfg: &Config, paths: &Paths) -> Self {
         let cache_dir = cfg.cache_dir.trim();
         Self {
@@ -74,7 +53,6 @@ impl Spec {
         }
     }
 
-    /// A copy with `repo`/`revision` overridden when supplied (the `model …` flags).
     pub fn with_overrides(&self, repo: Option<String>, revision: Option<String>) -> Self {
         let mut spec = self.clone();
         if let Some(repo) = repo {
@@ -87,37 +65,24 @@ impl Spec {
     }
 }
 
-/// One file's presence in a cached revision.
 #[derive(Debug, Clone)]
 pub struct FileState {
-    /// File name.
     pub name: String,
-    /// Present as a regular file.
     pub present: bool,
-    /// Size in bytes when present.
     pub size: Option<u64>,
 }
 
-/// A point-in-time description of the cache. Never touches the network.
 #[derive(Debug, Clone)]
 pub struct Status {
-    /// HF repo id.
     pub repo: String,
-    /// Revision as requested.
     pub revision: String,
-    /// Resolved commit sha, when known.
     pub resolved: Option<String>,
-    /// Directory inspected.
     pub dir: PathBuf,
-    /// Per-file state.
     pub files: Vec<FileState>,
-    /// A manifest is present.
     pub manifest: bool,
-    /// Whether the caller forbade network.
     pub offline: bool,
 }
 
-/// 40-char hex strings are treated as pinned commit shas.
 fn looks_like_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -129,7 +94,6 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Ref -> sha map recorded on disk (SPEC §6.1: `main` resolved once, then pinned).
 fn read_refs(root: &Path, repo: &str) -> Result<BTreeMap<String, String>> {
     let path = cache::refs_path(root, repo);
     if !path.exists() {
@@ -145,7 +109,6 @@ fn record_ref(root: &Path, repo: &str, reference: &str, sha: &str) -> Result<()>
     cache::write_atomic(&cache::refs_path(root, repo), body.as_bytes())
 }
 
-/// Resolve the requested revision to a commit sha, without network when possible.
 fn resolve_sha(spec: &Spec, fetcher: Option<&dyn Fetcher>) -> Result<String> {
     if looks_like_sha(&spec.revision) {
         return Ok(spec.revision.clone());
@@ -168,7 +131,6 @@ fn resolve_sha(spec: &Spec, fetcher: Option<&dyn Fetcher>) -> Result<String> {
     }
 }
 
-/// The directory the encoder should load from: `--model-dir`, or a complete revision dir.
 pub fn ensure(spec: &Spec, fetcher: &dyn Fetcher) -> Result<PathBuf> {
     if let Some(dir) = &spec.model_dir {
         let missing = missing_required(dir);
@@ -206,7 +168,6 @@ pub fn ensure(spec: &Spec, fetcher: &dyn Fetcher) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Download (or repair) every file, writing the manifest last. Idempotent.
 pub fn download_all(spec: &Spec, fetcher: &dyn Fetcher, dir: &Path, sha: &str) -> Result<Manifest> {
     std::fs::create_dir_all(dir)?;
     let _lock = cache::Lock::acquire(&dir.join(".lock"))?;
@@ -221,7 +182,7 @@ pub fn download_all(spec: &Spec, fetcher: &dyn Fetcher, dir: &Path, sha: &str) -
             && let Some(entry) = files.get(name)
             && manifest::size_of(&dest) == Some(entry.size)
         {
-            continue; // already present and the right size
+            continue;
         }
 
         let url = fetch::file_url(&spec.endpoint, &spec.repo, sha, name);
@@ -253,11 +214,10 @@ pub fn download_all(spec: &Spec, fetcher: &dyn Fetcher, dir: &Path, sha: &str) -
         created: now_epoch(),
         files,
     };
-    manifest.save(dir)?; // last, so a crash never leaves a "complete" lie
+    manifest.save(dir)?;
     Ok(manifest)
 }
 
-/// Download one file to `<name>.partial`, hash it, then rename into place (SPEC §6.2).
 fn download_one(fetcher: &dyn Fetcher, url: &str, dest: &Path) -> Result<FileEntry> {
     let partial = dest.with_extension("partial");
     {
@@ -274,7 +234,6 @@ fn download_one(fetcher: &dyn Fetcher, url: &str, dest: &Path) -> Result<FileEnt
     Ok(FileEntry { sha256, size })
 }
 
-/// Required files missing from `dir`.
 fn missing_required(dir: &Path) -> Vec<String> {
     REQUIRED_FILES
         .iter()
@@ -297,7 +256,6 @@ fn file_states(dir: &Path, names: &[&str]) -> Vec<FileState> {
         .collect()
 }
 
-/// Describe the cache without touching the network (`model status`, `doctor`).
 pub fn status(spec: &Spec) -> Result<Status> {
     if let Some(dir) = &spec.model_dir {
         return Ok(Status {
@@ -335,7 +293,6 @@ pub fn status(spec: &Spec) -> Result<Status> {
     })
 }
 
-/// Recompute every recorded hash (the expensive `doctor --verify` path, SPEC §6.3).
 pub fn verify(spec: &Spec) -> Result<Vec<String>> {
     let status = status(spec)?;
     if status.resolved.is_none() && spec.model_dir.is_none() {
@@ -349,8 +306,6 @@ pub fn verify(spec: &Spec) -> Result<Vec<String>> {
     manifest.verify(&status.dir)
 }
 
-/// Remove cached revisions. `all` clears every revision of the repo; otherwise just the
-/// requested one. Returns how many revision dirs were removed.
 pub fn remove(spec: &Spec, all: bool) -> Result<usize> {
     if spec.model_dir.is_some() {
         return Err(Error::Model("refusing to remove a --model-dir".into()));
@@ -366,7 +321,6 @@ pub fn remove(spec: &Spec, all: bool) -> Result<usize> {
     }
 }
 
-/// Drop every cached revision of the repo, plus its `refs` index.
 fn remove_all(spec: &Spec, repo_dir: &Path) -> Result<usize> {
     let mut removed = 0;
     for entry in std::fs::read_dir(repo_dir)? {
@@ -383,7 +337,6 @@ fn remove_all(spec: &Spec, repo_dir: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-/// Drop the one requested revision, resolving a ref to its sha first.
 fn remove_one(spec: &Spec) -> Result<usize> {
     let sha = if looks_like_sha(&spec.revision) {
         Some(spec.revision.clone())

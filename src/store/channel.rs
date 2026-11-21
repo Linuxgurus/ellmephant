@@ -1,71 +1,18 @@
-//! ELLMECHAT (#151): channels, the message log, and the gate that follows a pen.
-//!
-//! A channel message is not a memory. It is a log line with a fan-out and a receipt — and the
-//! receipt is the interesting half, because it is the only thing that can answer "were you told?"
-//!
-//! Three events per recipient (see `migrations/0029_ellmechat.sql`):
-//!
-//! - `available_at` — the message exists for this pen: it was **told**;
-//! - `presented_at` — the harness offered the inbox at a turn boundary: an **opportunity**;
-//! - `fetched_at` — it actually pulled it in: it **listened**.
-//!
-//! The gate is the consequence of the gap between *opportunity* and *listened*. Never of the
-//! sender's timing: a pen that was asleep was not ignoring anyone, so a channel on
-//! `clock = 'delivery'` measures from `presented_at`, and a message that was never presented never
-//! gates.
-//!
-//! ★ IT IS A SEATBELT, NOT A PENALTY. The unread message from a locking channel is exactly the news
-//! a pen needs before it acts — a deployment went out, a server crashed, an incident is live. An
-//! agent writing the record on a world it has not been told about is the thing this prevents. The
-//! normal path is present-then-fetch in the same turn, so a well-behaved harness never meets the
-//! lock; it exists for the turn that offered nothing.
-//!
-//! ★ `misses` makes one boundary a coincidence and two a pattern: `ops` tolerates one (a message can
-//! arrive mid-turn), `emergency` does not.
-//!
-//! ★ The gate fails open on its own errors. Only a *confirmed* unread message past its grace holds
-//! the lock — a false lock is indistinguishable from a broken store, and the pen cannot tell which
-//! it is. It also expires: a lock that only a fetch or an ancestor can clear is a lock forever when
-//! both are asleep, so `lock_max_secs` releases it loudly.
-//!
-//! ★ The gate is evaluated on the pen the effect is **attributed to**, not the one holding the
-//! keyboard. A `sudo`-borrowed write therefore cannot launder a breach. That rule lives at the call
-//! site (the tool wrapper); this module is the ledger it reads.
-
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
 
-/// No lock: the channel is conversation.
 pub const GATE_NONE: &str = "none";
-/// The record is blocked (`memory_upsert`, delete, merge, adopt, project writes); talking is not.
 pub const GATE_WRITES: &str = "writes";
-/// Everything except recovery is blocked. Reserved for a live incident.
 pub const GATE_ALL: &str = "all";
 
-/// The ops team's room. Membership is `list`, and joining it implies `#emergency`.
 pub const OPS_TEAM: &str = "ops_team";
-/// The channel every member must be reachable in if they run the cluster.
 pub const EMERGENCY: &str = "emergency";
 
-/// Which tools a breach is allowed to stop.
-///
-/// Two classes, not five: the five in the issue are the **tool** classes, and they collapse to
-/// these two the moment the gate asks the question. Liveness and communication are never gated —
-/// a locked-out mind must be able to ask what happened — so they have no class here at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// Changes the record: `memory_upsert`, `memory_delete`, `memory_merge`, `memory_adopt`,
-    /// `project_upsert`. Gated by `writes` and by `all`.
     Record,
-    /// Acts on the world: dispatch, handoff, prune. Gated by `all` only.
-    ///
-    /// ★ NOT maintenance (#168 review). `memory_reparse` and `memory_reembed` are derived-data
-    /// rebuilds — idempotent, and their output depends on the bodies rather than on the news — so
-    /// they are not in this class at all. Putting them here would make "acting" mean "upkeep", and
-    /// the first pen annoyed by a lockout would weaken the gate to quiet the noise, taking the
-    /// prune that *does* belong here with it.
     Acting,
 }
 
@@ -78,15 +25,12 @@ impl Class {
     }
 }
 
-/// One channel and its policy.
 #[derive(Debug, Clone, Serialize)]
 pub struct Channel {
     pub key: String,
     pub title: String,
-    /// `open` (every live self unless opted out) or `list` (explicit members only).
     pub members: String,
     pub gate: String,
-    /// Seconds of text this channel keeps; `0` = forever. See [`prune`].
     pub keep_secs: i64,
     pub grace_secs: i64,
     pub clock: String,
@@ -94,7 +38,6 @@ pub struct Channel {
     pub lock_max_secs: i64,
 }
 
-/// One message as a reader sees it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub seq: i64,
@@ -103,29 +46,20 @@ pub struct Message {
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i64>,
-    /// Set when the body was pruned. The receipt survives the text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pruned_at: Option<String>,
     pub created: String,
 }
 
-/// The oldest message that is holding a pen behind, and why it qualifies.
 #[derive(Debug, Clone, Serialize)]
 pub struct Breach {
     pub channel: String,
     pub seq: i64,
     pub gate: String,
-    /// The instant the clock started: `available_at` on `send`, `presented_at` on `delivery`.
     pub since: String,
-    /// Turn boundaries that offered this message without a fetch.
     pub misses: i64,
-    /// Seconds since `since`, measured by the store's own clock.
     pub age_secs: i64,
-    /// Seconds since the lock could first have bitten: from the first opportunity, never from the
-    /// message. An expiry measured from `since` would release an old message before a sleeping pen
-    /// ever woke, which is the opposite of protecting it.
     pub lock_age_secs: i64,
-    /// 0 = the lock never expires.
     pub lock_max_secs: i64,
 }
 
@@ -162,7 +96,6 @@ fn channel_row(conn: &Connection, key: &str) -> Result<Channel> {
     .ok_or_else(|| Error::Invalid(format!("no channel named {key}")))
 }
 
-/// Every channel, in creation order.
 pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
     let mut stmt = conn.prepare(
         "SELECT key, title, members, gate, keep_secs, grace_secs, clock, misses_to_gate, lock_max_secs
@@ -184,15 +117,6 @@ pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Who is in one channel: the live selves, filtered by the channel's membership kind.
-///
-/// Not fingers — a finger is a mechanism by which a self does more work, not a party to a
-/// conversation — and not `estate`, which has no entity behind it and can never authenticate to
-/// read anything.
-///
-/// `open` is opt-out: a live self is a member unless a `state = 'out'` row says otherwise.
-/// `list` is opt-in: only a `state = 'in'` row makes a member. One table serves both, and a channel
-/// changes kind without a migration.
 fn members_of(conn: &Connection, channel: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT p.id
@@ -212,14 +136,9 @@ fn members_of(conn: &Connection, channel: &str) -> Result<Vec<i64>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Join a channel. Joining `#ops_team` joins `#emergency` too — a team that runs the cluster must be
-/// reachable when it falls over, and the coupling belongs to the membership rather than to a check
-/// somewhere later.
 pub fn join(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
     let id = pen_id(conn, pen)?;
     let ch = channel_row(conn, channel)?;
-    // ★ INVITE-ONLY MEANS INVITED (#165 review). A `list` channel is a room, not a door: a pen
-    // cannot add itself. A keeper may, because a keeper is who the invitation would come from.
     if ch.members == "list" && !keeper(pen) {
         return Err(Error::Invalid(format!(
             "refused: #{chan} is invite-only (`list`); a pen cannot add itself. Ask `estate` or \
@@ -248,8 +167,6 @@ pub fn join(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
     Ok(())
 }
 
-/// Put ANOTHER pen in a channel. Keeper-only: an invitation has an inviter, and that is the whole
-/// difference between `list` and a door with no lock (#165 review).
 pub fn invite(conn: &Connection, actor: &str, pen: &str, channel: &str) -> Result<()> {
     if !keeper(actor) {
         return Err(Error::Invalid(format!(
@@ -257,9 +174,6 @@ pub fn invite(conn: &Connection, actor: &str, pen: &str, channel: &str) -> Resul
         )));
     }
     let id = pen_id(conn, pen)?;
-    // ★ AN INVITATION TO A PEN THAT CAN NEVER LISTEN IS A LIE (#168 review). Fingers are mechanisms
-    // and `estate` has no entity behind it; both are excluded from fan-out, so a row for them would
-    // show on the roster and deliver nothing.
     let (kind, name): (String, String) = conn.query_row(
         "SELECT kind, name FROM pen WHERE id = ?1",
         params![id],
@@ -284,8 +198,6 @@ pub fn invite(conn: &Connection, actor: &str, pen: &str, channel: &str) -> Resul
              ON CONFLICT(channel, pen_id) DO UPDATE SET state = 'in', at = datetime('now')",
             params![target, id],
         )?;
-        // ★ WHO PUT THEM ON THE TEAM IS A ROW (#168 review): membership was the one change with no
-        // audit trail, while gates and retention had one.
         tx.execute(
             "INSERT INTO channel_event (channel, pen_id, action, was, now)
              VALUES (?1, ?2, 'members', NULL, ?3)",
@@ -296,8 +208,6 @@ pub fn invite(conn: &Connection, actor: &str, pen: &str, channel: &str) -> Resul
     Ok(())
 }
 
-/// Leave a channel. Leaving `#emergency` while on the ops team is refused — the graceful path is to
-/// leave `#ops_team` first, which makes the reason the caller reads match the rule.
 pub fn leave(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
     let id = pen_id(conn, pen)?;
     let ch = channel_row(conn, channel)?;
@@ -325,9 +235,6 @@ pub fn leave(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
         "INSERT INTO channel_event (channel, pen_id, action, was, now) VALUES (?1, ?2, 'members', 'in', 'left')",
         params![ch.key, id],
     )?;
-    // ★ LEAVING ENDS THE HOLD (#168 review): an outstanding delivery in a room the pen has left must
-    // not keep it gated, or the only way out is to fetch a channel it is no longer in. The delivery
-    // ROW is kept — "you were told" stays answerable — but it no longer counts as an obligation.
     tx.execute(
         "UPDATE channel_delivery SET fetched_at = COALESCE(fetched_at, datetime('now'))
           WHERE pen_id = ?1
@@ -338,10 +245,6 @@ pub fn leave(conn: &Connection, pen: &str, channel: &str) -> Result<()> {
     Ok(())
 }
 
-/// Post a message and fan out a receipt to every member except the sender.
-///
-/// The sender is excluded deliberately: their own message must not be something they are "behind"
-/// on, and a pen gated by its own words would be a comedy.
 pub fn send(
     conn: &Connection,
     pen: &str,
@@ -357,9 +260,6 @@ pub fn send(
     let channel_name = channel_row.key.clone();
     let pen_id = pen_id(conn, pen)?;
 
-    // ★ MEMBERSHIP IS AN ADMISSION RULE, NOT A FAN-OUT FILTER (#158 review). Without this, any pen
-    // could post into an invite-only incident channel and every member would be TOLD — an injection
-    // path into the one place where being behind is expensive.
     if !members_of(conn, &channel_name)?.contains(&pen_id) {
         return Err(Error::Invalid(format!(
             "refused: `{pen}` is not a member of #{channel_name}, so this would be a message to a \
@@ -404,8 +304,6 @@ pub fn send(
     )?;
     let seq = tx.last_insert_rowid();
 
-    // Fan out at send time: a receipt exists from the moment the message exists for that pen, which
-    // is what makes `available_at` an honest answer to "were you told".
     for member in members_of(&tx, &channel_row.key)? {
         if member == pen_id {
             continue;
@@ -442,24 +340,9 @@ fn message_by_seq(conn: &Connection, seq: i64) -> Result<Message> {
     .map_err(Into::into)
 }
 
-/// Mark that the harness offered the inbox at a turn boundary.
-///
-/// Called by whatever owns the turn (the spine, the harness), never by the model, and normally
-/// followed by [`fetch`] in the same turn. Each call is one **miss** while the message stays
-/// unfetched; a channel decides how many misses it tolerates before the lock.
-///
-/// A pen that is never presented is never judged — absence is not a crime — which is why this is
-/// separate from [`fetch`].
 pub fn present(conn: &Connection, pen: &str, boundary: Option<&str>) -> Result<usize> {
     let id = pen_id(conn, pen)?;
-    // ★ ONE OPPORTUNITY, ONE MISS (#159 review). When the caller names the boundary, a repeat is the
-    // same opportunity — a retry, or the second step of a turn, must not count twice. Without a name
-    // the older behaviour stands, and the tool says so, because a caller that does not identify its
-    // turn cannot be given idempotency it did not ask for.
     if let Some(name) = boundary.map(str::trim).filter(|b| !b.is_empty()) {
-        // ★ A TOKEN IS NOT AN IMMORTALITY SPELL (#168 review). Dedupe only inside a short window: a
-        // body that reuses one token forever would otherwise never accrue a second miss, which would
-        // quietly switch the gate off for exactly the caller who names its boundaries.
         let seen: Option<(String, i64)> = conn
             .query_row(
                 "SELECT boundary, strftime('%s','now') - strftime('%s', at)
@@ -490,10 +373,6 @@ pub fn present(conn: &Connection, pen: &str, boundary: Option<&str>) -> Result<u
     Ok(n)
 }
 
-/// Read the inbox: everything this pen has been told and has not yet listened to.
-///
-/// Fetching *is* listening — the rows it returns are marked `fetched_at`, which is what clears the
-/// gate. Re-reading history is [`history`], which does not touch the ledger.
 pub fn fetch(
     conn: &Connection,
     pen: &str,
@@ -545,10 +424,6 @@ pub fn fetch(
     Ok(messages)
 }
 
-/// What this pen has been TOLD and has not yet LISTENED to, per channel.
-///
-/// Read-only in the strictest sense: it moves no receipt. `fetch` is the only thing that marks a
-/// message fetched, because fetching is listening and a count is not.
 #[derive(Debug, Clone, Serialize)]
 pub struct Unread {
     pub channel: String,
@@ -580,24 +455,13 @@ pub fn unread(conn: &Connection, pen: &str) -> Result<Vec<Unread>> {
     Ok(rows)
 }
 
-/// What a prune did: bodies emptied, receipts untouched.
 #[derive(Debug, Clone, Serialize)]
 pub struct Pruned {
     pub channel: String,
     pub emptied: usize,
 }
 
-/// Expire the TEXT of messages past their channel's `keep_secs`, and touch nothing else.
-///
-/// ★ A PRUNE IS NOT AN ERASURE OF WHAT HAPPENED. `body` is emptied and `pruned_at` is set; the
-/// message row, its `seq`, and every delivery row survive, so "you were told seq N" is still true
-/// afterwards. Deleting the rows would erase the receipt along with the conversation, which is the
-/// one thing the ledger exists to keep.
-///
-/// `keep_secs = 0` means forever, and a channel left at 0 is never touched.
 pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result<Vec<Pruned>> {
-    // ★ A TYPO IS NOT "NOTHING TO PRUNE" (#168 review): every other channel function refuses an
-    // unknown key, and a silent success here reads as "the retention ran".
     if let Some(key) = only {
         channel_row(conn, key)?;
     }
@@ -636,7 +500,6 @@ pub fn prune(conn: &Connection, only: Option<&str>, now: Option<&str>) -> Result
     Ok(out)
 }
 
-/// Set a channel's retention. Keeper-only, and recorded — retention is a policy, not a preference.
 pub fn set_retention(
     conn: &Connection,
     pen: &str,
@@ -646,8 +509,6 @@ pub fn set_retention(
     if keep_secs < 0 {
         return Err(Error::Invalid("keep_secs cannot be negative".into()));
     }
-    // ★ A FLOOR, BECAUSE THE UNIT IS EASY TO GET WRONG (#166 review): `60` read as "an hour" would
-    // destroy incident text after a minute and leave a row saying it was intended.
     if keep_secs > 0 && keep_secs < MIN_KEEP_SECS {
         return Err(Error::Invalid(format!(
             "keep_secs must be 0 (forever) or at least {MIN_KEEP_SECS} seconds; {keep_secs} is \
@@ -681,7 +542,6 @@ pub fn set_retention(
     channel_row(conn, &row.key)
 }
 
-/// One recorded change to a channel: who, when, what it was, what it is now.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub at: String,
@@ -691,20 +551,11 @@ pub struct Event {
     pub now: Option<String>,
 }
 
-/// The pens allowed to create or re-gate a LOCKED channel.
-///
-/// `estate` is in the list because the spec names it, but it cannot authenticate — it has no entity
-/// behind it and only ever acts as somebody's borrow — so in practice this is James, or a pen James
-/// has lent. The check is on the PROVEN caller, never on a name passed in.
 const GATE_KEEPERS: [&str; 2] = ["estate", "james"];
 
-/// A message body's ceiling. The mail door documents 1 MiB; chat is for a line, not a document.
 const MAX_BODY_CHARS: usize = 16 * 1024;
 
-/// The shortest retention above zero. Long enough that a unit mistake is survivable.
 const MIN_KEEP_SECS: i64 = 3600;
-/// How long a boundary token names the same opportunity. Long enough to cover a retry or a
-/// multi-step turn; short enough that a reused token cannot switch the gate off for ever.
 const BOUNDARY_WINDOW_SECS: i64 = 120;
 
 fn keeper(pen: &str) -> bool {
@@ -732,12 +583,6 @@ fn valid_key(key: &str) -> Result<String> {
     Ok(key)
 }
 
-/// Create a channel.
-///
-/// ★ A LOCKED CHANNEL NEEDS A GATE KEEPER: `gate` other than `none` is refused unless the caller is
-/// `estate` or `james`. A gate is the one thing here that can stop a pen writing to the record, so
-/// creating one is a decision that gets a name attached. A channel with `gate = none` may be made by
-/// any proven pen — conversation costs nobody anything.
 pub fn create(
     conn: &Connection,
     pen: &str,
@@ -763,8 +608,6 @@ pub fn create(
             "gate must be `none`, `writes` or `all`, not {gate:?}"
         )));
     }
-    // ★ AN INVITE-ONLY ROOM ITS CREATOR CANNOT ENTER IS A DEAD ROOM (#168 review). `list` is a
-    // policy decision like a gate, and it takes the same two hands.
     if (members == "list" || gate != "none") && !keeper(pen) {
         return Err(Error::Invalid(format!(
             "refused: creating a channel with gate `{gate}` or members `{members}` needs `estate` or `james`; \
@@ -772,9 +615,6 @@ pub fn create(
              is not something any pen may make on its own."
         )));
     }
-    // ★ NOT `channel_row(..).is_ok()` (#165 review): that reads "the query failed" as "the name is
-    // free", so a locked database would surface as a constraint error from the INSERT instead of
-    // the real cause. Ask the question directly.
     let exists: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM channel WHERE lower(key) = lower(?1))",
         params![key],
@@ -792,7 +632,6 @@ pub fn create(
         params![key, title, members, gate],
     )?;
     if members == "list" {
-        // The creator is in the room they made; otherwise their first message would be refused.
         tx.execute(
             "INSERT OR IGNORE INTO channel_member (channel, pen_id, state) VALUES (?1, ?2, 'in')",
             params![key, pen_id],
@@ -806,7 +645,6 @@ pub fn create(
     channel_row(conn, &key)
 }
 
-/// Change a channel's gate, and RECORD it — who, from what, to what (#161).
 pub fn set_gate(conn: &Connection, pen: &str, channel: &str, gate: &str) -> Result<Channel> {
     let gate = gate.trim().to_ascii_lowercase();
     if !matches!(gate.as_str(), "none" | "writes" | "all") {
@@ -837,7 +675,6 @@ pub fn set_gate(conn: &Connection, pen: &str, channel: &str, gate: &str) -> Resu
     channel_row(conn, &row.key)
 }
 
-/// The recorded changes to one channel, newest last. The answer to "who made this dangerous?".
 pub fn events(conn: &Connection, channel: &str) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
         "SELECT e.at, p.name, e.action, e.was, e.now
@@ -859,19 +696,10 @@ pub fn events(conn: &Connection, channel: &str) -> Result<Vec<Event>> {
     Ok(rows)
 }
 
-/// WHO is in a channel, as EFFECTIVE membership rather than as a list of override rows.
-///
-/// `open` channels are opt-out: every live self is a member unless it has an `out` row. `list`
-/// channels are opt-in: only `in` rows are members. Fingers are never members — a finger is a
-/// mechanism, not a party — and `estate` is not either: it has no entity behind it and can never
-/// authenticate to read.
 #[derive(Debug, Clone, Serialize)]
 pub struct Member {
     pub pen: String,
-    /// `in` for every effective member. A member by `open` and a member by invitation look the same
-    /// in the answer, because the question is "who is here", not "why".
     pub state: String,
-    /// Set when this pen has an EXPLICIT row (an invitation or an opt-out): the audit trail.
     pub explicit: bool,
     pub since: Option<String>,
 }
@@ -880,8 +708,6 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
     let row = channel_row(conn, channel)?;
     let mut out = Vec::new();
     if row.members == "list" {
-        // ★ THE SAME ADMISSION RULE AS `members_of` (#168 review): a finger is a mechanism and
-        // `estate` has no entity behind it, so neither is a member — even if a row says so.
         let mut stmt = conn.prepare(
             "SELECT p.name, m.at
                FROM channel_member m JOIN pen p ON p.id = m.pen_id
@@ -902,7 +728,6 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
         return Ok(rows);
     }
 
-    // open: every live self, minus those who left on purpose.
     let mut stmt = conn.prepare(
         "SELECT p.name,
                 (SELECT m.at FROM channel_member m
@@ -921,7 +746,7 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
     for row in rows {
         let (pen, out_at, invited) = row?;
         if out_at.is_some() && !invited {
-            continue; // left on purpose
+            continue;
         }
         out.push(Member {
             pen,
@@ -933,8 +758,6 @@ pub fn members(conn: &Connection, channel: &str) -> Result<Vec<Member>> {
     Ok(out)
 }
 
-/// The highest `seq` this pen has been told. A waiter with no cursor starts HERE, not at zero —
-/// otherwise a fresh body is flooded with the whole backlog (#168 review).
 pub fn head(conn: &Connection, pen: &str) -> Result<i64> {
     let id = pen_id(conn, pen)?;
     let head: Option<i64> = conn.query_row(
@@ -945,10 +768,6 @@ pub fn head(conn: &Connection, pen: &str) -> Result<i64> {
     Ok(head.unwrap_or(0))
 }
 
-/// What this pen was TOLD after `after_seq`, oldest first. Moves no receipt.
-///
-/// This is the delivery primitive a body waits on: a long poll reads from here, so "wait for
-/// something to arrive" never has to become "fetch and mark everything read".
 pub fn since(conn: &Connection, pen: &str, after_seq: i64, limit: i64) -> Result<Vec<Message>> {
     let id = pen_id(conn, pen)?;
     let limit = limit.clamp(1, 500);
@@ -977,7 +796,6 @@ pub fn since(conn: &Connection, pen: &str, after_seq: i64, limit: i64) -> Result
     Ok(rows)
 }
 
-/// The log: what was said, regardless of whether this pen has listened. Does not touch receipts.
 pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Result<Vec<Message>> {
     let limit = limit.clamp(1, 500);
     let mut stmt = conn.prepare(
@@ -1004,11 +822,6 @@ pub fn history(conn: &Connection, channel: &str, since: i64, limit: i64) -> Resu
     Ok(rows)
 }
 
-/// The oldest message holding this pen behind, if any.
-///
-/// `clock = 'send'` measures from `available_at`; `clock = 'delivery'` measures from
-/// `presented_at` and ignores a message that was never presented. A channel's own
-/// `misses_to_gate` decides how many offered-but-unfetched boundaries are tolerated.
 pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
     let id = pen_id(conn, pen)?;
     let found = conn
@@ -1064,26 +877,11 @@ pub fn breach(conn: &Connection, pen: &str) -> Result<Option<Breach>> {
     Ok(found)
 }
 
-/// Refuse a gated class of action, or allow it.
-///
-/// Fail open: a ledger this module cannot read does not gate. That is not leniency — a pen cannot
-/// distinguish "you are late" from "the store is broken", and punishing the second as if it were the
-/// first is how a chat bug locks the record.
-///
-/// Expire loudly: a lock past its channel's `lock_max_secs` releases, but says so, because an
-/// emergency lock that aged out in silence is worse than one that held.
 pub fn gate(conn: &Connection, pen: &str, class: Class) -> Result<()> {
     match breach(conn, pen) {
         Ok(Some(b)) if class.gated_by(&b.gate) => {
             if b.lock_max_secs > 0 && b.lock_age_secs >= b.lock_max_secs {
-                // ★ AN EXPIRY IS A RECORD, NOT A LOG LINE (#159 review). The design says a lock
-                // releases itself and the release is *recorded*; a `warn!` that nobody reads is not a
-                // record. The event row is best-effort: failing to write it must not hold the lock.
                 if let Ok(id) = pen_id(conn, pen) {
-                    // ★ A RELEASE THAT LEAVES THE LOCK IN PLACE IS NOT A RELEASE (#168 review): the
-                    // next call would expire it again, and again, one event per write. Clear the
-                    // opportunity as well as recording it, so the lock ends and the row is written
-                    // once.
                     let tx = conn.unchecked_transaction();
                     if let Ok(tx) = tx {
                         let _ = tx.execute(

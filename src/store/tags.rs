@@ -1,9 +1,3 @@
-//! Tag normalisation and the tag vocabulary (SPEC §9).
-//!
-//! Tags live as a comma-joined list on each `memory` row, so normalisation is the only
-//! invariant: it keeps names delimiter-safe (`normalize` drops commas) and comparable.
-//! [`encode`]/[`decode`] are the one codec for that column.
-
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
@@ -11,9 +5,6 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::store::codec;
 
-/// Canonicalise a tag: trim, lowercase, collapse internal whitespace to `-`, and replace any
-/// comma so a name can never break the stored comma-joined list. Returns `None` for tags that
-/// would be empty.
 pub fn normalize(raw: &str) -> Option<String> {
     let t = raw
         .trim()
@@ -28,8 +19,6 @@ pub fn normalize(raw: &str) -> Option<String> {
     }
 }
 
-/// Encode a tag set as the `memory.tags` column value: normalised, sorted and de-duped so
-/// re-ordering the input never changes the stored string (and so never forces a re-embed).
 pub fn encode(tags: &[String]) -> String {
     let mut tags: Vec<String> = tags.iter().filter_map(|t| normalize(t)).collect();
     tags.sort();
@@ -37,24 +26,14 @@ pub fn encode(tags: &[String]) -> String {
     tags.join(",")
 }
 
-/// Decode a `memory.tags` column value back into names — the inverse of [`encode`], via the shared
-/// comma codec ([`codec::split`]).
 pub fn decode(raw: &str) -> Vec<String> {
     codec::split(raw)
 }
 
-/// Every tag with its reference count, alphabetical — derived from the `memory.tags` column.
-/// The `(key, title)` pairs carrying `tag`, key-ascending — `/bootstrap`'s index of the self set.
-///
-/// Matching goes through [`normalize`] then [`decode`], which are the same two calls the structured
-/// search predicate makes (`search::matches`), so a boot can never list a key that
-/// `GET /search?tags=…` would not return. (Deliberately *not* a second `LIKE` over the stored
-/// column: the tag filter has drifted from the writer's encoding once already.)
 pub fn keys_with(conn: &Connection, tag: &str) -> Result<Vec<(String, String)>> {
     keys_with_seen(conn, tag, &crate::store::audience::Reader::everything())
 }
 
-/// The same index, as one reader sees it: a tagged row the reader may not see is not in the set.
 pub fn keys_with_seen(
     conn: &Connection,
     tag: &str,
@@ -84,13 +63,10 @@ pub fn keys_with_seen(
     Ok(out)
 }
 
-/// Single-tag counts over the whole store: `[(tag, count)]`, name-ascending.
 pub fn list(conn: &Connection) -> Result<Vec<(String, i64)>> {
     list_seen(conn, &crate::store::audience::Reader::everything())
 }
 
-/// The tag vocabulary as one reader sees it. A private row's tags are part of its content: a tag
-/// appearing in `stats` that appears on no visible row is a one-bit confession.
 pub fn list_seen(
     conn: &Connection,
     reader: &crate::store::audience::Reader,

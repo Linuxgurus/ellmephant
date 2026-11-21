@@ -1,13 +1,3 @@
-//! Integration: the QUIESCE — a consistent snapshot of a LIVE store.
-//!
-//! A file-level copy of a live SQLite database is not atomic, so a backup of the volume may capture a
-//! store mid-transaction. `VACUUM INTO` writes a second database holding the committed state at one
-//! point in time; the server does it on a timer, and `/health` reports the age so a bell can ask.
-//!
-//! The assertions that matter are the two that a green tick would hide: the snapshot is a COPY (a
-//! later write does not appear in it), and it is a USABLE database (opens, migrates to the same
-//! version, answers a query).
-
 mod common;
 
 use common::temp_store;
@@ -39,13 +29,11 @@ fn a_snapshot_is_a_usable_copy_and_not_a_link() -> Result<()> {
 
     assert_eq!(snapshot::age_seconds(paths.root()), None, "no snapshot yet");
 
-    // Snapshot through a READ-ONLY connection: the timer must never migrate or take the writer lock.
     let reader = db::open_read_only(&paths)?;
     let out = snapshot::write(&reader, paths.root())?;
     assert!(out.exists());
     assert_eq!(out, snapshot::file(paths.root()));
 
-    // ★ IT IS A COPY: a write AFTER the snapshot must not appear in it.
     common::add_now(
         &conn,
         &embedder,
@@ -74,7 +62,6 @@ fn a_snapshot_is_a_usable_copy_and_not_a_link() -> Result<()> {
         "a later write is NOT in the copy — it is a point in time"
     );
 
-    // …and the LIVE store has both.
     assert!(store::get(&conn, "after")?.is_some());
     assert!(snapshot::age_seconds(paths.root()).is_some_and(|s| s < 60));
     Ok(())
@@ -92,12 +79,10 @@ fn a_second_snapshot_replaces_the_first_atomically() -> Result<()> {
     common::add_now(&conn, &embedder, &memory("two", "second"))?;
     let out = snapshot::write(&conn, paths.root())?;
 
-    // The replacement is complete, not merged or truncated: both rows are present in the newer copy.
     let copy = rusqlite::Connection::open(&out)?;
     let n: i64 = copy.query_row("SELECT count(*) FROM memory", [], |r| r.get(0))?;
     assert_eq!(n, 2);
 
-    // And no temp file is left behind for the next backup to copy.
     let leftovers: Vec<_> = std::fs::read_dir(snapshot::dir(paths.root()))?
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())

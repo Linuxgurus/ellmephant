@@ -1,11 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// `POST /mail` — write one letter (`mail_send`). JSON body; nothing is delivered.
 pub async fn mail_send(
     State(state): State<HttpState>,
     server: Server,
@@ -54,14 +48,7 @@ pub async fn mail_send(
     }
 }
 
-/// `GET /mail?recipient=&since=&limit=` — envelopes after the reader's cursor (`mail_inbox`).
-///
-/// ★ THE CURSOR BELONGS TO THE PROVEN PEN (migration 0017). With `X-Stet-From`/`X-Stet-Auth` the
-/// request reads that pen's stored cursor; an explicit `since` still wins, because a diagnostic may
-/// want to look again. Anonymous is NOT an error here — reads are open — it simply has no stored
-/// cursor, so `since` (or 0) decides, and nothing is written.
-/// The proven pen behind an HTTP request, or the refusal to send.
-#[allow(clippy::result_large_err)] // the refusal IS the axum response; boxing it would be taste, not safety.
+#[allow(clippy::result_large_err)]
 pub(super) fn mail_reader_identity(
     caller: &crate::identity::Caller,
     json: bool,
@@ -72,12 +59,7 @@ pub(super) fn mail_reader_identity(
         .map_err(|r| refusal_response(json, r, StatusCode::FORBIDDEN))
 }
 
-/// ★ THE BOX IS THE BOUNDARY, on every door (soma/ellmephant#92).
-///
-/// The MCP tool has refused a non-recipient since 2026-10-18; this surface resolved an identity only
-/// to find the reader's CURSOR and then served any box to anyone. One rule, one place, both doors —
-/// `mail box?recipient=stet` answered 49 envelopes to an anonymous caller, measured 2026-10-22.
-#[allow(clippy::result_large_err)] // same: a refusal is returned whole, as on every other handler here.
+#[allow(clippy::result_large_err)]
 async fn mail_guard(
     state: &HttpState,
     reader: &str,
@@ -85,14 +67,10 @@ async fn mail_guard(
     json: bool,
     scope: crate::store::mail::BoxScope,
 ) -> ApiResult<()> {
-    // A helper rather than a handler: no `&mut Parts`, so no extractor (#233).
     let Some(server) = state.server() else {
         return Err(ApiError::internal(json, "server not attached"));
     };
     let (r, q) = (reader.to_string(), requested.to_string());
-    // ★ THE SAME RULE AS MCP, including the GRANT (soma/ellmephant#235): this asked the `read`
-    // grant even when the verb was `ack`, so a pen holding only an ack grant was refused here and
-    // admitted there. The sentence comes from the store, so the two doors cannot drift again.
     server
         .with_read(
             "mail_guard",
@@ -138,7 +116,6 @@ pub async fn mail_inbox(
             "mail_inbox",
             crate::store::audience::Reader::everything(),
             move |s| {
-                // The box's top, the page's top, and the READER's place are three facts (see the MCP tool).
                 let stored = match &me {
                     Some(name) => s.mail_cursor(name, &recipient)?,
                     None => None,
@@ -200,10 +177,6 @@ pub async fn mail_inbox(
     }
 }
 
-/// `POST /mail/ack?recipient=&seq=` — advance the caller's own cursor (`mail_ack`).
-///
-/// ★ A CURSOR NEEDS A READER, so this is the one mail route that REFUSES anonymous: there is no row
-/// to move without a proven pen, and guessing one would hand someone else's cursor to whoever asked.
 pub async fn mail_ack(
     State(state): State<HttpState>,
     server: Server,
@@ -254,7 +227,6 @@ pub async fn mail_ack(
     }
 }
 
-/// `GET /mail/{seq}` — one letter, body included (`mail_read`).
 pub async fn mail_read(
     State(state): State<HttpState>,
     server: Server,
@@ -274,7 +246,6 @@ pub async fn mail_read(
         .await
     {
         Ok(Some(letter)) => {
-            // The LETTER decides its box: the check is on the row, not on an argument.
             mail_guard(
                 &state,
                 &reader,
@@ -298,7 +269,6 @@ pub async fn mail_read(
     }
 }
 
-/// `POST /mail/prune?keep_days=7` — drop letters nobody ever read (`mail_prune`).
 pub async fn mail_prune(
     State(state): State<HttpState>,
     server: Server,
@@ -331,9 +301,6 @@ pub async fn mail_prune(
     }
 }
 
-// ── MAIL SURROGATES (#153) ───────────────────────────────────────────────────────────────────────
-
-/// `POST /mail/surrogate/grant` — lend your OWN name for mail.
 pub async fn mail_surrogate_grant(
     State(state): State<HttpState>,
     server: Server,
@@ -409,7 +376,6 @@ pub async fn mail_surrogate_grant(
     }
 }
 
-/// `POST /mail/surrogate/revoke` — take a lent name back.
 pub async fn mail_surrogate_revoke(
     State(state): State<HttpState>,
     server: Server,
@@ -463,7 +429,6 @@ pub async fn mail_surrogate_revoke(
     }
 }
 
-/// `GET /mail/surrogate` — every grant this pen holds, live or not.
 pub async fn mail_surrogate_list(
     State(state): State<HttpState>,
     server: Server,
@@ -506,12 +471,3 @@ pub async fn mail_surrogate_list(
         Err(e) => Err(ApiError::bad(json, &e)),
     }
 }
-
-// ── ELLMECHAT (#151): the channels ─────────────────────────────────────────────────────────────
-//
-// Thin on purpose. Every rule — membership, fan-out, the three-event ledger, the gate — lives in
-// `store::channel`, so this door cannot disagree with the MCP door or the store.
-//
-// A READ needs no credential (reads are never gated, and reading is the way out of a lock).
-// A WRITE needs a bearer AND a proven pen: the pen is who is speaking, the bearer says this client
-// may speak at all.

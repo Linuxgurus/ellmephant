@@ -1,8 +1,3 @@
-//! Integration: CONFIG — a stored value with a written ACL (migration `0038`).
-//!
-//! Two boundaries, two questions: `set_audience` is who may CHANGE the value, `read_audience` is who
-//! may see it. Each test names one boundary and the mistake it prevents.
-
 mod common;
 
 use common::temp_store;
@@ -10,7 +5,6 @@ use common::temp_store;
 use ellmephant::store::audience::Reader;
 use ellmephant::store::config;
 
-/// `estate` → `james` → {`stet`, `cline`} → `stet/hand`.
 fn tree(conn: &rusqlite::Connection) {
     conn.execute_batch(
         "DELETE FROM pen;
@@ -46,7 +40,6 @@ fn an_item_is_absent_when_it_is_not_addressed_to_you() {
     )
     .expect("an ancestor may address its own child");
 
-    // The pen it was shared with reads it; the SIBLING does not.
     let stet = reader(&conn, "stet");
     let item = config::get(&conn, &stet, "recess_daily_time")
         .unwrap()
@@ -61,7 +54,6 @@ fn an_item_is_absent_when_it_is_not_addressed_to_you() {
             .is_none(),
         "absence, not a refusal: a sibling must not learn the item exists"
     );
-    // Prefix, because a fresh store also carries the public recess seed (0039).
     assert!(
         config::list(&conn, &cline, Some("recess_daily_time"))
             .unwrap()
@@ -125,7 +117,6 @@ fn define_refuses_an_address_the_caller_cannot_reach() {
     let conn = ellmephant::db::open(&paths).unwrap();
     tree(&conn);
 
-    // Stet cannot hand Cline — a SIBLING — a read it does not control.
     let err = config::define(
         &conn,
         &reader(&conn, "stet"),
@@ -139,7 +130,6 @@ fn define_refuses_an_address_the_caller_cannot_reach() {
     .expect_err("no amplification: a sibling is not a share");
     assert!(format!("{err}").contains("may not name"), "{err}");
 
-    // Downward is fine: stet may address its own child.
     config::define(
         &conn,
         &reader(&conn, "stet"),
@@ -152,7 +142,6 @@ fn define_refuses_an_address_the_caller_cannot_reach() {
     )
     .unwrap();
 
-    // And the root may address anything, which is the break-glass.
     config::define(
         &conn,
         &Reader::everything(),
@@ -204,7 +193,6 @@ fn an_existing_items_policy_is_not_rewritten_by_a_non_writer() {
     )
     .unwrap();
 
-    // Stet can READ it (public) but cannot take it over by redefining the ACL.
     let err = config::define(
         &conn,
         &reader(&conn, "stet"),
@@ -225,7 +213,6 @@ fn write_implies_read_the_setter_is_told_what_it_wrote() {
     let conn = ellmephant::db::open(&paths).unwrap();
     tree(&conn);
 
-    // Provisioned by the root: stet maintains it, James alone reads it.
     config::define(
         &conn,
         &Reader::everything(),
@@ -244,7 +231,6 @@ fn write_implies_read_the_setter_is_told_what_it_wrote() {
         "the reader boundary holds for a pen that is not a reader"
     );
 
-    // ...but a WRITE hands the row back. This is the documented consequence, not a leak to fix.
     let written = config::set(&conn, &stet, "stet", "maintained", "new", None).unwrap();
     assert_eq!(written.value, "new", "a writer learns the value it wrote");
     assert_eq!(

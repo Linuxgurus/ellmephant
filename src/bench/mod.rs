@@ -1,10 +1,3 @@
-//! P10 — turn the SPEC §13 estimates into numbers, and tune retrieval (PLAN §6 P10).
-//!
-//! Two instruments live here. [`timings`] measures the real load/embed/search latency against
-//! a live store, and [`evaluate`] scores a *golden* query set with recall@k and MRR. [`sweep`]
-//! walks the result count. Everything takes an [`Embedder`] trait object, so the whole module
-//! runs offline with the deterministic [`HashEmbedder`](crate::embed::HashEmbedder).
-
 use std::path::Path;
 use std::time::Instant;
 
@@ -15,25 +8,18 @@ use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::search::{self, MatchMode, Query};
 
-/// The cutoff the golden set is scored at unless it names its own (PLAN §6 P10).
 pub const DEFAULT_EVAL_K: usize = 3;
 
-/// Recall@[`DEFAULT_EVAL_K`] a golden set must clear to count as a pass (PLAN §6 P10).
 pub const RECALL_TARGET: f64 = 0.8;
 
-/// One golden query: a natural question and the keys that count as a hit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Case {
-    /// The user's question.
     pub query: String,
-    /// Accept-set of keys — any one landing in the top `k` is a hit (not an order).
     pub expect: Vec<String>,
-    /// Optional per-case cutoff; the caller's `k` applies when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k: Option<usize>,
 }
 
-/// Read a JSONL golden set: one [`Case`] per line, blank lines and `#` comments ignored.
 pub fn load_cases(path: &Path) -> Result<Vec<Case>> {
     let text = std::fs::read_to_string(path)?;
     let mut cases = Vec::new();
@@ -67,29 +53,21 @@ pub fn load_cases(path: &Path) -> Result<Vec<Case>> {
     Ok(cases)
 }
 
-/// The score of one golden-set run.
 #[derive(Debug, Clone, Serialize)]
 pub struct Eval {
-    /// Golden cases scored.
     pub cases: usize,
-    /// Cases with an expected key in the top `k`.
     pub hits: usize,
-    /// `hits / cases` (the recall@k PLAN §6 P10 gates on).
     pub recall: f64,
-    /// Mean reciprocal rank of the first expected key (0 for a miss).
     pub mrr: f64,
-    /// The cutoff applied where a case did not name its own.
     pub k: usize,
 }
 
 impl Eval {
-    /// Whether this run clears the agreed recall gate.
     pub fn passes(&self) -> bool {
         self.recall >= RECALL_TARGET
     }
 }
 
-/// The semantic query a golden case runs: the phrase against both embedded fields.
 fn case_query(case: &Case, k: usize) -> Query {
     Query {
         key: None,
@@ -113,8 +91,6 @@ fn case_query(case: &Case, k: usize) -> Query {
     }
 }
 
-/// Score `cases` against the live store: run each query and look for an expected key in the
-/// top `k`.
 pub fn evaluate(
     conn: &Connection,
     embedder: Option<&dyn Embedder>,
@@ -152,11 +128,8 @@ pub fn evaluate(
     })
 }
 
-/// The default result counts to sweep.
 pub const SWEEP_KS: [usize; 3] = [3, 5, 10];
 
-/// Walk every `k`, scoring the golden set for each (PLAN §6 P10: "sweep k"). Cases with their
-/// own `k` are cleared so the swept cutoff applies uniformly.
 pub fn sweep(
     conn: &Connection,
     embedder: Option<&dyn Embedder>,
@@ -177,22 +150,15 @@ pub fn sweep(
     Ok(out)
 }
 
-/// A latency distribution: `n` samples summarised, all in milliseconds.
 #[derive(Debug, Clone, Serialize)]
 pub struct Sample {
-    /// Samples taken.
     pub n: usize,
-    /// Arithmetic mean.
     pub mean_ms: f64,
-    /// Median.
     pub p50_ms: f64,
-    /// 95th percentile.
     pub p95_ms: f64,
-    /// Worst sample.
     pub max_ms: f64,
 }
 
-/// Summarise samples (milliseconds); empty input yields a zeroed [`Sample`].
 pub fn summarise(mut samples: Vec<f64>) -> Sample {
     let n = samples.len();
     if n == 0 {
@@ -218,24 +184,15 @@ pub fn summarise(mut samples: Vec<f64>) -> Sample {
     }
 }
 
-/// Measured latency and the scale it was measured at (SPEC §13, replaced with numbers).
 #[derive(Debug, Clone, Serialize)]
 pub struct Timings {
-    /// Indexed title vectors (the `N rows` the numbers are reported at).
     pub rows: i64,
-    /// Embedding dimension.
     pub dim: usize,
-    /// Time to load the encoder (measured by the caller), in milliseconds.
     pub load_ms: f64,
-    /// Document-embedding latency.
     pub embed: Sample,
-    /// Search latency (query embed + KNN + hydrate).
     pub search: Sample,
 }
 
-/// Measure embed and search latency. `samples` are embedded as documents; `queries` are run
-/// through [`search::run`]. A warmup embed is issued first so the first sample does not carry
-/// one-time costs (lazy allocations, thread-pool spin-up).
 pub fn timings(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -285,7 +242,6 @@ pub fn timings(
     })
 }
 
-/// The best-scoring configuration in a sweep, by recall then MRR.
 pub fn best(evals: &[Eval]) -> Option<&Eval> {
     evals.iter().max_by(|a, b| {
         a.recall

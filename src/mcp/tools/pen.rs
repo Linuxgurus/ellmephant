@@ -1,9 +1,3 @@
-//! The `pen` tool group, split out of `mcp/mod.rs` (soma/ellmephant#50).
-//!
-//! Each group is its own `#[tool_router]` impl, which is what makes the split possible:
-//! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
-//! into the one table the handler dispatches through.
-
 use crate::mcp::context::{caller_of, pen_name, reader_of};
 use crate::mcp::*;
 use rmcp::handler::server::wrapper::Parameters;
@@ -11,8 +5,6 @@ use rmcp::{tool, tool_router};
 
 #[tool_router(router = pen_tool_router, vis = "pub(crate)")]
 impl MemoryServer {
-    /// WHO this connection speaks for — the name a write would be stamped with, and whether it was
-    /// PROVEN. A read: it changes nothing, and it never returns the secret.
     #[tool(
         name = "whoami",
         description = "Report the identity this connection writes as: `asserted_by` (the `sender`/author a write is stamped with) and `proven` (true when `X-Stet-From` was matched against `X-Stet-Auth`). `proven: false` with `asserted_by: anonymous` means the connection presents no identity, so every write will be REFUSED (reads need no identity). Use this instead of guessing, and never to test credentials — it does not echo them.",
@@ -36,8 +28,6 @@ impl MemoryServer {
                     "proven": false
                 }),
             },
-            // A claim that did not verify still deserves an answer: the caller learns the name it
-            // sent is not the name it has, which is the whole confusion this tool exists to end.
             Some(crate::identity::Denied::Forged(claimed)) => serde_json::json!({
                 "asserted_by": crate::identity::ANONYMOUS,
                 "proven": false,
@@ -53,7 +43,6 @@ impl MemoryServer {
         Ok(json_ok(body))
     }
 
-    /// WHO a pen is, and what it is to THIS connection — the question a name alone cannot answer.
     #[tool(
         name = "whois",
         description = "Look up one pen and its relationship to the pen asking. Returns `name`, `kind` (`self`/`finger`), `parent`, `created`, `ceased` (the tombstone of a retired pen), `owns` (how many rows it answers for) and `relation` — a walk in single letters from YOU to it: `ME` for yourself, `P` parent, `PP` grandparent, `C` child, `S` sibling, `PS` uncle, `SC` nephew, `PSC` cousin, with an English word in quotes only where English is exact. `relation: null` means no common root. A name is an address, never a permission; this is what the address is attached to.",
@@ -69,8 +58,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<WhoisParams>,
     ) -> std::result::Result<String, String> {
-        // An unproven reader may still ask WHO a pen is — the tree is configuration, not content —
-        // it simply gets no walk, because it has not proved to be anybody.
         let viewer = pen_name(&ctx, self.declared.as_deref(), &self.paths)
             .unwrap_or_else(|_| crate::identity::ANONYMOUS.to_string());
         let pen = p.pen;
@@ -84,7 +71,6 @@ impl MemoryServer {
         ))
     }
 
-    /// CREATE a pen under this one — the runtime door (James, 2026-10-23).
     #[tool(
         name = "pen_mint",
         description = "Create a pen under the CALLER. The parent is the pen that calls, never an argument: you may create downward, never sideways and never upward, because parentage is the grant. A hand mints a finger; `estate`'s children come from provisioning, which is a different door. Returns the new pen's name, kind, parent, and its SECRET — shown once, because the store keeps only its hash. Hand the secret to the child; the minter can impersonate the child until it rotates with `pen_rotate`. `kind` is `self` or `finger` and is never inferred from the name. ★ A NAME IS SPENT: a retired pen keeps its row and its name, so minting over a dead name is refused with the retirement time — generate a unique name (e.g. `finger-9f3a1c`).",
@@ -101,7 +87,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MintParams>,
     ) -> std::result::Result<String, String> {
-        // A mint is a WRITE: it needs a pen, and the pen is the parent.
         let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let name = p.name;
         let kind = p.kind;
@@ -114,7 +99,6 @@ impl MemoryServer {
         ))
     }
 
-    /// ROTATE a credential — the caller's own, or a descendant's (2026-10-30).
     #[tool(
         name = "pen_rotate",
         description = "Replace a credential and return the NEW secret, once. Omitted `pen` rotates YOURS; naming a pen rotates a DESCENDANT. A pen may rotate itself or a descendant — never a peer and never an ancestor, because authority is granted downward and borrowed only by policy. The old secret stops working on the very next call: authentication reads the row and caches nothing. Use this after minting (the minter knows the child's secret until the child rotates) and after a leak. There is no read-back verb; a lost secret is recovered by rotating again.",
@@ -145,7 +129,6 @@ impl MemoryServer {
         ))
     }
 
-    /// LEND this pen's authority DOWN to a descendant — the thing that lets a finger act.
     #[tool(
         name = "pen_lend",
         description = "Lend your own authority to a DESCENDANT (a finger you minted) for `secs`. This is what permits `memory_upsert` with `as: <that pen>`: parentage alone is NOT enough, because a lend EXPIRES and can be REVOKED, and an inheritance can do neither. Downward lending needs no policy row — parentage already grants it; `sudo` is for borrowing somebody else's authority across or upward, and that does need one. Returns the session: its id, the two pens, `expires_at`, and `via` (the session it was passed from, when it was).",
@@ -174,7 +157,6 @@ impl MemoryServer {
         ))
     }
 
-    /// BORROW a pen's authority — bounded by policy, expiring, revocable.
     #[tool(
         name = "sudo",
         description = "Borrow `powerful`'s authority for `secs`. Needs a `sudoers` policy naming you as the borrower and this pair — authority is GRANTED, never assumed — and the duration cannot exceed the policy's ceiling. This is how `estate` is used at all: it is a real pen with no identity behind it, so nobody can authenticate as it and its universal reach is only ever somebody's borrow. Returns the session: id, both pens, `expires_at`. ★ No cache: every check reads the row, so a release or an expiry takes effect on the very next call.",
@@ -203,7 +185,6 @@ impl MemoryServer {
         ))
     }
 
-    /// PASS a live session down to a descendant.
     #[tool(
         name = "sudo_pass",
         description = "Hand a live session of yours DOWN to a descendant of yours, for no longer than you have left. Downward only: passing sideways would arm a peer, and passing up would return authority to its source. The receiver's session dies with yours. Returns the new session with `via` naming the one it came from.",
@@ -235,7 +216,6 @@ impl MemoryServer {
         ))
     }
 
-    /// END a session, and everything passed down from it.
     #[tool(
         name = "sudo_release",
         description = "End your session for `powerful`, and every session passed down from it. Revocation cascades by `via`, so a hand letting go also ends its fingers' sessions — a revocation that left copies running would not be one. Takes effect on the next call: there is no lookup cache to expire.",
@@ -266,7 +246,6 @@ impl MemoryServer {
         ))
     }
 
-    /// WHO HOLDS WHAT, UNTIL WHEN — the question an agent asks before it acts on borrowed authority.
     #[tool(
         name = "sudo_sessions",
         description = "List LIVE borrowed authority: every session with its borrower, the pen it is borrowing, when it expires, whether it came from a policy or a lend, and which session it was passed from. Omit `pen` to see all pens (the operator's question before an audit); name one to see only that pen's. A session that has EXPIRED is not listed — expiry is the mechanism, and this is how you see it without guessing. Read-only.",

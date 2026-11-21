@@ -485,6 +485,14 @@ fn search_params(p: &Params) -> Result<SearchParams, String> {
             .maybe("key_prefix")
             .map(|v| bool_param(v, "key_prefix"))
             .transpose()?,
+        orphans: p
+            .maybe("orphans")
+            .map(|v| bool_param(v, "orphans"))
+            .transpose()?,
+        untagged: p
+            .maybe("untagged")
+            .map(|v| bool_param(v, "untagged"))
+            .transpose()?,
         title: p.maybe("title").map(ToString::to_string),
         status: p.maybe("status").map(ToString::to_string),
         fields,

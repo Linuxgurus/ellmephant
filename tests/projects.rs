@@ -438,6 +438,8 @@ fn a_project_tag_is_how_memories_join() {
             updated_before: None,
             key: None,
             key_prefix: false,
+            orphans: false,
+            untagged: false,
             title: None,
             status: None,
         };

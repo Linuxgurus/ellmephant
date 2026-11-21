@@ -126,6 +126,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             updated_before: None,
             key: None,
             key_prefix: None,
+            orphans: None,
+            untagged: None,
             title: None,
             status: None,
             fields: p.fields,
@@ -174,6 +176,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         let updated_before = p.updated_before;
         let key = p.key;
         let key_prefix = p.key_prefix.unwrap_or(false);
+        let orphans = p.orphans.unwrap_or(false);
+        let untagged = p.untagged.unwrap_or(false);
         let title = p.title;
         let status = p.status;
         let fields = Fields::selection(p.fields.into_iter().map(FieldParam::to_field));
@@ -198,6 +202,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
                     updated_before,
                     key,
                     key_prefix,
+                    orphans,
+                    untagged,
                     title,
                     status,
                 };

@@ -103,6 +103,8 @@ fn search_shows_it_to_the_author_and_nobody_else() -> Result<()> {
         updated_before: None,
         key: None,
         key_prefix: false,
+        orphans: false,
+        untagged: false,
         title: None,
         status: None,
     };
@@ -148,6 +150,8 @@ fn a_tag_filter_does_not_answer_questions_about_hidden_rows() -> Result<()> {
         updated_before: None,
         key: None,
         key_prefix: false,
+        orphans: false,
+        untagged: false,
         title: None,
         status: None,
     };
@@ -287,6 +291,8 @@ fn all_q() -> Query {
         updated_before: None,
         key: None,
         key_prefix: false,
+        orphans: false,
+        untagged: false,
         title: None,
         status: None,
     }

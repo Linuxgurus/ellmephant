@@ -356,12 +356,14 @@ mod tests {
                 "max_distance",
                 "min_chars",
                 "mode",
+                "orphans",
                 "pattern",
                 "query",
                 "semantic_only",
                 "status",
                 "tags",
                 "title",
+                "untagged",
                 "updated_after",
                 "updated_before"
             ]

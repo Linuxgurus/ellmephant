@@ -53,7 +53,7 @@ so a client that falls back between them must `initialize` twice:
 | endpoint | `tools/list` | for |
 | --- | --- | --- |
 | `/mcp` | every tool | clients that cannot call REST (opencode, TypingMind, fingers) |
-| `/mcp/core` | [`CORE_TOOLS`] — recall, writes, projects, communication | a brain that can call the REST API for the rest |
+| `/mcp/core` | the `core` rows of [`TOOLS`] — recall, writes, projects, communication | a brain that can call the REST API for the rest |
 
 The split is an **advertisement**, not a permission: a client on `/mcp/core` that names a non-core
 tool still reaches it. `GET /api` is the surface map: every op, the core door's included, one entry
@@ -133,7 +133,7 @@ rather than a mechanism.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 
-The MCP surface is 59 tools (`TOOLS` in `src/mcp/mod.rs`) and every one of them has a route. A second door that cannot reach the same
+The MCP surface is 64 tools (`TOOLS` in `src/mcp/catalog.rs`) and every one of them has a route. A second door that cannot reach the same
 core is a door with a queue in front of it: boot over HTTP, still write over MCP, and a wedged MCP
 leaves the agent **read-only**. So every tool gets a route over the same `Session` call, and MCP
 becomes a compatibility shim for clients that speak it rather than a dependency of the agent.
@@ -494,7 +494,7 @@ Under `?format=json` every error is `{"error": "...", "status": N}`, so a script
 
 ### Tests (`tests/http.rs`, offline, fake embedder)
 
-1. **Parity is enforced, not asserted by hand**: every name in `TOOLS` must appear in the route table and
+1. **Parity is enforced, not asserted by hand**: every row of `TOOLS` must appear in the route table and
    the table's length must equal `TOOLS.len()`. A tool added without a route fails the suite.
 2. **Telemetry**: `GET /memory/{key}` advances `visits` by one, exactly as `memory_get` does — the one
    write a read may make. No other `GET` touches a counter.

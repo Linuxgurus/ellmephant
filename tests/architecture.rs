@@ -51,6 +51,44 @@ fn only_ops_places_the_channel_gate() {
     }
 }
 
+/// What this checks: no second `const`/`static` item named `*TOOLS` under `src/` outside the
+/// catalog. What it does not check: a list under another name, a function-local slice, a
+/// runtime `Vec`, a `match` arm, or anything under `tests/`. The name says exactly the former.
+#[test]
+fn no_second_const_named_tools() {
+    for (path, text) in sources(&root().join("src")) {
+        if path.ends_with("mcp/catalog.rs") {
+            continue;
+        }
+        for line in code_only(&text).lines() {
+            let line = line.trim();
+            let Some(item) = item_after_visibility(line) else {
+                continue;
+            };
+            let declares = item.starts_with("const ") || item.starts_with("static ");
+            assert!(
+                !(declares && item.contains("TOOLS")),
+                "{}: `{line}` is a second list of tool names — put the row in \
+                 `mcp::catalog::TOOLS` (membership is one fact, stated once)",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Strip a leading `pub`/`pub(..)` and return the rest of the item, if the line declares one.
+fn item_after_visibility(line: &str) -> Option<&str> {
+    let rest = match line.strip_prefix("pub") {
+        Some(rest) if rest.starts_with('(') => {
+            let close = rest.find(')')?;
+            rest[close + 1..].trim_start()
+        }
+        Some(rest) => rest.trim_start(),
+        None => line,
+    };
+    Some(rest)
+}
+
 #[test]
 fn identity_is_built_in_one_place_per_door() {
     let mut http = 0;

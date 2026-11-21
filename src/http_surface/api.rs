@@ -40,7 +40,7 @@ pub(super) fn api_op(route: &Route, card: &crate::mcp::ToolCard, full: bool) -> 
         "group": crate::mcp::group_of(route.tool),
         "method": route.method,
         "path": route.path,
-        "core": crate::mcp::CORE_TOOLS.contains(&route.tool),
+        "core": crate::mcp::is_core(route.tool),
         "read_only": read_only,
         "destructive": destructive,
         "description": description,

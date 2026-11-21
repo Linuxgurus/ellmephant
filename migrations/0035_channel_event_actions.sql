@@ -1,12 +1,3 @@
--- THE EVENT TABLE MUST ACCEPT EVERY ACTION THE CODE WRITES (#159/#165 review).
---
--- 0032 was edited by later PRs to widen its CHECK, which is a deployment hazard: a store that
--- migrated at the earlier version never re-runs it, so a later action (retention, expiry, and now a
--- membership change) fails the CHECK forever — silently, because the expiry write is best-effort.
---
--- ★ MIGRATIONS ARE IMMUTABLE ONCE THEY CAN MERGE. SQLite cannot ALTER a CHECK, so widening it is a
--- table rebuild: create, copy, drop, rename, re-index. This migration is the one place the action set
--- lives, and adding an action is a new migration, never an edit to an old file.
 CREATE TABLE channel_event_new (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      TEXT NOT NULL DEFAULT (datetime('now')),

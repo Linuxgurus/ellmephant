@@ -1,12 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// `GET /memory/{key}` — one memory whole. Counts a `visits` read, exactly as `memory_get` does: the
-/// one write a read may make, because a counter is not data (HTTP.md invariant 1).
 pub async fn memory_get(
     server: Server,
     caller: crate::identity::Caller,
@@ -20,27 +13,21 @@ pub async fn memory_get(
         Ok(v) => v,
         Err(msg) => return Err(ApiError::bad(json, msg)),
     };
-    // `?version=N` reads a PAST state: by address, so the live row need not exist, and counting no
-    // visit — `visits` measures the memory, not a state the memory held.
     if let Some(n) = version {
         let lookup = key.clone();
         return match server
             .with_read("memory_get", reader.clone(), move |s| s.version(&lookup, n))
             .await
         {
-            Ok(Some(past)) => {
-                // A PAST state is read by address: its owner rides inside `content`, and a walk is
-                // for a pen that still answers, so no relation is printed here.
-                present(
-                    StatusCode::OK,
-                    json,
-                    &MemoryCard {
-                        mem: &past,
-                        relation: None,
-                        version: Some(n),
-                    },
-                )
-            }
+            Ok(Some(past)) => present(
+                StatusCode::OK,
+                json,
+                &MemoryCard {
+                    mem: &past,
+                    relation: None,
+                    version: Some(n),
+                },
+            ),
             Ok(None) => Err(ApiError::not_found(
                 json,
                 format!("no such version: {key} {n}"),
@@ -52,15 +39,12 @@ pub async fn memory_get(
     match server
         .with_read("memory_get", reader, move |s| {
             let mem = s.show(&lookup)?;
-            // The relation belongs to the READER, so it is computed where the proven pen is known.
             let relation = s.owner_relation(&mem);
             Ok((mem, relation))
         })
         .await
     {
         Ok((mut mem, relation)) => {
-            // Count the read best-effort (see `MemoryServer::bump_visit`): telemetry never makes a
-            // reader wait, so a write in flight means this visit goes uncounted.
             if let Some(seen) = server.bump_visit(&key) {
                 mem.visits = seen;
             }
@@ -78,7 +62,6 @@ pub async fn memory_get(
     }
 }
 
-/// `GET /unowned` — the rows nobody owns, and why (`memory_unowned`).
 pub async fn unowned(
     server: Server,
     caller: crate::identity::Caller,
@@ -122,7 +105,6 @@ pub async fn unowned(
     }
 }
 
-/// `GET /memory/{key}/backlinks` — incoming `[[…]]` edges (`memory_backlinks`).
 pub async fn backlinks(
     server: Server,
     caller: crate::identity::Caller,
@@ -143,7 +125,6 @@ pub async fn backlinks(
     }
 }
 
-/// `GET /dangling` — every broken `[[…]]` edge, one row per referrer (`memory_dangling`).
 pub async fn dangling(
     server: Server,
     caller: crate::identity::Caller,
@@ -163,11 +144,6 @@ pub async fn dangling(
     }
 }
 
-/// `GET /history` — one key's versions (`?key=…`), or the index of every key holding one.
-///
-/// A TOP-LEVEL path on purpose: history is not a sub-resource of a live memory. The case it exists
-/// for — an orphan, whose row is gone — has no `/memory/{key}` to hang from, and a path that implied
-/// the memory still existed would be wrong for exactly the caller who needs it most.
 pub async fn history(
     server: Server,
     caller: crate::identity::Caller,
@@ -203,7 +179,6 @@ pub async fn history(
                 Err(e) => Err(ApiError::store(json, e)),
             }
         }
-        // No key: the INDEX. Nothing else lists keys that are gone, so this is how an orphan is found.
         None => match server
             .with_read("memory_history", reader, move |s| {
                 s.version_index(orphans_only)
@@ -224,7 +199,6 @@ pub async fn history(
     }
 }
 
-/// `GET /search` — the same query surface as `memory_search`, same bytes.
 pub async fn search(
     server: Server,
     caller: crate::identity::Caller,
@@ -243,8 +217,6 @@ pub async fn search(
     }
 }
 
-/// `GET /semantic` — the store-wide search (`semantic_search`): an optional `type`, and
-/// `deleted=true` for the graveyard. Same body as the tool, by construction.
 pub async fn semantic_search(
     server: Server,
     caller: crate::identity::Caller,
@@ -268,8 +240,6 @@ pub async fn semantic_search(
             }
         }
     }
-    // `bool_param` is fallible, and this handler answers `Response` rather than `Result`, so the
-    // error becomes a 400 here instead of `?` (which cannot be used in this return type).
     let deleted = match params.maybe("deleted") {
         Some(v) => match bool_param(v, "deleted") {
             Ok(b) => Some(b),
@@ -291,9 +261,6 @@ pub async fn semantic_search(
     }
 }
 
-/// `GET /dupes` — near-duplicate candidate pairs (`memory_dupes`). `?plan=1` (or `?plan=true`)
-/// answers the merge plan instead: one keeper/absorb step per duplicate CLUSTER, and a named refusal
-/// for every other pair.
 pub async fn dupes(
     server: Server,
     caller: crate::identity::Caller,

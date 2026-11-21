@@ -1,11 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// `POST /claim` — take or renew an atomic lease (`claim_acquire`); JSON body of the tool's args.
 pub async fn claim_acquire(
     State(state): State<HttpState>,
     server: Server,
@@ -69,7 +63,6 @@ pub async fn claim_acquire(
     }
 }
 
-/// `POST /claim/{key}/release` — drop your own lease (`claim_release`). `owner` from body or query.
 pub async fn claim_release(
     State(state): State<HttpState>,
     server: Server,
@@ -98,8 +91,6 @@ pub async fn claim_release(
             "missing `owner`",
         ));
     };
-    // ★ THE HTTP SURFACE HAS NO PEN, ONLY A STORE-WIDE TOKEN, so it cannot check ancestry. It keeps
-    // the owner check and says so: an ancestor release is an MCP act, where the caller is proven.
     match server
         .with_store("claim_release", move |s| {
             s.claim_release(&name, &owner, None)
@@ -137,7 +128,6 @@ pub async fn claim_release(
     }
 }
 
-/// `GET /claim` — every claim, live or expired (`claim_list`).
 pub async fn claims(
     State(_state): State<HttpState>,
     server: Server,

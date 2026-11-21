@@ -1,13 +1,3 @@
-//! One live store session: the store handle the server and the CLI share (PLAN §6 P6).
-//!
-//! It owns a single writer connection (SPEC §15 #10) and loads the Qwen3 encoder lazily, so a
-//! command that never embeds (say `doctor`) never pays for 1.2 GB of weights while a running server
-//! keeps the model warm across calls (the reason v1 has no daemon — PLAN §2 #4).
-//!
-//! The surface is deliberately kept to what `mcp` and `doctor` actually reach for. A wrapper with
-//! no caller reads like a load-bearing one, and this file collected several: `paths`, `rename`,
-//! `dangling`, `tags` and `keys` all sat here, unused, for as long as they did.
-
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -20,28 +10,14 @@ use crate::model;
 use crate::search::{self, Bundle, Query};
 use crate::store::{self, Memory, channel, claim, config, encode, links, mail, maintain, project};
 
-/// The store's encoder: lazily loaded, and shared by the writer and by every reader.
-///
-/// **Lock-free after the load, and that is the fix, not a detail.** Embedding is the slow part of a
-/// write (~1.3-8.5 s per KB of body), and it used to run while the caller held the store lock — which
-/// is what turned one write into a store-wide stall. Giving the encoder its own lock only *moved* the
-/// stall: a semantic search then waited out the write's entire embed instead of the store's. So there
-/// is no lock over the weights at all. `Embedder` is `Send + Sync` for exactly this: two inferences at
-/// once contend for CPU and both finish, where serializing them makes the reader wait for the writer.
-///
-/// Loading happens once, on first use: ~1.2 GB of weights that a command which never embeds never
-/// pays for, while a running server keeps them warm across calls.
 pub struct Encoder {
     spec: model::Spec,
     cfg: Config,
-    /// The weights. A `OnceLock`, deliberately not a mutex — see the note above.
     inner: std::sync::OnceLock<Box<dyn Embedder>>,
-    /// Held only while the weights LOAD — once, ever — never while they are used.
     loading: std::sync::Mutex<()>,
 }
 
 impl Encoder {
-    /// A shared handle over the weights, not yet loaded.
     pub fn new(spec: model::Spec, cfg: Config) -> Arc<Self> {
         Arc::new(Self {
             spec,
@@ -51,19 +27,13 @@ impl Encoder {
         })
     }
 
-    /// Run `f` with the encoder, loading it on first use.
     pub fn with<T>(&self, f: impl FnOnce(&dyn Embedder) -> Result<T>) -> Result<T> {
         if let Some(embedder) = self.inner.get() {
             return f(embedder.as_ref());
         }
-        // Only the first use arrives here, and two threads may arrive together: this lock serializes
-        // the LOAD. It is released before `f`, so the first caller's work cannot block a second
-        // caller's load.
         {
             let _loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
             if self.inner.get().is_none() {
-                // Log both ends: a "stuck" first search in `docker logs` must be visibly a model
-                // load, not a hang.
                 tracing::info!(
                     model = %self.cfg.model,
                     device = %self.cfg.device,
@@ -74,7 +44,6 @@ impl Encoder {
                 let started = std::time::Instant::now();
                 let loaded: Box<dyn Embedder> =
                     Box::new(crate::embed::load_embedder(&self.spec, &self.cfg)?);
-                // Losing a race is fine: whoever set it first loaded the same weights.
                 let _ = self.inner.set(loaded);
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -85,17 +54,11 @@ impl Encoder {
         f(self.inner.get().expect("set just above").as_ref())
     }
 
-    /// Inject a pre-built encoder instead of loading Qwen3 — the MCP and HTTP harnesses feed a
-    /// deterministic fake so their round trips need no weights (PLAN §7). Must run before first use.
     pub fn inject(&self, embedder: Box<dyn Embedder>) {
         let _ = self.inner.set(embedder);
     }
 }
 
-/// The visibility rule for history, WITHOUT the audit side effect: a search asks "may this reader
-/// see it" for rows it is not returning, and logging a read for a row nobody read would be a lie
-/// in the ledger. The rule is `version_guard`'s: the row's audience, or — for an orphan — the
-/// audience in its latest snapshot, which is the last thing it said about who may read it.
 fn reader_allows(conn: &Connection, reader: &crate::store::audience::Reader, key: &str) -> bool {
     let class = match store::get(conn, key) {
         Ok(Some(mem)) => Some(mem.audience),
@@ -110,37 +73,21 @@ fn reader_allows(conn: &Connection, reader: &crate::store::audience::Reader, key
     };
     match class {
         Some(a) => reader.sees(&a),
-        // No row and no recorded class: a snapshot from before the audience travelled with the
-        // version. Treated as NOT VISIBLE — a content search must not be the door through which an
-        // unclassed private body becomes readable. Older history keeps its address-gated doors, which
-        // resolve the same `None` the other way; that divergence is stated on #226 rather than
-        // papered over, because tightening `version_guard` is its own change.
         None => false,
     }
 }
 
-/// A store handle: one connection, the settings, and a share of the encoder.
 pub struct Session {
     paths: Paths,
     cfg: Config,
     conn: Connection,
     encoder: Arc<Encoder>,
-    /// WHO this session reads as. The CLI holds the file, so it is [`Reader::everything`] by default
-    /// — the honest limit of the private tier (#54). A DOOR replaces it with the connection's proven
-    /// pen, and then every read below filters through it.
     reader: store::audience::Reader,
-    /// ★ AN AUDIT IS A WRITE (#129). A read-only session still has to be able to RECORD that it
-    /// crossed a boundary, and a read-only connection cannot. Opened lazily, on the rare act that
-    /// needs it, so the ordinary read path pays nothing for the audit and the audit still happens
-    /// where it matters. `None` until then, and `Some` for a writer session, which can just use its
-    /// own connection.
     audit_conn: std::cell::RefCell<Option<Connection>>,
-    /// True for a door's read-only session: it may READ the store and may still WRITE its audit.
     read_only: bool,
 }
 
 impl Session {
-    /// Open (creating if needed) the store and hold the connection.
     pub fn open(paths: Paths, cfg: Config, spec: model::Spec) -> Result<Self> {
         let conn = db::open_with(&paths, &cfg)?;
         let encoder = Encoder::new(spec, cfg.clone());
@@ -155,14 +102,10 @@ impl Session {
         })
     }
 
-    /// A READ-ONLY session: its own connection, the shared encoder, and no store lock. This is how a
-    /// read is served while a write is in flight — the writer holds its session for the whole write,
-    /// embedding included, so a read that queued on it would wait out the write.
     pub fn read_only(paths: &Paths, cfg: Config, encoder: Arc<Encoder>) -> Result<Self> {
         Self::read_only_as(paths, cfg, encoder, store::audience::Reader::everything())
     }
 
-    /// A read-only session that reads as one pen (or as nobody): the door's shape.
     pub fn read_only_as(
         paths: &Paths,
         cfg: Config,
@@ -170,10 +113,6 @@ impl Session {
         reader: store::audience::Reader,
     ) -> Result<Self> {
         let conn = db::open_read_only(paths)?;
-        // ★ PARENTAGE IS THE GRANT, resolved at use (#109): the reader reaches down into its own
-        // subtree, so an ancestor may read what a descendant addressed to itself — the doctor's
-        // licence, and what makes cluster-wide hygiene possible without being the author.
-        // …and a held session widens it to the pen being borrowed, for as long as the row says so.
         let reader = reader.in_tree(&conn).with_borrowed(&conn);
         Ok(Self {
             paths: paths.clone(),
@@ -186,75 +125,47 @@ impl Session {
         })
     }
 
-    /// The reader this session sees with.
     pub fn reader(&self) -> &store::audience::Reader {
         &self.reader
     }
 
-    /// Inject a pre-built encoder (see [`Encoder::inject`]) — the test harnesses' fake.
     pub fn with_embedder(self, embedder: Box<dyn Embedder>) -> Self {
         self.encoder.inject(embedder);
         self
     }
 
-    /// The store root, so a reader can open a connection of its own.
     pub fn paths(&self) -> &Paths {
         &self.paths
     }
 
-    /// The shared encoder, for a reader that needs the same warm weights.
     pub fn encoder(&self) -> Arc<Encoder> {
         Arc::clone(&self.encoder)
     }
 
-    /// The settings a reader needs (`default_k`, `default_max_distance`) without the store lock.
     pub fn cfg(&self) -> &Config {
         &self.cfg
     }
 
-    /// The vector space this store is configured for.
-    ///
-    /// The write path needs exactly two things from the embedder — the model id and the dimension, to
-    /// fingerprint a document — and both are config. That is what lets a write run without loading
-    /// 1.2 GB of weights (`ENCODE-WORKER.md`).
     pub fn vec_spec(&self) -> VecSpec {
         VecSpec::new(self.cfg.model.clone(), self.cfg.dim)
     }
 
-    /// Default result count for searches with no explicit `-k` (SPEC §12 config).
     pub fn default_k(&self) -> usize {
         self.cfg.default_k
     }
 
-    /// Default cosine-distance ceiling applied when a search omits `max_distance`
-    /// (SPEC §10). `None` means the cap is off.
     pub fn default_max_distance(&self) -> Option<f32> {
         self.cfg.default_max_distance
     }
 
-    /// Upsert a memory from a partial patch (SPEC §7): `None` fields keep their stored value, so one
-    /// field can change without resending the row.
-    ///
-    /// **No encoder.** The document is queued, not embedded (`ENCODE-WORKER.md`), so a write holds
-    /// nothing slower than a row insert — that coupling is what this whole design removes.
     pub fn memory_merge(&self, patch: &store::Patch) -> Result<store::MergeOutcome> {
         store::merge(&self.conn, patch)
     }
 
-    /// Fetch one memory by key without counting a visit. Not public API: `fetch` is the read path on
-    /// both doors, and the only caller is [`Self::fetch`] itself.
     pub(crate) fn show(&self, key: &str) -> Result<Memory> {
-        // ABSENCE, not refusal: a row this reader may not see is answered exactly as a key that was
-        // never written. A distinct "private" error would confirm the row exists, which is the
-        // disclosure the tier is for.
         match store::get(&self.conn, key)? {
             Some(mem) if self.reader.sees(&mem.audience) => {
-                // ★ A READ THAT CROSSED A BOUNDARY IS RECORDED (#129). An ancestor reading down its
-                // subtree is the one act the tier allowed and did not log; best effort, never fatal.
                 if self.reader.crosses(&mem.audience) {
-                    // ★ WHICH MECHANISM (adversarial review, 2026-10-24): reached by parentage, or by a
-                    // session this pen was lent? Recording both as `subtree` would make the log claim an
-                    // ancestor read for a read that no ancestry explains.
                     let why = if self.reader.is_borrowed(&mem.audience) {
                         store::audit::Why::Borrowed
                     } else {
@@ -268,22 +179,18 @@ impl Session {
         }
     }
 
-    /// May `proven` be credited as `claimed` on a write? (Live lend required.)
     pub fn may_act_as(&self, proven: &str, claimed: &str) -> Result<()> {
         store::may_act_as(&self.conn, proven, claimed)
     }
 
-    /// Lend this pen's own authority down to a descendant, for `secs` — it expires and can be revoked.
     pub fn lend(&self, powerful: &str, weak: &str, secs: i64) -> Result<store::sudo::Session> {
         store::sudo::lend(&self.conn, powerful, weak, secs)
     }
 
-    /// Borrow `powerful`'s authority for `secs` (needs a policy row).
     pub fn sudo(&self, weak: &str, powerful: &str, secs: i64) -> Result<store::sudo::Session> {
         store::sudo::sudo(&self.conn, weak, powerful, secs)
     }
 
-    /// Pass a live session down to a descendant.
     pub fn sudo_pass(
         &self,
         weak: &str,
@@ -294,17 +201,14 @@ impl Session {
         store::sudo::pass(&self.conn, weak, powerful, to, secs)
     }
 
-    /// End a session and its pass-down chain.
     pub fn sudo_release(&self, weak: &str, powerful: &str) -> Result<usize> {
         store::sudo::release(&self.conn, weak, powerful)
     }
 
-    /// Who holds what, right now — all pens, or one.
     pub fn sudo_sessions(&self, weak: Option<&str>) -> Result<Vec<store::sudo::Session>> {
         store::sudo::live_sessions(&self.conn, weak)
     }
 
-    /// End a session for `target` (defaulting to the caller) — an ancestor may end a descendant's.
     pub fn sudo_release_of(
         &self,
         caller: &str,
@@ -317,26 +221,18 @@ impl Session {
         }
     }
 
-    /// Mint a pen under `caller` — the runtime door.
     pub fn mint(&self, caller: &str, name: &str, kind: &str) -> Result<store::Minted> {
         store::mint(&self.conn, caller, name, kind)
     }
 
-    /// Replace a credential: the caller itself, or a descendant. Returns the new secret ONCE.
     pub fn rotate_credential(&self, caller: &str, target: &str) -> Result<String> {
         store::credential::rotate(&self.conn, Some(caller), target)
     }
 
-    /// One pen as `viewer` sees it — the tree through this session's connection.
     pub fn whois(&self, viewer: &str, pen: &str) -> Result<store::Whois> {
         store::whois(&self.conn, viewer, pen)
     }
 
-    /// What this row's owner is TO THE READER, in the settled letters (`PS "uncle"`, `ME`, …).
-    ///
-    /// ★ A NAME IS AN ADDRESS, and this is the rest of the sentence: `owner` says who answers for a
-    /// row, and the walk says what that pen is to the one asking (James, 2026-10-23). `None` when
-    /// there is no owner (the commons), no proven reader, or no common root — absence, never a guess.
     pub fn owner_relation(&self, mem: &Memory) -> Option<String> {
         let viewer = self.reader.pen_name()?;
         let owner = mem.owner.as_deref()?;
@@ -346,10 +242,6 @@ impl Session {
             .map(|k| k.gloss())
     }
 
-    /// Retire one memory into another: repoint every reference, then delete the source. The prose
-    /// fold is the caller's — this never touches `into`'s body. No encoder: the graph is not
-    /// embedded. (Distinct from [`memory_merge`](Self::memory_merge), which is the *field* patch
-    /// behind `memory_upsert`.)
     pub fn merge_into(
         &self,
         from: &str,
@@ -359,8 +251,6 @@ impl Session {
         links::merge_into(&self.conn, from, into, acted_by)
     }
 
-    /// Continue a subject with one line — one call, no read, no body resend (`memory_append`).
-    /// See [`store::append`] for why the cheap verb is the point.
     pub fn append(
         &self,
         key: &str,
@@ -371,8 +261,6 @@ impl Session {
         store::append::append(&self.conn, key, line, acted_by, force)
     }
 
-    /// Fold one row's lines into another WITHOUT deleting the source and WITHOUT write authority on
-    /// the keeper — the append-only cross-pen maintenance verb (#199).
     pub fn fold_into(
         &self,
         from: &str,
@@ -382,80 +270,49 @@ impl Session {
         links::fold_into(&self.conn, from, into, acted_by)
     }
 
-    /// Fetch one memory and count the read (`visits`, SPEC §9 telemetry) — the read path's entry
-    /// point, backing `memory_get` on **both** doors: MCP's tool and `GET /memory/{key}`.
-    ///
-    /// This one WRITES the counter, so it belongs to the writer's session. The read door serves the
-    /// row from a read-only connection and then bumps the count best-effort ([`Self::record_visit`]);
-    /// a read must never wait for its own telemetry.
     pub fn fetch(&self, key: &str) -> Result<Memory> {
         let mut mem = self.show(key)?;
         mem.visits = store::record_visit(&self.conn, key)?;
         Ok(mem)
     }
 
-    /// Count one read (`visits`) on this session's connection.
     pub fn record_visit(&self, key: &str) -> Result<i64> {
         store::record_visit(&self.conn, key)
     }
 
-    /// Bump `times_useful` for many keys at once. Returns `(key, new_total)` for the keys that
-    /// existed and the keys that did not, both in input order — a missing key is not an error.
     pub fn record_useful_many(&self, keys: &[String]) -> Result<store::UsefulSweep> {
         store::record_useful_many(&self.conn, keys)
     }
 
-    /// Find near-duplicate candidate pairs (the merge finder, SPEC §9). No encoder needed —    /// it reads the stored document vectors.
     pub fn dupes(&self, max_distance: f32, limit: usize) -> Result<Vec<store::dupes::DupePair>> {
         store::dupes::find_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
-    /// The merge plan behind the finder (#219): a keeper/loser step per `duplicate` pair, and a
-    /// refusal carrying its class and reason for every other pair.
     pub fn dupes_plan(&self, max_distance: f32, limit: usize) -> Result<store::dupes::MergePlan> {
         store::dupes::plan_seen(&self.conn, &self.reader, max_distance, limit)
     }
 
-    /// Rows nobody owns, newest first — the list behind the counts, filtered by this session's reader.
     pub fn unowned(&self, limit: i64) -> Result<Vec<store::Unowned>> {
         store::unowned(&self.conn, &self.reader, limit)
     }
 
-    /// Delete one memory by key; `false` means there was nothing to delete.
-    ///
-    /// `acted_by` is the proven pen the door is acting for: a delete is a write of absence, so it
-    /// takes the same reach as an edit and leaves a ledger row saying who removed it.
     pub fn rm(&self, key: &str, acted_by: Option<&str>) -> Result<bool> {
         store::delete(&self.conn, key, acted_by)
     }
 
-    /// Take responsibility for a row (`memory_adopt`). A finger's parent is what owns, so this
-    /// adopts as the parent.
     pub fn adopt(&self, key: &str, pen: &str, force: bool) -> Result<()> {
         store::adopt(&self.conn, key, pen, force)
     }
 
-    /// Give a row to another pen (`memory_adopt` with `to`). Authorization lives in
-    /// `store::assign`: self or subtree, or a live borrow of `estate`.
     pub fn assign(&self, key: &str, actor: &str, to: &str, force: bool) -> Result<()> {
         store::assign(&self.conn, key, actor, to, force)
     }
 
-    /// One key's versions, oldest first, WITHOUT bodies — enough to choose a version before paying
-    /// for one (`store::version`). An empty list is a fact and not an error: a key with no history
-    /// reads the same whether it never existed or never changed.
-    ///
-    /// Deliberately by KEY, never resolved through the `memory` row: a key that is GONE still has
-    /// history, and that history is then the only copy of what it said.
     pub fn versions(&self, key: &str) -> Result<Vec<store::version::Version>> {
         self.version_guard(key)?;
         store::version::history(&self.conn, key)
     }
 
-    /// ★ VERSIONS HOLD THE BODY, so history is gated by the row's CURRENT class (the decision #54
-    /// asked to state rather than discover): a note that went private takes its past with it. A key
-    /// with no live row is classed by its NEWEST snapshot, because that is the last thing it said
-    /// about who could read it — and a private note's history must not outlive the note in public.
     fn version_guard(&self, key: &str) -> Result<()> {
         let class: Option<String> = match store::get(&self.conn, key)? {
             Some(mem) => Some(mem.audience),
@@ -468,10 +325,6 @@ impl Session {
         match class {
             Some(audience) if !self.reader.sees(&audience) => Err(Error::NotFound(key.to_string())),
             Some(audience) => {
-                // ★ A PAST STATE IS STILL THE ROW (found reviewing #129). `version()` and `versions()`
-                // both come through here, and both can hand an ancestor the contents of a descendant's
-                // private row — so the boundary is crossed on this path too and must be recorded, or
-                // the audit covers `memory_get` and nothing else.
                 if self.reader.crosses(&audience) {
                     self.audit(
                         Some(key),
@@ -485,8 +338,6 @@ impl Session {
         }
     }
 
-    /// One version's snapshot, in the SAME shape as a live memory ([`Memory`]), so a caller handles a
-    /// past state and a present one alike. `None` means no such version; the address need not exist.
     pub fn version(&self, key: &str, n: i64) -> Result<Option<Memory>> {
         self.version_guard(key)?;
         match store::version::read(&self.conn, key, n)? {
@@ -495,8 +346,6 @@ impl Session {
         }
     }
 
-    /// The INDEX of history: every key that holds versions, with counts and an `orphan` flag. This is
-    /// how a deleted key is found at all — nothing else in the store lists keys that are gone.
     pub fn version_index(&self, orphans_only: bool) -> Result<Vec<store::version::HistoryIndex>> {
         let mut rows = store::version::index(&self.conn)?;
         rows.retain(|r| self.version_guard(&r.key).is_ok());
@@ -506,11 +355,6 @@ impl Session {
         Ok(rows)
     }
 
-    /// How many versions one key holds — what a delete does NOT remove.
-    /// ★ THE DOOR THE DELETE DOC PROMISES (soma/brain#82). It erases ONE key's history and only for a
-    /// key whose row is GONE: a live row's history is the only copy of what it said, so erasing it
-    /// while the row exists would be a delete with none of a delete's receipts. Delete first (which
-    /// snapshots), then erase — two deliberate acts rather than one that hides a second.
     pub fn erase_history(&self, key: &str) -> Result<usize> {
         if store::get(&self.conn, key)?.is_some() {
             return Err(Error::Invalid(format!(
@@ -520,26 +364,17 @@ impl Session {
         store::version::erase(&self.conn, key)
     }
 
-    /// ★ WORDS OVER HISTORY (soma/ellmephant#115). Every hit is a PAST state, and a hit whose row is
-    /// gone is the only copy of that text. Audience is enforced exactly as reading a version is —
-    /// a private note's history must not surface to a reader without the pen — so a hit the caller
-    /// may not see is simply absent, never redacted.
     pub fn history_search(
         &self,
         phrase: &str,
         limit: usize,
     ) -> Result<Vec<store::version::HistoryMatch>> {
-        // ★ THE BOUNDARY IS APPLIED BEFORE THE CAP (Stet, review of #226). This used to truncate in
-        // SQL and then drop what the reader may not see, so a narrow reader could be told "nothing
-        // ever said this" while matching history they ARE entitled to sat just past the cut. The
-        // predicate now travels INTO the ranked walk, and the cap counts only visible hits.
         let reader = &self.reader;
         store::version::search_visible(&self.conn, phrase, limit, |key| {
             reader_allows(&self.conn, reader, key)
         })
     }
 
-    /// Every orphan key's history, in one transaction. Returns `(keys, versions)`.
     pub fn erase_orphan_history(&self) -> Result<(usize, usize)> {
         store::version::erase_orphans(&self.conn)
     }
@@ -548,8 +383,6 @@ impl Session {
         store::version::count_for(&self.conn, key)
     }
 
-    /// Does this connection see a row for `key`? One boolean, and on a miss it is the one that splits
-    /// the space in half: reader-only blindness (WAL, snapshot, path) versus the store not having it.
     pub fn exists(&self, key: &str) -> Result<bool> {
         let found: Option<i64> = self
             .conn
@@ -562,24 +395,6 @@ impl Session {
         Ok(found.is_some())
     }
 
-    /// The facts a MISS needs to be evidence rather than an assertion (soma/ellmephant#57).
-    ///
-    /// `memory_get` answering "no such memory" makes a claim about the whole store, and a bare
-    /// refusal gives the reader nothing to test: on 2026-10-21 a live, versioned key was reported
-    /// absent for 42 minutes and nobody could tell "wrong store" from "deleted" from "stale reader".
-    /// These three numbers are the difference, and they cost one indexed query each.
-    /// WHO answers for `key` and what its audience is — read WITHOUT the audience filter, and used
-    /// only to tell a caller about a row it can already prove exists.
-    ///
-    /// ★ THE MISS HAS THREE ANSWERS, NOT TWO (soma/ellmephant#189, 2026-10-26). A row can be missing
-    /// from a reader for three reasons: it is not there; it is there and this reader may not see it;
-    /// or it is there, this reader may not see it, **and this reader is the pen that wrote it**. The
-    /// third case is not a permission question at all — the author already knows the row exists, so
-    /// telling it the truth leaks nothing — and answering it with "the store that holds it is not
-    /// this one" sends the author hunting a fault that is not there. That is exactly what happened.
-    ///
-    /// Only ever call this from a miss explanation, and only ever report the result to a caller that
-    /// OWNS the row; for anyone else the absence rule stands.
     pub fn self_facts(&self, key: &str) -> Result<Option<(String, String)>> {
         let row: Option<(Option<i64>, String)> = self
             .conn
@@ -601,9 +416,6 @@ impl Session {
     }
 
     pub fn miss_facts(&self, key: &str) -> Result<MissFacts> {
-        // ★ A DIAGNOSTIC IS A READ. "It existed 42 minutes ago" is exactly the sentence the tier
-        // exists to prevent, so the history half is gated by the same rule as `memory_history`, and
-        // the store count is the reader's count, not the file's.
         let (predicate, binds) = self.reader.sql();
         let memories: i64 = self.conn.query_row(
             &format!("SELECT count(*) FROM memory WHERE {predicate}"),
@@ -634,18 +446,10 @@ impl Session {
         })
     }
 
-    /// Run a query, borrowing the encoder only when there is a phrase to embed. A read-only session
-    /// serves the rows from its own connection, so a search does not wait for a write to finish.
-    /// Vectors held for one document type — what `semantic_search` checks before promising a type.
     pub fn vectors_of(&self, kind: &str) -> Result<i64> {
         crate::index::vec::count_of(&self.conn, kind)
     }
 
-    /// Search the **tombstone** index: deleted documents, by meaning.
-    ///
-    /// A different table rather than a filtered view, which is what makes "unreachable by a normal
-    /// search" structural: no ordinary query names this table, so no hit can leak into one, and the
-    /// `k` a caller asks for is exactly the `k` they get.
     pub fn search_deleted(
         &self,
         text: &str,
@@ -674,19 +478,10 @@ impl Session {
         } else {
             search::run(&self.conn, None, &self.reader, q)?
         };
-        // ★ A SEARCH IS THE COMMON WAY AN ANCESTOR LOOKS INTO ITS SUBTREE, so it is the common way a
-        // boundary gets crossed — and one row per hit would make the audit bigger than the store.
-        // One row per SEARCH, carrying how many of the hits were somebody else's private rows and a
-        // small sample, is the record of the ACT rather than of its results.
         self.record_search_boundary(&bundle);
         Ok(bundle)
     }
 
-    /// Record a read that crossed a boundary, wherever this session can write.
-    ///
-    /// ★ THE READ PATH IS READ-ONLY BY DESIGN, and the audit must still land: so the record goes on
-    /// the session's own connection when it can write, and otherwise on a lazily-opened writable one.
-    /// Best effort — a read never fails because its record could not be written.
     fn audit(&self, key: Option<&str>, why: store::audit::Why, detail: Option<&str>) {
         let Some(pen) = self.reader.pen_name() else {
             return;
@@ -710,7 +505,6 @@ impl Session {
         }
     }
 
-    /// Record the boundary a search crossed, if it crossed one. Best effort, never fails the read.
     fn record_search_boundary(&self, bundle: &Bundle) {
         if self.reader.pen_name().is_none() || self.reader.down() == 0 || bundle.hits.is_empty() {
             return;
@@ -733,9 +527,6 @@ impl Session {
         self.audit(None, store::audit::Why::Search, Some(&detail));
     }
 
-    /// A read-only digest of the store (`stats`); `db_bytes` comes from the store file, so the
-    /// MCP surface reports the real size rather than a zero the caller was expected to fill.
-    /// `with_tags` additionally fills the full tag vocabulary — the digest stays lean without it.
     pub fn stats(&self, with_tags: bool) -> Result<store::stats::Stats> {
         let mut stats = store::stats::compute_seen(&self.conn, &self.reader)?;
         if with_tags {
@@ -744,35 +535,18 @@ impl Session {
         Ok(stats)
     }
 
-    /// The five-number health surface (`memory_health`), through THIS session's reader.
-    ///
-    /// Shape (a): no store total, and no `Reader::everything()` — the reader is the boundary.
     pub fn health(&self) -> Result<store::health::Health> {
         store::health::compute_seen(&self.conn, &self.reader)
     }
 
-    /// Queue every document that needs (re-)embedding, and rebuild the derived indexes that take no
-    /// model — the `[[link]]` graph, and the `vec0` table when the width changed (P9).
-    ///
-    /// **No encoder.** This used to recompute every vector under the store lock — ~45 minutes on a
-    /// 291-row store, which made it a total write outage — and now schedules the work and returns.
-    /// It backs the `memory_reembed` tool.
     pub fn reembed(&self) -> Result<maintain::Report> {
         maintain::reembed(&self.conn, &self.vec_spec(), &self.cfg.instruction)
     }
 
-    /// Rebuild the `[[link]]` graph from every body — no model, no queue, milliseconds.
-    ///
-    /// The graph is derived but computed at *write* time, so any path that rewrites a body without
-    /// re-deriving (a textual rewrite like a rename/merge `replace()`, a parser change, an older
-    /// binary) leaves edges the rows no longer imply. `memory_reembed` fixes that as a side effect
-    /// and costs a model load plus an hour of worker time; this is the broom for when only the graph
-    /// moved. It backs the `memory_reparse` tool.
     pub fn reparse(&self) -> Result<maintain::Reparse> {
         maintain::reparse(&self.conn)
     }
 
-    /// The head of the encode queue, or `None` when nothing is waiting to be embedded.
     pub fn next_encode(
         &self,
         skip: &std::collections::HashSet<String>,
@@ -780,25 +554,14 @@ impl Session {
         encode::next(&self.conn, skip)
     }
 
-    /// Take one queued document **without embedding anything**: the read half of a job.
-    ///
-    /// Split from [`settle_encode`](Self::settle_encode) on purpose — the worker drops the store lock
-    /// between the two, so the model call runs holding nothing at all. `ENCODE-WORKER.md` is the why.
     pub fn claim_encode(&self, keyslug: &str) -> Result<Option<encode::Claim>> {
         encode::claim(&self.conn, keyslug)
     }
 
-    /// Store a claim's vector and settle its queue entry: the write half of a job.
     pub fn settle_encode(&self, claim: &encode::Claim, vector: &[f32]) -> Result<()> {
         encode::settle_encoded(&self.conn, claim, vector)
     }
 
-    /// Queue every document that has no vector, at bulk priority, skipping the keyslugs a caller has
-    /// just seen fail. Returns how many were queued.
-    ///
-    /// This is the queue's ONLY producer, and it is stateless on purpose: "what has no vector" is read
-    /// off the index, so a rebuild, a crash, a dropped entry and a hand-deleted vector all arrive here
-    /// as the same question. When nothing is missing it queues nothing and the worker idles.
     pub fn refill(&self, skip: &std::collections::HashSet<String>) -> Result<usize> {
         let mut queued = 0;
         for (keyslug, content) in encode::missing(&self.conn)? {
@@ -811,78 +574,46 @@ impl Session {
         Ok(queued)
     }
 
-    /// Documents still waiting for a vector — the encoder's backlog.
     pub fn encode_pending(&self) -> Result<i64> {
         encode::pending(&self.conn)
     }
 
-    /// The queue as a metric: backlog, exhausted entries, and the oldest wait (`store::encode::Counts`).
-    /// The honest form of [`Self::encode_pending`], which is now its `pending` head.
     pub fn encode_counts(&self) -> Result<encode::Counts> {
         encode::counts(&self.conn)
     }
 
-    /// Embed one queued document **now**, instead of leaving it to the worker: the `?wait=true` door.
-    ///
-    /// Deliberately the exception. It holds the store lock across the model call, which is precisely
-    /// the coupling the queue exists to remove — so it is opt-in, and for a caller that genuinely
-    /// cannot proceed until the row is searchable.
-    /// The `?wait=true` door is MEMORY-shaped: its callers have just written a memory and hold its
-    /// key, so the keyslug is built here rather than at every call site.
     pub fn encode_document(&self, key: &str) -> Result<bool> {
         let keyslug = crate::store::links::Kind::Memory.keyslug(key);
         self.encoder
             .with(|e| encode::encode_one(&self.conn, e, &keyslug))
     }
 
-    /// Every row whose body links to `key` — the MCP `memory_backlinks` surface.
-    ///
-    /// A key with no row is [`Error::NotFound`], not an empty list: *no backlinks* and *no such
-    /// memory* are different answers, and it is the second one that matters to a caller deciding
-    /// whether a memory is safe to delete. The lookup goes through `store::get`, so the key is
-    /// normalised exactly as it is everywhere else.
     pub fn backlinks(&self, key: &str) -> Result<Vec<links::Backlink>> {
-        // The TARGET is gated first: asking for backlinks of a row you cannot see must not tell you
-        // whether the row exists. Then the SOURCES are filtered — a private note that names this key
-        // is not a note this reader can be shown.
         let mem = self.show(key)?;
         links::backlinks_seen(&self.conn, &mem.key, &self.reader)
     }
 
-    /// Every broken `[[…]]` edge, one row per referrer — the finder behind `memory_dangling`.
-    /// [`crate::store::stats::Stats::dangling`] counts DISTINCT missing targets; this names them.
     pub fn dangling(&self) -> Result<Vec<links::DanglingEdge>> {
         links::dangling_edges(&self.conn)
     }
 
-    /// Close the books on a rebuild: the actual duration, beside the estimate (`#76`).
     pub fn note_rebuild_finished(&self) -> Result<()> {
         maintain::note_rebuild_finished(&self.conn)
     }
 
-    /// Upsert a project from a partial patch: `None` fields keep their stored value. No encoder — a
-    /// project is structure, not a document.
     pub fn project_merge(&self, patch: &project::Patch) -> Result<project::MergeOutcome> {
         project::merge(&self.conn, patch)
     }
 
-    /// One project with both relations resolved — the "stand inside it" read. `hydrate` decides how
-    /// much of each preload memory's body to carry.
     pub fn project_view(&self, key: &str, hydrate: project::Hydrate) -> Result<project::View> {
         project::view_seen(&self.conn, key, hydrate, &self.reader)?
             .ok_or_else(|| Error::NoProject(project::normalize_key(key)))
     }
 
-    /// Projects matching `filter`, key order.
     pub fn project_list(&self, filter: &project::Filter) -> Result<Vec<project::Project>> {
         project::list(&self.conn, filter)
     }
 
-    /// Take or renew an atomic lease over `name` — the cross-machine claim.
-    ///
-    /// `acquire` is one SQL statement (`store::claim::acquire`), so a live lease held by another owner
-    /// is refused and the same owner re-taking it renews. The store's versioning cannot give this: a
-    /// claim built from `memory_get` + `memory_upsert` would be a racy read-modify-write.
     pub fn claim_acquire(
         &self,
         name: &str,
@@ -892,7 +623,6 @@ impl Session {
         claim::acquire(&self.conn, name, owner, ttl_seconds)
     }
 
-    /// Release a lease as the proven pen: your own, or a descendant's with a reason.
     pub fn claim_release(
         &self,
         name: &str,
@@ -902,7 +632,6 @@ impl Session {
         claim::release_by(&self.conn, name, actor, reason)
     }
 
-    /// Ancestor releases on record, newest first — the durable half of `release_by`'s answer.
     pub fn claim_revocations(
         &self,
         name: Option<&str>,
@@ -911,8 +640,6 @@ impl Session {
         claim::revocations(&self.conn, name, limit)
     }
 
-    /// The claims a reader can see: one by `name`, or every claim (expired rows included) when `name`
-    /// is `None`. The audit view — an unexplained stale claim must be visible, not hidden.
     pub fn claims(&self, name: Option<&str>) -> Result<Vec<claim::Claim>> {
         match name {
             Some(n) => Ok(claim::get(&self.conn, n)?.into_iter().collect()),
@@ -920,30 +647,22 @@ impl Session {
         }
     }
 
-    // ---- ellmechat (#151): the door over the ledger. Thin on purpose: every rule lives in
-    // `store::channel`, so the MCP door, the CLI and a future HTTP surface cannot disagree.
-
-    /// Every channel and its policy (`members`, `gate`, `grace_secs`, `clock`, …).
     pub fn channels(&self) -> Result<Vec<channel::Channel>> {
         channel::channels(&self.conn)
     }
 
-    /// What `pen` has been told and not yet listened to, per channel. Moves no receipt.
     pub fn channel_unread(&self, pen: &str) -> Result<Vec<channel::Unread>> {
         channel::unread(&self.conn, pen)
     }
 
-    /// Join a channel. `#ops_team` also joins `#emergency`, in the same transaction, by rule.
     pub fn channel_join(&self, pen: &str, channel: &str) -> Result<()> {
         channel::join(&self.conn, pen, channel)
     }
 
-    /// Leave a channel. Leaving `#emergency` while on the team is refused, with the way out named.
     pub fn channel_leave(&self, pen: &str, channel: &str) -> Result<()> {
         channel::leave(&self.conn, pen, channel)
     }
 
-    /// Say one thing in one channel. The fan-out writes a delivery row for every member.
     pub fn channel_send(
         &self,
         pen: &str,
@@ -954,18 +673,14 @@ impl Session {
         channel::send(&self.conn, pen, channel, body, reply_to)
     }
 
-    /// Mark that a turn boundary OFFERED this pen its inbox. One call is one miss while unread.
-    /// Called by whatever owns the turn (the spine, the harness), never by the model.
     pub fn channel_present(&self, pen: &str, boundary: Option<&str>) -> Result<usize> {
         channel::present(&self.conn, pen, boundary)
     }
 
-    /// Put ANOTHER pen in a channel. Keeper-only: an invitation has an inviter.
     pub fn channel_invite(&self, actor: &str, pen: &str, channel: &str) -> Result<()> {
         channel::invite(&self.conn, actor, pen, channel)
     }
 
-    /// LISTEN: take the unread messages and mark them fetched. This is what clears a gate.
     pub fn channel_fetch(
         &self,
         pen: &str,
@@ -975,7 +690,6 @@ impl Session {
         channel::fetch(&self.conn, pen, channel, limit)
     }
 
-    /// Create a channel. A LOCKED channel needs `estate` or `james` — the store enforces it.
     pub fn channel_create(
         &self,
         pen: &str,
@@ -987,7 +701,6 @@ impl Session {
         channel::create(&self.conn, pen, key, title, members, gate)
     }
 
-    /// Change a channel's gate. Writes the `channel_event` row in the same transaction.
     pub fn channel_set_gate(
         &self,
         pen: &str,
@@ -997,7 +710,6 @@ impl Session {
         channel::set_gate(&self.conn, pen, channel, gate)
     }
 
-    /// Set a channel's retention. Keeper-only; recorded as a `channel_event`.
     pub fn channel_set_retention(
         &self,
         pen: &str,
@@ -1007,27 +719,22 @@ impl Session {
         channel::set_retention(&self.conn, pen, channel, keep_secs)
     }
 
-    /// Expire the TEXT of messages past their channel's retention. Receipts stay.
     pub fn channel_prune(&self, only: Option<&str>) -> Result<Vec<channel::Pruned>> {
         channel::prune(&self.conn, only, None)
     }
 
-    /// The recorded changes to a channel: who made this dangerous, and when.
     pub fn channel_events(&self, channel: &str) -> Result<Vec<channel::Event>> {
         channel::events(&self.conn, channel)
     }
 
-    /// WHO is in a channel: effective membership, not the override rows.
     pub fn channel_members(&self, channel: &str) -> Result<Vec<channel::Member>> {
         channel::members(&self.conn, channel)
     }
 
-    /// The highest seq this pen has been told — a waiter's default cursor.
     pub fn channel_head(&self, pen: &str) -> Result<i64> {
         channel::head(&self.conn, pen)
     }
 
-    /// What this pen was TOLD after `after_seq`. Moves no receipt: a wait is not a fetch.
     pub fn channel_since(
         &self,
         pen: &str,
@@ -1037,7 +744,6 @@ impl Session {
         channel::since(&self.conn, pen, after_seq, limit)
     }
 
-    /// Read the LOG. Does not touch receipts: reading history is not listening to a message.
     pub fn channel_history(
         &self,
         channel: &str,
@@ -1047,36 +753,22 @@ impl Session {
         channel::history(&self.conn, channel, since, limit)
     }
 
-    /// REFUSE a gated class of action for this pen, or allow it (#151).
-    ///
-    /// Fail open by design: a ledger the store cannot read does not gate, because a pen cannot tell
-    /// "you are late" from "the store is broken", and punishing the second as the first is how a
-    /// chat bug freezes the record.
     pub fn channel_gate(&self, pen: &str, class: channel::Class) -> Result<()> {
         channel::gate(&self.conn, pen, class)
     }
 
-    /// What, if anything, is stopping this pen from changing the record.
     pub fn channel_breach(&self, pen: &str) -> Result<Option<channel::Breach>> {
         channel::breach(&self.conn, pen)
     }
 
-    /// One config item, if it exists AND this reader may see it. `None` is the honest answer to both
-    /// questions — a caller may not probe an ACL by asking whether a key exists.
     pub fn config_get(&self, key: &str) -> Result<Option<config::Item>> {
         config::get(&self.conn, &self.reader, key)
     }
 
-    /// The config items this reader may see, key order.
     pub fn config_list(&self, prefix: Option<&str>) -> Result<Vec<config::Item>> {
         config::list(&self.conn, &self.reader, prefix)
     }
 
-    /// Change an existing item's value — gated by its `set_audience`, not by the caller's word.
-    ///
-    /// The WRITER session is built as `everything()`, so the permission check cannot use `self.reader`
-    /// (it would pass for every caller); it is resolved from the proven pen, tree and borrowed
-    /// sessions included, exactly as a read is.
     pub fn config_set(
         &self,
         who: &str,
@@ -1090,7 +782,6 @@ impl Session {
         config::set(&self.conn, &reader, who, key, value, source)
     }
 
-    /// Create an item or rewrite its ACL — the provisioning act behind `config`.
     pub fn config_define(
         &self,
         who: &str,
@@ -1115,7 +806,6 @@ impl Session {
         )
     }
 
-    /// Write one letter into `recipient`'s box. Nothing is delivered: this is the whole event.
     pub fn mail_send(
         &self,
         proven: &str,
@@ -1130,7 +820,6 @@ impl Session {
         )
     }
 
-    /// Lend this pen's name to another (mail surrogate). Self-only is enforced at the tool.
     pub fn mail_grant(
         &self,
         grantor: &str,
@@ -1142,13 +831,10 @@ impl Session {
         mail::grant(&self.conn, grantor, surrogate, scopes, expires_at, note)
     }
 
-    /// Take the grant back. Effective on the next call.
     pub fn mail_revoke(&self, grantor: &str, surrogate: &str) -> Result<usize> {
         mail::revoke(&self.conn, grantor, surrogate)
     }
 
-    /// ★ THE BOX RULE, with its refusal (soma/ellmephant#235): the doors call this instead of
-    /// asking the two primitives and writing their own sentence.
     pub fn mail_may_open_box(
         &self,
         reader: &str,
@@ -1158,22 +844,18 @@ impl Session {
         mail::may_open_box(&self.conn, reader, requested, scope)
     }
 
-    /// May this pen read that box? (own box, or a live `read` grant)
     pub fn mail_may_read(&self, reader: &str, requested: &str) -> Result<bool> {
         mail::may_read_box(&self.conn, reader, requested)
     }
 
-    /// May this pen advance that box's cursor? (own box, or a live `ack` grant)
     pub fn mail_may_ack(&self, reader: &str, requested: &str) -> Result<bool> {
         mail::may_ack_box(&self.conn, reader, requested)
     }
 
-    /// Every grant a pen holds, live or not.
     pub fn mail_surrogates_of(&self, surrogate: &str) -> Result<Vec<mail::Surrogate>> {
         mail::surrogates_of(&self.conn, surrogate)
     }
 
-    /// Everything in `recipient`'s box after `since`, oldest first, bodies omitted.
     pub fn mail_inbox(
         &self,
         recipient: &str,
@@ -1183,44 +865,33 @@ impl Session {
         mail::inbox(&self.conn, recipient, since, limit)
     }
 
-    /// The newest `seq` in a box, 0 when empty — the free "is anything there?" a hand's tick asks.
     pub fn mail_head(&self, recipient: &str) -> Result<i64> {
         mail::head(&self.conn, recipient)
     }
 
-    /// One letter whole.
     pub fn mail_read(&self, seq: i64) -> Result<Option<mail::Letter>> {
         mail::read(&self.conn, seq)
     }
 
-    /// Drop letters nobody ever read. ★ Letters expire; memories do not.
     pub fn mail_prune(&self, keep_days: i64) -> Result<usize> {
         mail::prune(&self.conn, keep_days)
     }
 
-    /// The reader's place in a box (`None` = never advanced, so the whole box is unread).
     pub fn mail_cursor(&self, reader: &str, recipient: &str) -> Result<Option<mail::Cursor>> {
         mail::cursor(&self.conn, reader, recipient)
     }
 
-    /// Advance the reader's own cursor — the commit of an inbox read.
     pub fn mail_advance(&self, reader: &str, recipient: &str, seq: i64) -> Result<mail::Cursor> {
         mail::advance(&self.conn, reader, recipient, seq)
     }
 }
 
-/// What a miss can prove without a second round trip — see [`Session::miss_facts`].
 #[derive(Debug, Clone)]
 pub struct MissFacts {
-    /// The store file the reader actually opened. The first hypothesis in #57 was "a different file".
     pub store: String,
-    /// How many memories that file holds: zero means an empty/other store, not a missing key.
     pub memories: i64,
-    /// Schema version of that file, so a stale reader or an unmigrated copy is visible.
     pub schema: i32,
-    /// Versions recorded for this key — history outlives a delete, so >0 means "deleted, not absent".
     pub versions: i64,
-    /// When the newest version was written, when there is one.
     pub newest: Option<String>,
 }
 
@@ -1229,8 +900,6 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A fake encoder that takes a measurable moment, so "did the second caller wait?" is a fact and
-    /// not an opinion.
     struct Slow;
 
     impl Embedder for Slow {
@@ -1241,19 +910,11 @@ mod tests {
             "slow-test"
         }
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            // The read pays this too. Concurrent, the reader finishes at ~250ms; serialized it waits
-            // out the writer first and finishes at ~400ms. The assert below separates those.
             std::thread::sleep(Duration::from_millis(200));
             Ok(vec![vec![0.0, 1.0]; texts.len()])
         }
     }
 
-    /// The encoder must NOT serialize its callers.
-    ///
-    /// A write embedding a document can take seconds; a read embedding a query must not wait for it.
-    /// That serialization was the whole stall, and putting a lock over the weights only moved it from
-    /// the store to the model — which is why there is a `OnceLock` here and not a `Mutex`. This test
-    /// is what keeps it one.
     #[test]
     fn the_encoder_does_not_serialize_its_callers() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1,8 +1,3 @@
-//! Integration: the P4 write path against a real store file and real `vec0` tables.
-//!
-//! Runs offline — the embedder is the deterministic [`HashEmbedder`], wrapped so the test can
-//! prove *when* a (re-)embed happens (and when it must not).
-
 mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +12,6 @@ use rusqlite::params;
 
 const DIM: usize = 8;
 
-/// `HashEmbedder` that counts `embed` calls, so re-embedding is observable.
 struct CountingEmbedder {
     inner: HashEmbedder,
     calls: AtomicUsize,
@@ -51,7 +45,6 @@ impl Embedder for CountingEmbedder {
     }
 }
 
-/// A memory with an explicit key and the given body/tags.
 fn memory(key: &str, title: &str, body: &str, tags: &[&str]) -> Memory {
     Memory {
         key: key.to_string(),
@@ -81,17 +74,14 @@ fn add_writes_row_one_vector_tags_and_links() {
     )
     .expect("add");
 
-    // row
     let got = store::get(&conn, "anchor").unwrap().expect("row");
     assert_eq!(got.id, Some(id));
     assert_eq!(got.tags, vec!["infra".to_string(), "k8s".to_string()]);
     assert!(got.title == "Anchor");
 
-    // one document vector
     assert_eq!(vec::count(&conn).unwrap(), 1);
     assert_eq!(vec::get(&conn, id).unwrap().unwrap().len(), DIM);
 
-    // tags live on the row, normalised + sorted
     let tags: String = conn
         .query_row("SELECT tags FROM memory WHERE id = ?1", params![id], |r| {
             r.get(0)
@@ -99,7 +89,6 @@ fn add_writes_row_one_vector_tags_and_links() {
         .unwrap();
     assert_eq!(tags, "infra,k8s");
 
-    // links
     let target: String = conn
         .query_row(
             "SELECT to_key FROM memory_link WHERE from_id = ?1",
@@ -227,20 +216,16 @@ fn visit_and_useful_counters_bump_by_key() {
     let embedder = CountingEmbedder::new();
     common::add_now(&conn, &embedder, &memory("a", "A", "body a", &["k8s"])).unwrap();
 
-    // A fresh row starts at zero.
     let got = store::get(&conn, "a").unwrap().unwrap();
     assert_eq!((got.visits, got.times_useful), (0, 0));
 
-    // Reads count; each call returns the new total.
     assert_eq!(store::record_visit(&conn, "a").unwrap(), 1);
     assert_eq!(store::record_visit(&conn, "a").unwrap(), 2);
-    // `times_useful` is independent of a fetch.
     assert_eq!(store::record_useful(&conn, "a").unwrap(), 1);
 
     let got = store::get(&conn, "a").unwrap().unwrap();
     assert_eq!((got.visits, got.times_useful), (2, 1));
 
-    // An unknown key is an error, not a silent zero.
     assert!(store::record_visit(&conn, "ghost").is_err());
     assert!(store::record_useful(&conn, "ghost").is_err());
 }
@@ -256,11 +241,9 @@ fn record_useful_many_sweeps_known_keys_and_reports_the_rest() {
     let keys = vec!["a".to_string(), "ghost".to_string(), "b".to_string()];
     let (upvoted, missing) = store::record_useful_many(&conn, &keys).unwrap();
 
-    // Known keys in input order with their new totals; the unknown one is reported, not fatal.
     assert_eq!(upvoted, vec![("a".to_string(), 1), ("b".to_string(), 1)]);
     assert_eq!(missing, vec!["ghost".to_string()]);
 
-    // A second sweep stacks on the first.
     let again = vec!["a".to_string()];
     let (upvoted, missing) = store::record_useful_many(&conn, &again).unwrap();
     assert_eq!(upvoted, vec![("a".to_string(), 2)]);
@@ -276,7 +259,6 @@ fn upsert_preserves_counters() {
     store::record_visit(&conn, "a").unwrap();
     store::record_useful(&conn, "a").unwrap();
 
-    // Re-writing the same key must not reset its telemetry.
     common::add_now(&conn, &embedder, &memory("a", "A2", "body a2", &["k8s"])).unwrap();
     let got = store::get(&conn, "a").unwrap().unwrap();
     assert_eq!(got.title, "A2");

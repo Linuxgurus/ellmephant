@@ -1,10 +1,3 @@
-//! Integration: the P10 instruments against a real store file (offline).
-//!
-//! The golden corpus (`tests/golden/`) is imported with the deterministic [`HashEmbedder`],
-//! so the whole thing runs with no model and no network. The seed queries are keyword-anchored
-//! on purpose: a bag-of-words fake can only measure token overlap, not meaning — real usage
-//! replaces the corpus *and* the queries (see `tests/golden/README.md`).
-
 mod common;
 
 use common::temp_store;
@@ -22,7 +15,6 @@ fn golden(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// Read the canonical-JSONL corpus into `Memory` drafts (ids/hashes are derived on insert).
 fn read_corpus(path: &std::path::Path) -> Vec<Memory> {
     std::fs::read_to_string(path)
         .expect("read corpus")

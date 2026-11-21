@@ -1,25 +1,12 @@
-//! Shared helpers for the MCP-facing wire (the compact positional tables).
-//!
-//! The list-shaped reads emit a `cols` header plus bare-array rows. Rendering each row on its
-//! own line costs one byte each but turns a single wall-of-blob payload into something a human
-//! can scan. JSON treats the whitespace as insignificant, so the result is still valid and
-//! machine-parseable — it is layout, not structure.
-
 pub mod dupes;
 pub mod links;
 pub mod project;
 pub mod search;
 
-/// Round a distance to 4 decimals for the wire: enough to rank, and it avoids the long
-/// `f32`→`f64` widening tail that `json!` would otherwise print (`0.41999998…`).
 pub fn wire_distance(d: f32) -> f64 {
     ((d as f64) * 10_000.0).round() / 10_000.0
 }
 
-/// Serialize a positional table body: a JSON array of rows, **one row per line, no indent**.
-///
-/// Empty yields `[]`; otherwise `[\n<row>,\n<row>\n]`. Each row is compact — a body's newlines
-/// arrive JSON-escaped (`\n`), so a row never spans physical lines.
 pub fn rows_array(rows: &[serde_json::Value]) -> String {
     if rows.is_empty() {
         return "[]".to_string();
@@ -29,7 +16,6 @@ pub fn rows_array(rows: &[serde_json::Value]) -> String {
         if i > 0 {
             out.push_str(",\n");
         }
-        // A `Value` of scalars/arrays/objects always serializes; `null` is the unreachable guard.
         out.push_str(&serde_json::to_string(row).unwrap_or_else(|_| "null".to_string()));
     }
     out.push_str("\n]");
@@ -54,7 +40,6 @@ mod tests {
         let out = rows_array(&rows);
         assert_eq!(out, "[\n[\"a\",\"A\",[\"t1\"]],\n[\"b\",\"B\",[]]\n]");
         assert_eq!(out.lines().count(), 4, "open, two rows, close: {out}");
-        // Whitespace is layout only — it parses back to the same values.
         let back: Vec<serde_json::Value> = serde_json::from_str(&out).expect("valid json");
         assert_eq!(back, rows);
     }

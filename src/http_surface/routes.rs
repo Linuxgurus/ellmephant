@@ -1,21 +1,9 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
-/// One MCP tool reachable over HTTP — the parity table. A route the table does not name is a tool
-/// a wedged MCP session would strand; the parity test keeps it exactly as long as `TOOLS`.
 pub struct Route {
-    /// HTTP method.
     pub method: &'static str,
-    /// Path template (`{key}` is the axum 0.8 placeholder).
     pub path: &'static str,
-    /// The MCP tool this route mirrors.
     pub tool: &'static str,
 }
 
-/// Every MCP tool, and the route that reaches the same `Session` call (`/health` and `/bootstrap`
-/// are surfaces of their own, not tools, so they are absent by design).
 pub const ROUTES: &[Route] = &[
     Route {
         method: "GET",

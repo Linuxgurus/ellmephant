@@ -1,10 +1,5 @@
-//! Slug generation for the `key` column: global-unique identity *and* link target
-//! (SPEC §4 #11). Key charset is `[a-z0-9-]+` so the link regex stays simple.
-
 use std::collections::HashSet;
 
-/// Collapse `s` into `[a-z0-9-]+`: lowercase, non-alphanumerics to `-`, runs
-/// collapsed, ends trimmed. Returns `"untitled"` if nothing survives.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_dash = false;
@@ -27,7 +22,6 @@ pub fn slugify(s: &str) -> String {
     }
 }
 
-/// First free variant of `base`, appending `-2`, `-3`, ... on collision.
 pub fn unique_slug(base: &str, taken: &HashSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_string();

@@ -1,7 +1,3 @@
-//! MCP round-trip tests (P7). In-process: the server runs over a `tokio::io::duplex`
-//! transport with the deterministic `HashEmbedder`, so this needs no weights and no
-//! network, yet still exercises the real `rmcp` handshake, tool routing and schemas.
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use ellmephant::config::{Config, Paths};
@@ -13,13 +9,9 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::{Peer, RoleClient, ServiceExt};
 use tower::ServiceExt as _;
 
-/// An open, offline session backed by the fake embedder.
 fn session(dir: &std::path::Path) -> Session {
     let paths = Paths::from_root(dir);
     paths.ensure().expect("create store root");
-    // The config is the WRITE path's view of the vector space — a write has no embedder to ask — so it
-    // has to agree with the fake injected below. Disagree, and `encode_hash` describes a different space
-    // than the stored vectors do, which makes every later write look like a document change.
     let cfg = Config {
         model: HASH_MODEL.to_string(),
         dim: DIM,
@@ -32,17 +24,9 @@ fn session(dir: &std::path::Path) -> Session {
         .with_embedder(Box::new(HashEmbedder::new(DIM)))
 }
 
-/// The embedder every session in this file is built with (see `session`).
 const DIM: usize = 64;
-/// Its model id, which the config has to echo (see `session`).
 const HASH_MODEL: &str = "fake-hash-v1";
 
-/// Settle every queued document, the way the worker would.
-///
-/// A write only *queues* its embed now (`ENCODE-WORKER.md`) and a test process has no worker, so a
-/// test that asserts on a search, a duplicate pair or a vector count has to settle first. The store is
-/// one file, so a second connection to it is how a test drives the queue — the one-writer rule is the
-/// *service's*, not the file's.
 fn settle(dir: &std::path::Path) {
     ellmephant::index::vec::register_extension();
     let conn = ellmephant::db::open(&Paths::from_root(dir)).expect("open");
@@ -51,7 +35,6 @@ fn settle(dir: &std::path::Path) {
     while ellmephant::store::encode::drain(&conn, &embedder, 64).expect("drain") > 0 {}
 }
 
-/// Call one tool and return its result (tool *errors* come back as `is_error`, not `Err`).
 async fn call(
     client: &Peer<RoleClient>,
     name: &'static str,
@@ -66,7 +49,6 @@ async fn call(
         .expect("tool call")
 }
 
-/// The first text block of a result, or "".
 fn text(result: &CallToolResult) -> String {
     result
         .content
@@ -93,7 +75,6 @@ async fn tools_round_trip_over_the_transport() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    // tools/list advertises the surface with annotations.
     let listed = client.list_tools(Default::default()).await.expect("list");
     let search = listed
         .tools
@@ -105,7 +86,6 @@ async fn tools_round_trip_over_the_transport() {
         Some(true)
     );
 
-    // add -> get -> search round-trip.
     let added = call(
         &client,
         "memory_upsert",
@@ -131,11 +111,8 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert!(text(&got).contains("Logs ship to ns1"), "{}", text(&got));
-    // A fetch counted exactly one visit.
     assert!(text(&got).contains("\"visits\":1"), "{}", text(&got));
 
-    // Feedback is independent of a fetch (a bare title can earn it) and bumps `times_useful`.
-    // A sweep takes one or more keys.
     let upvote = call(
         &client,
         "memory_upvote",
@@ -149,7 +126,6 @@ async fn tools_round_trip_over_the_transport() {
         text(&upvote)
     );
 
-    // A second fetch shows both counters riding on the row.
     let again = call(
         &client,
         "memory_get",
@@ -159,8 +135,6 @@ async fn tools_round_trip_over_the_transport() {
     let again: serde_json::Value = serde_json::from_str(&text(&again)).expect("memory json");
     assert_eq!(again["visits"], serde_json::json!(2));
     assert_eq!(again["times_useful"], serde_json::json!(1));
-    // The upvote cue rides the fetched *payload* itself, not just the tool's static description:
-    // the ask must sit where the model's attention lands after consuming the body.
     assert!(
         again["_nudge"]
             .as_str()
@@ -169,7 +143,6 @@ async fn tools_round_trip_over_the_transport() {
         "get result missing the upvote nudge: {again}"
     );
 
-    // An unknown key is a tool error (not a silent zero): a sweep that hits nothing fails.
     let bogus = call(
         &client,
         "memory_upvote",
@@ -178,7 +151,6 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     assert_eq!(bogus.is_error, Some(true));
 
-    // A mixed sweep upvotes the keys that exist and reports the rest in `missing` (not fatal).
     let mixed = call(
         &client,
         "memory_upvote",
@@ -191,8 +163,6 @@ async fn tools_round_trip_over_the_transport() {
     assert_eq!(mixed["upvoted"][0]["times_useful"], serde_json::json!(2));
     assert_eq!(mixed["missing"], serde_json::json!(["ghost"]));
 
-    // ★ ONE KEY AS A BARE STRING: the common case is one memory, and the caller should not have to
-    // wrap it in an array. Same tool, same reply, one code path.
     let single = call(
         &client,
         "memory_upvote",
@@ -214,11 +184,9 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     let found: serde_json::Value = serde_json::from_str(&text(&found)).expect("search json");
-    // Positional wire, lean default: no `fields` named, so a hit is just its key (SPEC §10).
     assert_eq!(found["cols"], serde_json::json!(["key", "via"]));
     assert_eq!(found["hits"][0][0], serde_json::json!("infra-logs"));
 
-    // Naming `fields` adds those columns (canonical order), `key` always leading.
     let named = call(
         &client,
         "memory_search",
@@ -232,7 +200,6 @@ async fn tools_round_trip_over_the_transport() {
     );
     assert_eq!(named["hits"][0][0], serde_json::json!("infra-logs"));
 
-    // A second memory links back; `memory_backlinks` finds it.
     call(
         &client,
         "memory_upsert",
@@ -250,17 +217,13 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     let back: serde_json::Value = serde_json::from_str(&text(&back)).expect("backlinks json");
-    // Positional wire: a `cols` header names the fields, rows are bare arrays.
     assert_eq!(back["cols"], serde_json::json!(["key", "title"]));
     assert_eq!(
         back["backlinks"][0][0],
         serde_json::json!("infra-observability")
     );
-    // Settle the row just written, so the index is non-empty for the searches below. The later
-    // re-upsert of `infra-logs` and its delete remove that row's vector on purpose.
     settle(dir.path());
 
-    // `memory_upsert` upserts: re-storing an existing key overwrites it, no twin row.
     let upserted = call(
         &client,
         "memory_upsert",
@@ -269,7 +232,6 @@ async fn tools_round_trip_over_the_transport() {
     .await;
     assert!(!upserted.is_error.unwrap_or(false), "{}", text(&upserted));
 
-    // delete removes it; a second get is a tool error.
     let removed = call(
         &client,
         "memory_delete",
@@ -284,8 +246,6 @@ async fn tools_round_trip_over_the_transport() {
     )
     .await;
     assert_eq!(gone.is_error, Some(true));
-    // ★ A MISS IS A CLAIM, AND IT MUST CARRY ITS EVIDENCE (soma/ellmephant#57): a deleted key is not
-    // an absent one, and a reader that cannot tell them apart spends a session on the wrong theory.
     let miss = text(&gone);
     assert!(
         miss.contains("version(s) for this key"),
@@ -299,9 +259,6 @@ async fn tools_round_trip_over_the_transport() {
         miss.contains("schema"),
         "the store's identity is the first thing to rule out: {miss}"
     );
-    // ★ AND THE BIT THAT HALVES THE SEARCH (soma/ellmephant#57): with the row deleted, this process's
-    // writer must AGREE it is absent. If it ever disagrees, the read is blind to a row the writer can
-    // prove — which is the only shape the original incident can have had.
     assert!(
         miss.contains("writer-agrees-absent"),
         "the miss must report what the writer connection sees: {miss}"
@@ -311,7 +268,6 @@ async fn tools_round_trip_over_the_transport() {
         "a deleted row must not be reported as visible to the writer: {miss}"
     );
 
-    // A key that never existed says the other thing, and does not pretend to know otherwise.
     let never = call(
         &client,
         "memory_get",
@@ -324,12 +280,10 @@ async fn tools_round_trip_over_the_transport() {
         "an absent key must not be described as deleted: {never_text}"
     );
 
-    // `memory_stats` is the read-only digest: one keyed JSON object, no bodies.
     let stats = call(&client, "memory_stats", serde_json::json!({})).await;
     assert!(!stats.is_error.unwrap_or(false), "{}", text(&stats));
     let raw = text(&stats);
     let stats: serde_json::Value = serde_json::from_str(&raw).expect("stats json");
-    // Only `infra-observability` survives (it carried no tags; `infra-logs` was deleted).
     assert_eq!(stats["memories"], serde_json::json!(1));
     assert_eq!(stats["tag_assignments"], serde_json::json!(0));
     assert_eq!(stats["visits_total"], serde_json::json!(0));
@@ -338,10 +292,6 @@ async fn tools_round_trip_over_the_transport() {
         "stats must not carry bodies: {raw}"
     );
 
-    // ★ AN UNKNOWN ARGUMENT IS REFUSED (soma/ellmephant#87). This test used to assert the opposite —
-    // that `match: "fuzzy"` was silently ignored and the search "still succeeded". That is precisely
-    // how `type` was dropped for a day: serde's default is to ignore what it does not know, so the
-    // server answered a question nobody asked and looked confident doing it.
     let extra = call(
         &client,
         "memory_search",
@@ -354,9 +304,6 @@ async fn tools_round_trip_over_the_transport() {
         "an argument the tool does not understand must be refused, not discarded: {}",
         text(&extra)
     );
-    // `memory_merge` integrates one key into another and deletes it, repointing its references (the
-    // safe merge). The survivor already carries the deleted body's prose, so there is nothing to
-    // integrate here and the call has nothing to integrate.
     for (key, body) in [
         ("merge-old", "deleted"),
         ("merge-new", "survivor, now carrying: deleted"),
@@ -417,9 +364,6 @@ async fn tools_round_trip_over_the_transport() {
         text(&referrer)
     );
 
-    // ★ `memory_fold` APPENDS AND DOES NOT DELETE (#199). Two rows, no ownership tricks here: the
-    // point of this case is the transport contract — the source survives, the keeper grows, and an
-    // argument that would change an existing field is REFUSED rather than silently ignored.
     for (key, body) in [
         ("fold-source", "line from the source"),
         ("fold-keeper", "line the keeper had"),
@@ -470,8 +414,6 @@ async fn tools_round_trip_over_the_transport() {
         "a fold must NOT delete the source: {}",
         text(&source)
     );
-    // A fold cannot be asked to change the keeper's title: the argument does not exist, and an
-    // unknown argument is refused (the same rule as `memory_search` above).
     let bad = call(
         &client,
         "memory_fold",
@@ -491,7 +433,6 @@ async fn tools_round_trip_over_the_transport() {
     handle.await.expect("join");
 }
 
-/// One MCP-over-HTTP POST to `/mcp`, returning status, `Mcp-Session-Id` (if any) and body.
 async fn post(
     app: &axum::Router,
     session_id: Option<&str>,
@@ -500,7 +441,6 @@ async fn post(
     post_to(app, "/mcp", session_id, body).await
 }
 
-/// One JSON-RPC POST to a named door (`/mcp` or `/mcp/core`).
 async fn post_to(
     app: &axum::Router,
     uri: &str,
@@ -534,8 +474,6 @@ async fn post_to(
     )
 }
 
-/// The server answers a POST with JSON or an SSE stream; pull the JSON-RPC payload out of
-/// whichever `data:` frame actually carries it (the stream opens with an empty one).
 fn payload(body: &str) -> serde_json::Value {
     for frame in body
         .lines()
@@ -549,7 +487,6 @@ fn payload(body: &str) -> serde_json::Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON-RPC: {e}: {body}"))
 }
 
-/// The default `mcp` transport is Streamable HTTP; drive the real router (no socket, no client).
 #[tokio::test]
 async fn tools_round_trip_over_http() {
     let dir = tempfile::tempdir().unwrap();
@@ -559,15 +496,12 @@ async fn tools_round_trip_over_http() {
         std::sync::Arc::new(ellmephant::http::LockWatch::new()),
         std::time::Instant::now(),
     );
-    // This router is driven in-process with no headers, so the server declares its pen (anonymous
-    // writes are refused by design). The header -> identity path is covered by the provenance tests.
     let app = http_router(
         MemoryServer::new(session(dir.path())).with_identity("tester"),
         "127.0.0.1",
         state,
     );
 
-    // initialize issues a session id.
     let (status, session, body) = post(
         &app,
         None,
@@ -587,7 +521,6 @@ async fn tools_round_trip_over_http() {
     let session = session.expect("Mcp-Session-Id header");
     assert_eq!(payload(&body)["result"]["serverInfo"]["name"], "ellmephant");
 
-    // The initialized notification is accepted (202, empty body).
     let (status, _, _) = post(
         &app,
         Some(&session),
@@ -596,7 +529,6 @@ async fn tools_round_trip_over_http() {
     .await;
     assert!(status.is_success(), "{status}");
 
-    // tools/list advertises the whole surface.
     let (status, _, body) = post(
         &app,
         Some(&session),
@@ -609,7 +541,6 @@ async fn tools_round_trip_over_http() {
         ellmephant::mcp::TOOLS.len()
     );
 
-    // A real write + read round-trips through the shared store.
     let (status, _, body) = post(
         &app,
         Some(&session),
@@ -631,7 +562,6 @@ async fn tools_round_trip_over_http() {
 
 #[tokio::test]
 async fn search_filters_round_trip() {
-    // `memory_search` filters on tags and size, intersecting; a lean reply is `key` + `via`.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path())).with_identity("tester");
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -659,7 +589,6 @@ async fn search_filters_round_trip() {
         assert!(!added.is_error.unwrap_or(false), "{}", text(&added));
     }
 
-    // Filters intersect: the tag keeps both, the size floor keeps the long one.
     let filtered = call(
         &client,
         "memory_search",
@@ -667,7 +596,6 @@ async fn search_filters_round_trip() {
     )
     .await;
     let filtered: serde_json::Value = serde_json::from_str(&text(&filtered)).expect("search json");
-    // A filter with no `fields` named is the lean `key` + `via` shape.
     assert_eq!(filtered["cols"], serde_json::json!(["key", "via"]));
     assert_eq!(filtered["hits"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["hits"][0][0], serde_json::json!("note-long"));
@@ -693,7 +621,6 @@ async fn projects_round_trip_over_the_transport() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    // The project tools are advertised alongside the memory ones.
     let listed = client.list_tools(Default::default()).await.expect("list");
     for name in ["project_upsert", "project_get", "project_list"] {
         assert!(
@@ -702,7 +629,6 @@ async fn projects_round_trip_over_the_transport() {
         );
     }
 
-    // A memory to preload, then the project itself.
     call(
         &client,
         "memory_upsert",
@@ -732,7 +658,6 @@ async fn projects_round_trip_over_the_transport() {
         "the key comes back as a plain name"
     );
 
-    // `project_get` returns the project with its ordered preload.
     let got = call(
         &client,
         "project_get",
@@ -770,7 +695,6 @@ async fn projects_round_trip_over_the_transport() {
         "hydration is opt-in: the default read carries no bodies"
     );
 
-    // ...and `hydrate: full` carries each preload memory's body in a sister table, in order.
     let full = call(
         &client,
         "project_get",
@@ -781,8 +705,6 @@ async fn projects_round_trip_over_the_transport() {
     assert_eq!(v["bodies"]["cols"], serde_json::json!(["key", "body"]));
     assert_eq!(v["bodies"]["rows"][0][0], serde_json::json!("boot-note"));
 
-    // A memory JOINS the project by carrying its tag — set on the memory write, never a relation,
-    // and read back with the ordinary `tags` filter.
     let tagged = call(
         &client,
         "memory_upsert",
@@ -796,8 +718,6 @@ async fn projects_round_trip_over_the_transport() {
     .await;
     assert!(!tagged.is_error.unwrap_or(false), "{}", text(&tagged));
 
-    // The tag vocabulary is opt-in (`tags: true`) so the digest stays lean — and a memory now
-    // carries tags (`chronos-design` just above), so the full set is real here.
     let lean = call(&client, "memory_stats", serde_json::json!({})).await;
     assert!(
         !text(&lean).contains("all_tags"),
@@ -828,7 +748,6 @@ async fn projects_round_trip_over_the_transport() {
         "the project tag, intersected with a topic tag, finds its members"
     );
 
-    // A second project is not a second home: a memory may carry as many project tags as it likes.
     call(
         &client,
         "project_upsert",
@@ -852,7 +771,6 @@ async fn projects_round_trip_over_the_transport() {
         text(&both)
     );
 
-    // `project_list` is the cheap index, and its filters intersect.
     let all = call(&client, "project_list", serde_json::json!({})).await;
     let v: serde_json::Value = serde_json::from_str(&text(&all)).expect("json");
     assert_eq!(v["projects"].as_array().unwrap().len(), 2);
@@ -866,7 +784,6 @@ async fn projects_round_trip_over_the_transport() {
     assert_eq!(v["projects"].as_array().unwrap().len(), 1);
     assert_eq!(v["projects"][0][0], serde_json::json!("chronos"));
 
-    // An unknown project is a clean tool error.
     let missing = call(&client, "project_get", serde_json::json!({ "key": "nope" })).await;
     assert_eq!(missing.is_error, Some(true));
     assert!(
@@ -896,7 +813,6 @@ async fn upsert_patches_one_field_over_the_transport() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    // Create, with tags.
     let created = call(
         &client,
         "memory_upsert",
@@ -908,8 +824,6 @@ async fn upsert_patches_one_field_over_the_transport() {
     let v: serde_json::Value = serde_json::from_str(&text(&created)).expect("json");
     assert_eq!(v["status"], serde_json::json!("created"));
 
-    // Patch ONE field: the tags are NOT resent, so they must survive. The row is settled first, so
-    // that `queued: false` is a fact about the document and not about an un-encoded row.
     settle(dir.path());
     let patched = call(
         &client,
@@ -935,7 +849,6 @@ async fn upsert_patches_one_field_over_the_transport() {
         "an omitted field keeps its stored value -- tags are not wiped"
     );
 
-    // Clearing IS expressible: `[]` empties the tags.
     call(
         &client,
         "memory_upsert",
@@ -946,7 +859,6 @@ async fn upsert_patches_one_field_over_the_transport() {
     let g: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
     assert_eq!(g["tags"], serde_json::json!([]));
 
-    // A new key with no title is refused rather than written empty.
     let bad = call(
         &client,
         "memory_upsert",
@@ -955,7 +867,6 @@ async fn upsert_patches_one_field_over_the_transport() {
     .await;
     assert!(bad.is_error.unwrap_or(false), "{}", text(&bad));
 
-    // Projects: patch one field, and an omitted `status` is NOT reset to `todo`.
     let made = call(
         &client,
         "project_upsert",
@@ -998,7 +909,6 @@ async fn upsert_patches_one_field_over_the_transport() {
 
 #[tokio::test]
 async fn dupes_and_reembed_round_trip_over_the_transport() {
-    // The two tools that were wired but never called by a test.
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path())).with_identity("tester");
 
@@ -1014,7 +924,6 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    // Two rows that differ only in their key, so the finder has a pair to report.
     for key in ["dup-a", "dup-b"] {
         call(
             &client,
@@ -1053,8 +962,6 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         "each pair carries its class: {d}"
     );
 
-    // The other half of the same tool: `plan: true` must arrive through the transport, not only
-    // through the store. A typo in the parameter name would pass every store-level test.
     let plan = call(
         &client,
         "memory_dupes",
@@ -1077,8 +984,6 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
     assert_eq!(steps[0][0], serde_json::json!("dup-a"), "the keeper: {p}");
     assert_eq!(steps[0][1], serde_json::json!("dup-b"), "the absorbed: {p}");
 
-    // Tear the index, the way a killed rebuild would: drop one row's vector and leave its `encode_hash`
-    // still saying "indexed". That is precisely the case the hash alone cannot see.
     {
         ellmephant::index::vec::register_extension();
         let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
@@ -1090,9 +995,6 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
         ellmephant::index::vec::delete(&conn, id).expect("tear the index");
     }
 
-    // `memory_reembed` takes no arguments: it QUEUES every document (`queued` is therefore the row
-    // count, not "the ones that look owed" — there is no stamp to judge that with) and rebuilds the
-    // parts that take no model. It embeds nothing itself — the worker does that.
     let re = call(&client, "memory_reembed", serde_json::json!({})).await;
     assert!(!re.is_error.unwrap_or(false), "{}", text(&re));
     let r: serde_json::Value = serde_json::from_str(&text(&re)).expect("json");
@@ -1142,10 +1044,6 @@ async fn project_get_on_a_missing_key_is_a_tool_error() {
     handle.await.expect("join");
 }
 
-/// ★ `semantic_search(type=…)` MUST FILTER (soma/ellmephant#87). The parameter was named `kind` in
-/// Rust while the description promised `type`, and serde discarded the argument it did not know — so
-/// every "kind-filtered" search returned the whole store, and one of my own verifications passed
-/// because the hits *looked* like projects.
 #[tokio::test]
 async fn semantic_search_honours_the_kind_parameter() {
     let dir = tempfile::tempdir().unwrap();
@@ -1172,10 +1070,6 @@ async fn semantic_search_honours_the_kind_parameter() {
     assert!(!m.is_error.unwrap_or(false), "{}", text(&m));
     settle(dir.path());
 
-    // ★ THE PROOF IS THE REFUSAL, NOT A HIT. Before the fix, `type: "project"` was silently dropped
-    // and this call answered with MEMORIES — confidently, and with no sign the filter was discarded
-    // (soma/ellmephant#87). Projects carry no vectors yet (that is its own open item), so an honest
-    // filtered search must SAY SO rather than quietly widen to every kind.
     let projects = call(
         &client,
         "semantic_search",
@@ -1194,7 +1088,6 @@ async fn semantic_search_honours_the_kind_parameter() {
         text(&projects)
     );
 
-    // The kind that DOES have vectors still answers.
     let memories = call(
         &client,
         "semantic_search",
@@ -1208,7 +1101,6 @@ async fn semantic_search_honours_the_kind_parameter() {
         text(&memories)
     );
 
-    // `kind` remains an alias for the name the schema advertises.
     let alias = call(
         &client,
         "semantic_search",
@@ -1218,8 +1110,6 @@ async fn semantic_search_honours_the_kind_parameter() {
     assert_eq!(alias.is_error, Some(true), "`kind` is an alias of `type`");
 }
 
-/// ★ soma/ellmephant#79 over the real transport: the cursor is the PROVEN pen's, stored in the store,
-/// so `mail_inbox` needs no `since` and the caller cannot forget, re-spell or advance someone else's.
 #[tokio::test]
 async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
     let dir = tempfile::tempdir().unwrap();
@@ -1252,7 +1142,6 @@ async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
         assert!(!sent.is_error.unwrap_or(false), "{}", text(&sent));
     }
 
-    // No `since`: the store knows where this pen is (nowhere yet) and says what is left.
     let inbox = call(
         &client,
         "mail_inbox",
@@ -1278,7 +1167,6 @@ async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
     assert_eq!(acked["moved"], 2, "what the advance covered");
     assert_eq!(acked["unread"], 0);
 
-    // The stored cursor is the default now: no `since` means "after where I am".
     let again = call(
         &client,
         "mail_inbox",
@@ -1289,7 +1177,6 @@ async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
     assert_eq!(second["cursor"], page_top);
     assert_eq!(second["letters"].as_array().map(Vec::len), Some(0));
 
-    // A cursor only moves forward, and the refusal says where it actually is.
     let back = call(
         &client,
         "mail_ack",
@@ -1307,16 +1194,9 @@ async fn the_mail_cursor_is_stored_for_the_proven_pen_over_the_transport() {
     handle.await.expect("join");
 }
 
-/// `memory_adopt` — responsibility, not authorship, and not a land-grab.
-///
-/// Three rules, all at the door: an ownerless row is claimable; an owned row needs `force` AND an
-/// ancestor; a row the pen cannot read cannot be adopted at all.
 #[tokio::test]
 async fn adopt_takes_responsibility_and_refuses_what_it_should() {
     let dir = tempfile::tempdir().unwrap();
-    // Build the schema, then seed pens and rows on a second connection: the door has no way to
-    // create an ownerless row (an upsert always sets the writer as owner), and a fixture that
-    // cannot produce the state under test would be testing itself.
     drop(session(dir.path()));
     {
         let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
@@ -1343,7 +1223,6 @@ async fn adopt_takes_responsibility_and_refuses_what_it_should() {
             [],
         )
         .expect("private");
-        // `add` settles nothing, but adopt reads only the row and the pen table.
         ellmephant::store::encode::drain(&conn, &HashEmbedder::new(DIM), 64).expect("drain");
     }
 
@@ -1360,7 +1239,6 @@ async fn adopt_takes_responsibility_and_refuses_what_it_should() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    // An ownerless row: no force needed.
     let ok = call(
         &client,
         "memory_adopt",
@@ -1371,9 +1249,6 @@ async fn adopt_takes_responsibility_and_refuses_what_it_should() {
     let body: serde_json::Value = serde_json::from_str(&text(&ok)).expect("json");
     assert_eq!(body["owner"], "tester");
 
-    // An owned row: refused, with or without force, because `tester` is not an ancestor of `other`.
-    // The ancestor check comes first on purpose — whether the caller passed `force` is irrelevant to
-    // a pen that had no right to ask.
     let no_force = call(
         &client,
         "memory_adopt",
@@ -1391,7 +1266,6 @@ async fn adopt_takes_responsibility_and_refuses_what_it_should() {
     assert!(forced.is_error.unwrap_or(false), "{}", text(&forced));
     assert!(text(&forced).contains("ancestor"), "{}", text(&forced));
 
-    // A row this pen cannot read: refused, and the refusal must not leak the content.
     let secret = call(
         &client,
         "memory_adopt",
@@ -1408,7 +1282,6 @@ async fn adopt_takes_responsibility_and_refuses_what_it_should() {
 #[tokio::test]
 async fn config_round_trips_with_its_written_acl() {
     let dir = tempfile::tempdir().unwrap();
-    // The registry is provisioning, not a tool: seed the tree the test speaks from.
     {
         let conn = ellmephant::db::open(&Paths::from_root(dir.path())).expect("open");
         conn.execute_batch(
@@ -1433,7 +1306,6 @@ async fn config_round_trips_with_its_written_acl() {
     });
     let client = ().serve(client_io).await.expect("client handshake");
 
-    // Define: the ACL is written on the row, and the caller is recorded as owner.
     let defined = call(
         &client,
         "config_define",
@@ -1451,7 +1323,6 @@ async fn config_round_trips_with_its_written_acl() {
     assert_eq!(row["value"], "2h");
     assert_eq!(row["owner"], "james");
 
-    // Set: allowed for the written setter.
     let set = call(
         &client,
         "config_set",
@@ -1460,7 +1331,6 @@ async fn config_round_trips_with_its_written_acl() {
     .await;
     assert!(!set.is_error.unwrap_or(false), "{}", text(&set));
 
-    // Get + list agree.
     let got = call(
         &client,
         "config_get",
@@ -1470,8 +1340,6 @@ async fn config_round_trips_with_its_written_acl() {
     let row: serde_json::Value = serde_json::from_str(&text(&got)).expect("json");
     assert_eq!(row["value"], "90m");
 
-    // A fresh store also carries the recess seed (0039), so assert the row is present rather than
-    // that it is the only row: a count here would make every later seed break this test.
     let listed = call(
         &client,
         "config_list",
@@ -1482,7 +1350,6 @@ async fn config_round_trips_with_its_written_acl() {
     assert_eq!(rows["config"].as_array().unwrap().len(), 1);
     assert_eq!(rows["config"][0]["key"], "recess_daily_time");
 
-    // `set` cannot invent an item: the ACL is the point.
     let invented = call(
         &client,
         "config_set",
@@ -1500,8 +1367,6 @@ async fn config_round_trips_with_its_written_acl() {
     handle.await.expect("join");
 }
 
-/// `/mcp/core` advertises the hot path and nothing else — and still ANSWERS for a tool it did not
-/// advertise. The split is an advertisement, not a permission.
 #[tokio::test]
 async fn the_core_door_advertises_only_the_hot_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -1570,7 +1435,6 @@ async fn the_core_door_advertises_only_the_hot_path() {
         "channel admin is not core"
     );
 
-    // Not advertised, still callable: the door filters the list, not the handler.
     let (status, _, body) = post_to(
         &app,
         "/mcp/core",

@@ -1,10 +1,3 @@
-//! Integration: AUTHORSHIP vs THE WRITER — two provenance facts, and only one of them moves
-//! (soma/ellmephant#107).
-//!
-//! Before this, `asserted_by` was one column stamped on every write, and tags create no version — so
-//! re-filing a row silently moved its author to whoever filed it, with nothing in `memory_history` to
-//! show the move. Measured on 2026-10-22 by a tag pass over 19 rows.
-
 mod common;
 
 use common::{count, temp_store};
@@ -14,7 +7,6 @@ use ellmephant::store::{self, Memory};
 
 const DIM: usize = 8;
 
-/// A row whose author is `james`, created the way the store creates one.
 fn seeded(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str) -> i64 {
     let mem = Memory {
         key: key.to_string(),
@@ -26,10 +18,6 @@ fn seeded(conn: &rusqlite::Connection, embedder: &HashEmbedder, key: &str) -> i6
     common::add_now(conn, embedder, &mem).expect("add memory").0
 }
 
-/// Register a pen, so a write has an identity that resolves. `cline` is the PARENT of `james` here on
-/// purpose: these tests are about authorship versus the writer, and the writer must be a pen that may
-/// write the row at all (soma/ellmephant#190 — before that fix the gate asked about the row's author,
-/// so this fixture passed without a registry and proved the bug by accident).
 fn pen(conn: &rusqlite::Connection, name: &str, parent: Option<&str>) {
     conn.execute(
         "INSERT OR IGNORE INTO pen (name, kind, parent_id)
@@ -61,7 +49,6 @@ fn a_tag_only_write_moves_the_writer_and_not_the_author() {
     registry(&conn);
     let id = seeded(&conn, &embedder, "handed-to-cline");
 
-    // ★ THE REPRODUCTION: a tag pass by another pen. No title, no body, no version_note.
     let outcome = common::merge_now(
         &conn,
         &embedder,
@@ -87,8 +74,6 @@ fn a_tag_only_write_moves_the_writer_and_not_the_author() {
         "the writer names itself, so the move is visible"
     );
 
-    // Filing is still not meaning: no version is created, and none is needed — the two columns hold
-    // both facts, which is why the bug is fixed without a history entry.
     assert_eq!(
         count(&conn, "SELECT count(*) FROM memory_version"),
         0,
@@ -158,16 +143,12 @@ fn the_same_pen_writing_again_is_not_a_change_of_either_fact() {
 
 #[test]
 fn an_upgraded_store_backfills_the_last_writer_from_the_author() {
-    // The migration's backfill is a CLAIM ABOUT HISTORY: before 0020 every write restamped
-    // `asserted_by`, so the stored author IS the last writer. A row that predates the column must
-    // not read as "never written".
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
     seeded(&conn, &embedder, "old-row");
     conn.execute("UPDATE memory SET edited_by = NULL", [])
         .unwrap();
-    // Re-run the backfill the migration performs.
     conn.execute(
         "UPDATE memory SET edited_by = asserted_by WHERE edited_by IS NULL",
         [],

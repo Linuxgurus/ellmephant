@@ -1,8 +1,3 @@
-//! Integration: the model cache (SPEC §6) against a **fake transport** — no network.
-//!
-//! Everything here runs offline; the real `ureq` fetch is exercised only by the
-//! `#[ignore]`d test at the bottom.
-
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -18,7 +13,6 @@ const REPO: &str = "Qwen/Qwen3-Embedding-0.6B";
 const ENDPOINT: &str = "https://hf.test";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// In-memory Hub: url -> bytes, plus url -> sha for ref resolution. Counts downloads.
 struct FakeFetcher {
     files: HashMap<String, Vec<u8>>,
     refs: HashMap<String, String>,
@@ -34,7 +28,6 @@ impl FakeFetcher {
             ("tokenizer.json", "{\"model\":\"qwen3\"}"),
             ("tokenizer_config.json", "{\"pad\":\"left\"}"),
             ("model.safetensors", "WEIGHTS-BLOB"),
-            // note: vocab.json / merges.txt intentionally absent -> optional skip
         ] {
             files.insert(
                 fetch::file_url(ENDPOINT, REPO, SHA, name),
@@ -81,7 +74,6 @@ impl Fetcher for FakeFetcher {
     }
 }
 
-/// A fetcher that fails loudly if the network is used at all.
 struct FakeOffline;
 
 impl Fetcher for FakeOffline {
@@ -137,7 +129,6 @@ fn fetch_populates_cache_then_reruns_are_noops() {
     assert!(manifest.is_complete(&dir, model::REQUIRED_FILES));
     assert_eq!(manifest.resolved, SHA);
 
-    // A second run downloads nothing.
     let before = fetcher.downloads();
     let again = model::ensure(&spec, &fetcher).expect("second ensure");
     assert_eq!(again, dir);
@@ -153,7 +144,6 @@ fn warm_cache_works_offline() {
     let (_dir, spec) = temp();
     model::ensure(&spec, &FakeFetcher::new()).expect("fetch");
 
-    // Offline, with a fetcher that panics on any use, the cache still resolves.
     let offline = Spec {
         offline: true,
         ..spec.clone()
@@ -249,7 +239,6 @@ fn spec_from_config_defaults_the_cache_to_home_models() {
     assert_eq!(spec.model_dir, None);
     assert!(!spec.offline);
 
-    // A configured cache_dir wins; `offline` rides along (SPEC §6.1, §6.4).
     let cfg = Config {
         cache_dir: "/tmp/elsewhere".to_string(),
         offline: true,
@@ -279,8 +268,6 @@ fn with_overrides_replaces_only_the_supplied_fields() {
 
 #[test]
 fn verify_errors_when_the_revision_never_resolved() {
-    // Cold cache, ref `main` unresolved: there is nothing to hash, so verify must say so
-    // rather than silently pass (SPEC §6.3).
     let (_dir, spec) = temp();
     let err = model::verify(&spec).unwrap_err();
     assert!(err.to_string().contains("not resolved"), "{err}");
@@ -313,12 +300,6 @@ fn remove_refuses_a_model_dir() {
     );
 }
 
-/// Real fetch — needs the network and ~1.2 GB. `cargo test -- --ignored`.
-///
-/// The endpoint is the **real** one on purpose. Every other test in this file points at `hf.test` so it
-/// can never touch the network — which meant this test could never have passed, and nobody noticed,
-/// because `#[ignore]` is where tests go to be wrong quietly. `HF_ENDPOINT` still overrides, as it does
-/// in production.
 #[test]
 #[ignore = "downloads ~1.2 GB from the Hub"]
 fn real_fetch_of_qwen3_embedding() {

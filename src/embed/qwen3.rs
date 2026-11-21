@@ -1,38 +1,16 @@
-//! Qwen3-Embedding encoder on candle (P3).
-//!
-//! We own the encoder rather than depend on `fastembed` (which drags in ONNX Runtime and
-//! mean-pools — PLAN §1 F1/F2). The weights come from the P2.5 cache as a flat dir; this
-//! module only *loads* them.
-//!
-//! Contract (SPEC §6): 1024-d, **last-token** pooling, left padding, L2-normalised, with
-//! `Instruct: <task>\nQuery: <q>` prepended on the *query* side only.
-//!
-//! Compiled only with the default-on `encoder` feature; `--no-default-features` leaves a
-//! stub that errors at runtime, keeping the store/search layers buildable without candle.
-
-/// HF repo id recorded in `meta` when the encoder is the default Qwen3 model.
 pub const MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
 
-/// How to load the encoder. `model_id` is folded into the row hash, so a different repo
-/// (or `--model-dir`) produces a different hash and forces a re-embed.
 #[derive(Debug, Clone)]
 pub struct Options<'a> {
-    /// Model id recorded in `meta` / the row hash.
     pub model_id: &'a str,
-    /// Expected embedding length; must match the loaded model.
     pub dim: usize,
-    /// `cpu` or `metal` (SPEC §15 #9).
     pub device: &'a str,
-    /// `bf16` (default) or `f16`.
     pub precision: &'a str,
-    /// Query-side instruction (SPEC §6); empty disables the prefix.
     pub instruction: &'a str,
-    /// Truncation length.
     pub max_len: usize,
 }
 
 impl<'a> Options<'a> {
-    /// Options for the default model, honouring `device`/`precision`/`instruction`.
     pub fn new(dim: usize, device: &'a str, precision: &'a str, instruction: &'a str) -> Self {
         Self {
             model_id: MODEL_ID,
@@ -69,12 +47,10 @@ mod real {
     use crate::embed::tokenize::{self, BatchConfig, PaddingSide};
     use crate::error::{Error, Result};
 
-    /// Map a candle failure into our error type, naming the step that failed.
     fn candle(err: candle_core::Error, what: &str) -> Error {
         Error::Model(format!("{what}: {err}"))
     }
 
-    /// Parse `cpu`/`metal` (SPEC §15 #9).
     fn device_from(name: &str) -> Result<Device> {
         match name {
             "cpu" => Ok(Device::Cpu),
@@ -87,7 +63,6 @@ mod real {
         }
     }
 
-    /// Parse `bf16`/`f16`/`f32` (SPEC §6).
     fn dtype_from(name: &str) -> Result<DType> {
         match name {
             "bf16" => Ok(DType::BF16),
@@ -100,12 +75,6 @@ mod real {
         }
     }
 
-    /// Bridge between the HF file's naming and candle's.
-    ///
-    /// `Qwen/Qwen3-Embedding-0.6B` stores the transformer under *bare* names
-    /// (`embed_tokens.weight`, `layers.0.…`), while `qwen3::Model` asks for the same tensors
-    /// under a `model.` prefix. This adapter strips that prefix on lookup, so we load the
-    /// shipped file directly instead of rewriting 1.2 GB.
     struct ModelPrefixBackend {
         inner: MmapedSafetensors,
         strip: bool,
@@ -113,7 +82,6 @@ mod real {
 
     impl ModelPrefixBackend {
         fn new(inner: MmapedSafetensors) -> Self {
-            // Only strip when the file does *not* already use the prefixed names.
             let strip = !inner
                 .tensors()
                 .iter()
@@ -155,7 +123,6 @@ mod real {
         }
     }
 
-    /// The Qwen3-Embedding encoder, loaded from a flat weights directory.
     pub struct Qwen3Embedder {
         model: qwen3::Model,
         tokenizer: Tokenizer,
@@ -166,10 +133,6 @@ mod real {
     }
 
     impl Qwen3Embedder {
-        /// Load `config.json`, `model.safetensors` and `tokenizer.json` from `dir`.
-        ///
-        /// `dir` is a cache revision directory (or a `--model-dir`); this function never
-        /// touches the network — the cache layer (P2.5) guarantees the files are present.
         pub fn load(dir: &Path, opts: &Options<'_>) -> Result<Self> {
             let batch = BatchConfig {
                 padding: PaddingSide::Left,
@@ -177,8 +140,6 @@ mod real {
             };
             batch.validate()?;
             let device = device_from(opts.device)?;
-            // candle's CPU matmul goes through Accelerate, which supports f32 only — no
-            // bf16, no f16 (PLAN §9 risk). CPU therefore runs f32; GPU honours `--precision`.
             let dtype = if device.is_cpu() {
                 tracing::debug!("cpu backend: forcing f32 (accelerate has no bf16/f16 matmul)");
                 DType::F32
@@ -199,8 +160,7 @@ mod real {
                     weights.display()
                 )));
             }
-            // SAFETY: mmaps the weights file; the cache wrote it with fsync + atomic rename
-            // and verified its sha256 (SPEC §6.2–6.3), so it cannot change under us.
+            // SAFETY: written with fsync + atomic rename, sha256-verified, so it cannot change under us.
             let mmap = unsafe { MmapedSafetensors::new(&weights) }
                 .map_err(|e| candle(e, &format!("mmap {}", weights.display())))?;
             let vb = VarBuilder::from_backend(
@@ -238,8 +198,6 @@ mod real {
             })
         }
 
-        /// Tokenise, run one forward, last-token pool and L2-normalise. One sequence at a
-        /// time — see the module docs on why padded batching is unsafe with this forward.
         fn forward_one(&self, text: &str) -> Result<Vec<f32>> {
             let ids = tokenize::encode(&self.tokenizer, text)?;
             let len = ids.len();
@@ -249,12 +207,10 @@ mod real {
             let input = Tensor::from_vec(ids, (1, len), &self.device)
                 .map_err(|e| candle(e, "input tensor"))?;
 
-            // `forward` mutates an internal KV cache; clone a pristine model so each call
-            // starts at offset 0 with an empty cache (Tensor clones are cheap Arc bumps).
             let mut model = self.model.clone();
             let hidden = model
                 .forward(&input, 0)
-                .map_err(|e| candle(e, "qwen3 forward"))?; // (1, L, H)
+                .map_err(|e| candle(e, "qwen3 forward"))?;
 
             let pooled = hidden
                 .narrow(1, len - 1, 1)
@@ -274,7 +230,6 @@ mod real {
             Ok(vector)
         }
 
-        /// The instruction prefix actually applied to queries.
         pub fn instruction(&self) -> &str {
             &self.instruction
         }
@@ -294,7 +249,6 @@ mod real {
         }
 
         fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-            // An empty instruction means documents and queries are symmetric.
             let prefixed = if self.instruction.is_empty() {
                 text.to_string()
             } else {
@@ -313,13 +267,11 @@ mod stub {
     use crate::embed::Embedder;
     use crate::error::{Error, Result};
 
-    /// Placeholder used when the crate is built without the `encoder` feature.
     pub struct Qwen3Embedder {
         dim: usize,
     }
 
     impl Qwen3Embedder {
-        /// Always fails: this build has no candle backend.
         pub fn load(_dir: &Path, opts: &Options<'_>) -> Result<Self> {
             let _ = opts;
             Err(Error::Unsupported(
@@ -327,7 +279,6 @@ mod stub {
             ))
         }
 
-        /// No instruction is ever applied by the stub.
         pub fn instruction(&self) -> &str {
             ""
         }

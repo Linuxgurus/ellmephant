@@ -1,11 +1,6 @@
-//! The wire form of a merge plan (soma/ellmephant#236): the steps, and the pairs refused with
-//! their reason. Moved out of `store::dupes` for the same reason as its siblings.
-
 use crate::error::Result;
 use crate::store::dupes::{DupePair, MergePlan};
 
-/// Positional wire for [`MergePlan`]: the steps to take, and the pairs `--plan` refuses with the
-/// reason. Both tables are positional, like every other list-shaped read.
 pub fn plan_to_wire_json(plan: &MergePlan) -> Result<String> {
     let steps: Vec<serde_json::Value> = plan
         .steps
@@ -28,8 +23,6 @@ pub fn plan_to_wire_json(plan: &MergePlan) -> Result<String> {
     ))
 }
 
-/// Positional wire for the pair list (mirrors the other list-shaped reads): a `cols` header and
-/// bare-array rows. `distance` is rounded to 4 decimals.
 pub fn to_wire_json(pairs: &[DupePair]) -> Result<String> {
     let rows: Vec<serde_json::Value> = pairs
         .iter()

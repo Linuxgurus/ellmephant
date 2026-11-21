@@ -1,33 +1,3 @@
-//! Projects: the **structures** half of the store (SPEC §7.1).
-//!
-//! A project is an activity completed over time — work with a beginning, a current state, and a
-//! place to stand: a key, a status, prose, and one relation to memories. A memory is the other
-//! half of the store: one body of closely related facts, matched by meaning, so it carries the
-//! machinery (votes, visits, a coherence verdict, an embedding) that a project has no use for — a
-//! shape is not something you match by meaning. Their keys are **plain names** — a project and a
-//! memory may share one — so a *reference* carries the type instead: `[[prj:x]]` crosses to the
-//! other table (see [`links::PROJECT_MARKER`]), and `memory_link.to_type` records which table an
-//! edge names.
-//!
-//! One relation, and one convention:
-//!
-//! - [`preload`] — project → memory, **ordered**, stored as the `mem_preload` column (`preload` is
-//!   the *relation's* name; the column carries it, prefixed so a reader of `project` can see that
-//!   its contents are memory keys and not tags). About *attention*: "to work in here, load
-//!   these." A project preloads memories it did not author (conventions, boot notes). It is a
-//!   **column** on `project`, not a tie table: order is a property of the list, and nothing here
-//!   is cross-row.
-//! - **membership is a TAG**, not a relation. A memory belongs to a project by carrying the
-//!   `prj:<key>` tag, intersected with topic tags by the ordinary `tags` filter — `prj:seaweedfs`
-//!   plus `storage` is "the storage memories belonging to seaweedfs". There is no `project_memory`
-//!   table and no `Home`: a memory may belong to any number of projects, nothing needs maintaining,
-//!   and nothing can dangle. The reversal (and why `contains` was a mistake) is migration `0007`
-//!   and SPEC §7.1.
-//!
-//! The reference is by-key, with no foreign keys — the same discipline as `memory_link.to_key`, so
-//! a forward reference is possible and rot is *detected* ([`dangling`]) instead of raising a
-//! broken-FK error.
-
 use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -38,20 +8,8 @@ use crate::search::MatchMode;
 use crate::search::lexical::Matcher;
 use crate::store::{codec, links, slug, tags};
 
-/// The prefix a project key *used* to carry. Accepted on input (muscle memory, and every doc ever
-/// written), never produced: a key is a plain name now, so a project and a memory may share one.
-///
-/// Kept only for the input boundary — see [`strip_marker`], and migration `0006` for why the old
-/// spelling has to be *interpreted* exactly once, while it still means anything.
 const LEGACY_PREFIX: &str = "prj-";
 
-/// Strip an optional project marker from an argument that names a project: the argument's job
-/// already says "project", so `chronos`, `prj:chronos` and the legacy `prj-chronos` all name the
-/// same one.
-///
-/// **A link token is a different case.** Prose is written by a model about a name that may be
-/// ambiguous, so there the marker must be the unambiguous [`links::PROJECT_MARKER`]: `[[prj-foo]]`
-/// in a body means a memory *called* `prj-foo`, and only `[[prj:foo]]` crosses to the project.
 fn strip_marker(raw: &str) -> &str {
     let raw = raw.trim();
     match raw
@@ -63,103 +21,59 @@ fn strip_marker(raw: &str) -> &str {
     }
 }
 
-/// The canonical form of a project key: a plain slug, with any marker stripped. One helper, used by
-/// every entry point, so `"chronos"`, `"Chronos"`, `"prj:chronos"` and `"prj-chronos"` all mean the
-/// same project.
 pub fn normalize_key(raw: &str) -> String {
     slug::slugify(strip_marker(raw))
 }
 
-/// Resolve a write's key: an explicit key is normalised; otherwise the title is slugified and a
-/// `-2`/`-3` suffix is added on collision.
 fn resolve_key(conn: &Connection, p: &Project) -> Result<String> {
     if p.key.trim().is_empty() {
         let base = normalize_key(&p.title);
         let taken = taken_keys(conn, &base)?;
         return Ok(slug::unique_slug(&base, &taken));
     }
-    // A key that is *only* a marker would otherwise slugify to the `untitled` fallback.
     if strip_marker(&p.key).trim().is_empty() {
         return Err(Error::Project("empty project key".into()));
     }
     Ok(normalize_key(&p.key))
 }
 
-/// The legal `status` values. `done` and `aborted` both end a project — there is no delete.
 pub const STATUSES: &[&str] = &["todo", "active", "paused", "done", "aborted"];
 
-/// The statuses that END a project: the work stopped, one way or the other. `end_date` rides on
-/// these — *how* it ended is `status`'s job, the date only says *when*.
 pub const ENDED_STATUSES: &[&str] = &["done", "aborted"];
 
-/// One project: identity, prose and shape.
-///
-/// `status` is a string rather than an enum because it is stored, checked and reported as-is
-/// ([`STATUSES`] is the vocabulary); `owner` is a *set* of names, stored comma-joined; the dates are
-/// ISO strings, so they sort as they read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Project {
-    /// Global-unique slug within the project table — a plain name, shared with `memory` if it wants
-    /// one too; identity and link target.
     pub key: String,
-    /// Smart-caveman one-liner.
     pub title: String,
-    /// What this is for.
     #[serde(default)]
     pub goal: String,
-    /// Mutable current-state prose: where it stands, what's next.
     #[serde(default)]
     pub state: String,
-    /// `todo` | `active` | `paused` | `done` | `aborted` (default `todo`).
     #[serde(default)]
     pub status: String,
-    /// Who owns it, by name — a **set**, stored comma-joined, sorted. Free text: there is no
-    /// vocabulary here, because the store does not know who exists (an empty set is unassigned).
     #[serde(default)]
     pub owner: Vec<String>,
-    /// Aspect tags (the same comma-joined codec as `memory.tags`).
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Creation timestamp — when the *row* appeared.
     #[serde(default)]
     pub created: String,
-    /// Last-update timestamp — last *write*, which is not the same as last *work*.
     #[serde(default)]
     pub updated: String,
-    /// When the work started, ISO date. Stated by the caller, or **derived from the status**:
-    /// stamped when a project stops being `todo`, since work cannot have started while it is only a
-    /// todo. **Never cleared** — a project pushed back to `todo` keeps it, so a non-empty start on a
-    /// `todo` project is the record that it was worked on once and parked. Also correctable:
-    /// [`created`] is when the *row* appeared, which is not the same thing — a project written down
-    /// three weeks late started three weeks ago.
     #[serde(default)]
     pub start_date: String,
-    /// When it ended, ISO date — empty while the project runs. Stamped when `status` becomes one of
-    /// [`ENDED_STATUSES`], cleared when it is reopened, and never moved once set (an unrelated later
-    /// write does not touch it). *How* it ended is `status`; this only says *when*.
     #[serde(default)]
     pub end_date: String,
 }
 
-/// How much of each preload memory's **body** the read carries.
-///
-/// The default ([`Hydrate::None`]) leaves `preload` a *reading list* — keys and titles, one
-/// `memory_get` away. A caller that means to *work in* a project can ask for the text instead, so a
-/// project becomes a warm start rather than a to-do list; the levels trade context for cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Hydrate {
-    /// Keys and titles only (the lean default): hydrate nothing.
     #[default]
     None,
-    /// The first [`crate::search::SNIPPET_CHARS`] of each body — a glance.
     Snippet,
-    /// The whole body — a warm start.
     Full,
 }
 
 impl Hydrate {
-    /// Parse the wire spelling (`none` | `snippet` | `full`). An unknown value is an error that
-    /// names the offenders rather than silently doing nothing.
     pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_lowercase().as_str() {
             "" | "none" => Ok(Hydrate::None),
@@ -171,7 +85,6 @@ impl Hydrate {
         }
     }
 
-    /// The body to carry for `body` at this level, or `None` when nothing is hydrated.
     fn body(self, body: &str) -> Option<String> {
         match self {
             Hydrate::None => None,
@@ -181,49 +94,29 @@ impl Hydrate {
     }
 }
 
-/// A key this project points at, with its title when the target still resolves.
-///
-/// `title: None` means the target row does not exist (a forward reference or rot) — the read
-/// reports it rather than hiding it, and [`dangling`] is the audit.
 #[derive(Debug, Clone, Serialize)]
 pub struct Ref {
-    /// The referenced key.
     pub key: String,
-    /// The target's salient line, or `None` when nothing resolves.
     pub title: Option<String>,
-    /// The target's body, hydrated at the requested [`Hydrate`] level; `None` when hydration was
-    /// off (the default) or the target does not resolve.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 }
 
-/// A project with its relation resolved — "stand inside it".
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
-    /// The project itself.
     pub project: Project,
-    /// Ordered preload (`project → memory`), titles hydrated where they resolve and bodies hydrated
-    /// at the requested level.
     pub preload: Vec<Ref>,
 }
 
-/// A `project_list` filter: structured predicates plus the lexical leg, all intersecting.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    /// Only this `status`.
     pub status: Option<String>,
-    /// Every listed tag must be present (AND).
     pub tags: Vec<String>,
-    /// Every listed owner must be present (AND), matched case-insensitively like `tags`.
     pub owner: Vec<String>,
-    /// Literal/regex pattern over `key`/`title`/`goal`/`state`; `None` = no lexical leg.
     pub pattern: Option<String>,
-    /// How `pattern` is read.
     pub mode: MatchMode,
 }
 
-/// Project keys sharing `base` as a prefix (collision avoidance). `base` is `[a-z0-9-]`, so its
-/// `LIKE` pattern carries no wildcards.
 fn taken_keys(conn: &Connection, base: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare("SELECT key FROM project WHERE key LIKE ?1")?;
     let rows = stmt.query_map(params![format!("{base}%")], |r| r.get::<_, String>(0))?;
@@ -234,8 +127,6 @@ fn taken_keys(conn: &Connection, base: &str) -> Result<HashSet<String>> {
     Ok(set)
 }
 
-/// Validate a single vocabulary value (a `status`) against its `allowed` set, substituting
-/// `default` for an empty one. `field` names the offender in the error.
 fn choice(value: &str, allowed: &[&str], default: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -251,10 +142,6 @@ fn choice(value: &str, allowed: &[&str], default: &str, field: &str) -> Result<S
     }
 }
 
-/// True for `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` — the two shapes `datetime('now')` writes, and
-/// the shapes that sort as they read, which is the whole reason to insist on them. Shape only: a
-/// shaped-but-wrong date (`2026-13-45`) is the writer's lie, not the store's, and the alternative —
-/// free text — breaks every "what ended in September" query silently.
 fn is_iso_date(value: &str) -> bool {
     let b = value.as_bytes();
     let digits = |ix: &[usize]| ix.iter().all(|&i| b[i].is_ascii_digit());
@@ -272,8 +159,6 @@ fn is_iso_date(value: &str) -> bool {
     }
 }
 
-/// Validate a `start_date`/`end_date` value: empty, or an ISO date ([`is_iso_date`]). `field` names
-/// the offender in the error.
 fn date_field(value: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || is_iso_date(value) {
@@ -285,18 +170,6 @@ fn date_field(value: &str, field: &str) -> Result<String> {
     }
 }
 
-/// Upsert a project by key in one transaction. `preload` (`Some`) replaces the ordered preload
-/// wholesale; `None` leaves it alone.
-///
-/// Returns the resolved key. `goal`/`state`/`tags`/`status`/`owner` are written as given, so a
-/// re-upsert is whole-row — read the project first if you mean to edit one field. The dates are the
-/// exception, and deliberately so — both follow an *event* rather than the caller's silence.
-/// `start_date` is the caller's if they state one; otherwise it is stamped when the project stops
-/// being `todo`, because work cannot have started while it is only a todo. It is then **never
-/// cleared**: a project pushed back to `todo` keeps its start, which is itself the record that the
-/// project was worked on once and parked. `end_date` follows `status` into [`ENDED_STATUSES`] and
-/// *does* clear on reopen — because it tracks a current state, where `start_date` records a past
-/// fact. `created`/`updated` are the row's own timestamps and never move backwards.
 pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Result<String> {
     let key = resolve_key(conn, p)?;
     let status = choice(&p.status, STATUSES, "todo", "status")?;
@@ -360,19 +233,10 @@ pub fn upsert(conn: &Connection, p: &Project, preload: Option<&[String]>) -> Res
     Ok(key)
 }
 
-/// Encode an ordered preload as the `project.mem_preload` column: keys slugified, blanks dropped and
-/// duplicates collapsed to their first position. The ORDER is the payload, so — unlike
-/// [`tags::encode`] — nothing is sorted. A key is `[a-z0-9-]` (see [`slug::slugify`]), so a comma
-/// can never occur inside one and the delimiter needs no escaping ([`codec`]).
-///
-/// `preload` holds **memory** keys, so a `prj:` token here is an error rather than a silent no-op:
-/// it names the other kind. (Membership in a project is the `prj:` tag, not this list.)
 fn encode_preload(keys: &[String]) -> Result<String> {
     let mut seen = HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for raw in keys {
-        // A blank entry means nothing to load. Checked *before* slugifying: `slug::slugify` never
-        // returns empty (it falls back to `untitled`), so a blank would otherwise become a key.
         if raw.trim().is_empty() {
             continue;
         }
@@ -392,27 +256,10 @@ fn encode_preload(keys: &[String]) -> Result<String> {
     Ok(out.join(","))
 }
 
-/// Decode `project.mem_preload` back into its ordered keys. Inverse of [`encode_preload`], minus the
-/// normalisation that already happened on the way in — via the shared comma codec ([`codec::split`]),
-/// so it cannot drift from the other two columns.
 fn decode_preload(raw: &str) -> Vec<String> {
     codec::split(raw)
 }
 
-/// Encode an owner set as the `project.owner` column: blanks dropped, duplicates collapsed
-/// **case-insensitively** (so `James` and `james` are one person — the first spelling wins, because
-/// these are proper names and lowercasing them would be a lie), then **sorted** case-insensitively,
-/// since owners are a set with no order and the stored form must not depend on the order they were
-/// typed in. Contrast [`encode_preload`], where the order *is* the payload.
-///
-/// Free text, deliberately: no vocabulary, no `me`/`us`, nothing to validate against. The store does
-/// not know who exists, and it cannot — `me` resolves differently for every reader, which is
-/// precisely what a shared store cannot afford. An empty set is an unassigned project.
-///
-/// The one thing an owner may not contain is the **delimiter** ([`codec::DELIMITER`]): owners are a
-/// comma-joined list, and this is the only free-text column among the three, so unlike `tags`
-/// (which folds a comma away) the name cannot be normalised around it. A comma in a name is a
-/// refusal, not a silent split into two owners — `Smith, John` names *one* person.
 pub fn encode_owners(owners: &[String]) -> Result<String> {
     let mut seen = HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -437,17 +284,10 @@ pub fn encode_owners(owners: &[String]) -> Result<String> {
     Ok(out.join(","))
 }
 
-/// Decode `project.owner` back into its set of names — the inverse of [`encode_owners`], minus the
-/// normalisation that already happened on the way in — via the shared comma codec
-/// ([`codec::split`]), which trims each name (so a legacy `Smith, John` reads back as `Smith` and
-/// `John`, the split the write path now refuses to create).
 fn decode_owners(raw: &str) -> Vec<String> {
     codec::split(raw)
 }
 
-/// Replace `project_key`'s ordered preload (one column, one write). Duplicates collapse to their
-/// first position; blank keys are dropped. A key that resolves to no memory is *allowed* (a
-/// forward reference) and surfaces in [`dangling`].
 fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<()> {
     tx.execute(
         "UPDATE project SET mem_preload = ?2 WHERE key = ?1",
@@ -456,62 +296,27 @@ fn write_preload(tx: &Connection, project_key: &str, keys: &[String]) -> Result<
     Ok(())
 }
 
-/// A **partial** write to one project: every field is optional and `None` means *leave it alone*.
-///
-/// `Some("")` clears a field where empty is a **fact** (`goal`, `state`) and is **refused** where
-/// empty is nonsense (`title`, `status`); `Some(vec![])` clears a list (`owner` = unassigned,
-/// `tags`, `preload`). The dates are not ordinary field values — `start_date` is never cleared and
-/// `end_date` follows `status` — but a stated `start_date` (a backfill) and `end_date` are honoured.
 #[derive(Debug, Clone, Default)]
 pub struct Patch {
-    /// Which project to write. Absent, the key is derived from `title`.
     pub key: Option<String>,
-    /// A new title. May not be empty.
     pub title: Option<String>,
-    /// A new goal. `Some("")` clears it.
     pub goal: Option<String>,
-    /// New current-state prose. `Some("")` clears it.
     pub state: Option<String>,
-    /// A new status. May not be empty; it carries the `end_date` rules.
     pub status: Option<String>,
-    /// A new owner set. `Some(vec![])` unassigns it.
     pub owner: Option<Vec<String>>,
-    /// New tags. `Some(vec![])` clears them.
     pub tags: Option<Vec<String>>,
-    /// A new ordered preload. `Some(vec![])` clears it.
     pub preload: Option<Vec<String>>,
-    /// A backfilled start (`YYYY-MM-DD`). Empty leaves the stored one alone — it is never cleared.
     pub start_date: Option<String>,
-    /// An end date — only legal with a status in [`ENDED_STATUSES`].
     pub end_date: Option<String>,
 }
 
-/// What [`merge`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeOutcome {
-    /// The row that was written (a slug derived from the title if no key was given).
     pub key: String,
-    /// True when the key did not exist and a row was inserted. This is the tell for a caller who
-    /// meant to *edit* a project and instead named a new one — see the `key` note on [`merge`].
     pub created: bool,
 }
 
-/// Upsert ONE project from a partial [`Patch`]: `None` keeps the stored value, `Some` replaces it.
-/// A key with no row is created, and then `title` is required — there is nothing to keep.
-///
-/// **`key` is an ADDRESS, not a field.** It selects the row to write; it never renames one. A patch
-/// that names a different key therefore addresses a different project — creating one if it does not
-/// exist — and `created` is how the caller finds out that is what happened. Renaming is a different
-/// operation entirely (it would have to rewrite `[[prj:key]]` bodies and `mem_preload` entries
-/// everywhere), so it does not belong in a field write.
-///
-/// Merging reads the stored row first, folds the patch onto it, and hands the result to [`upsert`],
-/// so every rule stays in one place: `status` still carries the `end_date` rules, a reopen still
-/// clears the end, `start_date` is still stamped once and never cleared, and `preload` still
-/// replaces the ordered list wholesale.
 pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
-    // Empty is an instruction only where empty is a fact. These two are not: refusing is the honest
-    // answer, and it is what stops `status: ""` from silently meaning `todo`.
     if patch.status.as_ref().is_some_and(|s| s.trim().is_empty()) {
         return Err(Error::Project(
             "`status` cannot be empty; omit it to leave the stored status alone".into(),
@@ -568,12 +373,9 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
         }
     };
 
-    // The dates follow the event, not the caller: validate the status, then let it decide the end.
     let status = choice(&merged.status, STATUSES, "todo", "status")?;
     let ended = ENDED_STATUSES.contains(&status.as_str());
     let stated_end = patch.end_date.clone().filter(|d| !d.trim().is_empty());
-    // The same refusal `upsert` makes — kept here rather than silently dropping the field, because
-    // an end date on a project that has not ended is the caller contradicting themselves.
     if stated_end.is_some() && !ended {
         return Err(Error::Project(format!(
             "`end_date` on a project that has not ended (`status` is `{status}`): set `status` to {} \
@@ -591,7 +393,6 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
             })
             .unwrap_or_default()
     } else {
-        // Reopening clears the end.
         String::new()
     };
     let merged = Project {
@@ -604,12 +405,9 @@ pub fn merge(conn: &Connection, patch: &Patch) -> Result<MergeOutcome> {
     Ok(MergeOutcome { key, created })
 }
 
-/// The canonical column list shared by every project read. The `mem_preload` column is deliberately
-/// absent: [`preload`] is a *relation*, read by that function and never mapped onto [`Project`].
 const PROJECT_COLUMNS: &str =
     "key, title, goal, state, status, owner, tags, created, updated, start_date, end_date";
 
-/// Map one `project` row (the canonical column list) to a [`Project`].
 fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let tags: String = r.get(6)?;
     let owner: String = r.get(5)?;
@@ -628,8 +426,6 @@ fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
-/// Fetch one project by key (a `prj:`/`prj-` marker is optional and stripped; see
-/// [`normalize_key`]).
 pub fn get(conn: &Connection, key: &str) -> Result<Option<Project>> {
     let key = normalize_key(key);
     Ok(conn
@@ -641,12 +437,6 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<Project>> {
         .optional()?)
 }
 
-/// The ordered preload (`project → memory`), titles hydrated where they resolve, and bodies at the
-/// requested [`Hydrate`] level.
-///
-/// The list is one column, so this is a parse plus a single lookup — which is then put back into
-/// *list* order, because the query's order must never leak into the result. A key that resolves to
-/// nothing is **kept** (with `title`/`body` null), not dropped: a forward reference is information.
 pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref>> {
     preload_seen(
         conn,
@@ -656,12 +446,6 @@ pub fn preload(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Vec<Ref
     )
 }
 
-/// Preload entries as one reader sees them.
-///
-/// ★ THE THREE STATES ARE NOT TWO. A key that names nothing is shown with no title (the field is the
-/// project's own, and a caller may be repairing it). A key that names a row this reader may not see
-/// is OMITTED — the entry is gone, because a `null` title in that slot would say "this exists and you
-/// cannot have it", which is the disclosure #55 forbids.
 pub fn preload_seen(
     conn: &Connection,
     key: &str,
@@ -691,7 +475,6 @@ pub fn preload_seen(
     Ok(keys
         .into_iter()
         .filter_map(|key| match rows.get(&key) {
-            // Present but not ours: absent. Not "present and withheld".
             Some((_, _, audience)) if !reader.sees(audience) => None,
             Some((title, body, _)) => Some(Ref {
                 key,
@@ -707,12 +490,6 @@ pub fn preload_seen(
         .collect())
 }
 
-/// Repoint every project `preload` entry naming `from` (a memory key) at `into`, keeping order and
-/// collapsing duplicates to their first position. Returns how many projects changed.
-///
-/// The graph half of a merge ([`crate::store::links::merge_into`]): a preload still naming a deleted
-/// key would be rot ([`dangling`]) that no amount of editing the memory could fix, because the
-/// reference lives on the *project* row.
 pub fn repoint_preload(conn: &Connection, from: &str, into: &str) -> Result<usize> {
     let from = slug::slugify(from);
     let into = slug::slugify(into);
@@ -743,8 +520,6 @@ pub fn repoint_preload(conn: &Connection, from: &str, into: &str) -> Result<usiz
     Ok(changed)
 }
 
-/// The project plus its preload — the `project_get` read ("stand inside it"). `hydrate` decides how
-/// much of each preload memory's body to carry ([`Hydrate::None`] keeps it a reading list).
 pub fn view(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Option<View>> {
     view_seen(
         conn,
@@ -754,7 +529,6 @@ pub fn view(conn: &Connection, key: &str, hydrate: Hydrate) -> Result<Option<Vie
     )
 }
 
-/// One project as a given reader sees it: the project itself is public, its preload is not.
 pub fn view_seen(
     conn: &Connection,
     key: &str,
@@ -770,13 +544,6 @@ pub fn view_seen(
     }))
 }
 
-/// Every project matching `filter`, key order. `state` rides along; the caller decides what to
-/// render (the list wire leaves it out).
-///
-/// The predicates intersect, like a memory search: status, then tags (AND), then owner (AND), then
-/// the lexical leg.
-/// The pattern is compiled once ([`Matcher::new`]) and matched over `key`/`title`/`goal`/`state` —
-/// the same leg `memory_search` uses, over the project columns.
 pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
     let matcher = match filter.pattern.as_deref().map(str::trim) {
         Some(pattern) if !pattern.is_empty() => Some(Matcher::new(pattern, filter.mode)?),
@@ -792,9 +559,6 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
         .iter()
         .filter_map(|t| tags::normalize(t))
         .collect();
-    // Owners are free text: the codec keeps names as typed (only the *set* is canonical), so a filter
-    // folds case and compares — the same latitude `tags` gives, minus the whitespace folding, which
-    // would rewrite a person's name.
     let owners: Vec<String> = filter
         .owner
         .iter()
@@ -832,14 +596,7 @@ pub fn list(conn: &Connection, filter: &Filter) -> Result<Vec<Project>> {
     Ok(out)
 }
 
-/// Project-side rot: `preload` keys that resolve to no memory.
-///
-/// `preload` is a column (`mem_preload`), so its list is parsed here and checked against the live
-/// memory keys. A key that names nothing is a forward reference the audit surfaces, exactly as
-/// SPEC §8 does for `[[…]]` — never a broken-FK error.
 pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
-    // Every target here is a memory (`preload` names memory keys), so the kind is not in question —
-    // only whether the row exists.
     let mut rows: Vec<(String, links::Kind, String)> = Vec::new();
     let present: HashSet<String> = {
         let mut stmt = conn.prepare("SELECT key FROM memory")?;
@@ -856,22 +613,14 @@ pub fn dangling(conn: &Connection) -> Result<Vec<links::Dangling>> {
             }
         }
     }
-    // `group_dangling` folds *consecutive* rows, so the sort is load-bearing.
     rows.sort();
     links::group_dangling(rows)
 }
 
-/// How many projects exist (reported by `doctor`).
 pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT count(*) FROM project", [], |r| r.get(0))?)
 }
 
-/// The projects still running: everything not `done` and not `aborted`, most recently started first —
-/// `/bootstrap`'s "what is in flight" list, as `(key, status, goal)`.
-///
-/// Deliberately not `list()`: the boot wants three columns of every open project and nothing else,
-/// and loading every project's prose, owner set and `preload` to print one line each would be the
-/// context fill the boot exists to avoid.
 pub fn open(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT key, status, coalesce(goal, '') FROM project \
@@ -902,7 +651,6 @@ mod tests {
             "chronos",
             "the legacy spelling is accepted on input"
         );
-        // Not a marker: a *name* that happens to read like one survives (a space, not a colon).
         assert_eq!(normalize_key("prj sessions"), "prj-sessions");
         assert_eq!(normalize_key("  Deep Work  "), "deep-work");
     }
@@ -933,11 +681,10 @@ mod tests {
         let keys = vec![
             "boot-note".to_string(),
             "  Chronos Rules ".to_string(),
-            "boot-note".to_string(), // a duplicate collapses to its first position
-            String::new(),           // blank: dropped, never `untitled`
+            "boot-note".to_string(),
+            String::new(),
             "   ".to_string(),
         ];
-        // Order is the payload, so nothing is sorted the way `tags` sorts.
         assert_eq!(encode_preload(&keys).unwrap(), "boot-note,chronos-rules");
         assert_eq!(encode_preload(&[]).unwrap(), "");
         assert!(
@@ -953,18 +700,14 @@ mod tests {
 
     #[test]
     fn owner_codec_keeps_names_free_and_stores_a_canonical_set() {
-        // Free text: there is no vocabulary to validate against, and no `me`/`us`.
         assert_eq!(
             encode_owners(&["Wile E. Coyote".to_string()]).unwrap(),
             "Wile E. Coyote"
         );
-        // A set: sorted (case-insensitively), so the stored form never depends on typing order.
         assert_eq!(
             encode_owners(&["James".to_string(), "Cline".to_string()]).unwrap(),
             "Cline,James"
         );
-        // Case is kept as typed -- proper names -- but is not identity: `James` and `james` are one
-        // person, so the first spelling wins.
         assert_eq!(
             encode_owners(&["James".to_string(), "james".to_string()]).unwrap(),
             "James",
@@ -988,11 +731,8 @@ mod tests {
 
     #[test]
     fn a_comma_in_an_owner_name_is_refused() {
-        // Owners are the only free-text column among the comma-joined three, so the delimiter
-        // cannot be folded away -- it is refused instead. `Smith, John` names ONE person.
         let err = encode_owners(&["Smith, John".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("comma"), "{err}");
-        // And the failure does not quietly write the half-name a split would have produced.
         assert_eq!(
             decode_owners("Smith,John"),
             vec!["Smith".to_string(), "John".to_string()],
@@ -1002,8 +742,6 @@ mod tests {
 
     #[test]
     fn owner_decode_trims_the_delimiters_neighbours() {
-        // A hand-written column (or a legacy row) may carry a stray space; decode trims it so the
-        // name is never stored/read with a leading blank.
         assert_eq!(
             decode_owners("Smith ,  John"),
             vec!["Smith".to_string(), "John".to_string()]

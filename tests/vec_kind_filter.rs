@@ -1,10 +1,3 @@
-//! Probe: `vec0` 0.1.9 — can a KNN be restricted to one document type?
-//!
-//! Throwaway measurement for MULTI-KIND-EMBEDDINGS.md; delete when answered.
-//! Result, measured 2026-10-21: auxiliary columns (`+type TEXT`) CANNOT be filtered in a KNN query
-//! ("An illegal WHERE constraint was provided on a vec0 auxiliary column in a KNN query"), so the
-//! filter has to be a `partition key`.
-
 use std::sync::Once;
 
 use rusqlite::Connection;
@@ -104,8 +97,6 @@ fn aux_column_survives_update_and_delete() {
         .expect("read back aux");
     assert_eq!(key, "moved");
 
-    // Can a row move PARTITION? (a kind never changes in practice, but the row's type must be
-    // writeable at insert time — check the error is honest if it cannot move.)
     let moved = conn.execute("UPDATE v SET type = 'memory' WHERE vector_id = 3", []);
     println!("MOVE PARTITION: {moved:?}");
 
@@ -134,9 +125,6 @@ fn keyslug_is_derivable_in_sql() {
 #[test]
 fn an_unfiltered_k_is_global_not_per_partition() {
     let conn = partition_table();
-    // k applies GLOBALLY when no partition is named — the opposite of the filtered case above. That is
-    // why an unfiltered search has to be built per-kind and merged: with a global k the kind with more
-    // rows takes every slot, and on a real store memories would bury projects entirely.
     let hits = knn(
         &conn,
         "SELECT type, key, distance FROM v WHERE embedding MATCH ? AND k = ? ORDER BY distance",
@@ -151,8 +139,6 @@ fn an_unfiltered_k_is_global_not_per_partition() {
 
 #[test]
 fn vectors_can_be_copied_between_vec0_tables() {
-    // The migration question: if dim and model are unchanged, can the existing vectors move into the
-    // new table by INSERT..SELECT instead of being re-embedded (~0.5-1 h)?
     register();
     let conn = Connection::open_in_memory().expect("open");
     conn.execute_batch(
@@ -177,7 +163,6 @@ fn vectors_can_be_copied_between_vec0_tables() {
     );
     println!("COPY RESULT: {copied:?}");
 
-    // If it copied, the new table must answer a KNN with the same semantics.
     if copied.is_ok() {
         let hits = knn(
             &conn,
@@ -192,8 +177,6 @@ fn vectors_can_be_copied_between_vec0_tables() {
 
 #[test]
 fn a_deleted_document_moves_to_the_tombstone_index() {
-    // Deleting a document must not erase what the store knew about it: the vector moves to a sibling
-    // table, so normal search stops returning it and a deleted-only search can still find it.
     register();
     let conn = Connection::open_in_memory().expect("open");
     conn.execute_batch(
@@ -216,7 +199,6 @@ fn a_deleted_document_moves_to_the_tombstone_index() {
     )
     .expect("seed live");
 
-    // The move, as one transaction would do it.
     conn.execute_batch(
         "INSERT INTO gone(vector_id, embedding, type, key, deleted_at)
            SELECT vector_id, embedding, type, key, datetime('now') FROM live WHERE key = 'drop';
@@ -249,11 +231,6 @@ fn a_deleted_document_moves_to_the_tombstone_index() {
     assert!(!tombstones[0].1.is_empty(), "deleted_at is readable");
 }
 
-/// Can the vec0 primary key be DERIVED instead of kept in a counter?
-///
-/// stet's question, and he was right that it must be measured, not reasoned: a counter in `meta` is a
-/// second record of a fact the table already holds, and a counter can fall behind the table after a
-/// restore. So: does vec0 assign an id when the caller omits it, and is `max(vector_id)` a legal read?
 #[test]
 fn probes_whether_vec0_can_allocate_its_own_identity() {
     register();
@@ -298,8 +275,6 @@ fn probes_whether_vec0_can_allocate_its_own_identity() {
     println!("MAX AFTER EXPLICIT 100: {max_after}");
 }
 
-/// Outside a KNN, is an auxiliary column filterable? The identity lookup `(type, key) -> vector_id`
-/// depends on it: if it works, no companion table is needed to map a keyslug to a vector.
 #[test]
 fn probes_a_plain_lookup_by_partition_and_aux_column() {
     register();
@@ -330,7 +305,6 @@ fn probes_a_plain_lookup_by_partition_and_aux_column() {
         });
     println!("COUNT BY PARTITION: {count:?}");
 
-    // The same key in two kinds must resolve to different vectors — the whole point of the keyslug.
     let mem: Result<i64, _> = conn.query_row(
         "SELECT vector_id FROM v WHERE type = 'memory' AND key = 'mem-a'",
         [],
@@ -339,8 +313,6 @@ fn probes_a_plain_lookup_by_partition_and_aux_column() {
     println!("PLAIN LOOKUP (memory): {mem:?}");
 }
 
-/// Can a vec0 table carry TWO partition keys — `type` and the author pen — so that a KNN can be
-/// restricted to "my private documents of this kind" instead of over-fetching and sifting?
 #[test]
 fn probes_two_partition_keys() {
     register();
@@ -359,7 +331,7 @@ fn probes_two_partition_keys() {
         return;
     }
     for (id, e, ty, pen, key) in [
-        (1, [1.0, 0.0, 0.0, 0.0], "memory", "stet", "mine"), // same pen, same type
+        (1, [1.0, 0.0, 0.0, 0.0], "memory", "stet", "mine"),
         (2, [0.9, 0.1, 0.0, 0.0], "memory", "stet", "mine2"),
         (3, [0.8, 0.2, 0.0, 0.0], "memory", "james", "theirs"),
         (4, [0.1, 0.9, 0.0, 0.0], "project", "stet", "other-type"),

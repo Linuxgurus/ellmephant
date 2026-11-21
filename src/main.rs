@@ -1,5 +1,3 @@
-//! `ellmephant` binary: parse arguments and hand off to the CLI.
-
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -10,7 +8,6 @@ use ellmephant::cli::Cli;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // `RUST_LOG=ellmephant=debug`; silent by default so stdout stays machine-readable.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),

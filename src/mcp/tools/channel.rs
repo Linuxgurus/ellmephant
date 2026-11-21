@@ -1,9 +1,3 @@
-//! The `channel` tool group, split out of `mcp/mod.rs` (soma/ellmephant#50).
-//!
-//! Each group is its own `#[tool_router]` impl, which is what makes the split possible:
-//! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
-//! into the one table the handler dispatches through.
-
 use crate::mcp::context::{caller_of, pen_name};
 use crate::mcp::*;
 use rmcp::handler::server::wrapper::Parameters;
@@ -11,7 +5,6 @@ use rmcp::{tool, tool_router};
 
 #[tool_router(router = channel_tool_router, vis = "pub(crate)")]
 impl MemoryServer {
-    /// Every channel, its policy, and — for a proven pen — what it has not listened to yet.
     #[tool(
         name = "channel_list",
         description = "List the channels this store knows, with each one's policy: `members` (open = every live self unless it opted out; list = invite-only), `gate` (none / writes / all), and the clock the grace runs on. For a PROVEN pen it also returns `unread` per channel and the current `breach`, if any. ★ A count is not a receipt: listing moves nothing. `channel_fetch` is the only thing that counts as listening.",
@@ -59,7 +52,6 @@ impl MemoryServer {
         .map_err(|e| e.to_string())
     }
 
-    /// Say one thing in one channel.
     #[tool(
         name = "channel_send",
         description = "Say ONE message in one channel. This is a channel, not a memory: the message is a log line with a fan-out and a receipt per member, and it becomes a memory only when a pen writes one deliberately. A write needs a PROVEN pen. Returns the `seq` and who was told.",
@@ -92,7 +84,6 @@ impl MemoryServer {
         serde_json::to_string(&msg).map_err(|e| e.to_string())
     }
 
-    /// The channel log, without moving a receipt.
     #[tool(
         name = "channel_history",
         description = "Read a channel's LOG: what was said, regardless of whether this pen has listened. ★ This does NOT touch the delivery ledger — only `channel_fetch` does — so reading history can never be mistaken for being up to date.",
@@ -109,7 +100,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelHistoryParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review)
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ChannelHistoryParams {
             channel,
             since,
@@ -127,7 +118,6 @@ impl MemoryServer {
             .map_err(|e| e.to_string())
     }
 
-    /// LISTEN: take the unread messages and mark them fetched — the only call that clears a gate.
     #[tool(
         name = "channel_fetch",
         description = "LISTEN to the channels: return everything this pen was told and has not yet fetched, and mark it fetched. ★ THIS is what clears a gate — `available_at` (told), `presented_at` (offered at a turn boundary) and `fetched_at` (listened) are three different facts, and only the third means the message reached the pen. Fetch before changing the record, not to keep a lock open.",
@@ -160,7 +150,6 @@ impl MemoryServer {
         .map_err(|e| e.to_string())
     }
 
-    /// Mark that a turn boundary OFFERED this pen its inbox.
     #[tool(
         name = "channel_present",
         description = "Mark that a TURN BOUNDARY offered this pen its inbox. Called by whatever owns the turn (the spine, the harness), never by the model — the normal path is present-then-fetch in the same turn, and a turn should never BEGIN gated. Each call while messages stay unfetched is one MISS; a channel decides how many misses it tolerates before it locks.",
@@ -189,7 +178,6 @@ impl MemoryServer {
             .map_err(|e| e.to_string())
     }
 
-    /// What, if anything, is stopping this pen from changing the record.
     #[tool(
         name = "channel_breach",
         description = "What, if anything, is gating this pen right now: the channel, the message `seq`, how many turn boundaries offered it, and how long ago. ★ Reading is never gated. `channel_fetch` clears it; `lock_max_secs` releases an old lock and RECORDS the expiry, because a lock that aged out silently is worse than one that held.",
@@ -223,7 +211,6 @@ impl MemoryServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Join a channel.
     #[tool(
         name = "channel_join",
         description = "Join a channel. Open channels are opt-out, so joining is only needed to undo a leave or to take up an invitation to a `list` channel. ★ Joining `ops_team` also joins `emergency` in the same transaction: a team that runs the cluster must be reachable when it falls over.",
@@ -248,7 +235,6 @@ impl MemoryServer {
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": true }).to_string())
     }
 
-    /// Invite a pen to a channel.
     #[tool(
         name = "channel_invite",
         description = "Put ANOTHER pen in a channel. ★ `estate` or `james` only: a `list` channel is invite-only, so an invitation has an inviter and a pen cannot add itself. Inviting to `ops_team` also puts the pen in `emergency` — a team that runs the cluster must be reachable when it falls over.",
@@ -277,7 +263,6 @@ impl MemoryServer {
         .to_string())
     }
 
-    /// Leave a channel.
     #[tool(
         name = "channel_leave",
         description = "Leave a channel. ★ Leaving `emergency` while on the ops team is REFUSED, with the way out named: leave `ops_team` first. Anyone may otherwise be in `emergency` — being told the cluster is going down should not require a title.",
@@ -302,7 +287,6 @@ impl MemoryServer {
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": false }).to_string())
     }
 
-    /// Wait for channel messages to arrive — the push primitive a body blocks on.
     #[tool(
         name = "channel_wait",
         description = "WAIT for channel messages to arrive, up to `timeout_secs` (max 25), returning everything this pen was TOLD after `after`. ★ This is a WAIT, not a LISTEN: it moves no receipt and cannot make a pen look up to date. A body that wants to be woken by chat blocks here; a body that wants to answer it then calls `channel_fetch`.",
@@ -320,8 +304,6 @@ impl MemoryServer {
         Parameters(p): Parameters<ChannelWaitParams>,
     ) -> std::result::Result<String, String> {
         let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        // ★ NO CURSOR MEANS "FROM NOW", NOT "FROM THE BEGINNING OF TIME" (#168 review): a fresh body
-        // that waits should see what arrives next, not the entire backlog.
         let after = match p.after {
             Some(after) => after,
             None => {
@@ -358,7 +340,6 @@ impl MemoryServer {
         }
     }
 
-    /// WHO is in a channel — effective membership, not the override rows.
     #[tool(
         name = "channel_members",
         description = "WHO is in a channel. Effective membership, not the override rows: an OPEN channel is every live self minus those who left on purpose; a LIST channel is its explicit members. Fingers and `estate` are never members. Answers \"am I on the team?\" without reading SQL, and lets a pen verify the rule that joining `ops_team` also joins `emergency`.",
@@ -375,7 +356,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMembersParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // the roster is configuration, not a public list
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -389,7 +370,6 @@ impl MemoryServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Create a channel.
     #[tool(
         name = "channel_create",
         description = "Create ONE channel. `open` channels are opt-out and may be made by any proven pen — conversation costs nobody anything. ★ A channel with a GATE (`writes` or `all`) can only be created by `estate` or `james`: a lock stops a pen changing the record, so creating one is a decision with a name on it. A key is created once; there is no rename.",
@@ -419,7 +399,6 @@ impl MemoryServer {
         serde_json::to_string(&made).map_err(|e| e.to_string())
     }
 
-    /// Change a gate, and record who did it.
     #[tool(
         name = "channel_set_gate",
         description = "Change a channel's gate (`none` / `writes` / `all`). ★ `estate` or `james` only, and EVERY change is written as a `channel_event` row — who, when, from what, to what. A lock that cannot be attributed is a lock nobody answers for.",
@@ -447,7 +426,6 @@ impl MemoryServer {
         serde_json::to_string(&row).map_err(|e| e.to_string())
     }
 
-    /// The recorded changes to a channel.
     #[tool(
         name = "channel_events",
         description = "The recorded changes to a channel: creation, and every gate change — who, when, from what, to what. ★ This is the answer to \"who made this dangerous?\", and it is a stored row rather than a convention.",
@@ -464,7 +442,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelEventsParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // who gated what is not a public record
+        pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
@@ -478,7 +456,6 @@ impl MemoryServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Set how long a channel keeps its text.
     #[tool(
         name = "channel_set_retention",
         description = "Set how long a channel keeps its message TEXT. `0` = forever (the default, and silence must never delete anything). ★ `estate` or `james` only, and recorded: how long a channel remembers is a decision, not a preference. ★ A prune empties `body` and sets `pruned_at`; the receipt survives, so 'you were told seq N' stays answerable.",
@@ -506,7 +483,6 @@ impl MemoryServer {
         serde_json::to_string(&row).map_err(|e| e.to_string())
     }
 
-    /// Expire the text past each channel's retention. Receipts stay.
     #[tool(
         name = "channel_prune",
         description = "Expire the TEXT of messages past their channel's `keep_secs`. ★ This is NOT an erasure of what happened: the body is emptied, `pruned_at` is set, and the message row, its `seq` and every delivery row survive — so 'you were told seq N' is still true. A channel with `keep_secs = 0` is never touched.",
@@ -523,7 +499,7 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPruneParams>,
     ) -> std::result::Result<String, String> {
-        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // a prune writes; anonymous is read-only
+        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let pen = crate::names::Pen::new(&who).map_err(|e| e.to_string())?;
         let only = p.channel;
         let rows = self

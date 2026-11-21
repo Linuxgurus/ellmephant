@@ -1,9 +1,3 @@
-//! Integration: `PROTECTED` — a memory writable only under a live lease.
-//!
-//! The tag says WHICH rows need a lease; the lease is the control. What is proved here is that the
-//! gate closes for a plain write, opens for a holder, attributes a proven writer, and that the same
-//! gate covers deletion and the tag itself.
-
 mod common;
 
 use common::temp_store;
@@ -36,8 +30,6 @@ fn seeded(key: &str) -> (tempfile::TempDir, Connection, HashEmbedder) {
 fn patch(key: &str, body: &str, asserted_by: Option<&str>) -> store::Patch {
     store::Patch {
         key: Some(key.to_string()),
-        // The actor mirrors the author HERE ON PURPOSE: these tests distinguish PROVEN from UNPROVEN
-        // writers, so an unproven patch must carry neither (soma/ellmephant#192).
         acted_by: asserted_by.map(str::to_string),
         body: Some(body.to_string()),
         asserted_by: asserted_by.map(str::to_string),
@@ -68,11 +60,9 @@ fn holding_the_lease_lets_the_holder_write_it() {
     let (_dir, conn, embedder) = seeded("vault");
     store::claim::acquire(&conn, "vault", "hands-mail-1:1", None).expect("take the lease");
 
-    // An unproven writer that holds the lease may write: the lease IS the statement.
     common::merge_now(&conn, &embedder, &patch("vault", "leased write", None))
         .expect("the holder may write");
 
-    // A PROVEN writer must be the holder.
     let err = common::merge_now(
         &conn,
         &embedder,
@@ -105,7 +95,6 @@ fn deleting_a_protected_memory_needs_the_lease_too() {
 fn tagging_a_memory_protected_also_needs_a_lease() {
     let (_dir, conn, embedder) = seeded_with("plain", vec!["aspect".to_string()]);
 
-    // Ratcheting a row shut is a write like any other, so it needs the lease.
     let mut ratchet = patch("plain", "plain body", None);
     ratchet.tags = Some(vec!["aspect".to_string(), store::PROTECTED.to_string()]);
     let err = common::merge_now(&conn, &embedder, &ratchet)

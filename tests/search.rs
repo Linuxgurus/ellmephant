@@ -1,9 +1,3 @@
-//! Integration: the P5 read path against a real store file and real `vec0` tables.
-//!
-//! Runs offline — the deterministic [`HashEmbedder`] stands in for Qwen3. It is a
-//! bag-of-words model, so "meaning" here reduces to shared tokens; that is enough to prove
-//! the constraints run and hydrate without loading weights.
-
 mod common;
 
 use common::temp_store;
@@ -30,7 +24,6 @@ fn seed(conn: &Connection, embedder: &HashEmbedder, key: &str, body: &str, tags:
     common::add_now(conn, embedder, &memory(key, key, body, tags)).expect("add");
 }
 
-/// A query with no constraints beyond the phrase, overridable by the caller.
 fn query(text: Option<&str>) -> Query {
     Query {
         text: text.map(str::to_string),
@@ -92,10 +85,6 @@ fn semantic_ranks_the_closest_document_first() {
 
 #[test]
 fn a_tag_is_reached_by_the_filter_not_by_semantics() {
-    // This replaces `tags_and_key_are_embedded`, which pinned the OLD projection (tags folded into
-    // the document). Tags left the projection (§6/§9): a tag is *filing*, answered exactly by the
-    // `tags` filter, and a tag-only write now re-embeds nothing. What the vector carries is the
-    // document's own text — `key`, title, body (see `embed::projection`'s unit tests).
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -145,7 +134,6 @@ fn max_distance_filters_the_semantic_leg() {
     seed(&conn, &embedder, "alpha-note", "alpha beta gamma", &[]);
     seed(&conn, &embedder, "other-note", "epsilon zeta eta", &[]);
 
-    // Cosine distance: the exact document is ~0, the unrelated one is ~1.
     let mut q = query(Some("alpha beta gamma"));
     q.max_distance = Some(0.5);
     let hits = search::run(
@@ -201,9 +189,8 @@ fn expand_pulls_link_neighbours_and_backlinks() {
     seed(&conn, &embedder, "note-b", "middle [[note-c]]", &[]);
     seed(&conn, &embedder, "note-c", "the terminal note", &[]);
 
-    // Outgoing: note-a -> note-b (hop 1) -> note-c (hop 2).
     let mut q = query(Some("start here"));
-    q.k = 1; // only the top hit seeds the expansion
+    q.k = 1;
     q.expand = 2;
     let bundle = search::run(
         &conn,
@@ -220,7 +207,6 @@ fn expand_pulls_link_neighbours_and_backlinks() {
         .collect();
     assert_eq!(keys, vec![("note-b", "note-a", 1), ("note-c", "note-b", 2)]);
 
-    // Incoming: note-c is reached from its backlink note-b.
     let mut q = query(Some("terminal note"));
     q.k = 1;
     q.expand = 1;
@@ -276,8 +262,6 @@ fn wire_json_is_positional_with_a_cols_header() {
         neighbors: vec![],
         search: None,
     };
-    // Every field requested: the full column shape, in canonical order. `score` joined the list with
-    // the two-leg report (2026-11-11): it is the lexical leg's number, beside the semantic distance.
     let all = Fields::selection(Field::ALL);
     let wire = to_wire_json(&bundle, &all).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
@@ -293,10 +277,8 @@ fn wire_json_is_positional_with_a_cols_header() {
         v.get("neighbors").is_none(),
         "no neighbours by default: {wire}"
     );
-    // Field names appear once, in the header — never per row.
     assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
     assert!(!wire.contains("\"body\""), "hits carry no body: {wire}");
-    // One row per line, so a raw result is scannable rather than a wall of blob.
     assert_eq!(wire.lines().count(), 3, "open+row+close: {wire}");
 }
 
@@ -318,7 +300,6 @@ fn wire_json_defaults_to_key_only() {
         neighbors: vec![],
         search: None,
     };
-    // Nothing asked for: a hit is just its key — the lean default (SPEC §10).
     let wire = to_wire_json(&bundle, &Fields::key_only()).expect("wire");
     let v: serde_json::Value = serde_json::from_str(&wire).expect("json");
     assert_eq!(v["cols"], serde_json::json!(["key", "via"]));
@@ -327,19 +308,15 @@ fn wire_json_defaults_to_key_only() {
 
 #[test]
 fn fields_always_include_key_and_keep_canonical_order() {
-    // `key` leads even when unrequested, and the rest come in canonical order regardless of the
-    // order they were named in.
     let fields = Fields::selection([Field::Distance, Field::Title]);
     assert_eq!(
         fields.names().collect::<Vec<_>>(),
         ["key", "via", "title", "distance"]
     );
 
-    // An empty selection still yields `key` — and `via`, which is never optional.
     let empty = Fields::selection(Vec::new());
     assert_eq!(empty.names().collect::<Vec<_>>(), ["key", "via"]);
 
-    // Wire names round-trip through `parse`.
     for f in Field::ALL {
         assert_eq!(Field::parse(f.name()), Some(f));
     }
@@ -387,7 +364,6 @@ fn tag_and_size_filters_intersect() {
     seed(&conn, &embedder, "short-k8s", "tiny", &["k8s"]);
     seed(&conn, &embedder, "long-web", &big, &["web"]);
 
-    // No phrase: a pure filter. The tag keeps the k8s rows, the size floor keeps the long one.
     let mut q = query(None);
     q.tags = vec!["k8s".into()];
     q.min_chars = Some(100);
@@ -406,7 +382,6 @@ fn tag_and_size_filters_intersect() {
     assert!(hits[0].chars >= 100, "{}", hits[0].chars);
 }
 
-/// The keys of a query's hits, in order.
 fn hit_keys(conn: &Connection, q: &Query) -> Vec<String> {
     search::run(
         conn,
@@ -436,7 +411,6 @@ fn literal_pattern_finds_a_half_remembered_string() {
     seed(&conn, &embedder, "other", "nothing to see here", &[]);
 
     let mut q = query(None);
-    // A literal the semantic leg cannot reach, and case-insensitive.
     q.pattern = Some("LOCALHOST:8888".into());
     let hits = search::run(
         &conn,
@@ -466,7 +440,7 @@ fn regex_mode_matches_over_key_title_and_body() {
     seed(&conn, &embedder, "ok-note", "fine", &[]);
 
     let mut q = query(None);
-    q.pattern = Some(r"err-(4|5)\d\d".into()); // matches the *key*
+    q.pattern = Some(r"err-(4|5)\d\d".into());
     q.mode = MatchMode::Regex;
     assert_eq!(hit_keys(&conn, &q), ["err-404", "err-500"]);
 }
@@ -498,7 +472,7 @@ fn a_blank_pattern_is_no_lexical_constraint() {
 
     let mut q = query(None);
     q.pattern = Some("   ".into());
-    assert_eq!(hit_keys(&conn, &q), ["a", "b"]); // every row, key order
+    assert_eq!(hit_keys(&conn, &q), ["a", "b"]);
 }
 
 #[test]
@@ -506,7 +480,6 @@ fn the_lexical_leg_intersects_the_semantic_phrase() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
-    // Both are semantically near "alpha beta gamma"; only one holds the literal.
     seed(
         &conn,
         &embedder,
@@ -536,7 +509,6 @@ fn the_lexical_leg_intersects_the_semantic_phrase() {
         hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
         ["ports-a"]
     );
-    // The survivor kept its semantic distance (it is still a ranked hit).
     assert!(hits[0].distance.is_some());
 }
 
@@ -555,8 +527,6 @@ fn the_lexical_leg_intersects_the_tag_filter() {
 }
 #[test]
 fn time_bounds_filter_created_and_updated() {
-    // The stored ISO shape is what makes a lexicographic compare correct, and `add` honours a
-    // stated timestamp — so the fixture can set its own clock.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(DIM);
@@ -571,23 +541,19 @@ fn time_bounds_filter_created_and_updated() {
         common::add_now(&conn, &embedder, &m).expect("add");
     }
 
-    // A `created` window: only `mid` was created in June.
     let mut q = query(None);
     q.created_after = Some("2026-06-01".into());
     q.created_before = Some("2026-06-30".into());
     assert_eq!(hit_keys(&conn, &q), ["mid"]);
 
-    // `updated_after`: `old` never moved past January.
     let mut q = query(None);
     q.updated_after = Some("2026-09-01 00:00:00".into());
     assert_eq!(hit_keys(&conn, &q), ["mid", "new"]);
 
-    // A window containing nothing matches NOTHING — not everything.
     let mut q = query(None);
     q.created_after = Some("2030-01-01".into());
     assert!(hit_keys(&conn, &q).is_empty());
 
-    // Bounds compose with the semantic phrase by intersection (this leg needs the encoder).
     let mut q = query(Some("fact"));
     q.updated_before = Some("2026-02-01".into());
     let bundle = search::run(
@@ -607,7 +573,6 @@ fn time_bounds_filter_created_and_updated() {
     );
 }
 
-/// ★ #114: predicates FILTER, the legs rank, and a predicate that does not apply is an ERROR.
 #[test]
 fn key_is_exact_and_prefix_is_explicit() {
     let (_dir, paths) = temp_store();
@@ -622,7 +587,6 @@ fn key_is_exact_and_prefix_is_explicit() {
     );
     seed(&conn, &embedder, "beta", "a different body", &[]);
     let reader = ellmephant::store::audience::Reader::everything();
-    // Exact: the row, and nothing whose body merely mentions the key.
     let mut q = query(None);
     q.key = Some("alpha".into());
     let b = search::run(&conn, None, &reader, &q).expect("run");
@@ -633,7 +597,6 @@ fn key_is_exact_and_prefix_is_explicit() {
     );
     assert!(b.search.unwrap().predicates.contains(&"key".to_string()));
 
-    // Prefix, when asked for.
     let mut q = query(None);
     q.key = Some("alp".into());
     q.key_prefix = true;
@@ -663,7 +626,6 @@ fn title_is_scoped_to_the_title_field() {
     seed(&conn, &embedder, "beta", "a different body", &[]);
     let reader = ellmephant::store::audience::Reader::everything();
     let mut q = query(None);
-    // `beta` is in alpha's BODY and in beta's TITLE: the predicate must pick only the latter.
     q.title = Some("beta".into());
     let b = search::run(&conn, None, &reader, &q).expect("run");
     assert_eq!(

@@ -1,11 +1,3 @@
-//! Integration: the CAS token — `expected_version`, so a read-modify-write cannot lose an update.
-//!
-//! The store versions a row but does not transact, so two writers can both read `$0.95`, both write
-//! `$0.75`, and last-write-wins silently drops one debit. The claim serializes FINGERS; this makes
-//! the WRITE itself safe, which is what a spender outside a finger needs.
-//!
-//! Runs offline against a real store file, with the deterministic `HashEmbedder`.
-
 mod common;
 
 use std::sync::{Arc, Barrier};
@@ -35,7 +27,6 @@ fn patch(key: &str, body: &str, expected: Option<i64>) -> Patch {
     }
 }
 
-/// A CREATE needs a title as well as a body, so it gets its own constructor.
 fn create(key: &str, body: &str, expected: Option<i64>) -> Patch {
     Patch {
         title: Some("Fresh".into()),
@@ -43,8 +34,6 @@ fn create(key: &str, body: &str, expected: Option<i64>) -> Patch {
     }
 }
 
-/// The token is the LIVE state's number: a missing key has none (`0`), a fresh row is `1`, and every
-/// superseded state bumps it by one.
 #[test]
 fn the_version_counts_live_states() -> Result<()> {
     let (_dir, paths) = temp_store();
@@ -68,8 +57,6 @@ fn the_version_counts_live_states() -> Result<()> {
     Ok(())
 }
 
-/// The whole point: a token that no longer matches writes NOTHING, and says what the current version
-/// is so the caller can re-read and retry. A lost update is now a visible conflict.
 #[test]
 fn a_stale_token_writes_nothing_and_reports_the_current_version() -> Result<()> {
     let (_dir, paths) = temp_store();
@@ -77,12 +64,10 @@ fn a_stale_token_writes_nothing_and_reports_the_current_version() -> Result<()> 
     let embedder = HashEmbedder::new(DIM);
     common::add_now(&conn, &embedder, &memory("bank", "Bank", "balance 10"))?;
 
-    // Two writers read version 1. The first commits, taking the key to version 2.
     let first = merge_now(&conn, &embedder, &patch("bank", "balance 9", Some(1)))?;
     assert_eq!(first.conflict, None, "the first writer wins");
     assert!(!first.created);
 
-    // The second still believes version 1, so its write is refused rather than clobbering the first.
     let stale = merge_now(&conn, &embedder, &patch("bank", "balance 8", Some(1)))?;
     assert_eq!(
         stale.conflict,
@@ -96,15 +81,12 @@ fn a_stale_token_writes_nothing_and_reports_the_current_version() -> Result<()> 
         "the loser's body never landed"
     );
 
-    // With the fresh token the same write succeeds.
     let retried = merge_now(&conn, &embedder, &patch("bank", "balance 8", Some(2)))?;
     assert_eq!(retried.conflict, None);
     assert_eq!(store::live_version(&conn, "bank")?, 3);
     Ok(())
 }
 
-/// `0` means "this key does not exist yet", so a CREATE can be raced too: two creators cannot both
-/// believe they wrote the first state.
 #[test]
 fn a_create_is_guarded_by_version_zero() -> Result<()> {
     let (_dir, paths) = temp_store();
@@ -121,8 +103,6 @@ fn a_create_is_guarded_by_version_zero() -> Result<()> {
     Ok(())
 }
 
-/// ★ THE RACE ITSELF, with real connections and a starting barrier: N writers hold the SAME token, so
-/// exactly one may commit and every other must come back with a conflict. This is the bank bug.
 #[test]
 fn a_race_has_exactly_one_winner() -> Result<()> {
     const WRITERS: usize = 8;
@@ -142,7 +122,6 @@ fn a_race_has_exactly_one_winner() -> Result<()> {
         handles.push(std::thread::spawn(move || {
             let conn = db::open(&paths).expect("open");
             let embedder = HashEmbedder::new(DIM);
-            // Everyone reads the SAME version, then starts together.
             let seen = store::get(&conn, "race")
                 .expect("get")
                 .expect("row")
@@ -164,7 +143,6 @@ fn a_race_has_exactly_one_winner() -> Result<()> {
         .count();
     assert_eq!(wins, 1, "exactly one writer may commit a CASed row");
 
-    // And the row is the winner's, at the next version — not a torn mixture.
     let conn = db::open(&paths)?;
     assert_eq!(store::live_version(&conn, "race")?, 2);
     assert!(
@@ -176,7 +154,6 @@ fn a_race_has_exactly_one_winner() -> Result<()> {
     Ok(())
 }
 
-/// An omitted token keeps last-write-wins, so every existing caller is unchanged.
 #[test]
 fn no_token_still_writes() -> Result<()> {
     let (_dir, paths) = temp_store();

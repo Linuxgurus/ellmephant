@@ -1,8 +1,3 @@
-//! Integration: P9 maintenance — `reembed` (rebuild the vector index).
-//!
-//! Runs offline: the deterministic [`HashEmbedder`] stands in for Qwen3, and varying its
-//! `dim` is exactly the model-swap the phase exists to handle.
-
 mod common;
 
 use common::temp_store;
@@ -49,7 +44,6 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
     add(&conn, &small, "b", "gamma delta", &[]);
     assert_eq!(vec::stored_dim(&conn).unwrap(), Some(8));
 
-    // Swap to a wider model (a dim change `index::vec::ensure` would refuse).
     let wide = HashEmbedder::new(16);
     let spec = VecSpec::of(&wide);
     let report = maintain::reembed(&conn, &spec, "test instruction").expect("reembed");
@@ -59,7 +53,6 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
         (2, 16),
         "every row is owed a vector at the new width"
     );
-    // The vectors are the worker's job now, so settle exactly as it would.
     common::settle(&conn, &wide);
 
     assert_eq!(vec::stored_dim(&conn).unwrap(), Some(16));
@@ -75,8 +68,6 @@ fn reembed_with_a_different_dim_recreates_vec_and_updates_meta() {
         let mem = store::get(&conn, key).unwrap().unwrap();
         let id = mem.id.unwrap();
         assert_eq!(vec::get(&conn, id).unwrap().unwrap().len(), 16);
-        // ★ THE ROW KEEPS NO BOOKKEEPING (0016), so the proof is the vector: it must be the one for
-        // this document under the WIDE model, at the new width.
         let want = wide
             .embed_one(&projection::embed_document(&mem.key, &mem.title, &mem.body))
             .expect("wide vector");
@@ -96,16 +87,12 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     let a = add(&conn, &embedder, "a", "alpha", &[]);
     add(&conn, &embedder, "b", "beta", &[]);
 
-    // Simulate a damaged derived index: drop one row's vector.
     vec::delete(&conn, a).unwrap();
     assert_eq!(vec::count(&conn).unwrap(), 1);
 
     let spec = VecSpec::of(&embedder);
     let report = maintain::reembed(&conn, &spec, "").expect("reembed");
     assert!(!report.rebuilt, "same dim keeps the table");
-    // EVERY row, deliberately: with no per-row stamp there is no "nothing changed" to skip, and a
-    // rebuild queues rather than deletes, so nothing here is destructive. `a` is repaired by the same
-    // pass that re-embeds `b` for nothing.
     assert_eq!(report.queued, 2, "a rebuild is always-full");
     common::settle(&conn, &embedder);
     assert_eq!(vec::count(&conn).unwrap(), 2, "the missing vector is back");
@@ -123,10 +110,6 @@ fn reembed_same_dim_repairs_missing_vectors_and_is_stable() {
     );
 }
 
-/// A changed **projection** forces a full re-embed, and `encode_hash` cannot detect it: the hash covers the
-/// model, the dimension and the text — never the recipe that assembled them. So every row is queued on
-/// the fingerprint's say-so alone. Without that, a projection change would queue *nothing* and every
-/// vector would keep describing the old recipe in silence — the drift the fingerprint exists to catch.
 #[test]
 fn reembed_requeues_everything_when_the_projection_changed() {
     let (_dir, paths) = temp_store();
@@ -136,13 +119,9 @@ fn reembed_requeues_everything_when_the_projection_changed() {
     add(&conn, &embedder, "b", "beta", &[]);
     let spec = VecSpec::of(&embedder);
 
-    // A rebuild queues every row whatever the fingerprint says — the fingerprint no longer decides
-    // WHETHER to rebuild, only whether the store is out of step afterwards.
     assert_eq!(maintain::reembed(&conn, &spec, "").unwrap().queued, 2);
     assert!(!vec::projection_stale(&conn).unwrap());
 
-    // Now the projection moves underneath it, which is what a code change to `embed_document` looks
-    // like from the store's side — the fingerprint is a hash of the projection's own output.
     conn.execute("UPDATE meta SET v = 'moved' WHERE k = 'projection'", [])
         .unwrap();
     assert!(vec::projection_stale(&conn).unwrap(), "precondition");
@@ -163,14 +142,11 @@ fn reembed_requeues_everything_when_the_projection_changed() {
 
 #[test]
 fn reembed_records_the_projection_fingerprint() {
-    // A change to what the projection emits would leave every stored vector describing the old
-    // recipe; the fingerprint in `meta` is what makes that drift detectable.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(8);
     add(&conn, &embedder, "a", "alpha beta", &[]);
 
-    // The write recorded the baseline (`index::vec::ensure`), so nothing is stale.
     assert!(
         meta(&conn, "projection").is_some(),
         "the baseline is recorded on first use"
@@ -188,8 +164,6 @@ fn reembed_records_the_projection_fingerprint() {
 
 #[test]
 fn reembed_rebuilds_the_link_graph_from_the_bodies() {
-    // Edges are computed at WRITE time, so a parser change does not reach an existing body on its
-    // own — the stored graph can disagree with the rows. The full rebuild re-parses every body.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(8);
@@ -197,7 +171,6 @@ fn reembed_rebuilds_the_link_graph_from_the_bodies() {
     add(&conn, &embedder, "b", "the target", &[]);
     assert_eq!(edge_count(&conn), 1);
 
-    // Simulate a stale edge an older parser would have left: one the current body does not imply.
     conn.execute(
         "INSERT INTO memory_link (from_id, to_key, to_type, rel) VALUES (?1, 'ghost', 'memory', 'see')",
         params![a],
@@ -217,16 +190,12 @@ fn reembed_rebuilds_the_link_graph_from_the_bodies() {
 
 #[test]
 fn reparse_applies_the_code_span_rule_to_an_existing_body() {
-    // The backtick escape is a parser change; a full rebuild is how a body written before it
-    // catches up (the edge it wrongly created is not removed by rewriting the row alone).
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).expect("open");
     let embedder = HashEmbedder::new(8);
-    // A body that only *documents* the syntax creates no edge under the current parser...
     let a = add(&conn, &embedder, "doc", "write `[[key]]` to link", &[]);
     assert_eq!(edge_count(&conn), 0);
 
-    // ...but one left by the old parser did. Rebuild and it is gone.
     conn.execute(
         "INSERT INTO memory_link (from_id, to_key, to_type, rel) VALUES (?1, 'key', 'memory', 'see')",
         params![a],
@@ -242,12 +211,6 @@ fn reparse_applies_the_code_span_rule_to_an_existing_body() {
     );
 }
 
-/// The legacy index is **copied**, not re-embedded: `memory_vec` was keyed by `memory_id`, the new
-/// table is partitioned by `type` with an opaque `vector_id`, and the dimension did not change — so
-/// the vectors move by `INSERT..SELECT` and the encoder is never called.
-///
-/// This is the migration that makes the whole change cheap: ~300 vectors at ~11s each would be an
-/// hour of work, and a copy is milliseconds (measured: the copy answers a KNN at distance 0.0).
 #[test]
 fn the_legacy_index_is_copied_not_reembedded() {
     let (_dir, paths) = temp_store();
@@ -258,8 +221,6 @@ fn the_legacy_index_is_copied_not_reembedded() {
         .expect("write")
         .0;
 
-    // Put the store back into the OLD shape by hand: no partitioned table, a `memory_vec` holding one
-    // vector under the memory's own id.
     conn.execute_batch(
         "DROP TABLE IF EXISTS document_vec;
          DROP TABLE IF EXISTS document_vec_deleted;
@@ -273,7 +234,6 @@ fn the_legacy_index_is_copied_not_reembedded() {
     )
     .expect("legacy vector");
 
-    // The first `ensure` after the upgrade is the migration.
     vec::ensure(&conn, 4).expect("migrate");
 
     assert_eq!(
@@ -300,11 +260,6 @@ fn the_legacy_index_is_copied_not_reembedded() {
     assert_eq!(legacy, 0, "the old table is gone once copied");
 }
 
-/// A delete MOVES the vector into the tombstone index — it is not erased.
-///
-/// James, 2026-10-21: an embedding is semantic, not the source of truth, so deleting a document must
-/// not erase what the store knew about it. The tombstone is a *separate table*, which is what makes
-/// "unreachable by any normal search" structural rather than a filter someone must remember.
 #[test]
 fn a_delete_moves_the_vector_to_the_tombstone_index() {
     let (_dir, paths) = temp_store();
@@ -329,12 +284,6 @@ fn a_delete_moves_the_vector_to_the_tombstone_index() {
     assert_eq!(vec::count(&conn).expect("live"), 0);
 }
 
-/// The half-copied state, constructed on purpose — stet's test, and the one that catches the bug this
-/// code had: `execute_batch` autocommits each statement, so the copy could land while the DROP did
-/// not, and then `ensure` failed on every open and the store never started again.
-///
-/// The contract: the copy and the drop are ONE transaction, and a partial state (rows in BOTH tables)
-/// COMPLETES rather than colliding. Nothing is duplicated, nothing is overwritten with legacy data.
 #[test]
 fn a_half_copied_legacy_index_completes_without_duplicating() {
     let (_dir, paths) = temp_store();
@@ -348,7 +297,6 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
         .expect("write")
         .0;
 
-    // Old shape, with two vectors in it.
     conn.execute_batch(
         "DROP TABLE IF EXISTS document_vec;
          DROP TABLE IF EXISTS document_vec_deleted;
@@ -360,7 +308,6 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
     )
     .expect("legacy shape");
 
-    // The crash window, reproduced: the copy landed for one row, the drop did not.
     vec::ensure(&conn, 4).expect("first ensure migrates");
     conn.execute_batch(
         "DROP TABLE document_vec_deleted;
@@ -373,7 +320,6 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
     )
     .expect("re-create the legacy table with an already-copied id");
 
-    // A store that already holds both must still open, complete, and not duplicate.
     let done = vec::ensure(&conn, 4);
     assert!(done.is_ok(), "a half-copied index must complete: {done:?}");
     assert_eq!(
@@ -401,10 +347,6 @@ fn a_half_copied_legacy_index_completes_without_duplicating() {
     assert_eq!(legacy, 0, "and the legacy table is gone at the end");
 }
 
-/// ★ A ROLLED STORE MUST NOT SERVE AN EMPTY INDEX (2026-10-21). The vec0 tables used to appear on the
-/// first *embed*, so a store whose queue was quiet after an upgrade had no index at all: search
-/// returned nothing and nothing said why. Opening the store now creates (and migrates) the derived
-/// index, so "the store is up" and "the index exists" are one event.
 #[test]
 fn opening_the_store_migrates_the_index_without_any_write() {
     let (_dir, paths) = temp_store();
@@ -414,7 +356,6 @@ fn opening_the_store_migrates_the_index_without_any_write() {
         let conn = db::open(&paths).expect("open");
         let (id, _) = store::add(&conn, &memory("a", "alpha", &[])).expect("write");
         common::settle(&conn, &embedder);
-        // Put the store back into the OLD shape: no partitioned table, a populated `memory_vec`.
         conn.execute_batch(
             "DROP TABLE IF EXISTS document_vec;
              DROP TABLE IF EXISTS document_vec_deleted;
@@ -427,13 +368,11 @@ fn opening_the_store_migrates_the_index_without_any_write() {
             params![id, vec::to_blob(&[1.0, 0.0, 0.0, 0.0])],
         )
         .expect("legacy vector");
-        // Nothing left to do: the queue is empty and no write is coming.
         conn.execute("DELETE FROM encode_queue", [])
             .expect("empty queue");
         id
     };
 
-    // Re-opening — the roll — is the only event that happens.
     let conn = db::open(&paths).expect("re-open");
     assert_eq!(
         vec::count(&conn).expect("count"),
@@ -451,11 +390,6 @@ fn opening_the_store_migrates_the_index_without_any_write() {
     );
 }
 
-/// ★ THE GRAVEYARD IS REACHABLE, AND ONLY BY ASKING (2026-10-21).
-///
-/// A delete MOVES the vector into `document_vec_deleted`, so the document stops being findable by a
-/// normal search — not because a filter hides it, but because no normal query names that table. The
-/// deleted-search is the way back, and it returns a NAME, never a body.
 #[test]
 fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
     let (_dir, paths) = temp_store();
@@ -480,7 +414,6 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
         max_distance: None,
     };
 
-    // Nothing is buried yet.
     assert!(
         vec::knn_deleted(&conn, &query, &hint)
             .expect("graveyard")
@@ -490,7 +423,6 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
 
     assert!(store::delete(&conn, "buried", None).expect("delete"));
 
-    // The LIVE index no longer answers, and the vector count says so.
     assert_eq!(
         vec::count(&conn).expect("live"),
         0,
@@ -501,7 +433,6 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
         "no live vector for the id"
     );
 
-    // The GRAVEYARD does — as a name with a date, never a body.
     let buried = vec::knn_deleted(&conn, &query, &hint).expect("graveyard");
     assert_eq!(buried.len(), 1, "the graveyard finds it");
     assert_eq!(buried[0].key, "buried");
@@ -509,21 +440,6 @@ fn a_deleted_document_moves_to_the_graveyard_and_is_found_by_asking() {
     assert!(!buried[0].deleted_at.is_empty(), "and says when it went");
 }
 
-/// ★ A TOMBSTONE MUST BE AS IDEMPOTENT AS THE DELETE IT RECORDS (hygiene run, 2026-10-24).
-///
-/// Found on the live store: three rows answered
-/// `UNIQUE constraint failed on document_vec_deleted primary key` on DELETE, because their vector had
-/// been tombstoned by an earlier delete that did not finish. A row that cannot be deleted is a row that
-/// cannot be repaired.
-/// ★ A TOMBSTONE MUST BE AS IDEMPOTENT AS THE DELETE IT RECORDS (hygiene run, 2026-10-24).
-///
-/// Found on the live store: three rows answered
-/// `UNIQUE constraint failed on document_vec_deleted primary key` on DELETE. Their vector had been
-/// tombstoned by an earlier delete that did not finish, while the LIVE vector was still there — so the
-/// tombstone INSERT could never run again and the memory was permanently undeletable.
-///
-/// The state must be built on purpose: tombstone the vector, keep the live one, then delete. Deleting
-/// twice in a row does NOT reproduce it (the second delete finds no live vector to copy).
 #[test]
 fn a_half_deleted_row_can_be_deleted_again() {
     let (_dir, paths) = temp_store();
@@ -533,7 +449,6 @@ fn a_half_deleted_row_can_be_deleted_again() {
     let (id, _) = store::add(&conn, &memory("tomb", "half deleted", &[])).expect("write");
     common::settle(&conn, &embedder);
 
-    // The half-copied state: the tombstone exists AND the live vector still does.
     let vector = vec::get(&conn, id).expect("get").expect("indexed");
     vec::delete(&conn, id).expect("first half: tombstone");
     conn.execute(
@@ -542,7 +457,6 @@ fn a_half_deleted_row_can_be_deleted_again() {
     )
     .expect("put the live vector back, as an interrupted delete leaves it");
 
-    // Before the fix this was `UNIQUE constraint failed on document_vec_deleted primary key`.
     vec::delete(&conn, id).expect("a half-deleted row must still be deletable");
     assert!(
         vec::get(&conn, id).expect("get").is_none(),

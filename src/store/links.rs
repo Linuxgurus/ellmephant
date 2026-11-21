@@ -1,7 +1,3 @@
-//! Wiki links: `[[key]]` in a body is parsed into `memory_link` edges (a derived
-//! index) and stripped from the embed projection (SPEC §8). Rename and the dangling
-//! audit live here too — both are link-graph maintenance (PLAN §3, P9).
-
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -13,18 +9,9 @@ use crate::error::{Error, Result};
 use crate::index;
 use crate::store::slug;
 
-/// Capture a `[[key]]` or `[[prj:key]]` target. Key charset `[a-z0-9-]+`; the `prj:` marker is the
-/// only thing allowed before it.
 static LINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[\[((?:prj:)?[a-z0-9-]+)\]\]").expect("link regex is valid"));
 
-/// Walk `s`, splitting it into alternating `(is_code, segment)` runs at each backtick. The backtick
-/// delimiters are not part of any segment, so joining the segments with `` ` `` rebuilds `s`
-/// verbatim; that is how [`strip_links`] re-emits them.
-///
-/// A backtick toggles: text between an odd backtick and the next is a **code span**, where a
-/// `[[token]]` is documentation, not a reference. This is the escape the parser used to lack — a
-/// body about links writes `` the marker is `[[prj:x]]` ``, and that no longer becomes an edge.
 fn spans(s: &str) -> Vec<(bool, &str)> {
     let mut out = Vec::new();
     let mut in_code = false;
@@ -40,22 +27,14 @@ fn spans(s: &str) -> Vec<(bool, &str)> {
     out
 }
 
-/// Which table a key names.
-///
-/// A key is a plain name — two tables may each hold a `sessions` — so the type travels with the
-/// *reference* and never with the name. The table is a row's type; this says which table an edge
-/// points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// A `memory` row.
     Memory,
-    /// A `project` row.
     Project,
 }
 
 impl Kind {
-    /// The stored spelling (`memory_link.to_type`).
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Memory => "memory",
@@ -63,8 +42,6 @@ impl Kind {
         }
     }
 
-    /// Read the stored spelling back. The column's `CHECK` constrains it to the two values, so
-    /// anything that is not `project` is a memory.
     pub fn from_stored(raw: &str) -> Self {
         if raw == Kind::Project.as_str() {
             Kind::Project
@@ -73,17 +50,10 @@ impl Kind {
         }
     }
 
-    /// The identity of one document: `kind:key`. The type is the TABLE name, so the slug says where
-    /// the row lives rather than what it is called — a kind is a table that holds documents.
-    ///
-    /// Safe by construction: keys are `[a-z0-9-]+` ([`slug::slugify`]), so `:` can never occur inside
-    /// one and the split is unambiguous without escaping.
     pub fn keyslug(self, key: &str) -> String {
         format!("{}:{}", self.as_str(), key)
     }
 
-    /// Split a keyslug back into its kind and key. `None` when it is not one — an unknown type, no
-    /// separator, or an empty half. Used by the queue, which stores text and must not guess.
     pub fn from_keyslug(slug: &str) -> Option<(Kind, &str)> {
         let (kind, key) = slug.split_once(':')?;
         if key.is_empty() {
@@ -97,16 +67,6 @@ impl Kind {
         Some((kind, key))
     }
 
-    /// ★ THE ONE DEFINITION of "this document owes a vector" (soma/ellmephant#77). Both the queue
-    /// writer ([`crate::store::encode::enqueue`]) and the health verdict
-    /// ([`crate::store::encode::projection`]) call this and nothing else.
-    ///
-    /// It is a property of the KIND, not of the row and not of `vectors < documents`. A project is a
-    /// structure and is not matched by meaning (`0005`, and [`crate::store::encode::claim`] drops its
-    /// queued work for the same reason), and a lexical-only document — the day #62 lands — will
-    /// never have a vector by design. Counting documents against vectors would call every such
-    /// document a permanent rebuild: an alarm that never clears is worse than no alarm, because it
-    /// teaches everyone to ignore the field.
     pub fn is_embeddable(self) -> bool {
         match self {
             Kind::Memory => true,
@@ -115,15 +75,8 @@ impl Kind {
     }
 }
 
-/// The marker that names a **project** in a link token: `[[prj:chronos]]`.
-///
-/// Links live in memory bodies, so a bare `[[key]]` means a memory and only the other kind needs
-/// saying. `:` cannot occur in a slug (`[a-z0-9-]`, see [`slug::slugify`]), so unlike the old
-/// `prj-` prefix no name can ever squat on it.
 pub const PROJECT_MARKER: &str = "prj:";
 
-/// Parse a link token's target into its kind and bare key. The token has already matched the
-/// [`LINK_RE`] charset, so what comes back is always a valid key.
 pub fn parse_target(token: &str) -> (Kind, String) {
     match token.strip_prefix(PROJECT_MARKER) {
         Some(key) => (Kind::Project, key.to_string()),
@@ -131,8 +84,6 @@ pub fn parse_target(token: &str) -> (Kind, String) {
     }
 }
 
-/// Extract link targets in first-seen order, de-duplicated. A token inside a backtick code span is
-/// literal text, not a reference (see [`spans`]).
 pub fn extract_links(body: &str) -> Vec<(Kind, String)> {
     let mut seen = Vec::new();
     for (is_code, segment) in spans(body) {
@@ -149,9 +100,6 @@ pub fn extract_links(body: &str) -> Vec<(Kind, String)> {
     seen
 }
 
-/// Remove every `[[key]]` token from `s` (the embed projection needs this; SPEC §8). A token inside
-/// a backtick code span is left alone — it is literal text the projection should keep, not a link to
-/// strip (see [`spans`]).
 pub fn strip_links(s: &str) -> String {
     spans(s)
         .into_iter()
@@ -166,34 +114,20 @@ pub fn strip_links(s: &str) -> String {
         .join("`")
 }
 
-/// A `[[key]]` that resolves to no row — an allowed forward/renamed reference that the
-/// audit surfaces (SPEC §8: dangling links are detected, not fatal).
 #[derive(Debug, Clone, Serialize)]
 pub struct Dangling {
-    /// The missing target key.
     pub to_key: String,
-    /// Which table it was expected in — a missing memory and a missing project are different rot.
     pub to_type: Kind,
-    /// Keys of the rows whose bodies point at it, sorted.
     pub from_keys: Vec<String>,
 }
 
-/// One broken EDGE, not one missing target: the referrer, what it pointed at, and the table that
-/// target was expected in. [`Dangling`] groups these; this is the row a repair pass can act on
-/// (`memory_dangling`, soma/ellmephant#48) — the count alone cannot name the body to fix.
 #[derive(Debug, Clone, Serialize)]
 pub struct DanglingEdge {
-    /// The memory whose body carries the token.
     pub from_key: String,
-    /// The target key that resolves to nothing.
     pub to_key: String,
-    /// Which table the target was expected in.
     pub to_type: Kind,
 }
 
-/// Group ordered `(to_key, to_type, from_key)` rows into [`Dangling`]s. Shared by the `[[…]]` audit
-/// and the project audit, which both count rot the same way: one entry per unresolved target. The
-/// GROUP is the pair — the same bare key can be missing as both a memory and a project.
 pub fn group_dangling(rows: Vec<(String, Kind, String)>) -> Result<Vec<Dangling>> {
     let mut out: Vec<Dangling> = Vec::new();
     for (to_key, to_type, from_key) in rows {
@@ -211,22 +145,10 @@ pub fn group_dangling(rows: Vec<(String, Kind, String)>) -> Result<Vec<Dangling>
     Ok(out)
 }
 
-/// Every `[[key]]` target that resolves to nothing, grouped by target (SPEC §8 SQL), ordered by
-/// target key.
-///
-/// **A target resolves against the table its kind names** — a memory may point at a project with
-/// `[[prj:chronos]]`, so a project key is not rot, and `to_type` is what keeps that honest. The
-/// same name in the other table does *not* satisfy the edge: a `prj:sessions` link is not fixed by
-/// a memory called `sessions`. A link to a project is still a `see` edge and not membership:
-/// `contains` means "born here", a link only points.
 pub fn dangling(conn: &Connection) -> Result<Vec<Dangling>> {
     group_dangling(dangling_rows(conn)?)
 }
 
-/// Every broken edge, one row per referrer. The same SQL as [`dangling`], flattened rather than
-/// grouped: `memory_stats.dangling` counts DISTINCT MISSING TARGETS, so two referrers to one missing
-/// key are one count and two rows here. That difference is the point of soma/ellmephant#48 — the
-/// count could not tell a maintenance reader which body to repair.
 pub fn dangling_edges(conn: &Connection) -> Result<Vec<DanglingEdge>> {
     Ok(dangling_rows(conn)?
         .into_iter()
@@ -238,8 +160,6 @@ pub fn dangling_edges(conn: &Connection) -> Result<Vec<DanglingEdge>> {
         .collect())
 }
 
-/// Distinct missing targets — the same rule `memory_stats.dangling` counts by, so a finder and a
-/// count cannot disagree about the number.
 pub fn dangling_targets(edges: &[DanglingEdge]) -> usize {
     let mut targets: Vec<(&str, Kind)> = edges
         .iter()
@@ -250,7 +170,6 @@ pub fn dangling_targets(edges: &[DanglingEdge]) -> usize {
     targets.len()
 }
 
-/// `(to_key, to_type, from_key)` for every unresolved edge, ordered by target then referrer.
 fn dangling_rows(conn: &Connection) -> Result<Vec<(String, Kind, String)>> {
     let mut stmt = conn.prepare(
         "SELECT l.to_key, l.to_type, m.key FROM memory_link l
@@ -269,16 +188,6 @@ fn dangling_rows(conn: &Connection) -> Result<Vec<(String, Kind, String)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Rebuild the `memory_link` graph for every memory from its **current** body.
-///
-/// `memory_link` is documented as *derived*, but edges are computed at **write** time ([`write_links`],
-/// which this reuses) — so a parser change, or a body written by an older version, leaves a stored
-/// graph the rows no longer imply. Two stores with identical rows could otherwise hold different
-/// graphs, and a body that documented the link syntax under an old parser keeps an edge it should
-/// not ([`spans`]). This recomputes every row's outgoing edges, so the graph really is *rebuildable*
-/// from its source of truth; the `memory_reembed` tool runs it alongside the vector rebuild.
-///
-/// Returns the number of rows visited.
 pub fn reparse(conn: &Connection) -> Result<usize> {
     let rows: Vec<(i64, String, String)> = {
         let mut stmt = conn.prepare("SELECT id, key, body FROM memory ORDER BY id")?;
@@ -287,48 +196,21 @@ pub fn reparse(conn: &Connection) -> Result<usize> {
     };
     let tx = conn.unchecked_transaction()?;
     for (id, key, body) in &rows {
-        // One home for the edge write: `write_links` deletes the row's edges and re-inserts those
-        // its body implies, so the reparse cannot drift from the write path.
         crate::store::write_links(&tx, *id, key, body)?;
     }
     tx.commit()?;
     Ok(rows.len())
 }
 
-/// What a [`merge_into`] did.
 #[derive(Debug, Clone, Serialize)]
 pub struct MergeInto {
-    /// The key that was deleted.
     pub from: String,
-    /// The key it was folded into.
     pub into: String,
-    /// Memory bodies whose `[[from]]` token was rewritten to `[[into]]`.
     pub bodies: usize,
-    /// `project` preloads whose `from` entry was repointed.
     pub preloads: usize,
-    /// Lines of `from`'s body the survivor did not already carry, appended to it verbatim.
-    ///
-    /// Empty when the caller had already folded the prose — then there was nothing to integrate.
     pub integrated: Vec<String>,
 }
 
-/// Every line of `from`'s body that the survivor does not already carry, in order, deduped.
-///
-/// This is the *integration* — and the reason nothing here refuses. [`merge_into`] repoints links and
-/// deletes `from`, so without this a merge would be a legal way to **destroy** prose: delete a memory
-/// carrying a line the target lacks and the line is simply gone, behind a `200` that reports link
-/// counts and says nothing about the words. So the missing lines are folded in rather than demanded
-/// of the caller, and "every line of `from` survives in `into`" holds **by construction** instead of
-/// by refusal.
-///
-/// **Per line, whitespace-insensitive**: layout is the caller's, so interleaving, reordering and
-/// relaying-out all count as survived, and a whole-body substring would demand a verbatim paste and
-/// refuse every honest fold. Lines the survivor already carries are not missing — which is exactly
-/// how a merge removes the redundancy it exists to remove.
-///
-/// **Verbatim**: the store keeps facts straight and a model writes the words. Appending is lossless;
-/// a rewrite this store could not verify would be a way to lose a fact with nothing to notice it.
-/// Discarding prose on purpose has its own verb — a DELETE says "gone", a merge says "integrated".
 fn missing_lines(from: &str, into: &str) -> Vec<String> {
     let into = squash(into);
     let mut out: Vec<String> = Vec::new();
@@ -341,31 +223,10 @@ fn missing_lines(from: &str, into: &str) -> Vec<String> {
     out
 }
 
-/// Squash every run of whitespace to a single space, so these checks ignore how prose is laid out.
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Integrate `from` into `into`, then delete `from` (PLAN §3).
-///
-/// **`into` is the survivor — the caller judges which memory is the stronger one.** Then, in one
-/// transaction:
-///
-/// - every line of `from`'s body that `into` does not already carry is appended to it verbatim
-///   ([`missing_lines`]), so the source's information is IN the survivor by construction;
-/// - every `[[from]]` token in every memory body becomes `[[into]]`;
-/// - the edge set is repointed in lockstep, and any self-edge the rewrite creates is dropped (the
-///   same rule the write path applies);
-/// - every project `preload` naming `from` is repointed at `into`, order kept and duplicates
-///   collapsed;
-/// - `from` is deleted (row, vector, edge set, queue entry).
-///
-/// Merging used to be a hand-fold plus `memory_delete`, which **breaks the graph** — every `[[from]]`
-/// left behind dangles — so hygiene never happened. This does the repointing, so it is safe.
-///
-/// A caller may still fold the prose itself FIRST, and should when it wants the survivor to read as
-/// one thing rather than as an append: nothing is then missing, `integrated` comes back empty, and
-/// the call has nothing to integrate. `[[prj:from]]` is *not* rewritten: that names a project.
 pub fn merge_into(
     conn: &Connection,
     from: &str,
@@ -374,10 +235,6 @@ pub fn merge_into(
 ) -> Result<MergeInto> {
     let from = slug::slugify(from);
     let into = slug::slugify(into);
-    // ★ A MERGE IS A DELETE WEARING A REASON (found in the final adversarial pass). It repoints every
-    // reference to `from`, appends its lines to `into`, and removes it — and until now it asked
-    // nobody's leave, so any proven pen could destroy another pen's row, including a private one it
-    // could not read. Both ends are gated: the source is destroyed, and the survivor's body changes.
     crate::store::may_write(conn, &from, acted_by)?;
     crate::store::may_write(conn, &into, acted_by)?;
     if from == into {
@@ -393,7 +250,7 @@ pub fn merge_into(
         .ok_or_else(|| Error::NotFound(key.to_string()))
     };
     let from_id = rowid(&from)?;
-    let into_id = rowid(&into)?; // must exist: a merge into a typo would silently destroy the source
+    let into_id = rowid(&into)?;
     let from_body: String = conn.query_row(
         "SELECT body FROM memory WHERE id = ?1",
         params![from_id],
@@ -407,16 +264,12 @@ pub fn merge_into(
     let integrated = missing_lines(&from_body, &into_body);
 
     let tx = conn.unchecked_transaction()?;
-    // INTEGRATE FIRST, and before the token rewrite below: `from`'s own lines can carry `[[from]]`,
-    // and appending them afterwards would leave a token aimed at a key that no longer exists.
     if !integrated.is_empty() {
         let body = format!("{}\n{}", into_body.trim_end(), integrated.join("\n"));
         tx.execute(
             "UPDATE memory SET body = ?2, updated = datetime('now') WHERE id = ?1",
             params![into_id, body],
         )?;
-        // The survivor's body moved, so its outgoing edges moved with it — `write_links` is the one
-        // home for that write — and a moved document is queued for a new vector like any other write.
         crate::store::write_links(&tx, into_id, &into, &body)?;
         let doc = projection::embed_document(&into, &into_title, &body);
         crate::store::encode::enqueue(
@@ -426,8 +279,6 @@ pub fn merge_into(
             crate::store::encode::PRIORITY_LIVE,
         )?;
     }
-    // The tokens. A bare `[[from]]` is a memory; `[[prj:from]]` names the other table and must not
-    // move — which is why the kind rides on the edge, not the name.
     let bodies = tx.execute(
         "UPDATE memory SET body = replace(body, ?1, ?2), updated = datetime('now')
           WHERE body LIKE ?3",
@@ -437,15 +288,11 @@ pub fn merge_into(
             format!("%[[{from}]]%")
         ],
     )?;
-    // Repoint the edges with the bodies. `OR REPLACE` clears the PK collision when a source already
-    // links to `into`. Memory edges only, like `rename`.
     tx.execute(
         "UPDATE OR REPLACE memory_link SET to_key = ?2
           WHERE to_key = ?1 AND to_type = 'memory'",
         params![from, into],
     )?;
-    // The rewrite can turn a `[[from]]` inside `into`'s own body into a self-link, which the write
-    // path never creates. Drop it, so the graph keeps that invariant.
     tx.execute(
         "DELETE FROM memory_link
           WHERE to_type = 'memory'
@@ -455,8 +302,6 @@ pub fn merge_into(
     let preloads = crate::store::project::repoint_preload(&tx, &from, &into)?;
     tx.execute("DELETE FROM memory WHERE id = ?1", params![from_id])?;
     index::vec::delete(&tx, from_id)?;
-    // The deleted key's queue entry goes with the row: `from` no longer exists, so a document for it
-    // can never be embedded and must not be left for the worker to discover.
     crate::store::encode::forget(&tx, &Kind::Memory.keyslug(&from))?;
     tx.commit()?;
 
@@ -469,45 +314,14 @@ pub fn merge_into(
     })
 }
 
-/// What a fold changed. It names the keeper, the row whose lines moved, and the lines it appended.
-///
-/// ★ NO DELETION IS REPORTED BECAUSE NONE HAPPENS. A fold moves prose; removing the absorbed row is
-/// the act of the pen that answers for it, and this verb deliberately cannot do it.
 #[derive(Debug, Clone, Serialize)]
 pub struct FoldOutcome {
-    /// The row that gained lines.
     pub into: String,
-    /// The row those lines came from. It still exists.
     pub from: String,
-    /// The lines appended to `into`, verbatim. Empty means `into` already carried every line.
     pub integrated: Vec<String>,
-    /// Whether anything was written at all.
     pub changed: bool,
 }
 
-/// Fold `from` into `into` WITHOUT deleting `from` and WITHOUT write authority on `into`.
-///
-/// This is the one cross-pen maintenance verb (soma/ellmephant#199). `merge_into` requires full
-/// write authority on the survivor because it is a PATCH; exempting it would let any reader rewrite
-/// the title, audience and tags of a row it does not answer for — the #190 defect wearing a tidy
-/// excuse. A fold is narrower by construction:
-///
-/// - it appends only the source's lines the keeper does not already carry ([`missing_lines`]), so
-///   nothing existing can be changed, reworded or reordered;
-/// - it records `edited_by` (the pen that acted) and a row in `memory_fold` naming what was absorbed;
-/// - it never deletes the source, never repoints a `[[link]]`, and never touches a project preload;
-/// - it works in either direction, so a sibling pair has no impossible direction.
-///
-/// The gate is READ, not write: a pen must be able to see both rows (you cannot fold prose you are
-/// not allowed to read), and a PROTECTED keeper still needs its lease. Nothing else is asked,
-/// because nothing else can be changed.
-///
-/// ★ AN ACTOR IS REQUIRED (Stet's finding at `fb9ade3`, 2026-11-13). The read gate answers *may this
-/// pen see the row*; it never answers *whose act is this*. An append made by a client that cannot be
-/// told apart from any other would land in the keeper with `memory_fold.actor` NULL — "a write nobody
-/// is named for is indistinguishable from a mistake", the delete doctrine (#109), one verb over. The
-/// hole would also outlive the open-write window: a bearer-token client passes `authorize` and still
-/// resolves to no pen.
 pub fn fold_into(
     conn: &Connection,
     from: &str,
@@ -529,13 +343,6 @@ pub fn fold_into(
         ));
     };
 
-    // ★ ONE SERIALIZED UNIT: take the write lock, THEN read (soma/ellmephant#199). `missing_lines` is
-    // computed from both bodies and the append lands against what was read, so a rival commit landing
-    // between the read and the write is a lost update — a fold racing the keeper's owner's `upsert`
-    // is deleted silently, and a fold racing a fold loses one of the two appends. DEFERRED cannot fix
-    // this: it reads first and then promotes its lock, which in WAL fails as `SQLITE_BUSY_SNAPSHOT`
-    // the caller cannot tell apart from a conflict. IMMEDIATE makes compare-then-write one unit, the
-    // same idiom `upsert` uses for its version CAS.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
     let body_of = |key: &str| -> Result<(String, String)> {
@@ -559,9 +366,6 @@ pub fn fold_into(
         .ok_or_else(|| Error::NotFound(into.clone()))?;
     let (from_body, from_audience) = body_of(&from)?;
 
-    // ★ THE DOOR IS VISIBILITY, AND IT OPENS BOTH WAYS. A pen that cannot read the keeper must not
-    // append to it (it would be writing words it cannot see), and a pen that cannot read the source
-    // must not fold it (folding is copying, and copying is reading).
     if !crate::store::may_read_audience(&tx, actor, &from_audience)? {
         return Err(Error::Forbidden(format!(
             "cannot fold `{from}`: its audience does not include the pen doing it. Folding copies \
@@ -574,14 +378,10 @@ pub fn fold_into(
              cannot read is not a row you may append to."
         )));
     }
-    // A protected keeper is still protected: an append is a write, and the lease is what makes it
-    // visible. Asked by the same predicate the delete path asks.
     crate::store::guard_protected_lease(&tx, &into, Some(actor))?;
 
     let integrated = missing_lines(&from_body, &into_body);
     if integrated.is_empty() {
-        // Nothing to append: no version, no `edited_by`, no ledger row. The transaction is dropped
-        // uncommitted, which is the rollback this branch means.
         return Ok(FoldOutcome {
             into,
             from,
@@ -590,17 +390,12 @@ pub fn fold_into(
         });
     }
 
-    // The keeper's PREVIOUS text survives as a version, exactly as any document write does: a fold
-    // that is later judged wrong must be reversible by reading what it replaced.
     crate::store::version::snapshot(&tx, into_id, &into, Some(&format!("fold from {from}")))?;
     let body = format!("{}\n{}", into_body.trim_end(), integrated.join("\n"));
     tx.execute(
         "UPDATE memory SET body = ?2, edited_by = ?3, updated = datetime('now') WHERE id = ?1",
         params![into_id, body, acted_by],
     )?;
-    // The keeper's body moved, so its outgoing edges moved with it — and the new lines may carry
-    // `[[links]]` of their own. `write_links` is the one home for that write, and a changed document
-    // is queued for a new vector like any other write. The TITLE is read, never written.
     crate::store::write_links(&tx, into_id, &into, &body)?;
     let doc = projection::embed_document(&into, &into_title, &body);
     crate::store::encode::enqueue(
@@ -609,7 +404,6 @@ pub fn fold_into(
         &doc,
         crate::store::encode::PRIORITY_LIVE,
     )?;
-    // The record that this happened, and where the lines came from. Append-only, like the prose.
     tx.execute(
         "INSERT INTO memory_fold (keeper_id, absorbed_key, actor) VALUES (?1, ?2, ?3)",
         params![into_id, from, acted_by],
@@ -623,30 +417,13 @@ pub fn fold_into(
     })
 }
 
-/// What a [`rename`] changed.
 #[derive(Debug, Clone)]
 pub struct RenameOutcome {
-    /// The resolved new key.
     pub key: String,
-    /// Bodies whose `[[old]]` token was rewritten.
     pub bodies: usize,
-    /// `memory_link` edges repointed from `old` to `new`.
     pub edges: usize,
 }
 
-/// Rename a key in one transaction (SPEC §15 #3, PLAN §2 #3): move `memory.key`, rewrite every
-/// `[[old]]` token in every body, and repoint the incoming `memory_link` edges.
-///
-/// Keys are near-immutable, so this is deliberate rather than routine. **`key` IS in the embed
-/// projection**, so a rename changes the renamed row's document — and the row is **queued** for a new
-/// vector, the same path a write takes. Nothing on the row is stamped here for the worker to
-/// advance, which is what keeps it meaning "the text whose vector is stored".
-///
-/// The rows whose bodies had `[[old]]` rewritten do **not** need it: `[[…]]` is stripped from the
-/// projection (SPEC §8), so their document — and therefore their vector — is unchanged by the token
-/// swap. (Their `updated` moves; that is the whole of it.)
-///
-/// Refuses to clobber an existing key; a same-key rename is a no-op.
 pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> {
     let old = slug::slugify(old);
     let new = slug::slugify(new);
@@ -658,8 +435,6 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
         });
     }
 
-    // Read the row before moving it: the new document needs its title and body, and the vector
-    // needs its rowid. Tags are not read — they are not part of the embed projection.
     let row: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT id, title, body FROM memory WHERE key = ?1",
@@ -679,8 +454,6 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
         return Err(Error::Config(format!("key {new:?} already exists")));
     }
 
-    // The document under the NEW key. Nothing is embedded here: the key moved, so the document moved,
-    // and a moved document is queued like any other write.
     let doc_text = projection::embed_document(&new, &title, &body);
 
     let tx = conn.unchecked_transaction()?;
@@ -688,8 +461,6 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
         "UPDATE memory SET key = ?2, updated = datetime('now') WHERE id = ?1",
         params![id, new],
     )?;
-    // Keys are `[a-z0-9-]+`, so the literal token can only match the exact link; the LIKE
-    // prefilter keeps the scan bounded (and its `%` are not user-controlled).
     let bodies = tx.execute(
         "UPDATE memory SET body = replace(body, ?1, ?2), updated = datetime('now')
           WHERE body LIKE ?3",
@@ -699,9 +470,6 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
             format!("%[[{old}]]%")
         ],
     )?;
-    // OR REPLACE clears a would-be PK collision when a source already links to `new`. Scoped to
-    // `memory`: a bare key can also name a *project*, and renaming a memory must not repoint edges
-    // that were aimed at it.
     let edges = tx.execute(
         "UPDATE OR REPLACE memory_link SET to_key = ?2
           WHERE to_key = ?1 AND to_type = 'memory'",
@@ -722,34 +490,21 @@ pub fn rename(conn: &Connection, old: &str, new: &str) -> Result<RenameOutcome> 
     })
 }
 
-/// One incoming `[[key]]` edge, as returned by [`backlinks`].
 #[derive(Debug, Serialize)]
 pub struct Backlink {
-    /// The linking memory's key.
     pub key: String,
-    /// Its salient line.
     pub title: String,
 }
 
-/// Incoming `[[…]]` edges for `key`, ordered by source key (the MCP `memory_backlinks`).
-///
-/// Memory-kind edges only: a `[[prj:sessions]]` link is aimed at the project, so it is not a
-/// backlink of a memory called `sessions`.
 pub fn backlinks(conn: &Connection, key: &str) -> Result<Vec<Backlink>> {
     backlinks_seen(conn, key, &crate::store::audience::Reader::everything())
 }
 
-/// The same list, filtered to the sources this reader may see.
-///
-/// ★ BACKLINKS LEAK UPWARD (#55): "this private note links to X" tells anyone who can see the note
-/// that X exists. So the filter is on the SOURCE, and a source the reader may not see is not a
-/// source — the edge is absent, exactly as an unwritten one would be.
 pub fn backlinks_seen(
     conn: &Connection,
     key: &str,
     reader: &crate::store::audience::Reader,
 ) -> Result<Vec<Backlink>> {
-    // The TARGET is gated first: a list of backlinks is itself an answer to "does this key exist".
     let target: Option<String> = conn
         .query_row(
             "SELECT audience FROM memory WHERE key = ?1",
@@ -794,8 +549,6 @@ mod tests {
 
     #[test]
     fn the_project_marker_is_what_types_a_target() {
-        // A bare token is a memory; `prj:` is what crosses to the other table — so one name can be
-        // both, and both edges survive.
         assert_eq!(
             extract_links("[[sessions]] and [[prj:sessions]]"),
             vec![
@@ -803,9 +556,6 @@ mod tests {
                 (Kind::Project, "sessions".to_string())
             ]
         );
-        // The legacy spelling is NOT a marker in prose: a body saying `[[prj-foo]]` meant a memory
-        // called `prj-foo`. (`prj-` is only stripped from tool *arguments*, where the type is
-        // already given by the argument's job.)
         assert_eq!(
             extract_links("[[prj-foo]]"),
             vec![(Kind::Memory, "prj-foo".to_string())]
@@ -828,13 +578,11 @@ mod tests {
 
     #[test]
     fn a_backtick_code_span_escapes_a_token() {
-        // Documenting the syntax must not itself be a write to the graph.
         assert_eq!(
             extract_links("write `[[key]]` to link, like [[real]]"),
             vec![(Kind::Memory, "real".to_string())],
             "only the prose token is a reference"
         );
-        // An unclosed backtick makes the rest of the body code: nothing after it links.
         assert!(extract_links("oops `[[a]]").is_empty());
     }
 
@@ -870,7 +618,6 @@ mod tests {
         assert_eq!(v["cols"], serde_json::json!(["key", "title"]));
         assert_eq!(v["backlinks"][0], serde_json::json!(["a", "A"]));
         assert!(!wire.contains("\"key\":"), "no per-row keys: {wire}");
-        // One row per line: header(+open), row, row, close.
         assert_eq!(wire.lines().count(), 4, "scannable rows: {wire}");
     }
 }

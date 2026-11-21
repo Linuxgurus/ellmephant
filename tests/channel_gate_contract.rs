@@ -1,15 +1,3 @@
-//! THE GATE BITES BOTH DOORS (soma/ellmephant#231, #232, #234).
-//!
-//! The epic names three ways the two adapters had drifted. Two are pinned by tests now: who may
-//! write (`tests/authority_contract.rs`) and who may open a box (`tests/mail_contract.rs`). This is
-//! the third: `channel_gate` was hand-placed in seven write verbs *per door*, and the only thing
-//! keeping coverage correct was that nobody had added an eighth.
-//!
-//! Since #234 the gate lives in `ops::`, which every write verb on both doors goes through, and it
-//! runs unconditionally — so a `gate: writes` channel bites a caller who named no pen at all (the
-//! old HTTP door skipped the gate entirely for those). This test proves the sentence, on both
-//! doors, and proves that LISTENING is what releases it: the gate is a seatbelt, not a lock.
-
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -49,9 +37,6 @@ fn session(dir: &std::path::Path) -> Session {
         .with_embedder(Box::new(HashEmbedder::new(DIM)))
 }
 
-/// Two pens, both members of `ops_team`; the channel gated on writes, one missed delivery.
-///
-/// Returns the caller's secret.
 fn gated_channel(dir: &std::path::Path) -> String {
     let paths = Paths::from_root(dir);
     let conn = db::open(&paths).expect("open");
@@ -65,8 +50,6 @@ fn gated_channel(dir: &std::path::Path) -> String {
     }
     let secret = ellmephant::store::credential::issue(&conn, PEN, None).expect("issue credential");
 
-    // ★ ONE MISSED DELIVERY IS ENOUGH (misses_to_gate = 1), so the test reads as one rule rather
-    // than as an arithmetic exercise.
     conn.execute(
         "UPDATE channel
             SET gate = 'writes', grace_secs = 0, clock = 'delivery',
@@ -78,7 +61,6 @@ fn gated_channel(dir: &std::path::Path) -> String {
     channel::invite(&conn, SENDER, SENDER, CHANNEL).expect("sender is a member");
     channel::invite(&conn, SENDER, PEN, CHANNEL).expect("invite the caller");
     channel::send(&conn, SENDER, CHANNEL, "we are rolling", None).expect("send");
-    // The turn boundary passes without a fetch: that is the breach.
     channel::present(&conn, PEN, None).expect("present");
     channel::gate(&conn, PEN, channel::Class::Record).expect_err("the gate is closed");
     secret
@@ -174,10 +156,8 @@ async fn mcp_upsert(
     }
 }
 
-/// The clause the gate refuses with. It must name the channel and say what to do about it.
 const GATE: &str = "has not been fetched";
 
-/// ★ A BREACHED PEN IS REFUSED ON BOTH DOORS, in the same words.
 #[tokio::test]
 async fn a_gated_pen_is_refused_on_both_doors_in_the_same_words() {
     let dir = tempfile::tempdir().unwrap();
@@ -208,10 +188,6 @@ async fn a_gated_pen_is_refused_on_both_doors_in_the_same_words() {
     );
 }
 
-/// ★ DROPPING THE PEN IS NOT A WAY PAST IT (soma/ellmephant#231). The old HTTP door ran the gate
-/// only `if let Some(caller)`, so an unidentified caller skipped a `gate: writes` channel entirely.
-/// They are refused at the identity gate now — which is earlier, and the point is that neither
-/// answer is a write.
 #[tokio::test]
 async fn an_unidentified_caller_cannot_skip_the_gate() {
     let dir = tempfile::tempdir().unwrap();
@@ -234,15 +210,12 @@ async fn an_unidentified_caller_cannot_skip_the_gate() {
     );
 }
 
-/// ★ LISTENING RELEASES IT — the gate is a seatbelt, not a lock. After a fetch, the same pen writes
-/// on both doors.
 #[tokio::test]
 async fn fetching_releases_the_gate_on_both_doors() {
     let dir = tempfile::tempdir().unwrap();
     let secret = gated_channel(dir.path());
 
     {
-        // Listening: the one act the gate is asking for.
         let paths = Paths::from_root(dir.path());
         let conn = db::open(&paths).expect("open");
         let got = channel::fetch(&conn, PEN, Some(CHANNEL), 50).expect("fetch");

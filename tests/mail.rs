@@ -1,9 +1,3 @@
-//! Integration: the MAILBOX — addressed rows, a per-reader cursor, and letters that expire.
-//!
-//! Runs offline against a real store file. The assertions that matter are the ones a green tick would
-//! hide: a letter with no `seq` regression (the cursor is a number, not a clock), an inbox that sees
-//! only what is after the cursor, and a body that is NOT copied into an envelope.
-
 mod common;
 
 use common::temp_store;
@@ -34,7 +28,6 @@ fn a_letter_is_stored_addressed_and_stamped() -> Result<()> {
         "I think the retry is wrong. Object?".len() as i64
     );
 
-    // The box is addressed case-insensitively, so a name is one box however it is typed.
     let inbox = mail::inbox(&conn, "twine", 0, 50)?;
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].seq, sent.seq);
@@ -48,7 +41,6 @@ fn the_cursor_shows_only_what_is_after_it() -> Result<()> {
 
     let first = mail::send(&conn, "stet", "stet", "twine", "one", "first", "text")?;
     let second = mail::send(&conn, "stet", "stet", "twine", "two", "second", "text")?;
-    // Another box, to prove boxes do not leak into each other.
     let _other = mail::send(
         &conn,
         "stet",
@@ -141,9 +133,6 @@ fn a_letter_is_refused_when_it_is_not_a_letter() -> Result<()> {
     Ok(())
 }
 
-/// ★ `seq` IS THE CURSOR, so it must never go BACKWARDS. SQLite reuses the largest rowid after the
-/// highest row is deleted unless the table is declared `AUTOINCREMENT`; a prune would then hand out a
-/// number a reader had already passed, and old mail would silently look read.
 #[test]
 fn a_prune_cannot_make_old_mail_look_new() -> Result<()> {
     let (_dir, paths) = temp_store();
@@ -152,7 +141,6 @@ fn a_prune_cannot_make_old_mail_look_new() -> Result<()> {
     let first = mail::send(&conn, "stet", "stet", "twine", "one", "first", "text")?;
     let second = mail::send(&conn, "stet", "stet", "twine", "two", "second", "text")?;
 
-    // Age both, then prune them.
     conn.execute("UPDATE mail SET at = datetime('now', '-30 days')", [])?;
     assert_eq!(mail::prune(&conn, 7)?, 2, "both aged out");
     assert_eq!(mail::head(&conn, "twine")?, 0, "the box is empty");
@@ -195,10 +183,6 @@ fn an_encoded_body_keeps_its_encoding() -> Result<()> {
 
 #[test]
 fn a_short_page_reports_its_own_top_not_the_boxs() -> Result<()> {
-    // ★ THE CONFLATION THAT COST TWO READERS AN HOUR (2026-10-21). `mail_inbox` answered with a
-    // single `max_seq`, which reads as "the newest letter that exists" and meant "the highest seq in
-    // this page". Ask for ten of forty and it reported the tenth — a real answer to a different
-    // question, and stet and I each built a theory on it before anyone asked what the field meant.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
 
@@ -232,8 +216,6 @@ fn a_short_page_reports_its_own_top_not_the_boxs() -> Result<()> {
     Ok(())
 }
 
-/// ★ soma/ellmephant#79: three cursors for two readers, in three shapes. The cursor is now ONE row per
-/// (reader, box) — and "one reader" is a fact the store holds, not a convention two callers remember.
 #[test]
 fn a_cursor_belongs_to_one_reader_and_only_moves_forward() -> Result<()> {
     let (_dir, paths) = temp_store();
@@ -242,11 +224,9 @@ fn a_cursor_belongs_to_one_reader_and_only_moves_forward() -> Result<()> {
     let one = mail::send(&conn, "james", "james", "stet", "one", "first", "text")?;
     let two = mail::send(&conn, "james", "james", "stet", "two", "second", "text")?;
 
-    // No row is not 0: it is "this reader has never advanced here", and the whole box is unread.
     assert_eq!(mail::cursor(&conn, "stet", "stet")?, None);
     assert_eq!(mail::cursor_or_zero(&conn, "stet", "stet")?, 0);
 
-    // Two readers of ONE box are two rows — the hand and the self are not the same place.
     let hand = mail::advance(&conn, "hands", "stet", one.seq)?;
     assert_eq!(hand.moved, one.seq, "it skipped the first letter");
     assert_eq!(hand.head, two.seq);
@@ -261,23 +241,17 @@ fn a_cursor_belongs_to_one_reader_and_only_moves_forward() -> Result<()> {
         "the hand's place did not move when the self advanced"
     );
 
-    // Backwards is REFUSED, not silently ignored — and the refusal says where you actually are.
     let err = mail::advance(&conn, "hands", "stet", 0).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("already at"), "{msg}");
     assert!(msg.contains("only moves forward"), "{msg}");
 
-    // Idempotent at the current value: a re-acknowledgement is a success with nothing moved.
     let again = mail::advance(&conn, "hands", "stet", one.seq)?;
     assert_eq!(again.moved, 0);
     assert_eq!(again.seq, one.seq);
     assert_eq!(mail::cursor(&conn, "hands", "stet")?.unwrap().seq, one.seq);
     Ok(())
 }
-
-// ── SURROGATES (#153) ────────────────────────────────────────────────────────────────────────────
-// The defect these exist for: a letter written on someone's behalf used to be stamped with the
-// typist's name, silently. The rule is now: prove it, or be refused by name.
 
 #[test]
 fn an_unauthorized_sender_is_refused_by_name() -> Result<()> {
@@ -406,12 +380,10 @@ fn env_pairs_import_once_and_a_revocation_survives_a_reimport() -> Result<()> {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths)?;
 
-    // The hand that serves stet's box is `hands`; the old env pair was `hands=stet`.
     unsafe { std::env::set_var("ELLMEPHANT_MAIL_SURROGATES", "hands=stet") };
     assert!(mail::import_env_surrogates(&conn)? >= 1);
     assert!(mail::may_read_box(&conn, "hands", "stet")?);
 
-    // A second import changes nothing (INSERT OR IGNORE), and a revoke is not undone by boot.
     assert_eq!(mail::import_env_surrogates(&conn)?, 0);
     mail::revoke(&conn, "stet", "hands")?;
     let _ = mail::import_env_surrogates(&conn);

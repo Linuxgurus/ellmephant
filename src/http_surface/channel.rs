@@ -1,16 +1,9 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// Who is asking, if anyone proved it. Reads are open, so `None` is a legitimate answer.
 pub(super) fn proven(caller: &crate::identity::Caller) -> Option<String> {
     caller.proven().map(ToString::to_string)
 }
 
-/// GET /channels — policy for every channel, plus this pen's unread counts and breach.
 pub async fn channel_list(
     server: Server,
     caller: crate::identity::Caller,
@@ -72,7 +65,6 @@ pub async fn channel_list(
     }
 }
 
-/// GET /channels/{channel}/messages — the LOG, which moves no receipt.
 pub async fn channel_history(
     server: Server,
     caller: crate::identity::Caller,
@@ -81,8 +73,6 @@ pub async fn channel_history(
 ) -> ApiResult<Response> {
     let params = Params::parse(raw.as_deref());
     let json = params.json();
-    // ★ A CHANNEL LOG IS NOT PUBLIC (#158 review): the store filters private memories by audience and
-    // a chat log has the same problem — an incident channel is not a public page.
     proven_pen(&caller, json)?;
     let since = params
         .maybe("since")
@@ -123,7 +113,6 @@ pub async fn channel_history(
     }
 }
 
-/// GET /channels/breach — what, if anything, is stopping this pen from changing the record.
 pub async fn channel_breach(
     server: Server,
     caller: crate::identity::Caller,
@@ -169,7 +158,6 @@ pub async fn channel_breach(
     }
 }
 
-/// POST /channels/{channel}/messages — say one thing.
 pub async fn channel_send(
     State(state): State<HttpState>,
     server: Server,
@@ -215,7 +203,6 @@ pub async fn channel_send(
     }
 }
 
-/// POST /channels/fetch — LISTEN: take the unread messages and mark them fetched.
 pub async fn channel_fetch(
     State(state): State<HttpState>,
     server: Server,
@@ -263,7 +250,6 @@ pub async fn channel_fetch(
     }
 }
 
-/// POST /channels/present — a turn boundary offered this pen its inbox.
 pub async fn channel_present(
     State(state): State<HttpState>,
     server: Server,
@@ -303,7 +289,6 @@ pub async fn channel_present(
     }
 }
 
-/// POST /channels/{channel}/join — join, and `ops_team` brings `emergency` with it.
 pub async fn channel_join(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
@@ -314,7 +299,6 @@ pub async fn channel_join(
     channel_membership(caller, state, channel, headers, raw, true).await
 }
 
-/// POST /channels/{channel}/leave — leave; leaving `emergency` on the team is refused.
 pub async fn channel_leave(
     State(state): State<HttpState>,
     Path(channel): Path<String>,
@@ -337,8 +321,6 @@ async fn channel_membership(
     authorize(&state, &headers, json)?;
     let pen = proven_pen(&caller, json)?;
     let (who, chan) = (pen.clone(), channel.clone());
-    // The one remaining hand-written session guard: this helper takes the state by value, so it has
-    // no `&mut Parts` for the `Server` extractor. Every handler uses the extractor instead (#233).
     let Some(server) = state.server() else {
         return Err(ApiError::internal(json, "server not attached"));
     };
@@ -370,7 +352,6 @@ async fn channel_membership(
     }
 }
 
-/// GET /channels/wait — block for new messages. A WAIT, not a LISTEN: no receipt moves.
 pub async fn channel_wait(
     server: Server,
     caller: crate::identity::Caller,
@@ -388,7 +369,6 @@ pub async fn channel_wait(
     let after = match params.maybe("after").and_then(|v| v.parse::<i64>().ok()) {
         Some(after) => after,
         None => {
-            // No cursor = "from now", not the whole backlog.
             let who = pen.clone();
             match server
                 .with_read(
@@ -448,7 +428,6 @@ pub async fn channel_wait(
     }
 }
 
-/// GET /channels/{channel}/members — effective membership.
 pub async fn channel_members(
     server: Server,
     caller: crate::identity::Caller,
@@ -495,7 +474,6 @@ pub async fn channel_members(
     }
 }
 
-/// POST /channels — create one. A gated channel needs `estate` or `james` (the store says so).
 pub async fn channel_create(
     State(state): State<HttpState>,
     server: Server,
@@ -538,7 +516,6 @@ pub async fn channel_create(
     }
 }
 
-/// POST /channels/{channel}/gate — change a gate; the change is a row.
 pub async fn channel_set_gate(
     State(state): State<HttpState>,
     server: Server,
@@ -584,7 +561,6 @@ pub async fn channel_set_gate(
     }
 }
 
-/// GET /channels/{channel}/events — who made this channel dangerous, and when.
 pub async fn channel_events(
     server: Server,
     caller: crate::identity::Caller,
@@ -633,7 +609,6 @@ pub async fn channel_events(
     }
 }
 
-/// POST /channels/{channel}/retention — how long the text is kept. Keeper-only, recorded.
 pub async fn channel_set_retention(
     State(state): State<HttpState>,
     server: Server,
@@ -683,7 +658,6 @@ pub async fn channel_set_retention(
     }
 }
 
-/// POST /channels/prune — expire the text past retention. Receipts stay.
 pub async fn channel_prune(
     State(state): State<HttpState>,
     server: Server,
@@ -694,9 +668,6 @@ pub async fn channel_prune(
 ) -> ApiResult<Response> {
     let json = Params::parse(raw.as_deref()).json();
     authorize(&state, &headers, json)?;
-    // ★ THE PEN IS REQUIRED, AND THEN CONSULTED (#168 review): the gate lives on this door too.
-    // The MCP tool gated `channel_prune` and this route did not, so a locked pen could destroy the
-    // text it was locked out of knowing — the two doors disagreed exactly where it matters.
     let caller = proven_pen(&caller, json)?;
     let doc = match json_body(&headers, body).await {
         Ok(Some(v)) => v,
@@ -732,7 +703,6 @@ pub async fn channel_prune(
     }
 }
 
-/// POST /channels/{channel}/invite — put another pen in. Keeper-only: an invitation has an inviter.
 pub async fn channel_invite(
     State(state): State<HttpState>,
     server: Server,

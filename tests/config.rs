@@ -1,10 +1,3 @@
-//! Integration: config loading and path resolution (SPEC §12).
-//!
-//! Runs offline. `Config::load` merges `config.toml` over the defaults; `Paths` owns the
-//! store layout. Neither `Config::discover` nor `Paths::discover` is exercised here —
-//! both read process-global env vars, so their behaviour is proven through the black-box
-//! CLI tests (tests/cli.rs), which set `ELLMEPHANT_HOME` on a child process.
-
 mod common;
 
 use common::temp_store;
@@ -24,7 +17,6 @@ fn missing_config_file_yields_the_documented_defaults() {
     assert_eq!(cfg.device, "cpu");
     assert_eq!(cfg.default_k, 5);
     assert_eq!(cfg.instruction, ellmephant::config::DEFAULT_INSTRUCTION);
-    // The MCP server listens on a high, unassigned port by default.
     assert_eq!(cfg.port, 8888);
     assert_eq!(cfg.port, ellmephant::config::DEFAULT_PORT);
 }
@@ -44,7 +36,6 @@ fn config_toml_overrides_only_the_keys_it_names() {
     assert!(cfg.offline);
     assert_eq!(cfg.default_k, 3);
     assert_eq!(cfg.port, 9999);
-    // Unnamed keys keep their defaults (serde `default`).
     assert_eq!(cfg.revision, "main");
     assert_eq!(cfg.device, "cpu");
 }
@@ -53,7 +44,6 @@ fn config_toml_overrides_only_the_keys_it_names() {
 fn unknown_and_malformed_config_are_rejected() {
     let (_dir, paths) = temp_store();
 
-    // `deny_unknown_fields`: a typo must fail loudly, not silently fall back.
     std::fs::write(paths.config(), "modl = \"oops\"\n").expect("write");
     let err = Config::load(&paths).unwrap_err();
     assert!(format!("{err}").contains("toml"), "got: {err}");
@@ -64,7 +54,6 @@ fn unknown_and_malformed_config_are_rejected() {
 
 #[test]
 fn validate_rejects_a_bad_device_precision_or_dim() {
-    // Defaults are valid, so a bare `validate` is a no-op.
     Config::default().validate().expect("defaults are valid");
 
     let bad_device = Config {
@@ -116,7 +105,6 @@ fn paths_hang_off_the_root_and_ensure_creates_the_layout() {
     paths.ensure().expect("ensure");
     assert!(paths.models().is_dir(), "ensure must create models/");
 
-    // `from_root` is verbatim: no hidden `APP_DIR` suffix is appended.
     let explicit = Paths::from_root(root);
     assert_eq!(explicit.root(), root);
 }

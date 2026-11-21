@@ -1,8 +1,3 @@
-//! Credentials are rows: mint issues one, rotation replaces it, and authority stays downward.
-//!
-//! Provisioning is in the test, not the door: a parent row is written directly, then the runtime
-//! verbs are exercised exactly as the MCP tools call them.
-
 use ellmephant::config::Paths;
 use ellmephant::store::{self, credential};
 
@@ -81,7 +76,6 @@ fn a_parent_may_rotate_a_descendant_but_a_peer_may_not() {
 fn a_root_pen_cannot_issue_or_rotate_a_credential() {
     let (_dir, paths) = store();
     let conn = ellmephant::db::open(&paths).unwrap();
-    // `James` has no parent in this fixture, so it is a root — and a root is break-glass, not a party.
     let issued = credential::issue(&conn, "James", None);
     assert!(
         format!("{}", issued.unwrap_err()).contains("root pen"),

@@ -1,30 +1,8 @@
-//! `ellmephant pen …` — the PROVISIONING door: standing, on purpose (2026-10-24).
-//!
-//! The runtime door (`pen_mint` over MCP) lets a live pen create a pen under *itself*, with the caller's
-//! authority behind it. Provisioning is the other door: whoever can open the database says what a pen IS —
-//! its parent, and that it exists at all. Until now that door was "somebody runs SQL", which nothing could
-//! do (no `sqlite3` in the image, no mounting the PVC beside a running brain) — so the attach had to be
-//! smuggled in as boot configuration, and James called it: *"the estate is in an environment variable
-//! instead of a table?"*
-//!
-//! It is not, and this is how it stops being one. The env var is a **seed** — it only fills a `parent_id`
-//! that is empty. Moving a pen that already has a standing is a deliberate act, and deliberate acts have a
-//! verb, a shell history entry and a log line:
-//!
-//! ```console
-//! $ ellmephant pen attach 'stet=estate' 'twine=stet'
-//! $ ellmephant pen tree
-//! ```
-//!
-//! Nothing here is new authority: `set_parent` and `mint` already refuse a loop, a retired pen, an
-//! unaddressable name and the reserved word. This is only the way to reach them.
-
 use crate::config::{Config, Paths};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::store;
 
-/// `pen attach child=parent …` — move pens, deliberately. Overwrites what the table says.
 pub fn attach(paths: &Paths, cfg: &Config, edges: &[String]) -> Result<()> {
     if edges.is_empty() {
         return Err(Error::Invalid(
@@ -35,8 +13,6 @@ pub fn attach(paths: &Paths, cfg: &Config, edges: &[String]) -> Result<()> {
     let conn = db::open_with(paths, cfg)?;
     let mut changed = 0;
     let mut already = 0;
-    // Report every failure and still apply the rest, then FAIL the command if any was refused: this is a
-    // provisioning shell, and a typo must not look like success.
     let mut refusals: Vec<String> = Vec::new();
     for edge in edges {
         let Some((child, parent)) = edge.split_once('=') else {
@@ -54,7 +30,6 @@ pub fn attach(paths: &Paths, cfg: &Config, edges: &[String]) -> Result<()> {
                 already += 1;
             }
             Ok(store::Seeded::Disagrees(current)) => {
-                // ★ THE TABLE WINS TO THE SEED, NOT TO YOU. A verb typed on purpose overwrites.
                 store::set_parent(&conn, child, parent)?;
                 println!("  moved     {child}: {current} → {parent}");
                 changed += 1;
@@ -79,11 +54,6 @@ pub fn attach(paths: &Paths, cfg: &Config, edges: &[String]) -> Result<()> {
     }
 }
 
-/// `pen mint <name> --parent <parent> [--kind self|finger]` — create a pen by provisioning.
-///
-/// The runtime door wants a live caller with authority; this one wants the database. It refuses exactly
-/// what `store::mint` refuses — `anonymous`, a name that cannot be addressed, a retired parent — because
-/// a provisioning door is not a licence to make a broken row.
 pub fn mint(paths: &Paths, cfg: &Config, name: &str, parent: &str, kind: &str) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -97,11 +67,6 @@ pub fn mint(paths: &Paths, cfg: &Config, name: &str, parent: &str, kind: &str) -
     Ok(())
 }
 
-/// `pen rotate <name>` — provisioning: replace a credential and print the new secret once.
-///
-/// Provisioning, not a door: whoever can open the database can already read every hash, so there is
-/// no caller to authorize against. The runtime door (`pen_rotate` over MCP) is the one that checks
-/// self-or-descendant.
 pub fn rotate(paths: &Paths, cfg: &Config, name: &str) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -112,7 +77,6 @@ pub fn rotate(paths: &Paths, cfg: &Config, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `pen tree` — the shape, and the one number that matters: the number of roots.
 pub fn tree(paths: &Paths, cfg: &Config) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -143,15 +107,8 @@ pub fn tree(paths: &Paths, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-// ── AUTHORITY, BY HAND (2026-10-24) ──────────────────────────────────────────────────────────────
-// These are the *provisioning* half of the sudo model: the policy, the lend, the borrow. They exist
-// because `kubectl exec` is already a privilege that owns the box — so a verb here grants nothing that
-// the person typing it could not already do with the database open. What they do NOT do is decide
-// whether a *live pen* may invoke them: that is the door's question, and the door is not built.
-
 use crate::store::sudo;
 
-/// `pen grant <powerful> <weak> <secs>` — a sudoers policy: weak may borrow powerful for at most secs.
 pub fn grant(paths: &Paths, cfg: &Config, powerful: &str, weak: &str, secs: i64) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -160,7 +117,6 @@ pub fn grant(paths: &Paths, cfg: &Config, powerful: &str, weak: &str, secs: i64)
     Ok(())
 }
 
-/// `pen lend <powerful> <weak> <secs>` — powerful lends its own authority DOWN to weak.
 pub fn lend(paths: &Paths, cfg: &Config, powerful: &str, weak: &str, secs: i64) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -169,7 +125,6 @@ pub fn lend(paths: &Paths, cfg: &Config, powerful: &str, weak: &str, secs: i64) 
     Ok(())
 }
 
-/// `pen sudo <weak> <powerful> <secs>` — weak borrows powerful, under a policy.
 pub fn borrow(paths: &Paths, cfg: &Config, weak: &str, powerful: &str, secs: i64) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -178,7 +133,6 @@ pub fn borrow(paths: &Paths, cfg: &Config, weak: &str, powerful: &str, secs: i64
     Ok(())
 }
 
-/// `pen release <weak> <powerful>` — end a session early.
 pub fn release(paths: &Paths, cfg: &Config, weak: &str, powerful: &str) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -187,7 +141,6 @@ pub fn release(paths: &Paths, cfg: &Config, weak: &str, powerful: &str) -> Resul
     Ok(())
 }
 
-/// `pen sessions [<weak>]` — who holds what, and until when.
 pub fn sessions(paths: &Paths, cfg: &Config, weak: Option<&str>) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -236,10 +189,6 @@ fn report(session: &sudo::Session) {
     );
 }
 
-/// `pen revoke <powerful> <weak>` — remove a policy AND every session it authorised, in one act.
-///
-/// A policy removed while its sessions keep running is a revocation that has not happened yet, and the
-/// sessions would be indistinguishable from permission.
 pub fn revoke(paths: &Paths, cfg: &Config, powerful: &str, weak: &str) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;
@@ -248,7 +197,6 @@ pub fn revoke(paths: &Paths, cfg: &Config, powerful: &str, weak: &str) -> Result
     Ok(())
 }
 
-/// `pen policies` — every standing grant, and where it came from.
 pub fn policies(paths: &Paths, cfg: &Config) -> Result<()> {
     paths.ensure()?;
     let conn = db::open_with(paths, cfg)?;

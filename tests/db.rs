@@ -1,7 +1,3 @@
-//! Integration tests: real SQLite file, real schema.
-//!
-//! Everything here runs offline — no model, no extension.
-
 mod common;
 
 use common::{count, temp_store};
@@ -36,7 +32,6 @@ fn insert(conn: &Connection, key: &str, title: &str, body: &str) {
     .expect("insert memory");
 }
 
-/// A v4 store predates `mail` entirely, so the column drop has to tolerate a missing table.
 fn drop_sent_under(conn: &Connection) {
     let has_mail: i64 = conn
         .query_row(
@@ -65,23 +60,16 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
     for name in ["memory", "memory_link", "meta", "project", "config"] {
         assert!(object_exists(&conn, "table", name), "missing table {name}");
     }
-    // 0032: configuration carries TWO boundaries, so both columns must be there.
     for column in ["set_audience", "read_audience"] {
         assert!(
             column_exists(&conn, "config", column),
             "config.{column} is missing"
         );
     }
-    // 0007 dropped the one-home association: membership is a tag now, so the table must be GONE —
-    // and must never creep back.
     assert!(
         !object_exists(&conn, "table", "project_memory"),
         "project_memory should have been dropped by 0007"
     );
-    // ★ THE v2 DECISION IS REVERSED FOR THE WORD INDEX (soma/ellmephant#62, 2026-10-22): a single
-    // semantic phrase could not find a name-shaped query — the right memory ranked FIFTH at 0.5945
-    // behind an unrelated 0.5795 — so `memory_fts` is now INTENDED, and its absence would be the bug.
-    // The tag tables stay absent: a tag is a column, and a join table for it was never right.
     assert!(
         object_exists(&conn, "table", "memory_fts"),
         "the word index is now part of the schema (0017)"
@@ -92,15 +80,12 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
             "{name} should not exist"
         );
     }
-    // The preload list is a COLUMN on `project`, not a tie table (0005's header says why):
-    // guard against a `project_preload` table creeping back.
     for column in ["mem_preload", "start_date", "end_date"] {
         assert!(
             column_exists(&conn, "project", column),
             "project.{column} is missing"
         );
     }
-    // v6: an edge says which table its bare key names.
     assert!(
         column_exists(&conn, "memory_link", "to_type"),
         "memory_link.to_type is missing"
@@ -118,9 +103,6 @@ fn fresh_store_is_at_latest_schema_with_every_object() {
 
 #[test]
 fn the_recess_rows_are_retired_and_a_reopen_does_not_resurrect_them() {
-    // ★ MIGRATIONS 0039/0040 SEEDED THESE AND 0041 REMOVED THEM (2026-10-31). The recess bank moved
-    // into brain.db with its policy, so the store must answer NOTHING about a recess. This asserts
-    // the END STATE of the whole chain, not the seed: a fresh store runs every migration in order.
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
 
@@ -137,9 +119,6 @@ fn the_recess_rows_are_retired_and_a_reopen_does_not_resurrect_them() {
         "the recess policy lives in brain.db; a second copy here is the copy nobody updates"
     );
 
-    // ★ A REOPEN MUST NOT RE-SEED. The seed rows are INSERT OR IGNORE and 0041 already ran, so the
-    // migration list stops at the current version: a reopen that re-ran 0039/0040 would resurrect
-    // exactly the duplicate this retirement exists to prevent.
     drop(conn);
     let conn = db::open(&paths).expect("reopen");
     let again: i64 = conn
@@ -185,80 +164,55 @@ fn migrations_are_idempotent_across_reopen() {
 fn a_v4_store_gains_the_project_tables_on_open() {
     let (_dir, paths) = temp_store();
 
-    // A store from before projects existed: the tables gone, the link type gone, and the version
-    // rolled back.
     let conn = db::open(&paths).unwrap();
     insert(&conn, "keep-me", "Kept", "survives the upgrade");
     conn.execute("DROP TABLE project", []).unwrap();
     conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
         .unwrap();
-    // A v4 store predates the encode queue as well.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
-    // ...and predates memory versions, which 0011 recreates: a fake old store has to UNDO what the
-    // newer migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE memory_version", []).unwrap();
-    // ...and predates claims (0012), for the same reason.
     conn.execute("DROP TABLE claim", []).unwrap();
-    // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
-    // migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE mail", []).unwrap();
-    // ...and predates the MAIL CURSOR (0017), which is a table of its own.
     conn.execute("DROP TABLE mail_cursor", []).unwrap();
-    // ...and predates PROVENANCE (0014): undo its columns, index first — SQLite refuses to drop an
-    // indexed column.
     conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN asserted_by", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN origin", [])
         .unwrap();
-    // ...and it still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
         [],
     )
     .unwrap();
-    // And it still spells the column `doc_hash`: 0010 is the rename that fixes that, and 0016 is the
-    // migration that removes it entirely — so the OLD store is built by ADDING the old spelling, not
-    // by renaming a column this schema no longer has.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN doc_hash TEXT NOT NULL DEFAULT ''",
         [],
     )
     .unwrap();
-    // ...and predates the WORD INDEX (0017): drop its triggers BEFORE the table, or a trigger body
-    // survives naming a table that no longer exists and every later write fails.
     for t in ["memory_fts_ai", "memory_fts_ad", "memory_fts_au"] {
         conn.execute(&format!("DROP TRIGGER IF EXISTS {t}"), [])
             .unwrap();
     }
     conn.execute("DROP TABLE memory_fts", []).unwrap();
-    // ...and predates the READ AUDIENCE (0018): drop the column the migration would add.
     conn.execute("DROP INDEX IF EXISTS memory_audience", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
         .unwrap();
-    // ...and predates LAST-WRITTEN-BY (0020), the second provenance column.
     conn.execute("ALTER TABLE memory DROP COLUMN edited_by", [])
         .unwrap();
-    // ...and predates the PEN REGISTRY (0021), which is a table of its own.
-    // ...config references pen(id), so it must go FIRST or the drop below trips the foreign key.
     conn.execute("DROP TABLE IF EXISTS config", []).unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
-    // ...and predates SUDO (0024), which is two tables of its own.
     conn.execute("DROP TABLE IF EXISTS active_sudo", [])
         .unwrap();
     conn.execute("DROP TABLE IF EXISTS sudoers", []).unwrap();
-    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
     conn.execute("DROP INDEX IF EXISTS memory_owner", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
         .unwrap();
     conn.execute("DROP TABLE pen_event", []).unwrap();
-    // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
-    // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_boundary;
          DROP TABLE IF EXISTS channel_event;
@@ -277,7 +231,6 @@ fn a_v4_store_gains_the_project_tables_on_open() {
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
-    // Opening it again runs only the newer steps, and the rows are untouched.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
     assert!(object_exists(&conn, "table", "project"), "missing project");
@@ -292,8 +245,6 @@ fn a_v4_store_gains_the_project_tables_on_open() {
 fn a_v5_store_gets_bare_keys_and_typed_edges() {
     let (_dir, paths) = temp_store();
 
-    // The state an earlier v5 build left behind: prefixed project keys, a one-home membership row,
-    // and edges that named them by prefix — with no `to_type` column to say so.
     let conn = db::open(&paths).unwrap();
     conn.execute("ALTER TABLE memory_link DROP COLUMN to_type", [])
         .unwrap();
@@ -304,8 +255,6 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         [],
     )
     .unwrap();
-    // A v5 store still HOLDS the one-home table (0007 has not run yet), so the fixture rebuilds it —
-    // otherwise 0006's backfill below would have nothing to rewrite.
     conn.execute(
         "CREATE TABLE project_memory (memory_key TEXT PRIMARY KEY, project_key TEXT NOT NULL)",
         [],
@@ -321,8 +270,6 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         params![from_id],
     )
     .unwrap();
-    // ...and predates the WORD INDEX (0017): drop its triggers BEFORE the table, or a trigger body
-    // survives naming a table that no longer exists and every later write fails.
     for t in ["memory_fts_ai", "memory_fts_ad", "memory_fts_au"] {
         conn.execute(&format!("DROP TRIGGER IF EXISTS {t}"), [])
             .unwrap();
@@ -332,27 +279,20 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN audience", [])
         .unwrap();
-    // ...and predates LAST-WRITTEN-BY (0020), the second provenance column.
     conn.execute("ALTER TABLE memory DROP COLUMN edited_by", [])
         .unwrap();
-    // ...and predates the PEN REGISTRY (0021), which is a table of its own.
-    // ...config references pen(id), so it must go FIRST or the drop below trips the foreign key.
     conn.execute("DROP TABLE IF EXISTS config", []).unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
-    // ...and predates SUDO (0024), which is two tables of its own.
     conn.execute("DROP TABLE IF EXISTS active_sudo", [])
         .unwrap();
     conn.execute("DROP TABLE IF EXISTS sudoers", []).unwrap();
-    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
     conn.execute("DROP INDEX IF EXISTS memory_owner", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
         .unwrap();
     conn.execute("DROP TABLE pen_event", []).unwrap();
-    // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
-    // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_boundary;
          DROP TABLE IF EXISTS channel_event;
@@ -369,31 +309,22 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     .unwrap();
     drop_sent_under(&conn);
     conn.pragma_update(None, "user_version", 5).unwrap();
-    // A v5 store predates the encode queue too.
     conn.execute("DROP TABLE encode_queue", []).unwrap();
-    // ...and predates memory versions (0011), for the same reason as above.
     conn.execute("DROP TABLE memory_version", []).unwrap();
-    // ...and predates claims (0012), for the same reason.
     conn.execute("DROP TABLE claim", []).unwrap();
-    // ...and predates MAIL (0013), for the same reason: a fake old store must UNDO what the newer
-    // migrations add, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE mail", []).unwrap();
-    // ...and predates the MAIL CURSOR (0017), which is a table of its own.
     conn.execute("DROP TABLE mail_cursor", []).unwrap();
-    // ...and predates PROVENANCE (0014), for the same reason.
     conn.execute("DROP INDEX IF EXISTS idx_memory_asserted_by", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN asserted_by", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN origin", [])
         .unwrap();
-    // ...and still HOLDS the split-review column: 0004 added it, and 0009 is what drops it.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN coherent INTEGER CHECK (coherent IN (0, 1) OR coherent IS NULL)",
         [],
     )
     .unwrap();
-    // …and still carries the old `doc_hash` spelling, which 0010 renames and 0016 removes.
     conn.execute(
         "ALTER TABLE memory ADD COLUMN doc_hash TEXT NOT NULL DEFAULT ''",
         [],
@@ -401,8 +332,6 @@ fn a_v5_store_gets_bare_keys_and_typed_edges() {
     .unwrap();
     drop(conn);
 
-    // 0006 interprets the prefix exactly once — while it still means something — and 0007 then
-    // drops the one-home table entirely.
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(
         count(&conn, "SELECT count(*) FROM project WHERE key = 'chronos'"),
@@ -444,13 +373,10 @@ fn memory_keeps_tags_and_no_scope_or_type() {
         .unwrap();
     assert_eq!(tags, "k8s,infra");
 
-    // ★ NO ENCODING STATE ON THE ROW (0016): a document records what it IS, never whether its vector
-    // exists. The queue and the index answer that, and a stamp here was the bug.
     assert!(
         !column_exists(&conn, "memory", "encode_hash"),
         "the truth table carries no derived stamp"
     );
-    // `tags` defaults to the empty string.
     conn.execute(
         "INSERT INTO memory (key, title, body) VALUES ('c', 'T', 'B')",
         [],
@@ -497,19 +423,11 @@ fn key_is_unique() {
     );
 }
 
-// The skipped-migration (hole in the list) case is unit-tested in `src/db/migrate.rs`, because a
-// store at a version *below* the binary's highest and *unknown to it* cannot be built against a
-// contiguous list: with 1..15 present, every lower version is known. The synthetic-list test is the
-// honest way to exercise it.
-
-/// The opposite state: the STORE IS NEWER than this binary, which is what a rollback looks like.
-/// Refusing here would make a bad deploy unrecoverable, so it is allowed — but only deliberately.
 #[test]
 fn a_v20_store_gains_the_pen_registry_on_open() {
     let (_dir, paths) = temp_store();
     let conn = db::open(&paths).unwrap();
 
-    // Two rows whose authors are of different shapes: a self, and a finger acting for it.
     insert(&conn, "said-by-stet", "Said by stet", "body");
     conn.execute(
         "UPDATE memory SET asserted_by = 'stet' WHERE key = 'said-by-stet'",
@@ -523,9 +441,6 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     )
     .unwrap();
 
-    // A store from before the registry: the table gone, the version rolled back. It must also
-    // UNDO 0022 (the rename and the version column), or that migration collides with work it has
-    // already done — the same rule the v4/v5 tests follow for every later migration.
     conn.execute("DROP INDEX IF EXISTS memory_version_editor", [])
         .unwrap();
     conn.execute("ALTER TABLE memory_version DROP COLUMN edited_by", [])
@@ -537,23 +452,18 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         [],
     )
     .unwrap();
-    // ...config references pen(id), so it must go FIRST or the drop below trips the foreign key.
     conn.execute("DROP TABLE IF EXISTS config", []).unwrap();
     conn.execute("DROP TABLE pen", []).unwrap();
-    // ...and predates SUDO (0024), which is two tables of its own.
     conn.execute("DROP TABLE IF EXISTS active_sudo", [])
         .unwrap();
     conn.execute("DROP TABLE IF EXISTS sudoers", []).unwrap();
-    // ...and predates OWNERSHIP (0023): the column, its index, and the ledger table.
     conn.execute("DROP INDEX IF EXISTS memory_owner", [])
         .unwrap();
     conn.execute("ALTER TABLE memory DROP COLUMN owner", [])
         .unwrap();
     conn.execute("DROP TABLE pen_event", []).unwrap();
-    // ...and predates the READ AUDIT (0026): a fake old store must undo what newer migrations add.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
-    // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_boundary;
          DROP TABLE IF EXISTS channel_event;
@@ -575,7 +485,6 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
     let conn = db::open(&paths).expect("reopen");
     assert_eq!(db::migrate::version(&conn).unwrap(), db::migrate::latest());
 
-    // Every name that has ever spoken became a pen...
     assert_eq!(
         count(&conn, "SELECT count(*) FROM pen WHERE name = 'stet'"),
         1
@@ -588,9 +497,6 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         1
     );
 
-    // ★ THE SEED NEVER INVENTS A TREE (Stet, review round 3). A history row knows a NAME existed, not
-    // a pen's standing: no parent, no kind. So a slash in a name grants nothing — the finger is
-    // seeded as a plain self with no parent, and its standing must be registered deliberately.
     assert_eq!(
         count(
             &conn,
@@ -600,7 +506,6 @@ fn a_v20_store_gains_the_pen_registry_on_open() {
         "a slash is an address, never a permission"
     );
 
-    // Nothing is tombstoned on the way in: the registry records history, it does not rewrite it.
     assert_eq!(
         count(
             &conn,
@@ -630,7 +535,6 @@ fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
         "and it must name the escape: {text}"
     );
 
-    // The deliberate override proceeds, and applies nothing (the store is already beyond this list).
     migrate::run_with(&conn, true).expect("the rollback override must work");
     assert_eq!(migrate::version(&conn).unwrap(), 99, "untouched");
 }
@@ -639,9 +543,6 @@ fn a_store_ahead_of_this_binary_can_only_be_entered_deliberately() {
 fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
     let (_dir, paths) = temp_store();
 
-    // A store that already ran the OLD seed: `anonymous` exists as a pen, owns a row, and is named in
-    // the ledger and in a version snapshot. This is the state the pre-roll rehearsal found in a copy
-    // of the live store — 249 rows, not one.
     let conn = db::open(&paths).expect("open");
     conn.execute(
         "INSERT INTO memory (key, title, body, created, updated, asserted_by, owner, audience)
@@ -656,11 +557,8 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
         [],
     )
     .unwrap();
-    // Pretend the store stopped at v24, so only the later steps run on reopen — and undo what those
-    // later steps create, or the migration collides with a table that never went away.
     conn.execute("DROP TABLE IF EXISTS private_read", [])
         .unwrap();
-    // ...and predates ELLMECHAT (0029), whose three tables are its own.
     conn.execute_batch(
         "DROP TABLE IF EXISTS channel_boundary;
          DROP TABLE IF EXISTS channel_event;
@@ -693,7 +591,6 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
         "`anonymous` is a value meaning nobody, never a pen"
     );
 
-    // Nothing was reassigned to somebody else: the row is UNATTRIBUTED, which is the honest state.
     let owner: Option<i64> = conn
         .query_row("SELECT owner FROM memory WHERE key = 'ghosted'", [], |r| {
             r.get(0)
@@ -704,7 +601,6 @@ fn a_ghost_pen_called_anonymous_is_repaired_not_preserved() {
         "un-owning restores the question rather than answering it"
     );
 
-    // And the ledger no longer points at a pen that does not exist.
     let dangling: i64 = conn
         .query_row("SELECT count(*) FROM pen_event WHERE pen_id IS NOT NULL AND pen_id NOT IN (SELECT id FROM pen)", [], |r| r.get(0))
         .unwrap();

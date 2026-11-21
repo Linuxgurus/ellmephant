@@ -1,23 +1,3 @@
-//! MCP server (P7) on `rmcp`: Streamable HTTP (default, the networked transport) or stdio.
-//!
-//! Tools: `memory_upsert`, `memory_delete`, `memory_search`,
-//! `memory_get`, `memory_backlinks`, `memory_upvote`, `memory_stats`,
-//! `memory_dupes` — with read-only annotations on the read tools and destructive on `delete`.
-//! The tool descriptions carry the SPEC §9 write policy; that is where memory quality is
-//! actually tuned. `memory_get` counts a `visits` read and carries the upvote cue — both in its
-//! description *and* in the returned payload (`_nudge`), where the model's attention sits after
-//! consuming a body; `memory_upvote` bumps the `times_useful` feedback counter.
-//!
-//! The store is one SQLite file behind a single connection (SPEC §15 #10), so the
-//! server holds the [`Session`] behind a mutex and serves requests serially. SQLite and
-//! the encoder are synchronous and can hold the lock for a while, so each tool runs its
-//! store work on a blocking thread via [`tokio::task::spawn_blocking`] rather than
-//! occupying a tokio worker.
-//!
-//! Two transports, both standard MCP: [`Transport::Http`] (the default) mounts the tool
-//! surface at `/mcp` on a listening port via `rmcp`'s `StreamableHttpService` + `axum`;
-//! [`Transport::Stdio`] keeps the client-launched pipe.
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,15 +9,12 @@ use rmcp::{ServerHandler, ServiceExt, schemars, tool_handler};
 use serde::Deserialize;
 
 use crate::config::{Config, Paths};
-use crate::store::session::Session;
-// NOTE: do *not* import `crate::error::Result` here — `#[tool_handler]` expands to code that
-// uses the unqualified `Result` from `rmcp`, and our single-parameter alias would shadow it.
 use crate::error::Error;
 use crate::model;
 use crate::search::{Bundle, Field, MatchMode};
+use crate::store::session::Session;
 use crate::store::{self, project};
 
-/// Names of the tools this server exposes.
 pub const TOOLS: &[&str] = &[
     "whoami",
     "memory_unowned",
@@ -105,36 +82,14 @@ pub const TOOLS: &[&str] = &[
     "mail_surrogate_list",
 ];
 
-/// The server's name, as `serverInfo` reports it — one source for both doors, so a boot and an
-/// `initialize` cannot disagree about who is answering.
 pub(crate) const SERVER_NAME: &str = "ellmephant";
 
-/// Which tools an MCP door ADVERTISES.
-///
-/// The store serves two doors over the same [`Session`] and the same auth: `/mcp` (the whole
-/// surface) and `/mcp/core` (the hot path). The split exists because tool schemas are re-read on
-/// every model step — the full surface is ~80 KB, and a client that can call the REST API does not
-/// need most of it in context. The call path is NOT filtered: a core client that names a non-core
-/// tool still reaches it, so this is an advertisement decision, never a permission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
-    /// Every tool. `/mcp`.
     Full,
-    /// The hot path: memory recall/write, projects, and communication. `/mcp/core`.
     Core,
 }
 
-/// The tools `/mcp/core` advertises. Everything else is reachable over REST and indexed at `GET /api`.
-///
-/// Chosen by frequency, not by power: these are the calls a turn makes without thinking. Hygiene,
-/// identity, admin and repair are rare and live on the expanded door and the API.
-///
-/// Four calls that look like siblings are deliberately outside it, and the reason is the
-/// "without thinking" half rather than rarity: `semantic_search` is the wide door (every document
-/// type, plus the graveyard) against `memory_search`'s cheap memory-only pass; `memory_append` and
-/// `memory_fold` are edits whose correctness depends on a `memory_get` first, so the turn reads
-/// before it writes; `channel_wait` blocks the turn for up to 25 seconds. Add one only with a
-/// measurement of how often it is called, never because it reads like the others.
 pub const CORE_TOOLS: &[&str] = &[
     "whoami",
     "memory_search",
@@ -158,8 +113,6 @@ pub const CORE_TOOLS: &[&str] = &[
     "channel_fetch",
 ];
 
-/// The group an API index entry belongs to. The group is a shelf, not a permission: `GET /api`
-/// carries every op, and the group only decides which short list a reader asks for first.
 pub(crate) fn group_of(tool: &str) -> &'static str {
     if CORE_TOOLS.contains(&tool) {
         return "core";
@@ -175,35 +128,22 @@ pub(crate) fn group_of(tool: &str) -> &'static str {
     } else if tool.starts_with("channel") {
         "channel"
     } else {
-        // memory_dupes, merge, adopt, unowned, dangling, reembed, reparse, history_*.
         "hygiene"
     }
 }
 
-/// One tool exactly as `tools/list` presents it, for a surface that is not MCP.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCard {
-    /// Tool name.
     pub name: String,
-    /// The law: what it does, when to use it, what it returns.
     pub description: String,
-    /// The JSON Schema the model is handed as `inputSchema`.
     pub input_schema: serde_json::Value,
-    /// The tool's annotation hints, as `tools/list` serializes them. The human-readable title lives
-    /// in here (`annotations.title`), not at the top level — which is why a card has no `title`.
     pub annotations: serde_json::Value,
 }
 
-/// The server-level instruction — the same text an MCP `initialize` carries.
 pub(crate) fn instructions() -> &'static str {
     INSTRUCTIONS
 }
 
-/// The tool surface as `tools/list` presents it.
-///
-/// Read from the router the `#[tool]` attributes build, so a door that is not MCP describes the
-/// same toolkit from the same source instead of a hand-kept copy: a tool added below appears
-/// here for free. `TOOLS` is the name contract; this is the content.
 pub(crate) fn tool_catalog() -> Vec<ToolCard> {
     MemoryServer::tool_router()
         .list_all()
@@ -225,9 +165,6 @@ pub(crate) fn tool_catalog() -> Vec<ToolCard> {
         .collect()
 }
 
-/// Server-level instruction: the identity, the smart-caveman style, and the one duty that spans
-/// every tool (curation), defined once here. Every other law lives in the tool descriptions — each
-/// states its own, so nothing is written twice (SPEC §9).
 const INSTRUCTIONS: &str = "ellmephant = Memory storage in smart-caveman style — big words in, \
 small words out; drop filler, articles, glue. List-shaped reads return a positional table: a \
 `cols` header names the fields, rows are bare arrays. Curation is part of the job, not an extra: \
@@ -241,15 +178,6 @@ tables may share one). \
 Tool descriptions are the spec.";
 
 impl MemoryServer {
-    /// ★ ONE TOOL TABLE, BUILT FROM SEVEN ROUTERS (soma/ellmephant#50).
-    ///
-    /// `#[tool_router]` builds a `ToolRouter` from one impl block, so a 2,661-line impl was the
-    /// only way to have 63 tools. The groups each export their own router now, and this composes
-    /// them: `ToolRouter::merge` is rmcp's own API, so the table is still built by the library
-    /// rather than by a hand-kept list that could drift from the `#[tool]` attributes.
-    ///
-    /// The order is irrelevant to behaviour (the map is keyed by name) and alphabetical by group
-    /// so a diff cannot hide a new one.
     pub(crate) fn tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::channel_tool_router();
         router.merge(Self::claim_tool_router());
@@ -264,9 +192,6 @@ impl MemoryServer {
 
 #[tool_handler(router = Self::tool_router())]
 impl ServerHandler for MemoryServer {
-    /// The surface split lives here and nowhere else. `#[tool_handler]` fills this method in only
-    /// when the impl does not define one, so this override is the whole mechanism: one server, two
-    /// advertised lists, one call path.
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -287,8 +212,6 @@ impl ServerHandler for MemoryServer {
     }
 
     fn get_info(&self) -> ServerConfig {
-        // The core door says what it is NOT carrying, and where to find it. A hint in the
-        // instructions costs one line here; a hidden tool with no signpost is an unfindable tool.
         let instructions = if self.surface == Surface::Core {
             format!(
                 "{INSTRUCTIONS}\n\nCORE SURFACE: this door advertises the hot path only. The rest \
@@ -316,7 +239,6 @@ mod tests {
             assert!(TOOLS.contains(tool), "core names an unknown tool: {tool}");
             assert!(seen.insert(*tool), "core names a tool twice: {tool}");
         }
-        // The split has to be a SPLIT: a core list equal to the whole surface saves nothing.
         assert!(
             CORE_TOOLS.len() < TOOLS.len() / 2,
             "core is {} of {} — not a hot path",
@@ -325,9 +247,6 @@ mod tests {
         );
     }
 
-    /// ★ THE COMPOSITION IS THE CONTRACT (soma/ellmephant#50). `MemoryServer::tool_router` merges
-    /// seven group routers; a group forgotten in that merge would still compile, still pass the core
-    /// tests, and quietly stop serving its tools. This is the test that makes the merge checkable.
     #[test]
     fn the_composed_router_carries_exactly_tools() {
         let mut served: Vec<String> = MemoryServer::tool_router()
@@ -393,7 +312,6 @@ mod tests {
         };
         let ann = |name: &str| find(name).annotations.clone().expect("annotations");
 
-        // Read tools declare themselves read-only.
         for name in [
             "memory_search",
             "memory_get",
@@ -408,35 +326,28 @@ mod tests {
                 "{name} must be read-only"
             );
         }
-        // Delete is the destructive one; upsert is an idempotent write.
         assert_eq!(ann("memory_delete").destructive_hint, Some(true));
         assert_eq!(ann("memory_delete").read_only_hint, Some(false));
-        // Feedback writes but is neither read-only nor destructive.
         assert_eq!(ann("memory_upvote").read_only_hint, Some(false));
         assert_eq!(ann("memory_upvote").destructive_hint, Some(false));
         assert_eq!(ann("memory_upsert").idempotent_hint, Some(true));
-        // Re-embed writes, but only to the derived index -- nothing it touches is source data.
         assert_eq!(ann("memory_reembed").read_only_hint, Some(false));
         assert_eq!(ann("memory_reembed").destructive_hint, Some(false));
         assert_eq!(ann("memory_reembed").idempotent_hint, Some(true));
 
-        // The write *policy* rides on the upsert description (SPEC §9)...
         let upsert = find("memory_upsert")
             .description
             .clone()
             .expect("description");
         assert!(upsert.to_lowercase().contains("one topic"), "{upsert}");
         assert!(upsert.to_lowercase().contains("merge"), "{upsert}");
-        // The pre-write split nudge: *evaluate* ("before saving"), then *action* (split, one call each).
         assert!(upsert.to_lowercase().contains("before saving"), "{upsert}");
         assert!(upsert.to_lowercase().contains("split"), "{upsert}");
-        // Growth law is *coherence, not size*: deepen a topic, never add a second; no "never grow".
         assert!(
             upsert.to_lowercase().contains("deepen the topic"),
             "{upsert}"
         );
         assert!(!upsert.to_lowercase().contains("never grow"), "{upsert}");
-        // The feedback nudge must carry a *trigger*, not just a quality bar.
         let upvote = find("memory_upvote")
             .description
             .clone()
@@ -446,14 +357,11 @@ mod tests {
             "{upvote}"
         );
         assert!(upvote.to_lowercase().contains("visit"), "{upvote}");
-        // The old "no flattery" clause was a *brake* that starved the counter; it must stay gone,
-        // replaced by a default-on push to vote.
         assert!(
             !upvote.to_lowercase().contains("no flattery"),
             "the withholding brake is back: {upvote}"
         );
         assert!(upvote.to_lowercase().contains("under-voting"), "{upvote}");
-        // The sweep takes *many* keys: the schema exposes `keys`, never a single `key`.
         let upvote_props = find("memory_upvote")
             .input_schema
             .get("properties")
@@ -462,19 +370,13 @@ mod tests {
             .expect("upvote schema has properties");
         assert!(upvote_props.contains_key("keys"), "{upvote_props:?}");
         assert!(!upvote_props.contains_key("key"), "{upvote_props:?}");
-        // ...and the firing cue must ride the *consuming* read, not the write tool —
-        // the model reads `memory_get`, uses the body, and there learns to upvote.
         let get = find("memory_get").description.clone().expect("description");
         assert!(get.contains("memory_upvote"), "{get}");
-        // ...and the cue must also ride `memory_get`'s *result* payload, where the model's
-        // attention actually sits after consuming the body (pinned end-to-end in tests/mcp.rs).
         assert!(GET_NUDGE.contains("memory_upvote"), "{GET_NUDGE}");
-        // Curation is a cross-tool duty, so it is announced once in the server instructions too.
         assert!(
             INSTRUCTIONS.contains("memory_upvote") && INSTRUCTIONS.contains("Curation"),
             "{INSTRUCTIONS}"
         );
-        // ...while field definitions live on the field schemas, not the description.
         let upsert_props = find("memory_upsert")
             .input_schema
             .get("properties")
@@ -495,10 +397,6 @@ mod tests {
             "field defs belong on the fields: {upsert}"
         );
 
-        // The `start_date` field description must not promise the OLD behaviour. It has now been
-        // wrong twice — once stamping at creation, once claiming it was never stamped — and the
-        // description is read as law (SPEC §9), so a stale sentence there is a lie the model acts on.
-        // Pin the two halves of the current rule: derive on leaving `todo`, and never clear.
         let start_desc = find("project_upsert")
             .input_schema
             .get("properties")
@@ -520,14 +418,6 @@ mod tests {
             "start_date is not stamped at creation time: {start_desc}"
         );
 
-        // Search carries the semantic phrase (`query`), the lexical leg (`pattern` + `mode`), the
-        // FIELD PREDICATES (`key`/`key_prefix`/`title`) and the structured filters. `key` was absent
-        // until #114 on the reasoning that a known key is `memory_get`; the issue overruled it — the
-        // only way to match a key was `pattern`, which scans key, title AND body, so "this row" and
-        // "this word appears somewhere" were the same request.
-        //
-        // `status` is here ON PURPOSE and refuses: it filters projects, and a memory search that
-        // silently ignored it would widen — the #87 lesson.
         let props = find("memory_search")
             .input_schema
             .get("properties")
@@ -558,9 +448,6 @@ mod tests {
                 "mode",
                 "pattern",
                 "query",
-                // ★ The honest empty list (#215): a caller must be able to ask "did my phrase reach
-                // anything real" and get NO rather than a lexical refill. This list is the wire
-                // surface, so a new knob appears here deliberately or not at all.
                 "semantic_only",
                 "status",
                 "tags",
@@ -569,7 +456,6 @@ mod tests {
                 "updated_before"
             ]
         );
-        // The `mode` values live in the schema (a `MatchModeParam` enum), never in the description.
         let mode_oneof = find("memory_search")
             .input_schema
             .get("$defs")
@@ -588,10 +474,7 @@ mod tests {
                 "missing mode {want}: {mode_vals:?}"
             );
         }
-        // The projection selection rides on `fields` (a hit returns `key` + `via` by default).
         assert!(props.contains_key("fields"), "search must expose `fields`");
-        // The `fields` *values* live in the schema (a `FieldParam` enum), never in the description —
-        // that is how the model learns them; the prose stays policy-only.
         let field_oneof = find("memory_search")
             .input_schema
             .get("$defs")
@@ -611,20 +494,16 @@ mod tests {
             );
         }
 
-        // The read law rides on the search description, not the server instructions.
         let search = find("memory_search")
             .description
             .clone()
             .expect("description");
         assert!(search.to_lowercase().contains("widen"), "{search}");
-        // The filter/projection *definitions* are the schema's job — the desc must not restate them.
         assert!(
             !search.contains("min_chars") && !search.contains("max_chars"),
             "search desc must not restate field defs: {search}"
         );
 
-        // The server instruction carries the identity + the smart-caveman style (defined
-        // once); it must not restate the tool law (that rides on the tools).
         let info = MemoryServer::new(memory_session()).get_info();
         let instructions = info.instructions.expect("instructions");
         assert!(
@@ -643,7 +522,6 @@ mod tests {
         );
     }
 
-    /// A throwaway session for inspecting server info (no store work is done).
     fn memory_session() -> Session {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = Paths::from_root(dir.path());
@@ -656,10 +534,6 @@ mod tests {
 
 #[cfg(test)]
 mod miss_answer_tests {
-    //! ★ HOSTILE REVIEW OF #194: the diagnostic is a decision about facts, so it is tested as one.
-    //! Every case here is a different sentence a caller can receive, and the two that matter are the
-    //! middle ones: an author whose audience DOES include them must not be told it excludes them, and a
-    //! stranger must not be told anything.
     use super::{MemoryServer, OwnRowMiss};
 
     #[test]
@@ -700,19 +574,12 @@ mod params;
 mod tools;
 mod transport;
 
-pub use transport::*;
-// Params are re-exported where a caller already named them (`mcp::SearchParams`).
 pub use params::*;
+pub use transport::*;
 
-/// One JSON object as the tool's text result.
 pub(crate) fn json_ok(value: serde_json::Value) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
-/// The `memory_upvote` sweep, implemented ONCE for both doors.
-///
-/// The MCP tool and `POST /memory/{key}/upvote` share this, so they cannot drift in either the error
-/// they raise or the JSON they return. That is the whole point of a second door: not a second
-/// implementation, a second *way in*.
 pub(crate) async fn upvote_sweep(
     server: &MemoryServer,
     reader: crate::store::audience::Reader,
@@ -721,9 +588,6 @@ pub(crate) async fn upvote_sweep(
     if keys.is_empty() {
         return Err("memory_upvote needs at least one key".to_string());
     }
-    // ★ A COUNTER IS STILL A READ. "Upvoted" for a row the caller cannot see would confirm it exists,
-    // and leaving it out of `missing` would confirm it twice. So the sweep is narrowed to visible
-    // keys first, and an invisible key is reported exactly as one that was never written.
     let probe = keys.clone();
     let visible: Vec<String> = server
         .with_read("memory_upvote", reader, move |s| {
@@ -733,8 +597,6 @@ pub(crate) async fn upvote_sweep(
                 .collect::<Vec<_>>())
         })
         .await?;
-    // Everything the probe could not see is reported as missing — which is also what a key that was
-    // never written reads as, and that is the point.
     let hidden: Vec<String> = keys
         .iter()
         .filter(|k| !visible.iter().any(|v| v == *k))
@@ -751,7 +613,6 @@ pub(crate) async fn upvote_sweep(
             missing.push(key);
         }
     }
-    // A sweep that hit nothing is a mistake worth surfacing, not a silent zero.
     if upvoted.is_empty() {
         return Err(Error::NotFound(keys.join(", ")).to_string());
     }

@@ -1,11 +1,5 @@
-//! Split out of `http_surface.rs` (soma/ellmephant#50): mechanical, no behaviour change.
-//!
-//! `use super::*` is deliberate — the shared vocabulary (the `Server` extractor, `Params`,
-//! the response builders) stays in `mod.rs`, so a handler reads the same here as it did there.
-
 use super::*;
 
-/// `GET /projects` — the project index (`project_list`), same bytes.
 pub async fn projects(
     server: Server,
     caller: crate::identity::Caller,
@@ -37,7 +31,6 @@ pub async fn projects(
     }
 }
 
-/// `GET /project/{key}` — one project with its ordered preload (`project_get`).
 pub async fn project_get(
     server: Server,
     caller: crate::identity::Caller,
@@ -65,7 +58,6 @@ pub async fn project_get(
     }
 }
 
-/// `GET /config/{key}` — one config item (`config_get`); `null` when absent or not addressed to you.
 pub async fn config_get(
     server: Server,
     caller: crate::identity::Caller,
@@ -87,7 +79,6 @@ pub async fn config_get(
     }
 }
 
-/// `GET /config` — every item this connection may read (`config_list`), with an optional `prefix`.
 pub async fn config_list(
     server: Server,
     caller: crate::identity::Caller,
@@ -112,7 +103,6 @@ pub async fn config_list(
     }
 }
 
-/// `POST /config/{key}` — change a value (`config_set`); JSON body `{value, source?}`.
 pub async fn config_set(
     State(state): State<HttpState>,
     server: Server,
@@ -154,7 +144,6 @@ pub async fn config_set(
     }
 }
 
-/// `POST /config` — create an item or rewrite its ACL (`config_define`); JSON body of the tool's args.
 pub async fn config_define(
     State(state): State<HttpState>,
     server: Server,

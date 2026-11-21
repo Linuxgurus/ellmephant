@@ -1,10 +1,3 @@
-//! Integration: `memory_append` — continuing a subject in one call (the cheap verb).
-//!
-//! The point of the verb is economic: a pen mid-work must be able to add a line WITHOUT reading and
-//! resending the whole body, or it will write a second row instead. These tests pin the refusals that
-//! keep it from becoming a back door to creating, and the bookkeeping a body write owes: a version,
-//! the edges the new line implies, and an embed job.
-
 mod common;
 
 use common::temp_store;
@@ -43,7 +36,6 @@ fn one_call_appends_one_line_and_keeps_a_version() {
     assert_eq!(out.version, Some(1), "the state it replaced is history");
     assert_eq!(body_of(&conn, "subject"), "the first fact\nand the second");
 
-    // The superseded state is readable by address.
     let versions: i64 = conn
         .query_row(
             "SELECT count(*) FROM memory_version WHERE type = 'memory' AND key = 'subject'",
@@ -64,7 +56,6 @@ fn the_same_line_twice_is_a_retry_not_a_second_fact() {
     let once = store::append::append(&conn, "subject", "another fact", Some("cline"), false)
         .expect("append");
     assert!(once.appended);
-    // Same words, different whitespace: still the same line.
     let twice = store::append::append(&conn, "subject", "another   fact", Some("cline"), false)
         .expect("append");
     assert!(!twice.appended, "a retry writes nothing");
@@ -209,8 +200,6 @@ fn a_protected_row_keeps_its_lease_gate() {
     };
     common::add_now(&conn, &embedder, &mem).expect("add");
 
-    // ★ Measured hole in the first head of #229: `may_write` alone let an append write a protected row
-    // that `upsert` refuses without a lease.
     let err = store::append::append(&conn, "pinned", "sneaked line", Some("cline"), false)
         .expect_err("a protected row needs a lease");
     assert!(format!("{err}").contains("PROTECTED"), "{err}");
@@ -229,8 +218,6 @@ fn three_terse_appends_may_not_build_the_body_upsert_refuses() {
     let embedder = HashEmbedder::new(DIM);
     add(&conn, &embedder, "runs", "cline", "the subject");
 
-    // ★ Measured hole in the first head of #229: a pen that cannot write a play-by-play in one call
-    // could write one in three, because the gate only inspected `upsert`.
     store::append::append(
         &conn,
         "runs",
@@ -261,7 +248,6 @@ fn three_terse_appends_may_not_build_the_body_upsert_refuses() {
         "{err}"
     );
 
-    // The deliberate override is the same one `upsert` offers.
     let forced = store::append::append(
         &conn,
         "runs",
@@ -294,7 +280,6 @@ fn case_is_part_of_the_fact() {
         false,
     )
     .expect("first");
-    // ★ Measured hole in the first head of #229: lowercasing the retry check silently dropped this.
     let second = store::append::append(
         &conn,
         "routes",

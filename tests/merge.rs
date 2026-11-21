@@ -452,3 +452,108 @@ fn a_run_shape_is_refused_and_force_writes_it() {
     );
     assert!(lesson.is_ok(), "one date is a citation: {:?}", lesson.err());
 }
+
+/// #257. A banner is an annotated wrong answer: search quotes an excerpt, so the one line that
+/// says "this is dead" is the one line no reader ever sees.
+#[test]
+fn a_banner_is_refused_with_the_replacement_process_named() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("store");
+    let embedder = HashEmbedder::new(DIM);
+    let bannered = "SUPERSEDED by the 2026-11 checklist.\n\nStep 1: run the old script.\nStep 2: \
+wait for the green light.";
+
+    let refused = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("old-deploy-checklist".into()),
+            title: Some("the old checklist".into()),
+            body: Some(bannered.into()),
+            ..Default::default()
+        },
+    );
+    let err = format!("{}", refused.unwrap_err());
+    assert!(err.contains("BANNER"), "the class is named: {err}");
+    assert!(err.contains("SUPERSEDED"), "the word that fired: {err}");
+    assert!(
+        err.contains("memory_delete") && err.contains("versions_remaining"),
+        "the exit deletes, and says the words survive: {err}"
+    );
+    assert!(
+        err.contains("NOT as a `[[wikilink]]`"),
+        "the exit must not trade one rot for a dangling edge: {err}"
+    );
+    assert!(err.contains("force: true"), "the override is named: {err}");
+    assert!(
+        store::get(&conn, "old-deploy-checklist").unwrap().is_none(),
+        "a refused write creates nothing"
+    );
+
+    let forced = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("old-deploy-checklist".into()),
+            title: Some("the old checklist".into()),
+            body: Some(bannered.into()),
+            force: true,
+            ..Default::default()
+        },
+    );
+    assert!(forced.is_ok(), "force must override: {:?}", forced.err());
+}
+
+/// The gate is on CREATE. Patching a row never turns it into a banner by accident, and a body
+/// that merely DISCUSSES supersession is prose.
+#[test]
+fn a_banner_gate_does_not_fire_on_patches_or_on_prose() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("store");
+    let embedder = HashEmbedder::new(DIM);
+    let (_, key) = seed(&conn, &embedder, "deploy-lesson", "the lesson, in one line");
+
+    let patched = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            body: Some(
+                "The old checklist was SUPERSEDED in 2026-11; this is what replaced it.".into(),
+            ),
+            ..bare(&key)
+        },
+    );
+    assert!(
+        patched.is_ok(),
+        "a patch is not a create: {:?}",
+        patched.err()
+    );
+
+    let prose = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("a-banner-word-mid-body".into()),
+            title: Some("a lesson".into()),
+            body: Some(
+                "A lesson about supersession\n\nAn old row was SUPERSEDED, and the fix was to \
+                 delete it rather than annotate it."
+                    .into(),
+            ),
+            ..Default::default()
+        },
+    );
+    assert!(
+        prose.is_ok(),
+        "only the first line can be a banner: {:?}",
+        prose.err()
+    );
+}

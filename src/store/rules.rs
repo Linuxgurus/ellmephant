@@ -33,6 +33,15 @@ pub(crate) static RULES_PRE: &[Rule] = &[
         run: shape_gate,
     },
     Rule {
+        name: "banner",
+        why: "★ A ROW THAT OPENS `SUPERSEDED` IS AN ANNOTATED WRONG ANSWER, NOT A SUPERSEDED ONE \
+              (#257). Search quotes an excerpt, so the banner is the one part of the body no reader \
+              ever sees. The refusal names the process — delete the row, name its key by PLAIN \
+              name in the good row — because a `[[wikilink]]` to a deleted row is a dangling edge. \
+              `force: true` writes it anyway: prose can legitimately open with one of those words.",
+        run: banner_gate,
+    },
+    Rule {
         name: "contradiction",
         why: "★ TWO INSTRUCTIONS THAT CONTRADICT ARE REFUSED, NOT RESOLVED (#189 D5). `private` \
               derives an audience from the proven pen; an explicit `audience` names others. Keeping \
@@ -99,6 +108,16 @@ fn shape_gate(ctx: &WriteCtx<'_>) -> Result<()> {
         .and_then(|body| shape::record_hint(body, ctx.key))
     {
         return Err(Error::Invalid(shape::refusal(&hint, ctx.key)));
+    }
+    Ok(())
+}
+
+fn banner_gate(ctx: &WriteCtx<'_>) -> Result<()> {
+    if ctx.patch.force || ctx.existing.is_some() {
+        return Ok(());
+    }
+    if let Some(word) = ctx.patch.body.as_deref().and_then(super::banner::word) {
+        return Err(Error::Invalid(super::banner::refusal(word, ctx.key)));
     }
     Ok(())
 }
@@ -188,7 +207,7 @@ mod tests {
     fn the_lists_are_in_the_documented_order() {
         assert_eq!(
             names(RULES_PRE),
-            vec!["shape", "contradiction", "actor-not-credit"]
+            vec!["shape", "banner", "contradiction", "actor-not-credit"]
         );
         assert_eq!(names(RULES_POST), vec!["protected", "audience", "field"]);
     }

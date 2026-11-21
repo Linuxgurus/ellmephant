@@ -1,6 +1,7 @@
 pub mod append;
 pub mod audience;
 pub mod audit;
+pub mod banner;
 pub mod channel;
 pub mod claim;
 pub mod codec;

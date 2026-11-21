@@ -168,6 +168,7 @@ becomes a compatibility shim for clients that speak it rather than a dependency 
 | `project_list` | `GET /projects` | **implemented** |
 | `config_get` | `GET /config/{key}` | **implemented** |
 | `config_set` | `POST /config/{key}` | **implemented** |
+| `config_unset` | `DELETE /config/{key}` | **implemented** |
 | `config_define` | `POST /config` | **implemented** |
 | `config_list` | `GET /config` | **implemented** |
 | `claim_acquire` | `POST /claim` | **implemented** |

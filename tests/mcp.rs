@@ -1329,6 +1329,36 @@ async fn config_round_trips_with_its_written_acl() {
         text(&invented)
     );
 
+    let unset = call(
+        &client,
+        "config_unset",
+        serde_json::json!({ "key": "recess_daily_time" }),
+    )
+    .await;
+    assert!(!unset.is_error.unwrap_or(false), "{}", text(&unset));
+    let status: serde_json::Value = serde_json::from_str(&text(&unset)).expect("json");
+    assert_eq!(status["status"], "removed");
+    assert_eq!(status["key"], "recess_daily_time");
+
+    let gone = call(
+        &client,
+        "config_get",
+        serde_json::json!({ "key": "recess_daily_time" }),
+    )
+    .await;
+    let row: serde_json::Value = serde_json::from_str(&text(&gone)).expect("json");
+    assert_eq!(row, serde_json::Value::Null, "the row is gone, not hidden");
+
+    let again = call(
+        &client,
+        "config_unset",
+        serde_json::json!({ "key": "recess_daily_time" }),
+    )
+    .await;
+    assert!(!again.is_error.unwrap_or(false), "{}", text(&again));
+    let status: serde_json::Value = serde_json::from_str(&text(&again)).expect("json");
+    assert_eq!(status["status"], "absent", "unset is idempotent");
+
     client.cancel().await.expect("cancel");
     handle.await.expect("join");
 }

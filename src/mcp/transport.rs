@@ -137,7 +137,9 @@ pub fn http_router(
         )
         .route(
             "/config/{key}",
-            axum::routing::get(surface::config_get).post(surface::config_set),
+            axum::routing::get(surface::config_get)
+                .post(surface::config_set)
+                .delete(surface::config_unset),
         )
         .route(
             "/claim",

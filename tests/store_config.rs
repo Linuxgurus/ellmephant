@@ -262,6 +262,148 @@ fn set_cannot_invent_an_item() {
 }
 
 #[test]
+fn unset_removes_the_row_and_the_absence_is_the_requested_state() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    config::define(
+        &conn,
+        &reader(&conn, "james"),
+        Some("james"),
+        "recess_daily_grant",
+        "1h",
+        "pen:james",
+        "pen:stet",
+        "who may raise a grant",
+    )
+    .unwrap();
+
+    let removed = config::unset(
+        &conn,
+        &reader(&conn, "james"),
+        "james",
+        "recess_daily_grant",
+    )
+    .expect("the writer may retire its own item")
+    .expect("it existed");
+    assert_eq!(removed.key, "recess_daily_grant");
+    assert_eq!(removed.value, "1h", "the caller is told what went");
+
+    assert!(
+        config::get(&conn, &reader(&conn, "james"), "recess_daily_grant")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        config::list(&conn, &reader(&conn, "james"), None)
+            .unwrap()
+            .is_empty(),
+        "an unset item is gone from the list too, not hidden"
+    );
+    assert!(
+        config::unset(
+            &conn,
+            &reader(&conn, "james"),
+            "james",
+            "recess_daily_grant"
+        )
+        .unwrap()
+        .is_none(),
+        "unsetting an absent item is the state you asked for, not an error"
+    );
+}
+
+#[test]
+fn unset_is_gated_by_the_written_audience() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    config::define(
+        &conn,
+        &reader(&conn, "james"),
+        Some("james"),
+        "recess_daily_grant",
+        "1h",
+        "pen:james",
+        "pen:stet",
+        "only James may raise or retire it",
+    )
+    .unwrap();
+
+    let err = config::unset(&conn, &reader(&conn, "stet"), "stet", "recess_daily_grant")
+        .expect_err("reading a grant is not a licence to remove it");
+    assert!(format!("{err}").contains("may not unset"), "{err}");
+    assert!(
+        config::get(&conn, &reader(&conn, "stet"), "recess_daily_grant")
+            .unwrap()
+            .is_some(),
+        "a refused unset leaves the row exactly where it was"
+    );
+}
+
+#[test]
+fn a_subtree_grant_can_be_withdrawn_by_the_subtree_it_addresses() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    config::define(
+        &conn,
+        &reader(&conn, "james"),
+        Some("james"),
+        "hand_policy",
+        "x",
+        "subtree:stet",
+        "pen:james",
+        "stet's hands maintain their own policy",
+    )
+    .unwrap();
+
+    let removed = config::unset(
+        &conn,
+        &reader(&conn, "stet/hand"),
+        "stet/hand",
+        "hand_policy",
+    )
+    .expect("a subtree grant is the widest write boundary, and removal follows the same gate")
+    .expect("it existed");
+    assert_eq!(removed.key, "hand_policy");
+    assert!(
+        config::get(&conn, &reader(&conn, "james"), "hand_policy")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn key_folding_applies_to_unset_as_to_get() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    config::define(
+        &conn,
+        &Reader::everything(),
+        None,
+        "Recess_Daily_Time",
+        "2h",
+        "pen:estate",
+        "public",
+        "provisioning",
+    )
+    .unwrap();
+
+    assert!(
+        config::unset(&conn, &Reader::everything(), "estate", "recess_daily_time")
+            .unwrap()
+            .is_some(),
+        "a key is an address: the fold that finds it also removes it"
+    );
+}
+
+#[test]
 fn keys_fold_case_and_refuse_whitespace() {
     let (_dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();

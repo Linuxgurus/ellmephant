@@ -782,6 +782,13 @@ impl Session {
         config::set(&self.conn, &reader, who, key, value, source)
     }
 
+    pub fn config_unset(&self, who: &str, key: &str) -> Result<Option<config::Item>> {
+        let reader = store::audience::Reader::pen(who)
+            .in_tree(&self.conn)
+            .with_borrowed(&self.conn);
+        config::unset(&self.conn, &reader, who, key)
+    }
+
     pub fn config_define(
         &self,
         who: &str,

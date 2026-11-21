@@ -156,6 +156,29 @@ pub fn set(
         .ok_or_else(|| Error::NotFound(format!("config `{key}` vanished while writing it")))
 }
 
+/// Remove an item, gated by its current `set_audience` — the same boundary `set` uses.
+///
+/// Returns the item as it stood, or `None` when there was no such item (an unset of something
+/// absent is already the requested state, not an error). The row's value and `source` are gone
+/// afterwards: `config` keeps no versions, which is why this is a separate, deliberate act.
+pub fn unset(conn: &Connection, reader: &Reader, who: &str, key: &str) -> Result<Option<Item>> {
+    let key = normalize_key(key)?;
+    let Some(old) = load(conn, &key)? else {
+        return Ok(None);
+    };
+    if !reader.sees(&old.set_audience) {
+        return Err(Error::Forbidden(format!(
+            "{who} may not unset `{key}`: its `set_audience` is `{}`",
+            old.set_audience
+        )));
+    }
+    let removed = conn.execute("DELETE FROM config WHERE key = ?1", params![key])?;
+    if removed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(old))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn define(
     conn: &Connection,

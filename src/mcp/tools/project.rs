@@ -231,6 +231,50 @@ impl MemoryServer {
     }
 
     #[tool(
+        name = "config_unset",
+        description = "REMOVE a config item, so `omit the item instead of storing a blank` becomes \
+                       something a caller can actually do. The gate is the item's CURRENT \
+                       `set_audience` — exactly `config_set`'s gate, so you cannot unset what you \
+                       could not set (and write implies read: the caller is told the item was \
+                       removed even if its `read_audience` never addressed it). An item that is \
+                       already absent is not an error; it is the state you asked for, and the \
+                       status says `absent`. This is how a mis-typed key is cleaned up and how a \
+                       grant is withdrawn by the pen holding its boundary. NO VERSIONS: the value \
+                       and its `source` are gone, so the reason is worth having written down \
+                       before this call. Prefer `config_set` when the policy is right and only the \
+                       value is wrong.",
+        annotations(
+            title = "Unset config",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn config_unset(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        Parameters(p): Parameters<ConfigUnsetParams>,
+    ) -> std::result::Result<String, String> {
+        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
+        let ConfigUnsetParams { key } = p;
+        let log_key = key.clone();
+        let removed = self
+            .with_store("config_unset", move |s| s.config_unset(&who, &key))
+            .await?;
+        tracing::info!(
+            tool = "config_unset",
+            key = %log_key,
+            removed = removed.is_some(),
+            "config unset"
+        );
+        Ok(json_ok(serde_json::json!({
+            "status": if removed.is_some() { "removed" } else { "absent" },
+            "key": log_key,
+        })))
+    }
+
+    #[tool(
         name = "config_list",
         description = "List the config items this connection may READ, in key order, optionally \
                        filtered by a name `prefix` (`recess` finds a namespace). Items outside your \

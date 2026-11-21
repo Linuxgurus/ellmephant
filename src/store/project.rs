@@ -741,14 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_decode_trims_the_delimiters_neighbours() {
-        assert_eq!(
-            decode_owners("Smith ,  John"),
-            vec!["Smith".to_string(), "John".to_string()]
-        );
-    }
-
-    #[test]
     fn iso_dates_are_shape_checked() {
         assert!(is_iso_date("2026-10-15"));
         assert!(

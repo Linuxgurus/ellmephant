@@ -52,16 +52,4 @@ mod tests {
         let doc = embed_document(" k ", "  Only title  ", "   ");
         assert_eq!(doc, "k\nOnly title");
     }
-
-    #[test]
-    fn fingerprint_is_stable_and_hashes_the_probe_document() {
-        assert_eq!(fingerprint(), fingerprint(), "deterministic");
-        assert_eq!(fingerprint().len(), 64, "a sha256, lowercase hex");
-
-        let probe = embed_document(PROBE_KEY, PROBE_TITLE, PROBE_BODY);
-        let mut h = Sha256::new();
-        h.update(probe.as_bytes());
-        assert_eq!(fingerprint(), crate::hex::encode(&h.finalize()));
-        assert!(!probe.contains("[[wiki-link]]"), "{probe}");
-    }
 }

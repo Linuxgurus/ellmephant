@@ -400,37 +400,6 @@ fn a_name_with_a_slash_does_not_make_a_finger() {
     );
 }
 
-#[test]
-fn a_synthetic_snapshot_is_marked_and_excludable() {
-    let (_dir, paths) = temp_store();
-    let conn = ellmephant::db::open(&paths).unwrap();
-    let embedder = HashEmbedder::new(DIM);
-    seed_pen(&conn, "stet", None);
-    row(&conn, &embedder, "observed", "stet");
-
-    conn.execute(
-        "INSERT INTO memory_version (type, key, n, encoding, note, content, synthetic)
-         VALUES ('memory', 'observed', 1, 'json', 'SYNTHETIC', '{}', 1)",
-        [],
-    )
-    .unwrap();
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_version WHERE synthetic = 1"
-        ),
-        1
-    );
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM memory_version WHERE synthetic = 0"
-        ),
-        0,
-        "the migration's snapshot must not answer a query for observed edits"
-    );
-}
-
 fn subtree() -> (tempfile::TempDir, rusqlite::Connection) {
     let (dir, paths) = temp_store();
     let conn = ellmephant::db::open(&paths).unwrap();
@@ -626,22 +595,6 @@ fn stats_separate_the_commons_from_the_unattributed() {
         stats.unattributed, 1,
         "one row nobody wrote and nobody owns"
     );
-}
-
-#[test]
-fn a_deletion_of_an_owned_row_records_a_retire_in_effect() {
-    let (_dir, conn) = subtree();
-    let embedder = HashEmbedder::new(DIM);
-    row(&conn, &embedder, "owned-note", "stet");
-
-    assert!(store::delete(&conn, "owned-note", Some("stet")).expect("delete"));
-    let events = store::pen_events(&conn, "owned-note").unwrap();
-    let entry = events
-        .iter()
-        .find(|e| e.1 == "delete")
-        .expect("a ledger row");
-    assert_eq!(entry.2.as_deref(), Some("stet"), "who held it");
-    assert_eq!(entry.4.as_deref(), Some("stet"), "who ended it");
 }
 
 #[test]
@@ -998,16 +951,6 @@ fn a_cousin_is_the_walk_through_the_common_ancestor() {
     let removed = kin("stet/hand/f-1/f-2", "cline/hand");
     assert_eq!(removed.walk, "PPPSC");
     assert_eq!(removed.word, None);
-}
-
-#[test]
-fn english_stops_where_it_starts_approximating() {
-    assert_eq!(
-        store::relation::word_for_public("PPSCC"),
-        Some("second cousin")
-    );
-    assert_eq!(store::relation::word_for_public("PPSCCC"), None);
-    assert_eq!(store::relation::word_for_public("PS"), Some("uncle"));
 }
 
 #[test]

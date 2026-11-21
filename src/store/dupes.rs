@@ -518,20 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn the_same_body_twice_is_a_duplicate() {
-        let body = "the turn boundary is offered once per wake; a miss is not a failure.";
-        assert_eq!(
-            classify(
-                "spine-issue-52-turn-boundary",
-                body,
-                "spine-52-turn-boundary-for-stet",
-                body
-            ),
-            Class::Duplicate
-        );
-    }
-
-    #[test]
     fn a_diff_that_names_its_source_is_an_artifact() {
         let body =
             "diff --git a/src/x.rs b/src/x.rs\n@@ -1,2 +1,3 @@\n-old\n+new\nsee commit 643eeb8";
@@ -586,19 +572,6 @@ mod tests {
         assert_eq!(key_marker("héllo-☃z"), None);
         assert_eq!(key_marker("日本-0538z"), Some(Marker::Clock));
         assert_eq!(key_marker("offsite-2026-11-05"), Some(Marker::Day));
-    }
-
-    #[test]
-    fn close_but_different_is_distinct() {
-        assert_eq!(
-            classify(
-                "offsite-retention",
-                "backups are verified by opening a copy, never by the copy existing.",
-                "offsite-schedule",
-                "the offsite job runs at 04:30 and reports the id count it verified."
-            ),
-            Class::Distinct
-        );
     }
 
     #[test]

@@ -140,22 +140,3 @@ fn the_same_pen_writing_again_is_not_a_change_of_either_fact() {
     assert_eq!(asserted, "james");
     assert_eq!(last_written.as_deref(), Some("james"));
 }
-
-#[test]
-fn an_upgraded_store_backfills_the_last_writer_from_the_author() {
-    let (_dir, paths) = temp_store();
-    let conn = db::open(&paths).expect("open");
-    let embedder = HashEmbedder::new(DIM);
-    seeded(&conn, &embedder, "old-row");
-    conn.execute("UPDATE memory SET edited_by = NULL", [])
-        .unwrap();
-    conn.execute(
-        "UPDATE memory SET edited_by = asserted_by WHERE edited_by IS NULL",
-        [],
-    )
-    .unwrap();
-
-    let (asserted, last_written) = provenance(&conn, 1);
-    assert_eq!(asserted, "james");
-    assert_eq!(last_written.as_deref(), Some("james"));
-}

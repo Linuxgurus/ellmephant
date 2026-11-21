@@ -42,10 +42,6 @@ fn word_for(walk: &str) -> Option<&'static str> {
     })
 }
 
-pub fn word_for_public(walk: &str) -> Option<&'static str> {
-    word_for(walk)
-}
-
 pub fn parse(walk: &str) -> Result<Vec<Step>> {
     let mut steps: Vec<Step> = Vec::new();
     for ch in walk.chars() {

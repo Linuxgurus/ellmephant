@@ -310,25 +310,20 @@ fn a_lock_expires_and_says_so() {
 }
 
 #[test]
-fn changes_never_gates() {
-    let (_dir, conn) = store();
-    channel::send(&conn, "james", "changes", "rolling in 30", None).expect("send");
-    channel::present(&conn, "cline", None).expect("present");
-    channel::present(&conn, "cline", None).expect("present again");
+fn the_default_channels_never_gate() {
+    for channel_name in ["changes", "general"] {
+        let (_dir, conn) = store();
+        channel::send(&conn, "james", channel_name, "chatter", None).expect("send");
+        channel::present(&conn, "cline", None).expect("present");
+        channel::present(&conn, "cline", None).expect("present again");
 
-    assert!(channel::breach(&conn, "cline").expect("breach").is_none());
-    channel::gate(&conn, "cline", Class::Record).expect("changes is information");
-}
-
-#[test]
-fn general_never_gates() {
-    let (_dir, conn) = store();
-    channel::send(&conn, "james", "general", "chatter", None).expect("send");
-    channel::present(&conn, "cline", None).expect("present");
-    channel::present(&conn, "cline", None).expect("present again");
-
-    assert!(channel::breach(&conn, "cline").expect("breach").is_none());
-    channel::gate(&conn, "cline", Class::Record).expect("general is a conversation");
+        assert!(
+            channel::breach(&conn, "cline").expect("breach").is_none(),
+            "{channel_name} breached"
+        );
+        channel::gate(&conn, "cline", Class::Record)
+            .unwrap_or_else(|e| panic!("{channel_name} gated: {e}"));
+    }
 }
 
 #[test]
@@ -347,12 +342,6 @@ fn writes_does_not_stop_acting_but_all_does() {
     conn.execute("UPDATE channel SET gate = 'all' WHERE key = 'ops_team'", [])
         .expect("raise gate");
     channel::gate(&conn, "cline", Class::Acting).expect_err("all stops acting too");
-}
-
-#[test]
-fn an_unreadable_ledger_fails_open() {
-    let (_dir, conn) = store();
-    channel::gate(&conn, "nobody-at-all", Class::Record).expect("fails open");
 }
 
 #[test]

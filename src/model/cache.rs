@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_is_exclusive_within_a_process() {
+    fn a_lock_is_released_when_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".lock");
         let first = Lock::acquire(&path).unwrap();

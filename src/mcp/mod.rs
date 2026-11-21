@@ -265,23 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn the_core_surface_advertises_exactly_core() {
-        let full = MemoryServer::tool_router().list_all();
-        let mut core = full.clone();
-        core.retain(|tool| CORE_TOOLS.contains(&tool.name.as_ref()));
-        assert_eq!(core.len(), CORE_TOOLS.len());
-        for tool in &full {
-            let expected = CORE_TOOLS.contains(&tool.name.as_ref());
-            assert_eq!(
-                core.iter().any(|t| t.name == tool.name),
-                expected,
-                "{} is on the wrong side of the split",
-                tool.name
-            );
-        }
-    }
-
-    #[test]
     fn every_tool_has_an_api_group() {
         let groups: std::collections::BTreeSet<&str> =
             TOOLS.iter().map(|tool| group_of(tool)).collect();

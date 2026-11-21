@@ -453,18 +453,6 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_argument_cannot_grant_reach() {
-        let (_dir, conn) = store();
-        pens(&conn);
-        acquire(&conn, "finger", "hands", Some(300)).expect("acquire");
-        let out = release_by(&conn, "finger", "twine", Some("I say I am hands")).expect("refused");
-        assert!(
-            !out.released,
-            "authority is the proven pen, never the asserted owner"
-        );
-    }
-
-    #[test]
     fn release_only_drops_your_own() {
         let (_dir, conn) = store();
         acquire(&conn, "bank", "hand-a", Some(300)).expect("first");

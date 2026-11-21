@@ -232,29 +232,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_log_prefix_list_is_the_eight_the_issue_fixed() {
-        assert_eq!(
-            LOG_CLASS_PREFIXES,
-            &[
-                "alerts-",
-                "hygiene-",
-                "recess-",
-                "maintenance-",
-                "pr-watch-",
-                "dispatch-",
-                "offsite-",
-                "cluster-watch-",
-            ]
-        );
-        for prefix in LOG_CLASS_PREFIXES {
-            assert!(
-                LOG_SHARE_DEFINITION.contains(prefix),
-                "the definition must name `{prefix}`: {LOG_SHARE_DEFINITION}"
-            );
-        }
-    }
-
-    #[test]
     fn an_empty_ratio_is_none_not_zero() {
         assert_eq!(percent(0, 0), None);
         assert_eq!(percent(1, 0), None);

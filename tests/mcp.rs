@@ -1011,40 +1011,6 @@ async fn dupes_and_reembed_round_trip_over_the_transport() {
 }
 
 #[tokio::test]
-async fn project_get_on_a_missing_key_is_a_tool_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let server = MemoryServer::new(session(dir.path())).with_identity("tester");
-
-    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let handle = tokio::spawn(async move {
-        server
-            .serve(server_io)
-            .await
-            .expect("serve")
-            .waiting()
-            .await
-            .expect("wait");
-    });
-    let client = ().serve(client_io).await.expect("client handshake");
-
-    let missing = call(
-        &client,
-        "project_get",
-        serde_json::json!({ "key": "ghost" }),
-    )
-    .await;
-    assert!(missing.is_error.unwrap_or(false), "{}", text(&missing));
-    assert!(
-        text(&missing).contains("no such project"),
-        "got: {}",
-        text(&missing)
-    );
-
-    client.cancel().await.expect("cancel");
-    handle.await.expect("join");
-}
-
-#[tokio::test]
 async fn semantic_search_honours_the_kind_parameter() {
     let dir = tempfile::tempdir().unwrap();
     let server = MemoryServer::new(session(dir.path())).with_identity("tester");

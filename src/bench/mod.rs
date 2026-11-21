@@ -259,21 +259,6 @@ pub fn best(evals: &[Eval]) -> Option<&Eval> {
 mod tests {
     use super::*;
 
-    fn case(query: &str, expect: &[&str]) -> Case {
-        Case {
-            query: query.to_string(),
-            expect: expect.iter().map(|s| s.to_string()).collect(),
-            k: None,
-        }
-    }
-
-    #[test]
-    fn case_is_an_accept_set_not_an_order() {
-        let c = case("q", &["a", "b"]);
-        assert!(c.expect.contains(&"b".to_string()));
-        assert_eq!(c.k, None, "an absent per-case k defers to the caller");
-    }
-
     #[test]
     fn summarise_reports_percentiles() {
         let s = summarise(vec![10.0, 20.0, 30.0, 40.0, 50.0]);

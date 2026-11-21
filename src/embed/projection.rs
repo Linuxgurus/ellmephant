@@ -53,15 +53,16 @@ mod tests {
         assert_eq!(doc, "k\nOnly title");
     }
 
+    // The literal, not a recomputation: `projection_stale()` trusts this value to decide whether
+    // the vectors were built by the current renderer, so a fingerprint that stops looking at the
+    // rendered document must be a failing test, not a silent pass. Recomputing it here would
+    // agree with any such mutation. Changing what a document looks like is a projection change,
+    // and that already owes a re-embed: update this constant in the same commit.
     #[test]
-    fn fingerprint_is_stable_and_hashes_the_probe_document() {
-        assert_eq!(fingerprint(), fingerprint(), "deterministic");
-        assert_eq!(fingerprint().len(), 64, "a sha256, lowercase hex");
-
-        let probe = embed_document(PROBE_KEY, PROBE_TITLE, PROBE_BODY);
-        let mut h = Sha256::new();
-        h.update(probe.as_bytes());
-        assert_eq!(fingerprint(), crate::hex::encode(&h.finalize()));
-        assert!(!probe.contains("[[wiki-link]]"), "{probe}");
+    fn the_fingerprint_is_the_sha256_of_the_probe_document() {
+        assert_eq!(
+            fingerprint(),
+            "fb0054621336c27d020d013848f7d38eadce11282d3c1bf5fc40b921c89b63dc"
+        );
     }
 }

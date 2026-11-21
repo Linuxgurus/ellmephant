@@ -15,121 +15,12 @@ use crate::search::{Bundle, Field, MatchMode};
 use crate::store::session::Session;
 use crate::store::{self, project};
 
-pub const TOOLS: &[&str] = &[
-    "whoami",
-    "memory_unowned",
-    "whois",
-    "pen_mint",
-    "pen_rotate",
-    "pen_lend",
-    "sudo",
-    "sudo_pass",
-    "sudo_release",
-    "sudo_sessions",
-    "memory_upsert",
-    "memory_append",
-    "memory_delete",
-    "memory_history_erase",
-    "memory_history_search",
-    "memory_merge",
-    "memory_fold",
-    "memory_adopt",
-    "memory_search",
-    "semantic_search",
-    "memory_get",
-    "memory_history",
-    "memory_backlinks",
-    "memory_dangling",
-    "memory_upvote",
-    "memory_stats",
-    "memory_health",
-    "memory_dupes",
-    "memory_reembed",
-    "memory_reparse",
-    "project_upsert",
-    "project_get",
-    "project_list",
-    "config_get",
-    "config_set",
-    "config_define",
-    "config_list",
-    "claim_acquire",
-    "claim_release",
-    "claim_list",
-    "mail_send",
-    "mail_inbox",
-    "mail_read",
-    "mail_ack",
-    "mail_prune",
-    "channel_list",
-    "channel_send",
-    "channel_history",
-    "channel_fetch",
-    "channel_present",
-    "channel_invite",
-    "channel_breach",
-    "channel_join",
-    "channel_leave",
-    "channel_wait",
-    "channel_members",
-    "channel_create",
-    "channel_set_gate",
-    "channel_events",
-    "channel_set_retention",
-    "channel_prune",
-    "mail_surrogate_grant",
-    "mail_surrogate_revoke",
-    "mail_surrogate_list",
-];
-
 pub(crate) const SERVER_NAME: &str = "ellmephant";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Full,
     Core,
-}
-
-pub const CORE_TOOLS: &[&str] = &[
-    "whoami",
-    "memory_search",
-    "memory_get",
-    "memory_upsert",
-    "memory_delete",
-    "memory_stats",
-    "memory_backlinks",
-    "memory_history",
-    "memory_upvote",
-    "project_get",
-    "project_upsert",
-    "project_list",
-    "mail_send",
-    "mail_inbox",
-    "mail_read",
-    "mail_ack",
-    "channel_list",
-    "channel_send",
-    "channel_history",
-    "channel_fetch",
-];
-
-pub(crate) fn group_of(tool: &str) -> &'static str {
-    if CORE_TOOLS.contains(&tool) {
-        return "core";
-    }
-    if tool.starts_with("pen_") || tool == "whois" || tool.starts_with("sudo") {
-        "identity"
-    } else if tool.starts_with("config") {
-        "config"
-    } else if tool.starts_with("claim") {
-        "claim"
-    } else if tool.starts_with("mail") {
-        "mail"
-    } else if tool.starts_with("channel") {
-        "channel"
-    } else {
-        "hygiene"
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +90,7 @@ impl ServerHandler for MemoryServer {
     ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         let mut tools = Self::tool_router().list_all();
         if self.surface == Surface::Core {
-            tools.retain(|tool| CORE_TOOLS.contains(&tool.name.as_ref()));
+            tools.retain(|tool| is_core(tool.name.as_ref()));
         }
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
@@ -233,16 +124,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_is_a_subset_of_every_tool_and_none_is_duplicated() {
+    fn the_table_names_no_tool_twice() {
         let mut seen = std::collections::BTreeSet::new();
-        for tool in CORE_TOOLS {
-            assert!(TOOLS.contains(tool), "core names an unknown tool: {tool}");
-            assert!(seen.insert(*tool), "core names a tool twice: {tool}");
+        for spec in TOOLS {
+            assert!(seen.insert(spec.name), "TOOLS names {} twice", spec.name);
         }
+    }
+
+    #[test]
+    fn core_is_a_minority_of_every_tool() {
         assert!(
-            CORE_TOOLS.len() < TOOLS.len() / 2,
+            core_count() < TOOLS.len() / 2,
             "core is {} of {} — not a hot path",
-            CORE_TOOLS.len(),
+            core_count(),
             TOOLS.len()
         );
     }
@@ -255,19 +149,40 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         served.sort();
-        let mut expected: Vec<String> = TOOLS.iter().map(|t| t.to_string()).collect();
+        let mut expected: Vec<String> = TOOLS.iter().map(|t| t.name.to_string()).collect();
         expected.sort();
         assert_eq!(
             served, expected,
             "the composed router and `TOOLS` disagree — a group router is missing from the merge in \
-             `MemoryServer::tool_router`, or a `#[tool]` was added without its name in `TOOLS`"
+             `MemoryServer::tool_router`, or a `#[tool]` was added without its row in `TOOLS`"
         );
+    }
+
+    /// `core_tools()` is the public replacement for the removed `CORE_TOOLS`; it has no call
+    /// sites in the tree, so this is the only thing keeping it honest against the table.
+    #[test]
+    fn core_tools_are_the_core_rows() {
+        let names: Vec<&str> = core_tools().collect();
+        assert_eq!(names.len(), core_count());
+        for name in &names {
+            assert!(
+                is_core(name),
+                "{name} is in core_tools() but is_core says no"
+            );
+        }
+        for spec in TOOLS.iter().filter(|spec| spec.core) {
+            assert!(
+                names.contains(&spec.name),
+                "{} is a core row but core_tools() omits it",
+                spec.name
+            );
+        }
     }
 
     #[test]
     fn every_tool_has_an_api_group() {
         let groups: std::collections::BTreeSet<&str> =
-            TOOLS.iter().map(|tool| group_of(tool)).collect();
+            TOOLS.iter().map(|spec| spec.group).collect();
         assert_eq!(
             groups,
             [
@@ -275,8 +190,16 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            "a new tool needs a group, and an empty group is a stale match arm"
+            "a new tool needs a group, and an empty group is a stale arm"
         );
+        for spec in TOOLS {
+            assert_eq!(
+                spec.group == "core",
+                spec.core,
+                "{} is on the core surface and must sit on the core shelf",
+                spec.name
+            );
+        }
     }
 
     #[test]
@@ -284,7 +207,11 @@ mod tests {
         let tools = MemoryServer::tool_router().list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in TOOLS {
-            assert!(names.contains(expected), "missing {expected:?}: {names:?}");
+            assert!(
+                names.contains(&expected.name),
+                "missing {:?}: {names:?}",
+                expected.name
+            );
         }
 
         let find = |name: &str| {
@@ -552,11 +479,14 @@ mod miss_answer_tests {
     }
 }
 
+pub mod catalog;
 mod context;
 mod params;
 mod tools;
 mod transport;
 
+pub(crate) use catalog::group_of;
+pub use catalog::{TOOLS, ToolSpec, core_count, core_tools, is_core, spec};
 pub use params::*;
 pub use transport::*;
 

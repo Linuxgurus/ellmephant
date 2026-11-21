@@ -302,10 +302,21 @@ fn every_tool_has_a_route() {
         TOOLS.len(),
         "the route table must have one entry per tool"
     );
-    for tool in TOOLS {
+    for spec in TOOLS {
         assert!(
-            ROUTES.iter().any(|route| route.tool == *tool),
-            "no HTTP route maps to `{tool}`"
+            ROUTES.iter().any(|route| route.tool == spec.name),
+            "no HTTP route maps to `{}`",
+            spec.name
+        );
+    }
+    // `group_of` panics on an unknown name; every route passes `route.tool`, so say here,
+    // next to the table it protects, that each one is a row of `TOOLS` rather than leaving
+    // it implied by the two lengths agreeing.
+    for route in ROUTES {
+        assert!(
+            TOOLS.iter().any(|spec| spec.name == route.tool),
+            "route `{}` names a tool that is not a row of TOOLS",
+            route.tool
         );
     }
 }

@@ -191,6 +191,11 @@ pub const ROUTES: &[Route] = &[
         tool: "config_set",
     },
     Route {
+        method: "DELETE",
+        path: "/config/{key}",
+        tool: "config_unset",
+    },
+    Route {
         method: "POST",
         path: "/claim",
         tool: "claim_acquire",

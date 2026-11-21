@@ -144,6 +144,55 @@ pub async fn config_set(
     }
 }
 
+pub async fn config_unset(
+    State(state): State<HttpState>,
+    server: Server,
+    caller: crate::identity::Caller,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Response> {
+    let json = Params::parse(raw.as_deref()).json();
+    let scope = authorize(&state, &headers, json)?;
+    let who = proven_pen(&caller, json)?;
+    let log_key = key.clone();
+    match server
+        .with_store("config_unset", move |s| s.config_unset(&who, &key))
+        .await
+    {
+        Ok(removed) => {
+            let removed = removed.is_some();
+            tracing::info!(
+                area = scope.area,
+                key = %log_key,
+                removed,
+                "config unset over http"
+            );
+            present(
+                StatusCode::OK,
+                json,
+                &report(
+                    (log_key, removed),
+                    |(key, removed)| {
+                        json_ok(serde_json::json!({
+                            "status": if *removed { "removed" } else { "absent" },
+                            "key": key,
+                        }))
+                    },
+                    |(key, removed)| {
+                        if *removed {
+                            format!("unset {key}: the row is gone, value and reason with it")
+                        } else {
+                            format!("unset {key}: already absent")
+                        }
+                    },
+                ),
+            )
+        }
+        Err(e) => Err(ApiError::store(json, e)),
+    }
+}
+
 pub async fn config_define(
     State(state): State<HttpState>,
     server: Server,

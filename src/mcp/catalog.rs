@@ -58,6 +58,7 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec::new("config_set", "config", false),
     ToolSpec::new("config_define", "config", false),
     ToolSpec::new("config_list", "config", false),
+    ToolSpec::new("config_unset", "config", false),
     ToolSpec::new("claim_acquire", "claim", false),
     ToolSpec::new("claim_release", "claim", false),
     ToolSpec::new("claim_list", "claim", false),

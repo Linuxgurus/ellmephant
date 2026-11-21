@@ -699,6 +699,18 @@ pub struct ConfigGetParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ConfigUnsetParams {
+    #[schemars(
+        description = "The config item's name to REMOVE. The caller must be one the item's \
+                       `set_audience` addresses (you cannot unset what you could not set). If the \
+                       item is already absent the call is a no-op that reports `absent`. Case is \
+                       folded."
+    )]
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigSetParams {
     #[schemars(
         description = "The config item's name. It must ALREADY exist: `config_set` cannot \

@@ -127,9 +127,14 @@ process holding the database can read it. It protects against another agent **us
 against nothing else. Encryption is the `secret` tier, parked.
 
 **Forensics, for now, is direct access**: the owner reads through MCP as the `James` pen where the row
-is his, or opens the store with `sqlite3`. A recorded owner path (`memory_forensic(key, reason)` plus
-a `private_read` audit table) is not built yet, and is the one part of this tier that is a promise
-rather than a mechanism.
+is his, or opens the store with `sqlite3`. The `private_read` audit table **is** built — migration
+`0026_read_audit.sql`, widened by `0028_read_borrowed.sql` — and every read that crosses a boundary
+records the `pen`, the `key` (when there is one), the `reason` (`subtree`, `search`, `borrowed`) and a
+`detail` line; rows older than 180 days are pruned each time the store opens for writing. What is
+**not** built is the verb that turns a record into an answer: `memory_forensic(key, reason)` has no
+tool, no route and no caller (the `forensic` value exists in the table's `CHECK` constraint, but
+nothing writes it), so reading the audit means opening the table directly. That verb is the one part
+of this tier that is a promise rather than a mechanism.
 
 ### Parity with MCP — the requirement, not a nice-to-have
 

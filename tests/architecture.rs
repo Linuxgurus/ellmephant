@@ -158,3 +158,30 @@ fn the_doors_stay_small() {
         );
     }
 }
+
+/// ★ THE ENVELOPE IS THE WAY IN (soma/ellmephant#231, #237).
+///
+/// A tool body may ask a question (`read_outcome`), perform a verb (`write_outcome`) or both; it may
+/// not open the store itself, because the five lines it would copy are the ladder #237 removed. The
+/// ceiling is not zero: a handful of bodies genuinely need a raw handle — `memory_get` threads ONE
+/// `Reader` through three calls so its miss diagnosis can explain itself, and the two shared runners
+/// (`run_search`, `run_semantic`) take a `Reader` because the HTTP door calls them too. Those are
+/// named exemptions, and raising this number is a decision someone has to make in a diff.
+#[test]
+fn tool_bodies_go_through_the_envelope() {
+    let mut raw = 0;
+    for (path, text) in sources(&root().join("src/mcp/tools")) {
+        let code = code_only(&text);
+        raw += code.matches(".with_store(").count() + code.matches(".with_read(").count();
+        assert!(
+            path.exists(),
+            "unreachable: keeps the scan honest about what it read"
+        );
+    }
+    assert!(
+        raw <= 8,
+        "{raw} raw store handles in `src/mcp/tools` — a tool body that opens the store copies the \
+         ladder #237 deleted; use `read_outcome`/`write_outcome` from `mcp/server.rs`"
+    );
+}
+

@@ -4,7 +4,6 @@
 //! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
 //! into the one table the handler dispatches through.
 
-use crate::mcp::context::pen_name;
 use crate::mcp::*;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
@@ -33,17 +32,17 @@ impl MemoryServer {
             owner,
             ttl_seconds,
         } = p;
-        // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands and the
-        // terminal, never a browser chat. Without it, this stays open exactly as it was.
-        let proven = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        crate::identity::may_lease(Some(&proven))?;
         // A PROVEN identity IS the owner of its lease, so the audit row cannot be signed with
         // someone else's name; an unproven caller's assertion stands, as before.
         let _asserted_owner = owner; // the pen decides; the argument is history
-        let owner = proven;
         let out = self
-            .with_store("claim_acquire", move |s| {
-                s.claim_acquire(&name, &owner, ttl_seconds)
+            .write_outcome("claim_acquire", &ctx, move |s, pen| {
+                // ★ WHO MAY LEASE. With `ELLMEPHANT_LEASERS` set, a lease is a privilege: the hands
+                // and the terminal, never a browser chat. Without it, this stays open exactly as it
+                // was. The sentence is `may_lease`'s own, so the tool's text is unchanged.
+                crate::identity::may_lease(Some(pen.as_str()))
+                    .map_err(crate::error::Error::Invalid)?;
+                s.claim_acquire(&name, pen.as_str(), ttl_seconds)
             })
             .await?;
         tracing::info!(
@@ -53,7 +52,7 @@ impl MemoryServer {
             won = out.won,
             "claim attempted"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// Release a lease — only your own.
@@ -76,17 +75,16 @@ impl MemoryServer {
         // ★ WHO MAY END A LEASE (soma/spine#43 fix 4): the PROVEN pen, against the ROW's owner. The
         // holder releases its own; an ancestor releases a descendant's WITH a reason. The `owner`
         // argument no longer grants anything — it never should have.
-        let actor = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ClaimReleaseParams {
             name,
             owner,
             reason,
         } = p;
         let log_name = name.clone();
-        let log_actor = actor.clone();
-        let out = self
-            .with_store("claim_release", move |s| {
-                s.claim_release(&name, &actor, reason.as_deref())
+        let (log_actor, out) = self
+            .write_outcome("claim_release", &ctx, move |s, pen| {
+                s.claim_release(&name, pen.as_str(), reason.as_deref())
+                    .map(|out| (pen.as_str().to_string(), out))
             })
             .await?;
         tracing::info!(
@@ -99,7 +97,7 @@ impl MemoryServer {
             reason = ?out.reason,
             "claim release attempted"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// List the claims — one by name, or every claim, expired rows included.
@@ -116,30 +114,25 @@ impl MemoryServer {
     )]
     async fn claim_list(
         &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ClaimListParams>,
     ) -> std::result::Result<String, String> {
         let name = p.name;
         let lookup = name.clone();
         let rows = self
-            .with_read(
-                "claim_list",
-                crate::store::audience::Reader::everything(),
-                move |s| s.claims(lookup.as_deref()),
-            )
+            .read_outcome("claim_list", &ctx, move |s| s.claims(lookup.as_deref()))
             .await?;
         tracing::info!(tool = "claim_list", claims = rows.len(), "claims listed");
         let mut out = serde_json::json!({ "claims": rows });
         if p.include_revocations.unwrap_or(false) {
             let lookup = name.clone();
             let rev = self
-                .with_read(
-                    "claim_list",
-                    crate::store::audience::Reader::everything(),
-                    move |s| s.claim_revocations(lookup.as_deref(), 50),
-                )
+                .read_outcome("claim_list", &ctx, move |s| {
+                    s.claim_revocations(lookup.as_deref(), 50)
+                })
                 .await?;
             out["revocations"] = serde_json::json!(rev);
         }
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 }

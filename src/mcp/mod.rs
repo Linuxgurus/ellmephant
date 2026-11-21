@@ -136,19 +136,20 @@ pub enum Surface {
     Core,
 }
 
-/// The tools `/mcp/core` advertises — a VIEW of [`TOOLS`], never a second list. Everything else is
-/// reachable over REST and indexed at `GET /api`.
-///
-/// Chosen by frequency, not by power: these are the calls a turn makes without thinking. Hygiene,
-/// identity, admin and repair are rare and live on the expanded door and the API.
-///
-/// Four calls that look like siblings are deliberately outside it, and the reason is the
-/// "without thinking" half rather than rarity: `semantic_search` is the wide door (every document
-/// type, plus the graveyard) against `memory_search`'s cheap memory-only pass; `memory_append` and
-/// `memory_fold` are edits whose correctness depends on a `memory_get` first, so the turn reads
-/// before it writes; `channel_wait` blocks the turn for up to 25 seconds. Add one only with a
-/// measurement of how often it is called, never because it reads like the others.
+// The tools `/mcp/core` advertises are a VIEW of [`TOOLS`] — the `core` flag — never a second
+// list. Everything else is reachable over REST and indexed at `GET /api`.
+//
+// Chosen by frequency, not by power: these are the calls a turn makes without thinking. Hygiene,
+// identity, admin and repair are rare and live on the expanded door and the API.
+//
+// Four calls that look like siblings are deliberately outside it, and the reason is the
+// "without thinking" half rather than rarity: `semantic_search` is the wide door (every document
+// type, plus the graveyard) against `memory_search`'s cheap memory-only pass; `memory_append` and
+// `memory_fold` are edits whose correctness depends on a `memory_get` first, so the turn reads
+// before it writes; `channel_wait` blocks the turn for up to 25 seconds. Add one only with a
+// measurement of how often it is called, never because it reads like the others.
 
+/// How many tools the hot-path door advertises.
 pub fn core_count() -> usize {
     TOOLS.iter().filter(|t| t.core).count()
 }
@@ -373,6 +374,30 @@ mod tests {
             .into_iter()
             .collect(),
             "a new tool needs a group, and an empty group is a stale match arm"
+        );
+    }
+
+    /// The model-facing text is prose, and a copy-edit once left a run of blanks where a word
+    /// belonged (`…or a live              {scope} grant`, soma/ellmephant#237). A run of 3+ spaces
+    /// in a tool description or the server instructions is that bug's shape.
+    #[test]
+    fn model_facing_text_has_no_run_of_blanks() {
+        for card in tool_catalog() {
+            assert!(
+                !card.description.contains("   "),
+                "tool `{}` description contains a run of 3+ spaces",
+                card.name
+            );
+            let schema = card.input_schema.to_string();
+            assert!(
+                !schema.contains("   "),
+                "tool `{}` input schema contains a run of 3+ spaces",
+                card.name
+            );
+        }
+        assert!(
+            !INSTRUCTIONS.contains("   "),
+            "the server instructions contain a run of 3+ spaces"
         );
     }
 

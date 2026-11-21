@@ -4,7 +4,7 @@
 //! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
 //! into the one table the handler dispatches through.
 
-use crate::mcp::context::{caller_of, pen_name, reader_of};
+use crate::mcp::context::{caller_of, pen_name};
 use crate::mcp::*;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
@@ -73,15 +73,9 @@ impl MemoryServer {
         // it simply gets no walk, because it has not proved to be anybody.
         let viewer = pen_name(&ctx, self.declared.as_deref(), &self.paths)
             .unwrap_or_else(|_| crate::identity::ANONYMOUS.to_string());
-        let pen = p.pen;
-        let lookup = pen.clone();
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
-        let facts = self
-            .with_read("whois", reader, move |s| s.whois(&viewer, &lookup))
-            .await?;
-        Ok(json_ok(
-            serde_json::to_value(&facts).map_err(|e| e.to_string())?,
-        ))
+        let lookup = p.pen;
+        self.read_tool("whois", &ctx, move |s| s.whois(&viewer, &lookup))
+            .await
     }
 
     /// CREATE a pen under this one — the runtime door (James, 2026-10-23).
@@ -102,16 +96,15 @@ impl MemoryServer {
         Parameters(p): Parameters<MintParams>,
     ) -> std::result::Result<String, String> {
         // A mint is a WRITE: it needs a pen, and the pen is the parent.
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let name = p.name;
         let kind = p.kind;
         let minted = self
-            .with_store("pen_mint", move |s| s.mint(&caller, &name, &kind))
+            .write_outcome("pen_mint", &ctx, move |s, caller| {
+                s.mint(caller.as_str(), &name, &kind)
+            })
             .await?;
         tracing::info!(tool = "pen_mint", pen = %minted.name, kind = %minted.kind, parent = %minted.parent, "pen minted");
-        Ok(json_ok(
-            serde_json::to_value(&minted).map_err(|e| e.to_string())?,
-        ))
+        json_out(&minted)
     }
 
     /// ROTATE a credential — the caller's own, or a descendant's (2026-10-30).
@@ -131,12 +124,12 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<RotateParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let target = p.pen.unwrap_or_else(|| caller.clone());
-        let for_store = target.clone();
-        let secret = self
-            .with_store("pen_rotate", move |s| {
-                s.rotate_credential(&caller, &for_store)
+        let claimed = p.pen;
+        let (target, secret) = self
+            .write_outcome("pen_rotate", &ctx, move |s, caller| {
+                let target = claimed.unwrap_or_else(|| caller.as_str().to_string());
+                let secret = s.rotate_credential(caller.as_str(), &target)?;
+                Ok((target, secret))
             })
             .await?;
         tracing::info!(tool = "pen_rotate", pen = %target, "credential rotated");
@@ -162,16 +155,15 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<LendParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let pen = p.pen;
         let secs = p.secs;
         let session = self
-            .with_store("pen_lend", move |s| s.lend(&caller, &pen, secs))
+            .write_outcome("pen_lend", &ctx, move |s, caller| {
+                s.lend(caller.as_str(), &pen, secs)
+            })
             .await?;
         tracing::info!(tool = "pen_lend", weak = %session.weak, powerful = %session.powerful, "authority lent down");
-        Ok(json_ok(
-            serde_json::to_value(&session).map_err(|e| e.to_string())?,
-        ))
+        json_out(&session)
     }
 
     /// BORROW a pen's authority — bounded by policy, expiring, revocable.
@@ -191,16 +183,15 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let powerful = p.powerful;
         let secs = p.secs;
         let session = self
-            .with_store("sudo", move |s| s.sudo(&caller, &powerful, secs))
+            .write_outcome("sudo", &ctx, move |s, caller| {
+                s.sudo(caller.as_str(), &powerful, secs)
+            })
             .await?;
         tracing::info!(tool = "sudo", weak = %session.weak, powerful = %session.powerful, "authority borrowed");
-        Ok(json_ok(
-            serde_json::to_value(&session).map_err(|e| e.to_string())?,
-        ))
+        json_out(&session)
     }
 
     /// PASS a live session down to a descendant.
@@ -220,19 +211,16 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoPassParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let powerful = p.powerful;
         let pen = p.pen;
         let secs = p.secs;
         let session = self
-            .with_store("sudo_pass", move |s| {
-                s.sudo_pass(&caller, &powerful, &pen, secs)
+            .write_outcome("sudo_pass", &ctx, move |s, caller| {
+                s.sudo_pass(caller.as_str(), &powerful, &pen, secs)
             })
             .await?;
         tracing::info!(tool = "sudo_pass", weak = %session.weak, powerful = %session.powerful, "session passed down");
-        Ok(json_ok(
-            serde_json::to_value(&session).map_err(|e| e.to_string())?,
-        ))
+        json_out(&session)
     }
 
     /// END a session, and everything passed down from it.
@@ -252,12 +240,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoReleaseParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let powerful = p.powerful;
         let target = p.pen;
         let killed = self
-            .with_store("sudo_release", move |s| {
-                s.sudo_release_of(&caller, target.as_deref(), &powerful)
+            .write_outcome("sudo_release", &ctx, move |s, caller| {
+                s.sudo_release_of(caller.as_str(), target.as_deref(), &powerful)
             })
             .await?;
         tracing::info!(tool = "sudo_release", killed, "authority released");
@@ -280,15 +267,13 @@ impl MemoryServer {
     )]
     async fn sudo_sessions(
         &self,
-        _ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<SudoSessionsParams>,
     ) -> std::result::Result<String, String> {
         let pen = p.pen;
-        let sessions = self
-            .with_store("sudo_sessions", move |s| s.sudo_sessions(pen.as_deref()))
-            .await?;
-        Ok(json_ok(
-            serde_json::to_value(&sessions).map_err(|e| e.to_string())?,
-        ))
+        self.read_tool("sudo_sessions", &ctx, move |s| {
+            s.sudo_sessions(pen.as_deref())
+        })
+        .await
     }
 }

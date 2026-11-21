@@ -31,10 +31,9 @@ impl MemoryServer {
         Parameters(p): Parameters<UnownedParams>,
     ) -> std::result::Result<String, String> {
         // An ownerless row is a row, so the audience tier applies exactly as it does to a search hit.
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let limit = p.limit.unwrap_or(50).clamp(1, 500);
         let rows = self
-            .with_read("memory_unowned", reader, move |s| s.unowned(limit))
+            .read_outcome("memory_unowned", &ctx, move |s| s.unowned(limit))
             .await?;
         Ok(json_ok(
             serde_json::to_value(&rows).map_err(|e| e.to_string())?,
@@ -326,15 +325,12 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<HistoryParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let cap = p.limit.unwrap_or(HISTORY_LIMIT as u32) as usize;
         match p.key {
             Some(key) => {
                 let lookup = key.clone();
                 let rows = self
-                    .with_read("memory_history", reader.clone(), move |s| {
-                        s.versions(&lookup)
-                    })
+                    .read_outcome("memory_history", &ctx, move |s| s.versions(&lookup))
                     .await?;
                 let total = rows.len();
                 tracing::debug!(tool = "memory_history", key = %key, total, "history listed");
@@ -347,9 +343,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             None => {
                 let orphans = p.orphans_only;
                 let rows = self
-                    .with_read("memory_history", reader.clone(), move |s| {
-                        s.version_index(orphans)
-                    })
+                    .read_outcome("memory_history", &ctx, move |s| s.version_index(orphans))
                     .await?;
                 let total = rows.len();
                 Ok(json_ok(serde_json::json!({
@@ -399,13 +393,10 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<KeyParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
         let lookup = key.clone();
         let links = self
-            .with_read("memory_backlinks", reader.clone(), move |s| {
-                s.backlinks(&lookup)
-            })
+            .read_outcome("memory_backlinks", &ctx, move |s| s.backlinks(&lookup))
             .await?;
         tracing::debug!(tool = "memory_backlinks", key = %key, count = links.len(), "backlinks");
         backlinks_to_wire_json(&links).map_err(|e| e.to_string())
@@ -427,9 +418,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let edges = self
-            .with_read("memory_dangling", reader, |s| s.dangling())
+            .read_outcome("memory_dangling", &ctx, |s| s.dangling())
             .await?;
         tracing::debug!(
             tool = "memory_dangling",
@@ -456,9 +446,8 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         &self,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let health = self
-            .with_read("memory_health", reader, |s| s.health())
+            .read_outcome("memory_health", &ctx, |s| s.health())
             .await?;
         tracing::info!(
             tool = "memory_health",
@@ -489,10 +478,9 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<StatsParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let with_tags = p.tags.unwrap_or(false);
         let stats = self
-            .with_read("memory_stats", reader.clone(), move |s| s.stats(with_tags))
+            .read_outcome("memory_stats", &ctx, move |s| s.stats(with_tags))
             .await?;
         tracing::info!(tool = "memory_stats", memories = stats.memories, "stats");
         serde_json::to_string(&stats).map_err(|e| e.to_string())
@@ -515,14 +503,11 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<DupesParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let max_distance = p.max_distance.unwrap_or(store::dupes::DEFAULT_MAX_DISTANCE);
         let limit = p.limit.unwrap_or(DUPES_LIMIT);
         if p.plan.unwrap_or(false) {
             let plan = self
-                .with_read("memory_dupes", reader.clone(), move |s| {
-                    s.dupes_plan(max_distance, limit)
-                })
+                .read_outcome("memory_dupes", &ctx, move |s| s.dupes_plan(max_distance, limit))
                 .await?;
             tracing::info!(
                 tool = "memory_dupes",
@@ -535,9 +520,7 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
             return crate::wire::dupes::plan_to_wire_json(&plan).map_err(|e| e.to_string());
         }
         let pairs = self
-            .with_read("memory_dupes", reader.clone(), move |s| {
-                s.dupes(max_distance, limit)
-            })
+            .read_outcome("memory_dupes", &ctx, move |s| s.dupes(max_distance, limit))
             .await?;
         tracing::info!(
             tool = "memory_dupes",
@@ -566,14 +549,13 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
-        let report = self
-            .with_store("memory_reembed", move |s| {
+        let (pen, report) = self
+            .write_outcome("memory_reembed", &ctx, move |s, pen| {
                 // ★ NOT GATED, AND THAT IS THE DECISION (#168 review): a rebuild is derived data —
                 // idempotent, and its output depends on the bodies, not on the news. A pen locked out
                 // of an incident may still repair the index; making maintenance mean "acting" would
                 // dilute the class until someone weakens it to stop the noise.
-                s.reembed()
+                s.reembed().map(|report| (pen.as_str().to_string(), report))
             })
             .await?;
         tracing::info!(
@@ -624,12 +606,11 @@ meaning over the kinds that have vectors (memory does). Ask for one, or omit `ty
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(_): Parameters<ListParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
-        let report = self
-            .with_store("memory_reparse", move |s| {
+        let (pen, report) = self
+            .write_outcome("memory_reparse", &ctx, move |s, pen| {
                 // ★ NOT GATED (#168 review): the link graph is derived data. Rebuilding it is
                 // idempotent and changes nothing anyone was told, so a locked pen may do it.
-                s.reparse()
+                s.reparse().map(|report| (pen.as_str().to_string(), report))
             })
             .await?;
         tracing::info!(

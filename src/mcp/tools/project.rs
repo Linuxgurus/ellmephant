@@ -4,7 +4,6 @@
 //! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
 //! into the one table the handler dispatches through.
 
-use crate::mcp::context::{caller_of, pen_name, reader_of};
 use crate::mcp::*;
 use crate::store::project;
 use rmcp::handler::server::wrapper::Parameters;
@@ -29,14 +28,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectUpsertParams>,
     ) -> std::result::Result<String, String> {
-        let pen = caller_of(&ctx, self.declared.as_deref(), &self.paths)
-            .pen()
-            .map_err(|r| r.to_string())?
-            .clone(); // writes are signed; anonymous is read-only
+        // writes are signed; anonymous is read-only
         let patch = p.into_patch();
         let outcome = self
-            .with_store("project_upsert", move |s| {
-                crate::ops::project_upsert(s, &pen, &patch)
+            .write_outcome("project_upsert", &ctx, move |s, pen| {
+                crate::ops::project_upsert(s, pen, &patch)
             })
             .await?;
         tracing::info!(
@@ -68,13 +64,12 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectKeyParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
         let hydrate = project::Hydrate::parse(p.hydrate.as_deref().unwrap_or("none"))
             .map_err(|e| e.to_string())?;
         let lookup = key.clone();
         let view = self
-            .with_read("project_get", reader.clone(), move |s| {
+            .read_outcome("project_get", &ctx, move |s| {
                 s.project_view(&lookup, hydrate)
             })
             .await?;
@@ -104,7 +99,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ProjectListParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let filter = project::Filter {
             status: p.status,
             tags: p.tags,
@@ -113,7 +107,7 @@ impl MemoryServer {
             mode: p.mode.map(MatchModeParam::to_mode).unwrap_or_default(),
         };
         let rows = self
-            .with_read("project_list", reader.clone(), move |s| {
+            .read_outcome("project_list", &ctx, move |s| {
                 s.project_list(&filter)
             })
             .await?;
@@ -144,10 +138,9 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ConfigGetParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let key = p.key;
         let item = self
-            .with_read("config_get", reader, move |s| s.config_get(&key))
+            .read_outcome("config_get", &ctx, move |s| s.config_get(&key))
             .await?;
         tracing::info!(tool = "config_get", found = item.is_some(), "config read");
         Ok(json_ok(
@@ -180,12 +173,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ConfigSetParams>,
     ) -> std::result::Result<String, String> {
-        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ConfigSetParams { key, value, source } = p;
         let log_key = key.clone();
         let item = self
-            .with_store("config_set", move |s| {
-                s.config_set(&who, &key, &value, source.as_deref())
+            .write_outcome("config_set", &ctx, move |s, pen| {
+                s.config_set(pen.as_str(), &key, &value, source.as_deref())
             })
             .await?;
         tracing::info!(tool = "config_set", key = %log_key, "config written");
@@ -222,7 +214,6 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ConfigDefineParams>,
     ) -> std::result::Result<String, String> {
-        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ConfigDefineParams {
             key,
             value,
@@ -232,8 +223,15 @@ impl MemoryServer {
         } = p;
         let log_key = key.clone();
         let item = self
-            .with_store("config_define", move |s| {
-                s.config_define(&who, &key, &value, &set_audience, &read_audience, &source)
+            .write_outcome("config_define", &ctx, move |s, pen| {
+                s.config_define(
+                    pen.as_str(),
+                    &key,
+                    &value,
+                    &set_audience,
+                    &read_audience,
+                    &source,
+                )
             })
             .await?;
         tracing::info!(tool = "config_define", key = %log_key, "config defined");
@@ -263,10 +261,9 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ConfigListParams>,
     ) -> std::result::Result<String, String> {
-        let reader = reader_of(&ctx, self.declared.as_deref(), &self.paths);
         let prefix = p.prefix;
         let items = self
-            .with_read("config_list", reader, move |s| {
+            .read_outcome("config_list", &ctx, move |s| {
                 s.config_list(prefix.as_deref())
             })
             .await?;

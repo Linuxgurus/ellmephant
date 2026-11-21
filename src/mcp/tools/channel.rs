@@ -31,25 +31,20 @@ impl MemoryServer {
             .proven()
             .map(ToString::to_string);
         let caller = pen.clone();
-        let out = self
-            .with_read(
-                "channel_list",
-                crate::store::audience::Reader::everything(),
-                move |s| {
-                    let channels = s.channels()?;
-                    let unread = match caller.as_deref() {
-                        Some(p) => s.channel_unread(p)?,
-                        None => Vec::new(),
-                    };
-                    let breach = match caller.as_deref() {
-                        Some(p) => s.channel_breach(p)?,
-                        None => None,
-                    };
-                    Ok((channels, unread, breach))
-                },
-            )
+        let (channels, unread, breach) = self
+            .read_outcome("channel_list", &ctx, move |s| {
+                let channels = s.channels()?;
+                let unread = match caller.as_deref() {
+                    Some(p) => s.channel_unread(p)?,
+                    None => Vec::new(),
+                };
+                let breach = match caller.as_deref() {
+                    Some(p) => s.channel_breach(p)?,
+                    None => None,
+                };
+                Ok((channels, unread, breach))
+            })
             .await?;
-        let (channels, unread, breach) = out;
         serde_json::to_string(&serde_json::json!({
             "channels": channels,
             "unread": unread,
@@ -76,19 +71,19 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelSendParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ChannelSendParams {
             channel,
             body,
             reply_to,
         } = p;
-        let (who, chan) = (pen.clone(), channel.clone());
-        let msg = self
-            .with_store("channel_send", move |s| {
-                s.channel_send(&who, &chan, &body, reply_to)
+        let (chan, log_channel) = (channel.clone(), channel);
+        let (msg, pen) = self
+            .write_outcome("channel_send", &ctx, move |s, pen| {
+                let msg = s.channel_send(pen.as_str(), &chan, &body, reply_to)?;
+                Ok((msg, pen.as_str().to_string()))
             })
             .await?;
-        tracing::info!(tool = "channel_send", pen = %pen, channel = %channel, seq = msg.seq, "channel message sent");
+        tracing::info!(tool = "channel_send", pen = %pen, channel = %log_channel, seq = msg.seq, "channel message sent");
         serde_json::to_string(&msg).map_err(|e| e.to_string())
     }
 
@@ -117,11 +112,9 @@ impl MemoryServer {
         } = p;
         let (chan, since, limit) = (channel.clone(), since.unwrap_or(0), limit.unwrap_or(50));
         let rows = self
-            .with_read(
-                "channel_history",
-                crate::store::audience::Reader::everything(),
-                move |s| s.channel_history(&chan, since, limit),
-            )
+            .read_outcome("channel_history", &ctx, move |s| {
+                s.channel_history(&chan, since, limit)
+            })
             .await?;
         serde_json::to_string(&serde_json::json!({ "channel": channel, "messages": rows }))
             .map_err(|e| e.to_string())
@@ -144,12 +137,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelFetchParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let ChannelFetchParams { channel, limit } = p;
-        let (who, chan, limit) = (pen.clone(), channel.clone(), limit.unwrap_or(50));
-        let rows = self
-            .with_store("channel_fetch", move |s| {
-                s.channel_fetch(&who, chan.as_deref(), limit)
+        let (rows, pen) = self
+            .write_outcome("channel_fetch", &ctx, move |s, pen| {
+                let rows = s.channel_fetch(pen.as_str(), channel.as_deref(), limit.unwrap_or(50))?;
+                Ok((rows, pen.as_str().to_string()))
             })
             .await?;
         tracing::info!(tool = "channel_fetch", pen = %pen, fetched = rows.len(), "channel messages fetched");
@@ -177,12 +169,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPresentParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let who = pen.clone();
         let boundary = p.boundary;
-        let touched = self
-            .with_store("channel_present", move |s| {
-                s.channel_present(&who, boundary.as_deref())
+        let (pen, touched) = self
+            .write_outcome("channel_present", &ctx, move |s, pen| {
+                let touched = s.channel_present(pen.as_str(), boundary.as_deref())?;
+                Ok((pen.as_str().to_string(), touched))
             })
             .await?;
         serde_json::to_string(&serde_json::json!({ "pen": pen, "marked": touched }))
@@ -213,11 +204,7 @@ impl MemoryServer {
         }
         let who = pen.clone().unwrap_or_default();
         let found = self
-            .with_read(
-                "channel_breach",
-                crate::store::audience::Reader::everything(),
-                move |s| s.channel_breach(&who),
-            )
+            .read_outcome("channel_breach", &ctx, move |s| s.channel_breach(&who))
             .await?;
         serde_json::to_string(&serde_json::json!({ "breach": found, "proven": true }))
             .map_err(|e| e.to_string())
@@ -240,10 +227,13 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMemberParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let channel = p.channel;
-        let (who, chan) = (pen.clone(), channel.clone());
-        self.with_store("channel_join", move |s| s.channel_join(&who, &chan))
+        let chan = channel.clone();
+        let pen = self
+            .write_outcome("channel_join", &ctx, move |s, pen| {
+                s.channel_join(pen.as_str(), &chan)?;
+                Ok(pen.as_str().to_string())
+            })
             .await?;
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": true }).to_string())
     }
@@ -265,14 +255,16 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelInviteParams>,
     ) -> std::result::Result<String, String> {
-        let actor = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let (who, guest, chan) = (actor.clone(), p.pen.clone(), p.channel.clone());
-        self.with_store("channel_invite", move |s| {
-            s.channel_invite(&who, &guest, &chan)
-        })
-        .await?;
+        let ChannelInviteParams { channel, pen: guest } = p;
+        let (chan, guest_in) = (channel.clone(), guest.clone());
+        let actor = self
+            .write_outcome("channel_invite", &ctx, move |s, actor| {
+                s.channel_invite(actor.as_str(), &guest_in, &chan)?;
+                Ok(actor.as_str().to_string())
+            })
+            .await?;
         Ok(serde_json::json!({
-            "channel": p.channel, "pen": p.pen, "member": true, "invited_by": actor
+            "channel": channel, "pen": guest, "member": true, "invited_by": actor
         })
         .to_string())
     }
@@ -294,10 +286,13 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelMemberParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let channel = p.channel;
-        let (who, chan) = (pen.clone(), channel.clone());
-        self.with_store("channel_leave", move |s| s.channel_leave(&who, &chan))
+        let chan = channel.clone();
+        let pen = self
+            .write_outcome("channel_leave", &ctx, move |s, pen| {
+                s.channel_leave(pen.as_str(), &chan)?;
+                Ok(pen.as_str().to_string())
+            })
             .await?;
         Ok(serde_json::json!({ "pen": pen, "channel": channel, "member": false }).to_string())
     }
@@ -326,12 +321,8 @@ impl MemoryServer {
             Some(after) => after,
             None => {
                 let who = pen.clone();
-                self.with_read(
-                    "channel_wait",
-                    crate::store::audience::Reader::everything(),
-                    move |s| s.channel_head(&who),
-                )
-                .await?
+                self.read_outcome("channel_wait", &ctx, move |s| s.channel_head(&who))
+                    .await?
             }
         };
         let deadline = std::time::Instant::now()
@@ -339,11 +330,7 @@ impl MemoryServer {
         loop {
             let who = pen.clone();
             let rows = self
-                .with_read(
-                    "channel_wait",
-                    crate::store::audience::Reader::everything(),
-                    move |s| s.channel_since(&who, after, 200),
-                )
+                .read_outcome("channel_wait", &ctx, move |s| s.channel_since(&who, after, 200))
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
                 let truncated = rows.len() >= 200;
@@ -379,11 +366,7 @@ impl MemoryServer {
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
-            .with_read(
-                "channel_members",
-                crate::store::audience::Reader::everything(),
-                move |s| s.channel_members(&key),
-            )
+            .read_outcome("channel_members", &ctx, move |s| s.channel_members(&key))
             .await?;
         serde_json::to_string(&serde_json::json!({ "channel": channel, "members": rows }))
             .map_err(|e| e.to_string())
@@ -406,13 +389,13 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelCreateParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let (who, key, title) = (pen.clone(), p.channel.clone(), p.title.clone());
+        let (key, title) = (p.channel.clone(), p.title);
         let members = p.members.unwrap_or_else(|| "open".to_string());
         let gate = p.gate.unwrap_or_else(|| "none".to_string());
-        let made = self
-            .with_store("channel_create", move |s| {
-                s.channel_create(&who, &key, &title, &members, &gate)
+        let (made, pen) = self
+            .write_outcome("channel_create", &ctx, move |s, pen| {
+                let made = s.channel_create(pen.as_str(), &key, &title, &members, &gate)?;
+                Ok((made, pen.as_str().to_string()))
             })
             .await?;
         tracing::info!(tool = "channel_create", pen = %pen, channel = %made.key, gate = %made.gate, "channel created");
@@ -436,11 +419,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelGateParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let (who, chan, gate) = (pen.clone(), p.channel.clone(), p.gate.clone());
-        let row = self
-            .with_store("channel_set_gate", move |s| {
-                s.channel_set_gate(&who, &chan, &gate)
+        let (chan, gate) = (p.channel, p.gate);
+        let (row, pen) = self
+            .write_outcome("channel_set_gate", &ctx, move |s, pen| {
+                let row = s.channel_set_gate(pen.as_str(), &chan, &gate)?;
+                Ok((row, pen.as_str().to_string()))
             })
             .await?;
         tracing::warn!(tool = "channel_set_gate", pen = %pen, channel = %row.key, gate = %row.gate, "channel gate changed");
@@ -468,11 +451,7 @@ impl MemoryServer {
         let channel = p.channel;
         let key = channel.clone();
         let rows = self
-            .with_read(
-                "channel_events",
-                crate::store::audience::Reader::everything(),
-                move |s| s.channel_events(&key),
-            )
+            .read_outcome("channel_events", &ctx, move |s| s.channel_events(&key))
             .await?;
         serde_json::to_string(&serde_json::json!({ "channel": channel, "events": rows }))
             .map_err(|e| e.to_string())
@@ -495,11 +474,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelRetentionParams>,
     ) -> std::result::Result<String, String> {
-        let pen = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let (who, chan, keep) = (pen.clone(), p.channel.clone(), p.keep_secs);
-        let row = self
-            .with_store("channel_set_retention", move |s| {
-                s.channel_set_retention(&who, &chan, keep)
+        let (chan, keep) = (p.channel, p.keep_secs);
+        let (row, pen) = self
+            .write_outcome("channel_set_retention", &ctx, move |s, pen| {
+                let row = s.channel_set_retention(pen.as_str(), &chan, keep)?;
+                Ok((row, pen.as_str().to_string()))
             })
             .await?;
         tracing::warn!(tool = "channel_set_retention", pen = %pen, channel = %row.key, keep_secs = row.keep_secs, "channel retention changed");
@@ -523,12 +502,10 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<ChannelPruneParams>,
     ) -> std::result::Result<String, String> {
-        let who = pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // a prune writes; anonymous is read-only
-        let pen = crate::names::Pen::new(&who).map_err(|e| e.to_string())?;
         let only = p.channel;
         let rows = self
-            .with_store("channel_prune", move |s| {
-                crate::ops::channel_prune(s, &pen, only.as_deref())
+            .write_outcome("channel_prune", &ctx, move |s, pen| {
+                crate::ops::channel_prune(s, pen, only.as_deref())
             })
             .await?;
         let total: usize = rows.iter().map(|r| r.emptied).sum();

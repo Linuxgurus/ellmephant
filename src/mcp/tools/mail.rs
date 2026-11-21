@@ -4,7 +4,7 @@
 //! rmcp builds a `ToolRouter` from ONE impl block, so `mod.rs` composes the group routers
 //! into the one table the handler dispatches through.
 
-use crate::mcp::context::{pen_name, reader_of};
+use crate::mcp::context::pen_name;
 use crate::mcp::*;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
@@ -39,24 +39,22 @@ impl MemoryServer {
         // They may differ only while the proven pen holds a live `send` grant from the named pen, and
         // the store refuses otherwise. It used to discard the argument and stamp the typist — a
         // silent override that produced a real misattribution (2026-10-25, seq 566).
-        let proven = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        let sender = sender.trim();
-        let sender = if sender.is_empty() {
-            proven.clone()
-        } else {
-            sender.to_string()
-        };
-        let (log_sender, log_recipient) = (sender.clone(), recipient.clone());
-        let out = self
-            .with_store("mail_send", move |s| {
-                s.mail_send(
-                    &proven,
+        let log_recipient = recipient.clone();
+        let (log_sender, out) = self
+            .write_outcome("mail_send", &ctx, move |s, proven| {
+                let sender = match sender.trim() {
+                    "" => proven.as_str().to_string(),
+                    given => given.to_string(),
+                };
+                let out = s.mail_send(
+                    proven.as_str(),
                     &sender,
                     &recipient,
                     subject.as_deref().unwrap_or(""),
                     &body,
                     encoding.as_deref().unwrap_or("text"),
-                )
+                )?;
+                Ok((sender, out))
             })
             .await?;
         tracing::info!(
@@ -67,7 +65,7 @@ impl MemoryServer {
             bytes = out.bytes,
             "letter written"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// Lend your OWN name to another pen for mail.
@@ -87,32 +85,29 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailGrantParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        if !caller.eq_ignore_ascii_case(p.grantor.trim()) {
-            return Err(format!(
-                "refused: `{caller}` may grant its OWN name only; `{}` must grant itself",
-                p.grantor
-            ));
-        }
         let grantor = p.grantor;
         let surrogate = p.surrogate;
         let scopes = p.scopes.unwrap_or_else(|| "send".to_string());
         let expires_at = p.expires_at;
         let note = p.note;
-        let out = self
-            .with_store("mail_surrogate_grant", move |s| {
-                s.mail_grant(
-                    &grantor,
-                    &surrogate,
-                    &scopes,
-                    expires_at.as_deref(),
-                    note.as_deref(),
-                )
-            })
-            .await?;
-        Ok(json_ok(
-            serde_json::to_value(&out).map_err(|e| e.to_string())?,
-        ))
+        self.write_tool("mail_surrogate_grant", &ctx, move |s, pen| {
+            // A pen may lend its OWN name only: the check is on the proven caller, never on an
+            // argument the caller chose.
+            if !pen.as_str().eq_ignore_ascii_case(grantor.trim()) {
+                return Err(crate::error::Error::Invalid(format!(
+                    "refused: `{}` may grant its OWN name only; `{grantor}` must grant itself",
+                    pen.as_str()
+                )));
+            }
+            s.mail_grant(
+                &grantor,
+                &surrogate,
+                &scopes,
+                expires_at.as_deref(),
+                note.as_deref(),
+            )
+        })
+        .await
     }
 
     /// Take a lent name back.
@@ -132,15 +127,16 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailRevokeParams>,
     ) -> std::result::Result<String, String> {
-        let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
-        if !caller.eq_ignore_ascii_case(p.grantor.trim()) {
-            return Err(format!(
-                "refused: `{caller}` may revoke its OWN grants only"
-            ));
-        }
-        let (grantor, surrogate) = (p.grantor, p.surrogate);
+        let grantor = p.grantor;
+        let surrogate = p.surrogate;
         let n = self
-            .with_store("mail_surrogate_revoke", move |s| {
+            .write_outcome("mail_surrogate_revoke", &ctx, move |s, pen| {
+                if !pen.as_str().eq_ignore_ascii_case(grantor.trim()) {
+                    return Err(crate::error::Error::Invalid(format!(
+                        "refused: `{}` may revoke its OWN grants only",
+                        pen.as_str()
+                    )));
+                }
                 s.mail_revoke(&grantor, &surrogate)
             })
             .await?;
@@ -164,18 +160,14 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailSurrogatesParams>,
     ) -> std::result::Result<String, String> {
+        // ★ The default subject is the CALLER, so this body needs the name before the read: the
+        // envelope hands a read no pen, only the reader the store scopes it by.
         let caller = pen_name(&ctx, self.declared.as_deref(), &self.paths)?;
         let subject = p.surrogate.unwrap_or(caller);
-        let rows = self
-            .with_read(
-                "mail_surrogate_list",
-                reader_of(&ctx, self.declared.as_deref(), &self.paths),
-                move |s| s.mail_surrogates_of(&subject),
-            )
-            .await?;
-        Ok(json_ok(
-            serde_json::to_value(&rows).map_err(|e| e.to_string())?,
-        ))
+        self.read_tool("mail_surrogate_list", &ctx, move |s| {
+            s.mail_surrogates_of(&subject)
+        })
+        .await
     }
 
     /// What is in a box after a cursor. Bodies omitted; `wait_seconds` long-polls.
@@ -217,21 +209,17 @@ impl MemoryServer {
             let who = recipient.clone();
             let me = reader.clone();
             let (rows, head, cursor) = self
-                .with_read(
-                    "mail_inbox",
-                    crate::store::audience::Reader::everything(),
-                    move |s| {
-                        // Three facts, and they were being conflated: the top of THIS PAGE, the top of
-                        // the BOX, and where the READER is. `max_seq` was read as "newest letter that
-                        // exists" while it meant "highest seq returned" — which cost two readers an
-                        // hour of theorising about a 273-letter discrepancy that never existed
-                        // (measured 2026-10-21).
-                        let stored = s.mail_cursor(&me, &who)?;
-                        let seq =
-                            since.unwrap_or_else(|| stored.as_ref().map(|c| c.seq).unwrap_or(0));
-                        Ok((s.mail_inbox(&who, seq, limit)?, s.mail_head(&who)?, stored))
-                    },
-                )
+                .read_outcome("mail_inbox", &ctx, move |s| {
+                    // Three facts, and they were being conflated: the top of THIS PAGE, the top of
+                    // the BOX, and where the READER is. `max_seq` was read as "newest letter that
+                    // exists" while it meant "highest seq returned" — which cost two readers an
+                    // hour of theorising about a 273-letter discrepancy that never existed
+                    // (measured 2026-10-21).
+                    let stored = s.mail_cursor(&me, &who)?;
+                    let seq =
+                        since.unwrap_or_else(|| stored.as_ref().map(|c| c.seq).unwrap_or(0));
+                    Ok((s.mail_inbox(&who, seq, limit)?, s.mail_head(&who)?, stored))
+                })
                 .await?;
             if !rows.is_empty() || std::time::Instant::now() >= deadline {
                 let page_top = rows.iter().map(|r| r.seq).max();
@@ -271,10 +259,10 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let MailAckParams { recipient, seq } = p;
         let reader = self.mail_box_for(&ctx, &recipient, "ack").await?;
-        let (log_reader, log_recipient) = (reader.clone(), recipient.clone());
+        let (log_reader, log_recipient) = (reader, recipient.clone());
         let out = self
-            .with_store("mail_ack", move |s| {
-                s.mail_advance(&reader, &recipient, seq)
+            .write_outcome("mail_ack", &ctx, move |s, pen| {
+                s.mail_advance(pen.as_str(), &recipient, seq)
             })
             .await?;
         tracing::info!(
@@ -286,7 +274,7 @@ impl MemoryServer {
             unread = out.unread,
             "cursor advanced"
         );
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        json_out(&out)
     }
 
     /// Turn a bare "no such memory" into a claim with its evidence (soma/ellmephant#57).
@@ -463,11 +451,7 @@ impl MemoryServer {
     ) -> std::result::Result<String, String> {
         let seq = p.seq;
         let found = self
-            .with_read(
-                "mail_read",
-                crate::store::audience::Reader::everything(),
-                move |s| s.mail_read(seq),
-            )
+            .read_outcome("mail_read", &ctx, move |s| s.mail_read(seq))
             .await?;
         // ★ A LETTER IS PRIVATE CORRESPONDENCE: the box it is addressed to decides who may read it,
         // and the check happens on the LETTER, not on an argument the caller chose.
@@ -497,10 +481,11 @@ impl MemoryServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         Parameters(p): Parameters<MailPruneParams>,
     ) -> std::result::Result<String, String> {
-        pen_name(&ctx, self.declared.as_deref(), &self.paths)?; // writes are signed; anonymous is read-only
         let keep_days = p.keep_days;
+        // The envelope refuses an anonymous write with the same sentence `pen_name` did: the pruner
+        // is signed like any other write.
         let removed = self
-            .with_store("mail_prune", move |s| s.mail_prune(keep_days))
+            .write_outcome("mail_prune", &ctx, move |s, _pen| s.mail_prune(keep_days))
             .await?;
         tracing::info!(tool = "mail_prune", keep_days, removed, "letters pruned");
         Ok(serde_json::json!({ "removed": removed, "keep_days": keep_days }).to_string())

@@ -29,12 +29,13 @@ pub fn serve(
         std::time::Instant::now(),
     );
     let encode_interval = std::time::Duration::from_millis(cfg.encode_interval_ms);
+    let encode_batch = cfg.encode_batch.max(1);
     let server = MemoryServer::with_watch(
         Arc::new(Mutex::new(Session::open(paths, cfg, spec)?)),
         watch,
     );
     #[cfg(feature = "encoder")]
-    let _worker = server.spawn_encode_worker(encode_interval);
+    let _worker = server.spawn_encode_worker(encode_interval, encode_batch);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         match transport {

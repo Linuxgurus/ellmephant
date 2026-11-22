@@ -17,6 +17,8 @@ pub const DEFAULT_PORT: u16 = 8888;
 pub const DEVICES: [&str; 2] = ["cpu", "metal"];
 pub const PRECISIONS: [&str; 3] = ["bf16", "f16", "f32"];
 pub const MAX_DIM: usize = 1024;
+/// Ceiling on `encode_batch`: a wide claim costs memory ahead of throughput.
+pub const MAX_ENCODE_BATCH: usize = 32;
 
 pub const DEFAULT_MAX_DISTANCE: f32 = 0.52;
 
@@ -83,6 +85,9 @@ pub struct Config {
     pub default_max_distance: Option<f32>,
     pub port: u16,
     pub encode_interval_ms: u64,
+    /// Documents the encode worker claims per tick. ONE batched forward pass serves the
+    /// whole claim, so this is the throughput knob; `1` restores one-pass-per-document.
+    pub encode_batch: usize,
     pub rebuild_max_documents: u64,
     pub rebuild_allow_over_budget: bool,
 }
@@ -102,6 +107,7 @@ impl Default for Config {
             default_max_distance: Some(DEFAULT_MAX_DISTANCE),
             port: DEFAULT_PORT,
             encode_interval_ms: 1_000,
+            encode_batch: 4,
             rebuild_max_documents: 2_000,
             rebuild_allow_over_budget: false,
         }
@@ -134,6 +140,12 @@ impl Config {
                 "invalid precision {:?} (want {})",
                 self.precision,
                 PRECISIONS.join("|")
+            )));
+        }
+        if self.encode_batch == 0 || self.encode_batch > MAX_ENCODE_BATCH {
+            return Err(Error::Config(format!(
+                "encode_batch must be 1..={MAX_ENCODE_BATCH} (got {})",
+                self.encode_batch
             )));
         }
         if self.dim == 0 || self.dim > MAX_DIM {

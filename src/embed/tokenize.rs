@@ -23,11 +23,12 @@ impl Default for BatchConfig {
 
 impl BatchConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.padding != PaddingSide::Left {
-            return Err(Error::Config(
-                "last-token pooling requires left padding (SPEC §6)".into(),
-            ));
-        }
+        // BOTH sides are legal, and the choice is about WHERE the pooled token sits.
+        // LEFT puts every row's last token at the fixed index `T-1`; RIGHT keeps real
+        // tokens at `0..len-1` and pools each row at `len-1`, which is exactly equivalent
+        // under a causal mask because a real token never reads a pad after it. The encoder
+        // batches with RIGHT padding (`embed::qwen3::forward_batch`) so that no padding
+        // mask is needed at all — candle-nn's CPU fused kernel refuses one for `B>1`.
         if self.max_len == 0 {
             return Err(Error::Config("max_len must be > 0".into()));
         }
@@ -55,13 +56,12 @@ mod tests {
     }
 
     #[test]
-    fn right_padding_is_rejected() {
+    fn right_padding_validates_too() {
         let cfg = BatchConfig {
             padding: PaddingSide::Right,
             max_len: 128,
         };
-        let err = cfg.validate().unwrap_err();
-        assert!(format!("{err}").contains("left padding"));
+        cfg.validate().unwrap();
     }
 
     #[test]

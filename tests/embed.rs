@@ -56,3 +56,45 @@ fn qwen3_is_deterministic_normalised_and_self_similar() {
         "unrelated text should not be identical"
     );
 }
+
+/// ★ THE POINT OF BATCHING, STATED AS A TEST. `embed` now stacks rows into one padded
+/// `[B,T]` forward and pools each row at its OWN last real token. Right padding plus a
+/// causal mask makes that the same computation as one row at a time — this asserts it
+/// against real weights rather than trusting the argument in `forward_batch`.
+#[test]
+#[ignore = "needs downloaded Qwen3 weights (ELLMEPHANT_TEST_MODEL_DIR)"]
+fn a_batch_matches_one_document_at_a_time() {
+    let dir = std::env::var("ELLMEPHANT_TEST_MODEL_DIR")
+        .expect("set ELLMEPHANT_TEST_MODEL_DIR to a flat weights dir");
+    let opts = Options::new(1024, "cpu", "bf16", "");
+    let embedder = ellmephant::embed::qwen3::Qwen3Embedder::load(std::path::Path::new(&dir), &opts)
+        .expect("load encoder");
+
+    // Deliberately ragged: a long one, a short one, and a one-word one, so the padded
+    // tensor has real work to mis-handle if the pooling index or the padding side is wrong.
+    let texts = vec![
+        "Memory is the only layer this process edits; everything else is reloaded.".to_string(),
+        "short one".to_string(),
+        "hello".to_string(),
+    ];
+
+    let one_by_one: Vec<Vec<f32>> = texts
+        .iter()
+        .map(|t| embedder.embed_one(t).expect("single"))
+        .collect();
+    let batched = embedder.embed(&texts).expect("batch");
+    assert_eq!(batched.len(), texts.len());
+
+    for (i, (single, batch)) in one_by_one.iter().zip(batched.iter()).enumerate() {
+        let worst = single
+            .iter()
+            .zip(batch)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "row {i}: batched differs from single by {worst} — padding, pooling index or \
+             mask semantics are wrong"
+        );
+    }
+}

@@ -93,7 +93,7 @@ fn a_write_returns_while_the_model_is_mid_embed() {
         .with_embedder(Box::new(Gate::new(started_tx, release_rx, 1)));
     let shared = Arc::new(Mutex::new(session));
     let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
-    let mut worker = server.spawn_encode_worker(Duration::from_millis(5));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(5), 1);
 
     shared
         .lock()
@@ -152,7 +152,7 @@ fn a_write_landing_mid_embed_is_kept_not_swallowed() {
         .with_embedder(Box::new(Gate::new(started_tx, release_rx, 2)));
     let shared = Arc::new(Mutex::new(session));
     let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
-    let mut worker = server.spawn_encode_worker(Duration::from_millis(5));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(5), 1);
 
     shared
         .lock()
@@ -262,7 +262,7 @@ fn many_writers_and_one_worker_converge_without_drift() {
         .with_embedder(Box::new(ellmephant::embed::HashEmbedder::new(DIM)));
     let shared = Arc::new(Mutex::new(session));
     let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
-    let mut worker = server.spawn_encode_worker(Duration::from_millis(1));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(1), 1);
 
     let mut writers = Vec::new();
     for w in 0..WRITERS {
@@ -347,7 +347,7 @@ fn the_worker_drives_the_real_encoder() {
         .with_embedder(Box::new(embedder));
     let shared = Arc::new(Mutex::new(session));
     let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
-    let mut worker = server.spawn_encode_worker(Duration::from_millis(20));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(20), 1);
 
     for (key, body) in [
         (
@@ -426,7 +426,7 @@ fn stop_joins_the_worker_and_no_further_work_is_picked_up() {
         .with_embedder(Box::new(ellmephant::embed::HashEmbedder::new(DIM)));
     let shared = Arc::new(Mutex::new(session));
     let server = MemoryServer::with_watch(Arc::clone(&shared), Arc::new(LockWatch::new()));
-    let mut worker = server.spawn_encode_worker(Duration::from_millis(5));
+    let mut worker = server.spawn_encode_worker(Duration::from_millis(5), 1);
 
     shared
         .lock()

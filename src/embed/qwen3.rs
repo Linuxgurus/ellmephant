@@ -47,6 +47,11 @@ mod real {
     use crate::embed::tokenize::{self, BatchConfig, PaddingSide};
     use crate::error::{Error, Result};
 
+    /// Rows x longest-row ceiling for ONE forward pass: bounds the attention score tensor
+    /// (`rows * T^2`) by the worst case a single max_len document already costs, and keeps
+    /// padding waste from eating the win.
+    const BATCH_TOKEN_BUDGET: usize = 8192;
+
     fn candle(err: candle_core::Error, what: &str) -> Error {
         Error::Model(format!("{what}: {err}"))
     }
@@ -135,7 +140,7 @@ mod real {
     impl Qwen3Embedder {
         pub fn load(dir: &Path, opts: &Options<'_>) -> Result<Self> {
             let batch = BatchConfig {
-                padding: PaddingSide::Left,
+                padding: PaddingSide::Right,
                 max_len: opts.max_len,
             };
             batch.validate()?;
@@ -198,6 +203,103 @@ mod real {
             })
         }
 
+        /// The pad token a short row is filled with. Its VALUE is immaterial: rows are
+        /// padded on the RIGHT, and a causal query never attends to a position after
+        /// itself, so no real token ever reads a pad. That is why batching needs no
+        /// attention mask — see `forward_batch`.
+        fn pad_id(&self) -> u32 {
+            self.tokenizer
+                .get_padding()
+                .map(|p| p.pad_id)
+                .or_else(|| self.tokenizer.token_to_id("<|endoftext|>"))
+                .unwrap_or(0)
+        }
+
+        /// Encode several texts in as few forward passes as the padding budget allows.
+        ///
+        /// ★ WHY RIGHT PADDING, AND WHY THAT IS THE WHOLE TRICK. The natural reading of
+        /// "batch the encoder" is "left-pad and stack [B,T]", which then needs an attention
+        /// mask so a short row's last token does not read its pads. This candle (0.11)
+        /// cannot carry one: `qwen3::Model::forward` takes no mask at all, and on CPU it
+        /// hard-selects candle-nn's fused causal flash kernel, which REFUSES `B>1` with
+        /// anything but `Causal`/`None` (cpu_flash/mod.rs:85). Right padding makes the mask
+        /// unnecessary instead of unavailable: position i attends to 0..=i, real tokens
+        /// occupy 0..len-1 exactly as they do unbatched, and pads sit at len..T where no
+        /// causal query reads them. So the batched vector for a row is the SAME computation
+        /// as `forward_one`, not an approximation of it. The only per-row difference is
+        /// which position is pooled: `len-1`, not `T-1`.
+        fn forward_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let mut tokenized: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+            for text in texts {
+                let ids = tokenize::encode(&self.tokenizer, text)?;
+                if ids.is_empty() {
+                    return Err(Error::Config("empty tokenization".into()));
+                }
+                tokenized.push(ids);
+            }
+
+            let mut out: Vec<Vec<f32>> = Vec::with_capacity(tokenized.len());
+            let mut start = 0;
+            while start < tokenized.len() {
+                // Grow the group while `rows * longest_row` stays inside the budget, so one
+                // long document cannot drag its neighbours' padding into a 2x tensor, and a
+                // batch of long rows degrades into the passes it would have made alone.
+                let mut end = start + 1;
+                let mut longest = tokenized[start].len();
+                while end < tokenized.len() {
+                    let wider = longest.max(tokenized[end].len());
+                    if (end - start + 1) * wider > BATCH_TOKEN_BUDGET {
+                        break;
+                    }
+                    longest = wider;
+                    end += 1;
+                }
+                out.extend(self.forward_group(&tokenized[start..end], longest)?);
+                start = end;
+            }
+            Ok(out)
+        }
+
+        /// One `[B,T]` forward, pooled at each row's own last real token.
+        fn forward_group(&self, group: &[Vec<u32>], longest: usize) -> Result<Vec<Vec<f32>>> {
+            let rows = group.len();
+            let pad = self.pad_id();
+            let mut flat: Vec<u32> = Vec::with_capacity(rows * longest);
+            for ids in group {
+                flat.extend(ids.iter().copied());
+                flat.extend(std::iter::repeat_n(pad, longest - ids.len()));
+            }
+            let input = Tensor::from_vec(flat, (rows, longest), &self.device)
+                .map_err(|e| candle(e, "batch input tensor"))?;
+
+            let mut model = self.model.clone();
+            let hidden = model
+                .forward(&input, 0)
+                .map_err(|e| candle(e, "qwen3 batch forward"))?;
+
+            let mut out: Vec<Vec<f32>> = Vec::with_capacity(rows);
+            for (row, ids) in group.iter().enumerate() {
+                let pooled = hidden
+                    .narrow(0, row, 1)
+                    .and_then(|t| t.narrow(1, ids.len() - 1, 1))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_dtype(DType::F32))
+                    .map_err(|e| candle(e, "pool last token"))?;
+                let mut vector: Vec<f32> =
+                    pooled.to_vec1().map_err(|e| candle(e, "read vector"))?;
+                if vector.len() != self.dim {
+                    return Err(Error::Model(format!(
+                        "model produced dim {} but {} is configured",
+                        vector.len(),
+                        self.dim
+                    )));
+                }
+                l2_normalize(&mut vector);
+                out.push(vector);
+            }
+            Ok(out)
+        }
+
         fn forward_one(&self, text: &str) -> Result<Vec<f32>> {
             let ids = tokenize::encode(&self.tokenizer, text)?;
             let len = ids.len();
@@ -245,7 +347,7 @@ mod real {
         }
 
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            texts.iter().map(|t| self.forward_one(t)).collect()
+            self.forward_batch(texts)
         }
 
         fn embed_query(&self, text: &str) -> Result<Vec<f32>> {

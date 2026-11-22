@@ -204,72 +204,127 @@ fn lock(session: &Arc<Mutex<Session>>) -> crate::error::Result<std::sync::MutexG
 }
 
 #[cfg(feature = "encoder")]
+/// Take up to `batch` entries off the queue, skipping anything in `skip`.
+///
+/// ★ The entries are CHOSEN here and CLAIMED below; `skip` is extended with each pick so
+/// the same row cannot be chosen twice in one tick.
+fn pick(
+    idle: &rusqlite::Connection,
+    skip: &std::collections::HashSet<String>,
+    batch: usize,
+) -> crate::error::Result<Vec<crate::store::encode::Entry>> {
+    let mut taken = skip.clone();
+    let mut out = Vec::new();
+    for _ in 0..batch.max(1) {
+        match crate::store::encode::next(idle, &taken)? {
+            Some(entry) => {
+                taken.insert(entry.keyslug.clone());
+                out.push(entry);
+            }
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "encoder")]
 fn pass(
     session: &Arc<Mutex<Session>>,
     watch: &crate::http::LockWatch,
     encoder: &super::store::session::Encoder,
     idle: &rusqlite::Connection,
     skipped: &mut std::collections::HashMap<String, std::time::Instant>,
+    batch: usize,
 ) -> crate::error::Result<bool> {
     skipped.retain(|_, at| at.elapsed().as_secs() < SKIP_SECS);
-    let skip_now: std::collections::HashSet<String> = skipped.keys().cloned().collect();
-    let entry = match crate::store::encode::next(idle, &skip_now)? {
-        Some(entry) => entry,
-        None => {
-            let skip: std::collections::HashSet<String> = skipped.keys().cloned().collect();
-            let queued = {
-                let _held = watch.held("memory_encode_refill");
-                let session = lock(session)?;
-                session.refill(&skip)?
-            };
-            if queued > 0 {
-                tracing::info!(
-                    queued,
-                    "encode worker: refilled the queue from what has no vector"
-                );
-            }
-            match crate::store::encode::next(idle, &skip_now)? {
-                Some(entry) => entry,
-                None => return Ok(false),
-            }
-        }
+    let mut entries = {
+        let skip_now: std::collections::HashSet<String> = skipped.keys().cloned().collect();
+        pick(idle, &skip_now, batch)?
     };
+    if entries.is_empty() {
+        let skip: std::collections::HashSet<String> = skipped.keys().cloned().collect();
+        let queued = {
+            let _held = watch.held("memory_encode_refill");
+            let session = lock(session)?;
+            session.refill(&skip)?
+        };
+        if queued > 0 {
+            tracing::info!(
+                queued,
+                "encode worker: refilled the queue from what has no vector"
+            );
+        }
+        let skip_now: std::collections::HashSet<String> = skipped.keys().cloned().collect();
+        entries = pick(idle, &skip_now, batch)?;
+    }
+    if entries.is_empty() {
+        return Ok(false);
+    }
     let started = std::time::Instant::now();
-    let claim = {
+    let claims = {
         let _held = watch.held("memory_encode");
         let session = lock(session)?;
-        session.claim_encode(&entry.keyslug)?
+        let mut claimed = Vec::new();
+        for entry in &entries {
+            if let Some(claim) = session.claim_encode(&entry.keyslug)? {
+                claimed.push(claim);
+            }
+        }
+        claimed
     };
-    let Some(claim) = claim else {
+    if claims.is_empty() {
         return Ok(false);
-    };
-    let captured = claim.doc().to_string();
-    let vector = match encoder.with(|e| e.embed_one(&captured)) {
-        Ok(vector) => vector,
+    }
+    // ONE forward call for the whole claim. `embed` batches internally and falls back to
+    // single passes for anything too long to share a padded tensor with its neighbours.
+    let docs: Vec<String> = claims.iter().map(|c| c.doc().to_string()).collect();
+    let vectors = match encoder.with(|e| e.embed(&docs)) {
+        Ok(vectors) => vectors,
         Err(err) => {
-            skipped.insert(entry.keyslug.clone(), std::time::Instant::now());
+            let now = std::time::Instant::now();
+            for claim in &claims {
+                skipped.insert(claim.keyslug().to_string(), now);
+            }
             tracing::warn!(
-                keyslug = %entry.keyslug,
+                batch = claims.len(),
                 error = %err,
                 skip_secs = SKIP_SECS,
-                "encode worker: embed failed — entry dropped, retried after the skip window"
+                "encode worker: embed failed — entries dropped, retried after the skip window"
             );
             return Ok(true);
         }
     };
+    if vectors.len() != claims.len() {
+        return Err(crate::error::Error::Config(format!(
+            "embedder returned {} vectors for {} documents",
+            vectors.len(),
+            claims.len()
+        )));
+    }
     let counts = {
         let _held = watch.held("memory_encode_write");
         let session = lock(session)?;
-        session.settle_encode(&claim, &vector)?;
+        for (claim, vector) in claims.iter().zip(vectors.iter()) {
+            session.settle_encode(claim, vector)?;
+        }
         session.encode_counts()?
     };
-    skipped.remove(&entry.keyslug);
-    tracing::info!(
-        keyslug = %entry.keyslug,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        pending = counts.pending,
-        "encode worker: encoded"
-    );
+    let batch_ms = started.elapsed().as_millis() as u64;
+    let per_doc_ms = batch_ms / claims.len() as u64;
+    for claim in &claims {
+        skipped.remove(claim.keyslug());
+        // One line per DOCUMENT, so counting "encode worker: encoded" still measures the
+        // drain rate. `elapsed_ms` is the whole batch's wall time (identical on every line
+        // of the batch): with `batch = 1` it means exactly what it meant before batching.
+        tracing::info!(
+            keyslug = %claim.keyslug(),
+            batch = claims.len(),
+            elapsed_ms = batch_ms,
+            per_doc_ms,
+            pending = counts.pending,
+            "encode worker: encoded"
+        );
+    }
     Ok(true)
 }
 
@@ -301,7 +356,7 @@ impl Drop for EncodeWorker {
 
 #[cfg(feature = "encoder")]
 impl MemoryServer {
-    pub fn spawn_encode_worker(&self, interval: std::time::Duration) -> EncodeWorker {
+    pub fn spawn_encode_worker(&self, interval: std::time::Duration, batch: usize) -> EncodeWorker {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -321,6 +376,7 @@ impl MemoryServer {
                 };
                 tracing::info!(
                     interval_ms = interval.as_millis() as u64,
+                    batch,
                     "encode worker up"
                 );
                 let mut skipped: std::collections::HashMap<String, std::time::Instant> =
@@ -340,7 +396,7 @@ impl MemoryServer {
                         continue;
                     }
                     held_stale = false;
-                    match pass(&session, &watch, &encoder, &idle, &mut skipped) {
+                    match pass(&session, &watch, &encoder, &idle, &mut skipped, batch) {
                         Ok(true) => {
                             if crate::store::encode::pending(&idle).unwrap_or(0) == 0 {
                                 let outcome = {

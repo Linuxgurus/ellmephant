@@ -107,7 +107,11 @@ impl Default for Config {
             default_max_distance: Some(DEFAULT_MAX_DISTANCE),
             port: DEFAULT_PORT,
             encode_interval_ms: 1_000,
-            encode_batch: 4,
+            // 1 until a measurement says otherwise: `examples/encode_bench` found batching
+            // neutral-to-slower on 2 cores (0.93-0.98x), because this model at this
+            // sequence length is memory-bandwidth bound. The knob and the batched path
+            // stay (they are tested); the DEFAULT does not promise a win it cannot show.
+            encode_batch: 1,
             rebuild_max_documents: 2_000,
             rebuild_allow_over_budget: false,
         }

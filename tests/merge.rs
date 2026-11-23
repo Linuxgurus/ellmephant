@@ -508,8 +508,9 @@ wait for the green light.";
     assert!(forced.is_ok(), "force must override: {:?}", forced.err());
 }
 
-/// The gate is on CREATE. Patching a row never turns it into a banner by accident, and a body
-/// that merely DISCUSSES supersession is prose.
+/// A patch whose first line is NOT a banner passes — including one that discusses supersession in
+/// prose. Since #269 the gate fires on INTRODUCTION, not on the verb `create`; the comment here
+/// said "the gate is on CREATE" and that sentence is now false, so it goes.
 #[test]
 fn a_banner_gate_does_not_fire_on_patches_or_on_prose() {
     let (_dir, paths) = temp_store();
@@ -556,4 +557,148 @@ fn a_banner_gate_does_not_fire_on_patches_or_on_prose() {
         "only the first line can be a banner: {:?}",
         prose.err()
     );
+}
+
+/// #269 review, finding 1. The gate refused a bannered CREATE and then let the SAME banner into
+/// the store one call later, through an upsert on the key it had just created — the normal path
+/// for a pen that realises a row is wrong and does not want to lose the words. The rule forced
+/// `existing.is_some()` to return Ok, which made it a rule about the verb `create` rather than
+/// about the state "no row is a banner".
+#[test]
+fn a_patch_that_introduces_a_banner_is_refused() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("store");
+    let embedder = HashEmbedder::new(DIM);
+
+    let created = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("evade".into()),
+            title: Some("a real claim".into()),
+            body: Some("A real claim, one per line.".into()),
+            ..Default::default()
+        },
+    );
+    assert!(created.is_ok(), "a clean create: {:?}", created.err());
+
+    let refused = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            body: Some("SUPERSEDED by the new row.".into()),
+            ..bare("evade")
+        },
+    );
+    let err = format!("{}", refused.expect_err("introducing a banner must be refused"));
+    assert!(err.contains("BANNER"), "the class is named: {err}");
+    assert!(err.contains("SUPERSEDED"), "the word that fired: {err}");
+
+    let after = store::get(&conn, "evade").unwrap().expect("the row survives");
+    assert_eq!(
+        after.body, "A real claim, one per line.",
+        "a refused patch writes nothing"
+    );
+
+    // The exit the refusal names still works, and it is not `force`:
+    let forced = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            body: Some("SUPERSEDED by the new row.".into()),
+            force: true,
+            ..bare("evade")
+        },
+    );
+    assert!(forced.is_ok(), "force must still override: {:?}", forced.err());
+}
+
+/// The other half of the introduction rule: a row that ALREADY carries a banner must remain
+/// patchable — including patchable to REMOVE it — because requiring `force: true` to fix a
+/// bannered row is how the annotation outlives the rule that forbids it.
+#[test]
+fn a_row_that_already_carries_a_banner_can_be_patched_clean() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("store");
+    let embedder = HashEmbedder::new(DIM);
+
+    let bannered = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            key: Some("old-row".into()),
+            title: Some("the old row".into()),
+            body: Some("SUPERSEDED by the new row.".into()),
+            force: true,
+            ..Default::default()
+        },
+    );
+    assert!(bannered.is_ok(), "pre-existing rot, forced: {:?}", bannered.err());
+
+    let cleaned = common::merge_now(
+        &conn,
+        &embedder,
+        &store::Patch {
+            acted_by: Some("stet".into()),
+            asserted_by: Some("stet".into()),
+            body: Some("What survives as a lesson, in one line.".into()),
+            ..bare("old-row")
+        },
+    );
+    assert!(
+        cleaned.is_ok(),
+        "removing a banner needs no force: {:?}",
+        cleaned.err()
+    );
+    assert!(
+        store::get(&conn, "old-row")
+            .unwrap()
+            .map(|m| m.body.starts_with("What survives"))
+            .unwrap_or(false),
+        "the clean body landed"
+    );
+}
+
+/// #269 review, finding 2. The dressed spellings are the common ones in a markdown body, and a
+/// matcher anchored at byte 0 saw none of them on CREATE either.
+#[test]
+fn a_dressed_banner_is_refused_like_a_bare_one() {
+    let (_dir, paths) = temp_store();
+    let conn = db::open(&paths).expect("store");
+    let embedder = HashEmbedder::new(DIM);
+
+    for (i, body) in [
+        "**SUPERSEDED** by the new row",
+        "# SUPERSEDED by the new row",
+        "- SUPERSEDED by the new row",
+        "> SUPERSEDED by the new row",
+        "[SUPERSEDED] by the new row",
+        "_SUPERSEDED_ by the new row",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = common::merge_now(
+            &conn,
+            &embedder,
+            &store::Patch {
+                acted_by: Some("stet".into()),
+                asserted_by: Some("stet".into()),
+                key: Some(format!("dressed-{i}")),
+                title: Some("a dressed banner".into()),
+                body: Some(body.into()),
+                ..Default::default()
+            },
+        );
+        let err = format!("{}", out.expect_err("a dressed banner is a banner"));
+        assert!(err.contains("BANNER"), "`{body}`: {err}");
+    }
 }

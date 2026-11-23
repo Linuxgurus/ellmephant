@@ -38,7 +38,11 @@ pub(crate) static RULES_PRE: &[Rule] = &[
               (#257). Search quotes an excerpt, so the banner is the one part of the body no reader \
               ever sees. The refusal names the process — delete the row, name its key by PLAIN \
               name in the good row — because a `[[wikilink]]` to a deleted row is a dangling edge. \
-              `force: true` writes it anyway: prose can legitimately open with one of those words.",
+              `force: true` writes it anyway: prose can legitimately open with one of those words. \
+              ★ It gates the STATE, not the verb that usually produces it (#269 review): a PATCH \
+              that INTRODUCES a banner is refused too, because create-then-patch walked the \
+              create-only version of this rule in one call, and a row that already carries one can \
+              still be patched, including to remove it.",
         run: banner_gate,
     },
     Rule {
@@ -112,14 +116,30 @@ fn shape_gate(ctx: &WriteCtx<'_>) -> Result<()> {
     Ok(())
 }
 
+/// #257 / #269 review. The rule protects a STATE — "no row in the store is a banner" — and a
+/// state is reachable by more than one verb. Keyed on `existing.is_some()` it refused a bannered
+/// CREATE and then wrote the same banner one call later through an upsert on the key it had just
+/// created. So the question asked here is the INTERESTING one: does this patch INTRODUCE a banner?
+///
+/// ★ INTRODUCTION, not presence. A row that already carries a banner may still be patched —
+/// including patched to REMOVE it — because forcing every writer of an existing bannered row to
+/// pass `force: true` would keep the annotation alive. A clean row cannot become an annotated
+/// wrong answer in one call.
 fn banner_gate(ctx: &WriteCtx<'_>) -> Result<()> {
-    if ctx.patch.force || ctx.existing.is_some() {
+    if ctx.patch.force {
         return Ok(());
     }
-    if let Some(word) = ctx.patch.body.as_deref().and_then(super::banner::word) {
-        return Err(Error::Invalid(super::banner::refusal(word, ctx.key)));
+    let Some(word) = ctx.patch.body.as_deref().and_then(super::banner::word) else {
+        return Ok(());
+    };
+    let already = ctx
+        .existing
+        .and_then(|old| super::banner::word(&old.body))
+        .is_some();
+    if already {
+        return Ok(());
     }
-    Ok(())
+    Err(Error::Invalid(super::banner::refusal(word, ctx.key)))
 }
 
 fn contradiction_gate(ctx: &WriteCtx<'_>) -> Result<()> {

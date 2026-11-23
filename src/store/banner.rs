@@ -13,12 +13,67 @@
 /// word (`MOOTNESS` is not `MOOT`, `SUPERSEDED_ROW` is a key). Punctuation and space end it, so
 /// `SUPERSEDED-BY-THE-NEW-ROW` IS a banner: naming what replaced the row while leaving it in
 /// search is the worst form of the rot, not an exception to it.
+///
+/// ★ MARKDOWN DECORATION IS STRIPPED FIRST (#269 review). A banner is a banner however it is
+/// dressed, and the dressed forms are the COMMON ones in a markdown body: `**SUPERSEDED**`,
+/// `# SUPERSEDED`, `- SUPERSEDED`, `> SUPERSEDED`, `[SUPERSEDED]`, `_SUPERSEDED_`. A matcher
+/// anchored at byte 0 of the trimmed line saw only the bare form, and the bare form is the LEAST
+/// likely spelling. The strip touches only the FRONT (and a matched emphasis prefix), so
+/// `MOOTNESS` and `SUPERSEDED_ROW` still do not fire.
 pub fn word(body: &str) -> Option<&'static str> {
     let first = body.lines().map(str::trim).find(|line| !line.is_empty())?;
-    WORDS.iter().copied().find(|word| opens_with(first, word))
+    let line = undecorate(first);
+    WORDS
+        .iter()
+        .copied()
+        .find(|word| opens_with(line, word) || emphasis_inner(line, word))
 }
 
 const WORDS: [&str; 4] = ["SUPERSEDED", "RETRACTED", "OBSOLETE", "MOOT"];
+
+/// The marks that can pair around the word as emphasis (`_MOOT_`, `*MOOT*`).
+const PAIRED: [char; 4] = ['_', '*', '`', '~'];
+
+fn is_front_mark(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '#' | '>' | '*' | '+' | '-' | '`' | '~' | '[' | '(')
+}
+
+/// Strip the decoration an author puts IN FRONT of the word: a list or header marker, a
+/// blockquote marker, emphasis, or an opening bracket. Only the front, so the word-boundary rule
+/// that refuses `SUPERSEDED_ROW` is untouched.
+///
+/// The underscore is deliberately NOT a front mark: a leading `_` is handled only as the opening
+/// half of a matched emphasis pair, which is what italic markdown is, while an underscore in
+/// `SUPERSEDED_ROW` continues the word and must keep doing so.
+fn undecorate(line: &str) -> &str {
+    let mut s = line.trim();
+    loop {
+        let t = s.trim_start_matches(is_front_mark);
+        if t.len() == s.len() {
+            break;
+        }
+        s = t;
+    }
+    s
+}
+
+/// `_MOOT_ by the new row` — the word is inside a matched emphasis pair that the front-strip left
+/// in place, because `_` is not a front mark. The inner text must be a single token: emphasis
+/// wraps a word, it does not wrap a sentence.
+fn emphasis_inner(line: &str, word: &str) -> bool {
+    for mark in PAIRED {
+        let Some(rest) = line.strip_prefix(mark) else {
+            continue;
+        };
+        if let Some(end) = rest.find(mark) {
+            let inner = &rest[..end];
+            if !inner.is_empty() && !inner.contains(char::is_whitespace) && opens_with(inner, word) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn opens_with(line: &str, word: &str) -> bool {
     let Some(rest) = line.get(..word.len()) else {
@@ -100,6 +155,38 @@ mod tests {
             None,
             "an underscore continues the word"
         );
+    }
+
+    /// #269 review: six of eight realistic spellings of a banner are DRESSED, and a matcher
+    /// anchored at byte 0 of the trimmed line saw none of them.
+    #[test]
+    fn markdown_decoration_does_not_hide_a_banner() {
+        for (body, expected) in [
+            ("**SUPERSEDED** by the new row", "SUPERSEDED"),
+            ("# SUPERSEDED by the new row", "SUPERSEDED"),
+            ("- SUPERSEDED by the new row", "SUPERSEDED"),
+            ("* SUPERSEDED by the new row", "SUPERSEDED"),
+            ("> SUPERSEDED by the new row", "SUPERSEDED"),
+            ("[SUPERSEDED] by the new row", "SUPERSEDED"),
+            ("_SUPERSEDED_ by the new row", "SUPERSEDED"),
+            ("*SUPERSEDED*", "SUPERSEDED"),
+            ("#### **`RETRACTED`** — this row was wrong", "RETRACTED"),
+            ("> - [MOOT] the budget line moved", "MOOT"),
+            ("  - OBSOLETE: the old script", "OBSOLETE"),
+            ("**SUPERSEDED-BY-THE-NEW-ROW** names its replacement", "SUPERSEDED"),
+        ] {
+            assert_eq!(word(body), Some(expected), "decoration hid the banner: `{body}`");
+        }
+    }
+
+    /// The strip touches only the front, so the negatives that make the rule mean something stay
+    /// negative — and a decorated KEY is still a key.
+    #[test]
+    fn decoration_stripping_keeps_the_word_boundary_rule() {
+        assert_eq!(word("**MOOTNESS** is not a banner"), None);
+        assert_eq!(word("- SUPERSEDED_ROW"), None, "an underscore continues the word");
+        assert_eq!(word("`MOOTED`"), None, "a decorated different word");
+        assert_eq!(word("# MOOTNESS_ROW"), None);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::store::audience::{self, Reader};
@@ -161,9 +162,15 @@ pub fn set(
 /// Returns the item as it stood, or `None` when there was no such item (an unset of something
 /// absent is already the requested state, not an error). The row's value and `source` are gone
 /// afterwards: `config` keeps no versions, which is why this is a separate, deliberate act.
+///
+/// The removal writes one `config_event` row first: the actor, the old `set_audience`,
+/// `read_audience`, owner and `updated_at`, and a SHA-256 of the value — never the value.
+/// **An unset releases the key's NAME**: nothing reserves it, so the next `config_define` of
+/// that key creates a fresh row and owns it, whoever it is.
 pub fn unset(conn: &Connection, reader: &Reader, who: &str, key: &str) -> Result<Option<Item>> {
     let key = normalize_key(key)?;
-    let Some(old) = load(conn, &key)? else {
+    let tx = conn.unchecked_transaction()?;
+    let Some(old) = load(&tx, &key)? else {
         return Ok(None);
     };
     if !reader.sees(&old.set_audience) {
@@ -172,10 +179,49 @@ pub fn unset(conn: &Connection, reader: &Reader, who: &str, key: &str) -> Result
             old.set_audience
         )));
     }
-    let removed = conn.execute("DELETE FROM config WHERE key = ?1", params![key])?;
+    // One statement, predicated on the audited ACL. The load above decided the gate; this makes
+    // the write conditional on the SAME value it decided on, so a writer that narrowed
+    // `set_audience` between the two cannot ride a stale authorisation. 0 rows is a REFUSAL,
+    // not a quiet "absent": the only `absent` answer is the load miss above.
+    let removed = tx.execute(
+        "DELETE FROM config WHERE key = ?1 AND set_audience = ?2",
+        params![key, old.set_audience],
+    )?;
     if removed == 0 {
-        return Ok(None);
+        return Err(Error::Forbidden(format!(
+            "may not unset `{key}`: the row's `set_audience` changed under the gate that \
+             authorised this call — re-read it and try again"
+        )));
     }
+    // Durable record: config keeps no versions, so this is the only trace of what was removed.
+    // It holds the OLD ACL/owner and a hash of the value — never the value itself.
+    let mut hasher = Sha256::new();
+    hasher.update(old.value.as_bytes());
+    let value_sha256 = format!("{:x}", hasher.finalize());
+    let actor = pen_id(&tx, who)?;
+    // `Item.owner` is the owner NAME; the audit row keeps the referential id so the
+    // record joins back to `pen` instead of holding a name a rename would outlive.
+    let old_owner_id = match &old.owner {
+        Some(name) => pen_id(&tx, name)?,
+        None => None,
+    };
+    tx.execute(
+        "INSERT INTO config_event
+           (key, action, actor, pen_id, old_set_audience, old_read_audience, old_owner,
+            old_updated_at, value_sha256)
+         VALUES (?1, 'unset', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            old.key,
+            who,
+            actor,
+            old.set_audience,
+            old.read_audience,
+            old_owner_id,
+            old.updated_at,
+            value_sha256
+        ],
+    )?;
+    tx.commit()?;
     Ok(Some(old))
 }
 

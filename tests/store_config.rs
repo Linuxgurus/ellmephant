@@ -4,6 +4,7 @@ use common::temp_store;
 
 use ellmephant::store::audience::Reader;
 use ellmephant::store::config;
+use sha2::Digest;
 
 fn tree(conn: &rusqlite::Connection) {
     conn.execute_batch(
@@ -468,4 +469,94 @@ fn an_audience_naming_no_pen_is_refused() {
     )
     .expect_err("an audience naming no pen is an item nobody can read");
     assert!(format!("{err}").contains("names no pen"), "{err}");
+}
+
+#[test]
+fn unset_leaves_a_durable_record_of_what_it_removed_without_the_value() {
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    config::define(
+        &conn,
+        &reader(&conn, "james"),
+        Some("james"),
+        "recess_daily_grant",
+        "1h",
+        "pen:james",
+        "pen:stet",
+        "only James may raise or retire it",
+    )
+    .unwrap();
+
+    let removed = config::unset(&conn, &reader(&conn, "james"), "james", "recess_daily_grant")
+        .unwrap()
+        .expect("james holds the boundary");
+    assert_eq!(removed.value, "1h");
+
+    let expected = format!("{:x}", sha2::Sha256::digest(b"1h"));
+
+    let row = conn
+        .query_row(
+            "SELECT e.action, e.actor, e.old_set_audience, e.old_read_audience,
+                    p.name, e.old_updated_at, e.value_sha256
+               FROM config_event e LEFT JOIN pen p ON p.id = e.old_owner
+              WHERE e.key = 'recess_daily_grant'",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .expect("an unset writes a config_event row");
+    assert_eq!(row.0, "unset");
+    assert_eq!(row.1, "james");
+    assert_eq!(row.2, "pen:james");
+    assert_eq!(row.3, "pen:stet");
+    assert_eq!(row.4.as_deref(), Some("james"));
+    assert!(!row.5.is_empty(), "the old updated_at is part of the record");
+    assert_eq!(row.6, expected, "the record carries a hash, not the value");
+}
+
+#[test]
+fn unset_releases_the_key_name_to_whoever_defines_it_next() {
+    // Documented and deliberate: `unset` removes the row and reserves NOTHING, so absence is a
+    // CREATE for any pen the key does not gate. The description says so; this test is what that
+    // sentence means, so a later tombstone has to break a test on purpose.
+    let (_dir, paths) = temp_store();
+    let conn = ellmephant::db::open(&paths).unwrap();
+    tree(&conn);
+
+    config::define(
+        &conn,
+        &reader(&conn, "james"),
+        Some("james"),
+        "hand_policy",
+        "x",
+        "pen:james",
+        "pen:stet",
+        "James owns this row",
+    )
+    .unwrap();
+    config::unset(&conn, &reader(&conn, "james"), "james", "hand_policy").unwrap();
+
+    let reclaimed = config::define(
+        &conn,
+        &reader(&conn, "cline"),
+        Some("cline"),
+        "hand_policy",
+        "mine now",
+        "pen:cline",
+        "public",
+        "the name was free",
+    )
+    .expect("absence is a CREATE: unset reserves no name");
+    assert_eq!(reclaimed.owner.as_deref(), Some("cline"));
 }

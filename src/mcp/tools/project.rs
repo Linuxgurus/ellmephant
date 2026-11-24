@@ -241,7 +241,7 @@ impl MemoryServer {
                        status says `absent`. This is how a mis-typed key is cleaned up and how a \
                        grant is withdrawn by the pen holding its boundary. NO VERSIONS: the value \
                        and its `source` are gone, so the reason is worth having written down \
-                       before this call. Prefer `config_set` when the policy is right and only the \
+                       before this call; the removal leaves a durable config_event row (actor, old ACL and owner, a hash of the value, never the value). An unset RELEASES THE KEY NAME: nothing reserves it, so the next config_define creates a fresh row and owns it, whoever it is. Prefer `config_set` when the policy is right and only the \
                        value is wrong.",
         annotations(
             title = "Unset config",

@@ -218,6 +218,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/0043_memory_fold.sql"),
         "fold: an append-only cross-pen fold, and the row it absorbed",
     ),
+    (
+        44,
+        include_str!("../../migrations/0044_config_event.sql"),
+        "`config_event`: an unset leaves a durable record — actor, old ACL and owner, a hash of the value, never the value (#208 review)",
+    ),
 ];
 
 pub fn version(conn: &Connection) -> Result<i32> {

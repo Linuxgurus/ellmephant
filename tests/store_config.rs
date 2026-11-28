@@ -489,9 +489,14 @@ fn unset_leaves_a_durable_record_of_what_it_removed_without_the_value() {
     )
     .unwrap();
 
-    let removed = config::unset(&conn, &reader(&conn, "james"), "james", "recess_daily_grant")
-        .unwrap()
-        .expect("james holds the boundary");
+    let removed = config::unset(
+        &conn,
+        &reader(&conn, "james"),
+        "james",
+        "recess_daily_grant",
+    )
+    .unwrap()
+    .expect("james holds the boundary");
     assert_eq!(removed.value, "1h");
 
     let expected = format!("{:x}", sha2::Sha256::digest(b"1h"));
@@ -521,7 +526,10 @@ fn unset_leaves_a_durable_record_of_what_it_removed_without_the_value() {
     assert_eq!(row.2, "pen:james");
     assert_eq!(row.3, "pen:stet");
     assert_eq!(row.4.as_deref(), Some("james"));
-    assert!(!row.5.is_empty(), "the old updated_at is part of the record");
+    assert!(
+        !row.5.is_empty(),
+        "the old updated_at is part of the record"
+    );
     assert_eq!(row.6, expected, "the record carries a hash, not the value");
 }
 

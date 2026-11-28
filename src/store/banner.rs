@@ -67,7 +67,8 @@ fn emphasis_inner(line: &str, word: &str) -> bool {
         };
         if let Some(end) = rest.find(mark) {
             let inner = &rest[..end];
-            if !inner.is_empty() && !inner.contains(char::is_whitespace) && opens_with(inner, word) {
+            if !inner.is_empty() && !inner.contains(char::is_whitespace) && opens_with(inner, word)
+            {
                 return true;
             }
         }
@@ -173,9 +174,16 @@ mod tests {
             ("#### **`RETRACTED`** — this row was wrong", "RETRACTED"),
             ("> - [MOOT] the budget line moved", "MOOT"),
             ("  - OBSOLETE: the old script", "OBSOLETE"),
-            ("**SUPERSEDED-BY-THE-NEW-ROW** names its replacement", "SUPERSEDED"),
+            (
+                "**SUPERSEDED-BY-THE-NEW-ROW** names its replacement",
+                "SUPERSEDED",
+            ),
         ] {
-            assert_eq!(word(body), Some(expected), "decoration hid the banner: `{body}`");
+            assert_eq!(
+                word(body),
+                Some(expected),
+                "decoration hid the banner: `{body}`"
+            );
         }
     }
 
@@ -184,7 +192,11 @@ mod tests {
     #[test]
     fn decoration_stripping_keeps_the_word_boundary_rule() {
         assert_eq!(word("**MOOTNESS** is not a banner"), None);
-        assert_eq!(word("- SUPERSEDED_ROW"), None, "an underscore continues the word");
+        assert_eq!(
+            word("- SUPERSEDED_ROW"),
+            None,
+            "an underscore continues the word"
+        );
         assert_eq!(word("`MOOTED`"), None, "a decorated different word");
         assert_eq!(word("# MOOTNESS_ROW"), None);
     }
